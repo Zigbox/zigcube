@@ -217,6 +217,7 @@ fn script(demo: *Demo) !void {
     try steps.labels_refused(demo);
     try step_start(demo);
     try steps.labels_registered(demo);
+    try step_relabel(demo);
     try steps.tenant_jobs(demo);
     try steps.open_jobs_avoid_exclusive(demo);
     try steps.tenant_c_pending(demo);
@@ -238,6 +239,27 @@ fn step_start(demo: *Demo) !void {
     for (0..fleet_mod.count) |index| try demo.fleet.start_agent(index);
     try host.wait_for({}, all_ready, "the three nodes to be ready", state.start_wait_ms);
     host.say("  three zcube-agents (FakeRuntime, 1000m CPU each) started and ready", .{});
+}
+
+/// An agent restarted under other labels while its lease lives would resume the old tenure under
+/// the old labels, so it refuses to start (ZC-E0505); the same labels start as before.
+fn step_relabel(demo: *Demo) !void {
+    const host = demo.host;
+    host.section("0d. a node restarted under other labels while its lease lives is refused");
+    try demo.fleet.kill_agent(0);
+    host.say("  # kill -9 of node1's agent; its lease lives on in its state directory", .{});
+    const server = try std.fmt.allocPrint(host.arena(), "127.0.0.1:{d}", .{host.port});
+    const args = [_][]const u8{
+        "--node",         fleet_mod.names[0],          "--server",     server,
+        "--state-dir",    try demo.fleet.state_dir(0), "--cpu-millis", "1000",
+        "--memory-bytes", "8589934592",                "--images",     host.config.images,
+        "--label",        "tenant=b",
+    };
+    try steps.refused(host, &args, "node1 under tenant=b while its tenant=a lease lives");
+    try demo.fleet.start_agent(0);
+    try host.wait_for({}, all_ready, "node1 to be ready again", state.start_wait_ms);
+    try host.check(std.mem.eql(u8, (try state.node_labels(host))[0], "node1 tenant=a"), "node1 " ++
+        "is back under its own labels, tenant=a", .{});
 }
 
 fn all_ready(_: void, host: *Host) !bool {

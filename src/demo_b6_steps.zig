@@ -21,7 +21,7 @@ const open_jobs = [_][]const u8{ "n1", "n2", "n3" };
 // ---- 0. Labels refused, and labels registered ----
 
 /// Runs `zcube-agent <args>`, shown; the agent must refuse its configuration with ZC-E0505.
-fn refused(host: *Host, args: []const []const u8, comptime what: []const u8) !void {
+pub fn refused(host: *Host, args: []const []const u8, comptime what: []const u8) !void {
     const argv = try host.arena().alloc([]const u8, args.len + 1);
     argv[0] = host.config.agent_exe;
     @memcpy(argv[1..], args);
