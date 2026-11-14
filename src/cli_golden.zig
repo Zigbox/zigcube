@@ -167,6 +167,13 @@ fn store_failed(diag: *diag_mod.Diag) void { // store_sqlite.zig
     diag.context("path", "/var/lib/zcube/store.db", .{});
 }
 
+fn store_not_built(diag: *diag_mod.Diag) void { // server_store.zig
+    const cause = "this zcube-server has no postgres store; it was built with memory and sqlite";
+    const sentence = "name a store this server has, or install the server package for " ++
+        "postgres (zigcube-server-postgres)";
+    sample(diag, .E0217, &.{cause}, sentence);
+}
+
 fn compacted(diag: *diag_mod.Diag) void { // store_failures.zig
     assert(failures.compacted(diag, 10, 380) == error.Compacted);
 }
@@ -897,6 +904,7 @@ const cases = [_]Case{
     relayed(.E0214, no_hash),
     relayed(.E0215, backwards),
     relayed(.E0216, unusable_file),
+    relayed(.E0217, store_not_built),
     relayed(.E0301, bad_record),
     relayed(.E0302, too_many),
     relayed(.E0303, record_too_new),

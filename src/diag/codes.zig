@@ -70,6 +70,7 @@ pub const Code = enum(u8) {
     E0214,
     E0215,
     E0216,
+    E0217,
     E0301,
     E0302,
     E0303,
@@ -878,6 +879,23 @@ pub const registry = [_]Entry{
         \\runs does not stop it: it warns once, naming the file, and tries
         \\again. If the file is damaged, delete it and restart the agent; it
         \\then remembers the server as it finds it.
+        ,
+    },
+    .{
+        .code = .E0217,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "this zcube-server was built without that store",
+        .explanation =
+        \\The store named by --store or the configuration is not compiled into
+        \\this zcube-server. The packaged servers each hold one store (SQLite or
+        \\Postgres) and the memory store, so that a machine needs only the
+        \\library of the one it uses. A development build holds all three.
+        \\
+        \\The cause line names the store and the ones this build has. Name one
+        \\of those, or install the server package for the store you want
+        \\(zigcube-server-sqlite or zigcube-server-postgres). Nothing was
+        \\opened or changed.
         ,
     },
     .{

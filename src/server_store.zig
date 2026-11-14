@@ -10,11 +10,16 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Clock = @import("clock.zig").Clock;
 const config_mod = @import("server_config.zig");
+const build_options = @import("build_options");
 const diag_mod = @import("diag.zig");
 const store = @import("store.zig");
 const MemoryStore = @import("store_memory.zig").MemoryStore;
-const PostgresStore = @import("store_postgres.zig").PostgresStore;
-const SqliteStore = @import("store_sqlite.zig").SqliteStore;
+// `-Dstore=sqlite|postgres` builds a server with one store, linking only its library (the
+// packaged servers); the unused backend's type is `void` and its code is never analysed.
+const has_sqlite = build_options.store != .postgres;
+const has_postgres = build_options.store != .sqlite;
+const PostgresStore = if (has_postgres) @import("store_postgres.zig").PostgresStore else void;
+const SqliteStore = if (has_sqlite) @import("store_sqlite.zig").SqliteStore else void;
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -73,12 +78,14 @@ pub const Backend = struct {
                 backend.kind = .{ .memory = .{ .memory = memory, .locked = locked } };
             },
             .sqlite => |path| {
+                if (comptime !has_sqlite) return not_built(diag, "sqlite");
                 const sqlite = try gpa.create(SqliteStore);
                 errdefer gpa.destroy(sqlite);
                 try sqlite.open(io, time, path, .{ .create = create }, diag);
                 backend.kind = .{ .sqlite = sqlite };
             },
             .postgres => |settings| {
+                if (comptime !has_postgres) return not_built(diag, "postgres");
                 const postgres = try gpa.create(PostgresStore);
                 errdefer gpa.destroy(postgres);
                 try postgres.open(io, .{ .conninfo = settings, .create = create }, diag);
@@ -97,14 +104,14 @@ pub const Backend = struct {
                 parts.memory.deinit();
                 gpa.destroy(parts.memory);
             },
-            .sqlite => |sqlite| {
+            .sqlite => |sqlite| if (comptime has_sqlite) {
                 sqlite.close();
                 gpa.destroy(sqlite);
-            },
-            .postgres => |postgres| {
+            } else unreachable, // `open` never makes a store this build lacks.
+            .postgres => |postgres| if (comptime has_postgres) {
                 postgres.close();
                 gpa.destroy(postgres);
-            },
+            } else unreachable, // As above.
         }
         gpa.destroy(backend);
     }
@@ -112,9 +119,28 @@ pub const Backend = struct {
     pub fn handle(backend: *Backend) Store {
         return switch (backend.kind) {
             .memory => |parts| parts.locked.interface(),
-            .sqlite => |sqlite| sqlite.interface(),
-            .postgres => |postgres| postgres.interface(),
+            .sqlite => |sqlite| if (comptime has_sqlite) sqlite.interface() else unreachable,
+            .postgres => |postgres| if (comptime has_postgres)
+                postgres.interface()
+            else
+                unreachable,
         };
+    }
+
+    /// The refusal of a store that is not compiled into this server (ZC-E0217).
+    fn not_built(diag: *Diag, comptime wanted: []const u8) store.Error {
+        diag.raise(.E0217);
+        const have = switch (build_options.store) {
+            .all => "memory, sqlite and postgres",
+            .sqlite => "memory and sqlite",
+            .postgres => "memory and postgres",
+        };
+        diag.cause("this zcube-server has no " ++ wanted ++ " store; it was built with {s}", .{
+            have,
+        });
+        diag.fix(.{ .sentence = "name a store this server has, or install the server package " ++
+            "for " ++ wanted ++ " (zigcube-server-" ++ wanted ++ ")" });
+        return error.BackendFailed;
     }
 
     pub fn clock(backend: *Backend) Clock {

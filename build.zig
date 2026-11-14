@@ -14,6 +14,11 @@ const v8_modes = [_][]const u8{ "--liftoff-only", "--no-liftoff" };
 
 const Backend = enum { memory, sqlite, postgres };
 
+/// Which stores `zcube-server` compiles in, besides the memory store (`-Dstore=`). `all` is the
+/// default for development and CI; the packaged servers each hold one, so a machine installs
+/// only the library of the store it uses.
+const StoreChoice = enum { all, sqlite, postgres };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -25,6 +30,9 @@ pub fn build(b: *std.Build) void {
     // Zigbox's package has a `build_options` module of its own; if the two files were byte for
     // byte the same, the compiler would see one file in two modules. This line keeps them apart.
     options.addOption([]const u8, "product", "zigcube");
+    const store_help = "Stores zcube-server compiles in besides memory (default all)";
+    const store_choice = b.option(StoreChoice, "store", store_help) orelse .all;
+    options.addOption(StoreChoice, "store", store_choice);
 
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
     const zigbox_module = zigbox.module("zigbox");
@@ -43,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .sqlite = sqlite,
         .libpq = libpq_module,
         .web_files = web_files,
+        .store = store_choice,
     };
     const built = add_executables(b, shared_options);
     add_unit_tests(b, shared_options, built);
@@ -232,6 +241,7 @@ const ExecutablesOptions = struct {
     sqlite: *std.Build.Module,
     libpq: *std.Build.Module,
     web_files: *std.Build.Module,
+    store: StoreChoice,
 };
 
 /// What `add_executables` made that other steps use: the server and the agent, and the steps that
@@ -260,8 +270,13 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
         // The server is the one executable that opens a store and serves the console; the CLI
         // and the agent reach it over HTTP.
         if (std.mem.eql(u8, executable.name, "zcube-server")) {
-            module.addImport("sqlite_c", executables_options.sqlite);
-            module.addImport("libpq_c", executables_options.libpq);
+            // Only the stores built in are imported, so only their libraries are linked.
+            if (executables_options.store != .postgres) {
+                module.addImport("sqlite_c", executables_options.sqlite);
+            }
+            if (executables_options.store != .sqlite) {
+                module.addImport("libpq_c", executables_options.libpq);
+            }
             module.addImport("web_files", executables_options.web_files);
         }
         const exe = b.addExecutable(.{ .name = executable.name, .root_module = module });

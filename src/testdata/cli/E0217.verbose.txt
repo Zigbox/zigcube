@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0217]: this zcube-server was built without that store
+  cause  this zcube-server has no postgres store; it was built with memory and
+         sqlite
+  reqid  r-0000001
+  fix    name a store this server has, or install the server package for postgres (zigcube-server-postgres)
+  more   zcube explain E0217
+  docs   https://zigbox.github.io/zigcube/errors/E0217.html
