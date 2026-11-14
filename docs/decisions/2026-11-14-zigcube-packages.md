@@ -1,8 +1,7 @@
 # Zigcube's packages: layout, key, site, tap
 
-*Proposed 2026-11-14 by the packaging slice. Becomes a decision when the owner answers the
-questions marked ASK in `docs/briefs/packaging.md`; this file is then edited once, before it
-merges, and never after.*
+*Decided 2026-11-14, by the supervisor (layout, key, site, formula, name collision, the `ZC-`
+code for a store not built in) and the owner (package list, Mac dependency).*
 
 ## The contract
 
@@ -20,18 +19,18 @@ merges, and never after.*
   workflows pin that fingerprint and check every signature is by a subkey of it, against a public
   key checked in to Zigcube, never against a keyring inside an asset. The keyring users fetch
   stays `https://zigbox.org/zigbox-archive-keyring.gpg`.
-- **Packages (owner, 2026-11-14; Linux only):** `zigbox` (`zbx`, no dependencies, see the open
-  collision in the brief), `zigcube` (`zcube`, no dependencies), `zigcube-server-sqlite` and
+- **Packages (owner, 2026-11-14; Linux only):** `zigbox` (`zbx`; Zigbox's own package from suite `stable`, never built by
+  Zigcube), `zigcube` (`zcube`, no dependencies), `zigcube-server-sqlite` and
   `zigcube-server-postgres` (one store each plus memory; both install `/usr/bin/zcube-server`, each
   `Conflicts` with and `Replaces` the other, both `Provide` `zigcube-server`; each depends on
   `zigcube` and its library), `zigcube-agent` (depends on `zigcube`, `Recommends` `zigbox`: the agent
   never runs `zbx`), `zigbox-dev` (no files; depends on `zigbox (>= pinned version)`,
   `zigcube-server-sqlite`, `zigcube-agent`). Installing starts nothing: units ship disabled.
   A build option `-Dstore=sqlite|postgres|all` (default `all`) makes the two server builds; a
-  `--store` for a backend not built in is refused in one line (a `ZC-` code, owner to approve).
+  `--store` for a backend not built in is refused in one line (a `ZC-` code, approved).
 - **Mac (owner, 2026-11-14):** formulas for `zbx` and `zcube` only; the `zigcube` formula in
   `Zigbox/homebrew-tap` (a universal zip, written by Zigcube's release and by nothing else)
-  `depends_on` the tap's `zigbox` formula, since the server and agent run in the zbx VM there.
+  `depends_on "zigbox/tap/zigbox"`, since the server and agent run in the zbx VM there.
 - **Server baseline:** each server flavour built on a RHEL 9 compatible image (glibc 2.34), one binary per
   architecture and flavour for all four distributions, until a test shows a distribution refuses it.
 - **Release order:** Zigbox's release is published before Zigcube's, because Zigcube's `verify`
