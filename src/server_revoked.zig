@@ -1,7 +1,7 @@
 //! The server's watch of its `revoked` file (B7 slice 5, docs/mtls.md "Revocation"). Shell code:
 //! the HTTP watchdog calls `tick` every `http_watchdog_ms`, and a tick that finds the file
-//! changed (its inode, size or modification time) reads it again and swaps the new set into the
-//! CA, without a restart. The decision file is
+//! changed (its inode, size, modification or status-change time) reads it again and swaps the
+//! new set into the CA, without a restart. The decision file is
 //! docs/decisions/2026-11-14-b7-slice5-runtime-cert-checks.md.
 //!
 //! The rules (and docs/decisions/2026-11-14-b7-slice5-review-fixes.md, R1 to R3):
