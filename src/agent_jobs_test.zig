@@ -1508,6 +1508,123 @@ test "a lost answer to an earlier run's write does not hold back a later run's s
     try testing.expectEqual(@as(?records.StopCause, .cancel), seen.stop_cause);
 }
 
+test "a failed read of the runs' reports does not hold back a stop the runs already show (#142)" {
+    // Goal: #142 (seed 2821617909). The job pass reads the runs, then this node's reports. When
+    // the second read fails, the runs it already holds say which stops are committed; a pass
+    // that ended there withheld the stop for as long as that read kept failing, while the
+    // heartbeat went on (so the fence never came), and the run outlived J6's bound. Method:
+    // `cancel_while_failing` with the reports' list failing.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const prefix = records.job_observed_prefix(sim_world.node_name);
+    try cancel_while_failing(&rig, .{ .list = prefix.slice() });
+}
+
+test "a failed read of the node's assignments does not hold back a run's stop (#142)" {
+    // Goal: the same bug before the job pass (#142, seed 4242675264 at f49041a). The step loads
+    // the replicas and this node's assignments first; a step that ended at a failed load never
+    // read the runs, so a store that renews the lease and cuts that list step after step kept
+    // a cancelled run going past J6's bound. Method: `cancel_while_failing` with the list of
+    // `/assigned/<node>/` failing.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const prefix = records.assigned_prefix(sim_world.node_name);
+    try cancel_while_failing(&rig, .{ .list = prefix.slice() });
+}
+
+test "a failed write of the image summary does not hold back a run's stop (#142)" {
+    // Goal: the summary (`/node-store/<node>`) is advisory; a step that ended at its failed
+    // write never reached the job pass, and the stop waited as for a failed load. Method: the
+    // agent gets an image store after the run starts, so the cancel's step writes the summary;
+    // `cancel_while_failing` with that write failing.
+    const node_store = @import("node_store.zig");
+    var rig = try Rig.start();
+    defer rig.stop();
+    var fake: node_store.FakeImages = .{ .digests = &.{image} };
+    try cancel_while_failing(&rig, .{ .write = records.prefix_node_store, .images = &fake });
+}
+
+test "a runtime failure kept first does not hide the server failure that stopped the step" {
+    // Goal: the review of #142 (SHOULD). The step's error, the one `why` shows, is the failure
+    // that cut its store calls short; a runtime failure kept before it (which lets the stages go
+    // on) is described as a later failure instead. Method: a replica's start fails in the
+    // runtime, then the read of the runs' reports fails; the run's cancel still stops it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const replica: records.Replica = .{
+        .id = "web-1",
+        .service = "web",
+        .generation = 1,
+        .image = image,
+        .command = &.{"true"},
+    };
+    _ = try rig.put(.replica_controller, records.replica_key("web", "web-1").slice(), replica);
+    const assigned = records.assigned_replica(
+        "web-1",
+        "web",
+        .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        "test",
+    );
+    const key = records.assigned_key(sim_world.node_name, "web-1");
+    _ = try rig.put(.scheduler, key.slice(), assigned);
+    try rig.ask_stop(.cancel, 60_000);
+    var wrapper: FailingList = .{ .inner = world.sim.interface(), .start_failing = true };
+    world.runtime_override = wrapper.interface();
+    const prefix = records.job_observed_prefix(sim_world.node_name);
+    world.switched.down_list_prefix = prefix.slice();
+    _ = world.agent_step();
+    world.switched.down_list_prefix = null;
+    world.runtime_override = null;
+    try testing.expectEqual(@as(u32, 1), wrapper.refused);
+    const noted = world.agent.enforce_failure();
+    try testing.expect(std.mem.startsWith(u8, noted, "reconcile a replica"));
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+}
+
+const Failing = struct {
+    /// A list under this prefix fails (ZC-E0201).
+    list: ?[]const u8 = null,
+    /// A transaction that writes under this prefix fails (ZC-E0201).
+    write: ?[]const u8 = null,
+    /// Given to the agent with the failure, so the step writes its image summary.
+    images: ?*@import("node_store.zig").FakeImages = null,
+};
+
+/// "train-job" runs and is cancelled; one step then runs with `failing` set (ZC-E0201). That step
+/// records the cancel as the cause and stops the container, and makes no store write; once the
+/// store answers, the cancel is reported.
+fn cancel_while_failing(rig: *Rig, failing: Failing) !void {
+    const world = rig.world;
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    try rig.ask_stop(.cancel, 60_000);
+    if (failing.images) |fake| world.images = fake.images();
+    world.switched.down_list_prefix = failing.list;
+    world.switched.down_write_prefix = failing.write;
+    world.switched.mark();
+    _ = world.agent_step();
+    world.switched.down_list_prefix = null;
+    world.switched.down_write_prefix = null;
+    try testing.expectEqual(@as(?codes.Code, .E0201), world.last_failure);
+    // No write but the failing one: a stopped pass makes none.
+    const txns: u32 = if (failing.write == null) 0 else 1;
+    try testing.expectEqual(txns, world.switched.txns_since_mark);
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .cancel), kept.stop_cause);
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+    world.last_failure = null;
+    rig.step();
+    rig.step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .cancel), seen.stop_cause);
+}
+
 /// "train-job" running, and "other-job", which sorts first, assigned; the caller has set
 /// `lost_answer_prefix` to "other-job"'s observation, so the next step's first write of it is
 /// committed and its answer lost (ZC-E0201).

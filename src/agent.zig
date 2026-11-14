@@ -453,9 +453,9 @@ pub const Agent = struct {
     ) u32 {
         var acted: u32 = 0;
         pass.replicas(kept);
-        // The job pass runs even after a replica stage's failure that is not the runtime's (that
-        // stage makes no store call: the arena or an encode): it then makes one read (the runs)
-        // and no write, and stops the runs whose stop is decided (#247).
+        // The job pass runs even after a failure that is not the runtime's, in a replica stage
+        // (#247), in the loading or in the image summary (#142): it then makes one read (the
+        // runs) and no write, and stops the runs whose stop is decided.
         if (kept.stopped and c1_teeth.job_pass_break) return acted;
         acted += kept.run(agent, ctx, "run the job pass", agent_jobs.pass(
             agent,
@@ -509,7 +509,12 @@ pub const Agent = struct {
         // A grant or a keepalive moves the fence: the calls that follow are capped by the new one.
         agent.cap_calls(ctx);
         const listings = listed orelse try ctx.runtime.list(ctx.arena, ctx.diag);
-        try agent.publish_store(ctx, listings);
+        // The summary is advisory and the loading only feeds the stages: a failure of either
+        // that is not the runtime's (the server) is kept like a stage's, and the job pass still
+        // reads the runs and stops what they decide. A step that ended here withheld a committed
+        // stop for as long as these calls kept failing while the keepalive went on (#142).
+        var kept: Kept = .{};
+        kept.stage(agent, ctx, "publish the image summary", agent.publish_store(ctx, listings));
         if (agent.fence.active) return agent.fence_step(ctx, now);
         var pass: Pass = .{
             .agent = agent,
@@ -517,8 +522,10 @@ pub const Agent = struct {
             .listings = listings,
             .node_key = records.node_key(agent.config.node),
         };
-        try pass.load();
-        var kept: Kept = .{};
+        if (!kept.stopped) kept.stage(agent, ctx, "read the replicas and assignments", pass.load());
+        // A failed loading leaves nothing loaded: no replica is reconciled, and the job pass's
+        // subjects come from the listings and the start records alone.
+        if (kept.stopped) assert(pass.given.len == 0);
         acted += agent.stages(ctx, &pass, listings, &kept);
         agent.forget_finished_stops(listings);
         if (kept.err) |err| {
@@ -997,6 +1004,8 @@ const Write = struct { key: []const u8, value: ?[]const u8 };
 pub const Kept = struct {
     err: ?Error = null,
     diag: ?Diag = null,
+    /// What the kept failure was doing, to describe it if a later one takes its place.
+    what: []const u8 = "",
     /// A failure that is not the runtime's (the server, the state directory, a crash): the
     /// stages after it are not run, as the step would have ended there before.
     stopped: bool = false,
@@ -1024,10 +1033,22 @@ pub const Kept = struct {
         };
     }
 
+    /// Only the runtime's failures (`RuntimeFailed`, `NotFound`) let the stages go on; any other
+    /// sets `stopped`. The step's error (what `why` shows) is the first failure that stopped the
+    /// stages, else the first failure: a runtime failure kept earlier must not hide the server
+    /// failure that cut the step's store calls short, so it is described instead.
     fn fail(kept: *Kept, agent: *Agent, ctx: *const Context, what: []const u8, err: Error) void {
-        if (err != error.RuntimeFailed and err != error.NotFound) kept.stopped = true;
-        if (kept.err != null) return agent.note_enforce_failure(ctx, what);
+        const stops = err != error.RuntimeFailed and err != error.NotFound;
+        if (kept.err != null) {
+            if (!stops or kept.stopped) return agent.note_enforce_failure(ctx, what);
+            const current = ctx.diag.*;
+            ctx.diag.* = kept.diag.?;
+            agent.note_enforce_failure(ctx, kept.what);
+            ctx.diag.* = current;
+        }
+        kept.stopped = stops;
         kept.err = err;
+        kept.what = what;
         // Kept by value: a copy in the arena could fail, and the error would then reach
         // `agent_run.fail` with no coded diagnostic (RB-S9).
         kept.diag = ctx.diag.*;
@@ -1078,8 +1099,6 @@ const Pass = struct {
             if (!wanted.contains(item.rec.id)) continue;
             mine.append(ctx.arena, item) catch return failures.no_memory(ctx.diag);
         }
-        pass.mine = mine.items;
-        pass.given = given.items;
         const prefix = records.observed_prefix(pass.agent.config.node);
         const seen = try controller.list_all(
             records.Observed,
@@ -1088,6 +1107,9 @@ const Pass = struct {
             null,
             constants.replicas_max,
         );
+        // Set together, after the last read: a failed loading leaves nothing half loaded.
+        pass.mine = mine.items;
+        pass.given = given.items;
         pass.observed = seen.items;
     }
 

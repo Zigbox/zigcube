@@ -83,6 +83,9 @@ pub const SwitchedStore = struct {
     /// A get of a key under this prefix fails as a server that cannot be reached does (ZC-E0201);
     /// test-only, null in every simulation.
     down_get_prefix: ?[]const u8 = null,
+    /// A list of keys under this prefix fails as a server that cannot be reached does (ZC-E0201);
+    /// test-only, null in every simulation.
+    down_list_prefix: ?[]const u8 = null,
     /// Runs once, just before the first transaction that puts a key under `prefix` is applied;
     /// it may write through the world's store (the transaction then meets that write). Test-only,
     /// null in every simulation.
@@ -210,6 +213,14 @@ pub const SwitchedStore = struct {
     ) store.Error!store.ListResult {
         const self = from(context);
         try self.gate(diag);
+        if (self.down_list_prefix) |prefix| {
+            if (std.mem.startsWith(u8, options.prefix, prefix)) {
+                diag.raise(.E0201);
+                diag.cause("connection refused", .{});
+                diag.fix(.{ .sentence = "switch it back on" });
+                return error.BackendFailed;
+            }
+        }
         return self.inner.list(arena, options, diag);
     }
 
