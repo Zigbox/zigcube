@@ -75,6 +75,7 @@ pub fn build(b: *std.Build) void {
     add_bench_watch_step(b, shared_options);
     add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
+    add_packages_steps(b);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
     add_sim_steps(b, .{
@@ -920,6 +921,54 @@ fn add_store_faults_step(
         before = &failover_run.step;
         step.dependOn(&failover_run.step);
     }
+}
+
+/// `zig build packages -Dbin=DIR -Dzigbox-version=V` writes the apt and dnf trees of the Zigcube
+/// packages under `zig-out/packages/`; `-Dsignatures=<dir>` adds the owner's signatures,
+/// `-Dtest-key` signs with the fixed test key (CI). `packages-check` places the same files, then
+/// checks every digest. `-Dbin` holds the executables the release job built (the servers come
+/// from a RHEL 9 container, so the build graph cannot make them). It never runs `gpg`: it prints
+/// the commands (docs/releases/packaging.md).
+fn add_packages_steps(b: *std.Build) void {
+    const bin = b.option([]const u8, "bin", "Directory of the built executables for `packages`");
+    const zigbox_help = "Version of the zigbox package that zigbox-dev depends on";
+    const zigbox_version = b.option([]const u8, "zigbox-version", zigbox_help);
+    const signatures_help = "Directory of the owner's signatures for `packages`";
+    const signatures = b.option([]const u8, "signatures", signatures_help);
+    const test_key_help = "Sign the packages with the fixed test key";
+    const test_key = b.option(bool, "test-key", test_key_help) orelse false;
+    const tool = package_tool(b);
+    var steps: [2]*std.Build.Step.Run = undefined;
+    for (&steps, [_]bool{ false, true }) |*slot, checking| {
+        const run = b.addRunArtifact(tool);
+        run.setCwd(b.path("."));
+        run.addArgs(&.{ "--version", @import("build.zig.zon").version });
+        run.addArgs(&.{ "--zigbox-version", zigbox_version orelse "0.0.0" });
+        run.addArgs(&.{ "--bin", bin orelse "zig-out/release-bin" });
+        run.addArgs(&.{ "--assets", "packaging", "--license", "LICENSE" });
+        run.addArgs(&.{ "--out", "zig-out/packages" });
+        if (signatures) |directory| run.addArgs(&.{ "--signatures", directory });
+        if (test_key) run.addArg("--test-key");
+        if (checking) run.addArg("--check");
+        run.has_side_effects = true;
+        slot.* = run;
+    }
+    steps[1].step.dependOn(&steps[0].step);
+    b.step("packages", "Write the apt and dnf trees of the Zigcube packages")
+        .dependOn(&steps[0].step);
+    b.step("packages-check", "Place the signatures, then check every package file")
+        .dependOn(&steps[1].step);
+}
+
+fn package_tool(b: *std.Build) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "package_main",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/package_main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
 }
 
 fn add_tidy_step(b: *std.Build) void {

@@ -1,0 +1,22 @@
+[Unit]
+Description=Zigcube server (the control plane)
+Documentation=https://zigbox.github.io/zigcube/
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/zigcube/server.zon
+
+[Service]
+Type=simple
+# The server's writes are unauthenticated: /etc/zigcube/server.zon listens on loopback.
+ExecStart=/usr/bin/zcube-server --config /etc/zigcube/server.zon
+DynamicUser=yes
+StateDirectory=zigcube
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

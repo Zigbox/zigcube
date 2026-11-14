@@ -1,0 +1,26 @@
+ new Debian package, version 2.0.
+ size 858 bytes: control archive=424 bytes.
+     315 bytes,    13 lines      control
+     114 bytes,     2 lines      md5sums
+ Package: sample
+ Version: 1.2.3
+ Architecture: amd64
+ Maintainer: Sample Maintainer <sample@example.invalid>
+ Installed-Size: 1
+ Recommends: uidmap, passt
+ Section: admin
+ Priority: optional
+ Homepage: https://example.invalid/sample
+ Description: A small sample package
+  First line of the description.
+  .
+  Second paragraph.
+---
+drwxr-xr-x root/root         0 1980-01-01 00:00 ./
+drwxr-xr-x root/root         0 1980-01-01 00:00 ./usr/
+drwxr-xr-x root/root         0 1980-01-01 00:00 ./usr/bin/
+-rwxr-xr-x root/root        22 1980-01-01 00:00 ./usr/bin/sample
+drwxr-xr-x root/root         0 1980-01-01 00:00 ./usr/share/
+drwxr-xr-x root/root         0 1980-01-01 00:00 ./usr/share/doc/
+drwxr-xr-x root/root         0 1980-01-01 00:00 ./usr/share/doc/sample/
+-rw-r--r-- root/root        12 1980-01-01 00:00 ./usr/share/doc/sample/copyright

@@ -1,0 +1,10 @@
+// zcube-agent's configuration (zcube-agent --help lists every field). Declare what this node
+// offers, then: systemctl enable --now zcube-agent
+.{
+    .server = "127.0.0.1:7070",
+    .state_dir = "/var/lib/zcube-agent",
+    .runtime = .zigbox,
+    // Uncomment and set both; the agent refuses to start without them.
+    // .cpu_millis = 4000,
+    // .memory_bytes = 8589934592,
+}

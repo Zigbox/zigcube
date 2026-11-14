@@ -1,0 +1,31 @@
+Name        : sample
+Version     : 1.2.3
+Release     : 1
+Architecture: x86_64
+Install Date: (not installed)
+Group       : Unspecified
+Size        : 34
+License     : MIT
+Signature   : (none)
+Source RPM  : sample-1.2.3-1.src.rpm
+Build Date  : Tue Jan  1 00:00:00 1980
+Build Host  : zigbox-build
+URL         : https://example.invalid/sample
+Summary     : A small sample package
+Description :
+First line of the description.
+
+Second paragraph.
+---
+/usr/bin/sample 22 315532800 3ab9f954e88d36b7dd4e4d07f010d4dbe7bcbb5899b38945a22de7673444b68c 0100755 root root 0 0 0 X
+/usr/share/doc/sample 0 315532800 0000000000000000000000000000000000000000000000000000000000000000 040755 root root 0 0 0 X
+/usr/share/doc/sample/copyright 12 315532800 564a190384600e495a3a3bcab233ba5401e049de3d87fd24da85c41dc7b37be1 0100644 root root 0 0 0 X
+---
+rpmlib(CompressedFileNames) <= 3.0.4-1
+rpmlib(FileDigests) <= 4.6.0-1
+rpmlib(PayloadFilesHavePrefix) <= 4.0-1
+sample = 1.2.3-1
+sample(x86-64) = 1.2.3-1
+shadow-utils
+passt
+/tmp/out/sample.rpm: digests OK

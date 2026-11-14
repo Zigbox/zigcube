@@ -74,6 +74,10 @@ test {
 test {
     _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
+    _ = @import("package.zig");
+    _ = @import("package_release.zig");
+    _ = @import("package_main.zig");
+    _ = @import("package_check.zig");
 }
 
 // The files below are imported by a file-level `comptime` block, not by a test: a test that a
