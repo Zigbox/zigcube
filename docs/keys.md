@@ -528,7 +528,9 @@ the cost is a couple of kilobytes per such decision.
 **Grant decisions (C4).** An apply that changes a service's `allow` also writes a `grant`
 decision, in the same transaction: `actor` `api`, subject the destination service, `reason`
 `"alex@laptop changed who may connect to db (request r-0001a4f)"`, `change` the grants that came
-and went, `"web → 5432 added, batch → 80 removed"`, and the same `cause` as the apply. Creating a
+and went, `"web → 5432 added, batch → 80 removed"`, and the same `cause` and `cause_evidence` as
+the apply (`zcube why grant` names `cause_evidence.applied_by` as who changed the grants, and the
+decision's `actor` if a record lacks it). Creating a
 service with grants writes one too; creating one without, or deleting a service, does not. The
 grants themselves are in the service record, so `zcube why grant` reads them there and finds when
 each came by these decisions.

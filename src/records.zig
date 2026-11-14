@@ -657,6 +657,37 @@ pub fn grants_contain(grants: []const Grant, grant: Grant) bool {
     return false;
 }
 
+/// How a `grant` decision's `change` names one grant (docs/keys.md, "Grant decisions").
+pub const GrantChange = enum { added, removed };
+
+/// The parts of a `grant` decision's `change` are joined by this.
+pub const grant_change_separator = ", ";
+
+/// One part of a `grant` decision's `change`: "web → 5432 added". `grant_change_names` reads it.
+pub fn grant_change_write(
+    writer: *std.Io.Writer,
+    grant: Grant,
+    how: GrantChange,
+) std.Io.Writer.Error!void {
+    assert(grant.port > 0);
+    try writer.print("{s} → {d} {s}", .{ grant.from, grant.port, @tagName(how) });
+}
+
+/// Whether a `grant` decision's `change` ("web → 5432 added, batch → 80 removed") names `grant`
+/// as `how`. A service name holds no ", " (`name_problem`), so the parts split cleanly.
+pub fn grant_change_names(change: []const u8, grant: Grant, how: GrantChange) bool {
+    assert(grant.port > 0);
+    var buffer: [constants.service_name_bytes_max + 32]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    // A name longer than any service's: no change names it.
+    grant_change_write(&writer, grant, how) catch return false;
+    var parts = std.mem.splitSequence(u8, change, grant_change_separator);
+    while (parts.next()) |held| {
+        if (std.mem.eql(u8, held, writer.buffered())) return true;
+    }
+    return false;
+}
+
 pub const Service = struct {
     v: u32 = service_version_mesh,
     name: []const u8,

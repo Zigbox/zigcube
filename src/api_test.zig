@@ -409,6 +409,14 @@ test "why grant answers the grant's verdict, its diagnostic and the destination'
     try rig.refused(rig.get("/v1/why/grant/web/db", ""), 404, "ZC-E0101");
     try rig.refused(rig.get("/v1/why/grant/web/db/0", ""), 400, "ZC-E0104");
     try rig.refused(rig.get("/v1/why/grant/web/db/65536", ""), 400, "ZC-E0104");
+    // Digits only: no sign, no `_`, no leading zero.
+    for ([_][]const u8{ "+5432", "5_432", "05432", "-1", "54x", "123456" }) |port| {
+        const path = try std.fmt.allocPrint(testing.allocator, "/v1/why/grant/web/db/{s}", .{port});
+        defer testing.allocator.free(path);
+        try rig.refused(rig.get(path, ""), 400, "ZC-E0104");
+    }
+    const highest = try rig.ok("/v1/why/grant/web/db/65535", "");
+    try testing.expectEqualStrings("no_grant", field(highest, "verdict").string);
     try rig.refused(rig.get("/v1/why/grant/Web!/db/80", ""), 400, "ZC-E0104");
     try rig.refused(rig.get("/v1/why/grant/web/db/80/x", ""), 404, "ZC-E0101");
 }

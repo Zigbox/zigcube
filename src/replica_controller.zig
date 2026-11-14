@@ -266,23 +266,13 @@ const Run = struct {
 
     /// `found` if the controller may act on it (authority.md section 3), else null: the replica is
     /// then treated as not reported, and the node controller's judgement decides what happens to
-    /// it. A C1 report carries the tenure it was written under, the node's `/nodes` record must
-    /// still have that revision, the report's placement epoch (if it names one) must be the
-    /// assignment's revision, and the node's status must be `ready`. A C0 report carries no
-    /// tenure and is taken as it is.
+    /// it. The rules are `Snapshot.admission`'s (tenure, placement epoch, node `ready`), which
+    /// the mesh plan's readiness shares.
     fn admissible(run: *Run, found: ?*const Entry(records.Observed)) ?*const Entry(
         records.Observed,
     ) {
         const entry = found orelse return null;
-        const tenure = entry.rec.tenure orelse return entry;
-        const node = run.snap.node_entry(entry.rec.node) orelse return null;
-        if (node.kv.mod_revision != tenure) return null;
-        if (entry.rec.assignment) |epoch| {
-            const placed = run.snap.assigned_of(entry.rec.replica) orelse return null;
-            if (placed.kv.mod_revision != epoch) return null;
-        }
-        const status = run.snap.status_of(entry.rec.node) orelse return null;
-        if (status.rec.state != .ready) return null;
+        if (run.snap.admission(entry) != .admitted) return null;
         return entry;
     }
 

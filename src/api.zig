@@ -1361,14 +1361,24 @@ const Call = struct {
         if (records.name_problem(to, constants.service_name_bytes_max) != null) {
             return bad_request(ctx, "to", "is not a valid service name");
         }
-        const port = std.fmt.parseInt(u16, port_text, 10) catch 0;
-        if (port == 0) return bad_request(ctx, "port", "is not a port from 1 to 65535");
+        const port = port_of(port_text) orelse
+            return bad_request(ctx, "port", "is not a port from 1 to 65535");
         const result = why_grant_mod.why_grant(ctx, .{ .from = from, .to = to, .port = port }) catch
             return propagate(ctx);
         const out = Out.create(ctx) catch return no_memory(ctx);
         out.json.options.emit_null_optional_fields = false;
         try out.value(result);
         return out.finish();
+    }
+
+    /// A port as a path segment: decimal digits only, no sign, `_` or leading zero, 1 to 65535.
+    fn port_of(text: []const u8) ?u16 {
+        if (text.len == 0 or text.len > 5) return null;
+        if (text[0] == '0') return null;
+        for (text) |byte| if (!std.ascii.isDigit(byte)) return null;
+        const port = std.fmt.parseInt(u16, text, 10) catch return null;
+        assert(port > 0);
+        return port;
     }
 
     // ---- Writes: POST /v1/apply and DELETE /v1/services/{name} ----
