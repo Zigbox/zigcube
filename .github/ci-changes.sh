@@ -12,6 +12,7 @@
 #   demo_c2       demo-c2 (four VMs, KVM, GHCR images)
 #   mtls_interop  mtls-interop (stock openssl and JDK servers)
 #   demo_b3       demo-b3 (one VM, KVM, a GHCR image)
+#   demo_b4       demo-b4 (demo-b3's rig and driver, B4's script)
 #
 # Environment: EVENT (github.event_name), HEAD_REF (the PR's head branch), LABELS (the PR's labels,
 # space separated). See docs/decisions/2026-11-04-ci-affected-demos.md.
@@ -22,11 +23,12 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3)
+jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 demo_b4)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
-want_one() { want[$1]=1; }
+# demo-b4 is demo-b3's driver and rig with another script: whatever runs demo-b3 runs it too.
+want_one() { want[$1]=1; if [ "$1" = demo_b3 ]; then want[demo_b4]=1; fi; }
 
 # Documentation only: a file ending in `.md` outside web/ and src/, or anything under site/ outside
 # site/errors/ (the error pages are generated from the diagnostic registry and checked by the
@@ -59,7 +61,8 @@ classify() {
     src/demo_b1*.zig) want_one demo_b1; return ;;
     src/demo_c2_steps.zig | src/demo_c2_vms.zig) want_one demo_c2; want_one demo_b3; return ;;
     src/demo_c2*.zig | ops/demo-c2/*) want_one demo_c2; return ;;
-    src/demo_b3*.zig | ops/demo-b3/*) want_one demo_b3; return ;;
+    src/demo_b3*.zig | src/demo_relay_tls.zig | ops/demo-b3/*) want_one demo_b3; return ;;
+    src/demo_b4*.zig) want_one demo_b4; return ;;
     # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
     src/zigbox_* | src/relay*.zig) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; return ;;

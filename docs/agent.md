@@ -350,7 +350,10 @@ faults, written into `<state-dir>/faults/<run id>`: `relay_open` (the fake runti
 `list` sends SIGUSR1 to the supervisor, which shuts the listener down). `zig build relay-teeth`
 builds two agents with each fail-closed check removed and passes only if the tests catch both.
 
-The Zigbox runtime's relay is still plain TCP until B4 slice 4.
+The Zigbox runtime's relay speaks TLS the same way (B4 slice 4): `supervise-zigbox` makes the
+run's key with `relay_secure.zig`, which both supervisors share, and the agent run with
+`--runtime zigbox` asks for certificates under `zigbox/`. `demo-b4` (docs/demos/b4.md) shows it
+on a real guest.
 
 ## What survives what
 

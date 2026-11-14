@@ -43,19 +43,20 @@ const identity_python =
     \\u.urlopen(os.environ["ZCUBE_RELAY"] + "/whoami", timeout=15).read()
 ;
 
-/// `keys`: waits for the node's root to publish the candidate keys (the upstream serves them),
-/// then looks for each, raw, hex and base64, in its environment and every regular file under
-/// every mount it sees but /proc, /sys and /dev, and reports the count through the relay.
+/// `keys`: waits (bounded by its deadline) for the node's root to publish the candidate keys (the
+/// upstream serves them), then looks for each, raw, hex and base64, in its environment and every
+/// regular file under every mount it sees but /proc, /sys and /dev, and reports the count through
+/// the relay.
 const keys_python =
     \\import base64 as B, os, time, urllib.request as u
     \\R = os.environ["ZCUBE_RELAY"]
+    \\o = os.path
     \\g = lambda p: u.urlopen(R + p, timeout=15).read()
     \\g("/whoami")
     \\c = b""
-    \\for i in range(300):
-    \\ c = g("/candidates")
-    \\ if c: break
+    \\while not c:
     \\ time.sleep(1)
+    \\ c = g("/candidates")
     \\P = []
     \\for k in [bytes.fromhex(x) for x in c.split()]:
     \\ h = k.hex().encode()
@@ -70,14 +71,15 @@ const keys_python =
     \\for m in {l.split()[4] for l in open("/proc/self/mountinfo")}:
     \\ if m.startswith(X): continue
     \\ for d, D, F in os.walk(m):
-    \\  D[:] = [x for x in D if not os.path.join(d, x).startswith(X)]
+    \\  D[:] = [x for x in D if not o.join(d, x).startswith(X)]
     \\  for f in F:
-    \\   p = os.path.join(d, f)
+    \\   p = o.join(d, f)
     \\   try:
-    \\    if os.path.isfile(p) and not os.path.islink(p) and os.path.getsize(p) < 1 << 26:
+    \\    if o.isfile(p) and not o.islink(p) and o.getsize(p) < 1 << 26:
     \\     s(p, open(p, "rb").read()); n += 1
     \\   except OSError: pass
-    \\g("/keys?candidates=%d&files=%d&found=%d&first=%s" % (len(P) // 5, n, len(H), H[:1]))
+    \\q = "candidates=%d&files=%d&found=%d&first=" % (len(P) // 5, n, len(H))
+    \\g("/keys?" + q + u.quote(str(H[:1])))
 ;
 
 /// `fence`: every count must be 0 and every route `failed`.

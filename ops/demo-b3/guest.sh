@@ -289,8 +289,8 @@ def candidates(marker):
             if at >= 32:
                 found.add(data[at - 32 : at])
             at = data.find(public, at + 1)
-    found.discard(bytes(32))
-    found = [c for c in found if c != public]
+    # A seed is random: fill patterns (zeros, Zig's 0xaa) and other low-entropy runs are not.
+    found = [c for c in found if c != public and len(set(c)) >= 16]
     if not found:
         sys.exit("FAIL: the run's key is not in supervisor %s's memory" % pid)
     with open("/root/candidates.hex", "w") as out:
