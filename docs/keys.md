@@ -209,16 +209,21 @@ known). So after an upgrade the first new generation can always be rolled back t
 ```
 
 Written only by the rollout controller (role `rollout_controller`), one per service. `phase` is
-`progressing`, `paused`, `rolling_back`, `complete` or `failed`. `from` is the generation the
-service last ran to completion: the `to` of its previous rollout if that ended `complete`, else
-that rollout's own `from`, so an apply over a rollout still progressing, paused or failed never
-names a generation that never became ready (with no previous rollout, the newest generation below the service's that its old
-replicas run; old replicas of a deleted incarnation at that generation or above count for none). `from` 0 means none: such a rollout that fails has nothing to roll back to and
-stays `failed`, owing no rollback, as a failed rollback does. A record that contradicts itself
-(`from` not below `to`, `reason` `rollback` with `from` 0, `progressing` with reason `rollback`
-or `rolling_back` with `apply`, `paused_at_ms` or `paused_by` set exactly when not `paused`, a
-deadline or `evidence_from_ms` before `started_at_ms`, a pause before `evidence_from_ms`) is
-refused when read (ZC-E0301). `budget` is how many new
+`progressing`, `paused`, `rolling_back`, `complete` or `failed`. `to` is the rollout's target
+generation; `from` is the generation the service last ran to completion (the target of its newest
+rollout that ended `complete`; when the previous rollout did not end `complete`, its own `from`),
+0 if none: a generation that never became ready is never a `from`, so a rollback never restores
+one. A service's first generation has no rollout of its own, so with no rollout of the service
+`from` is the newest generation below the service's that its old replicas run (old replicas of a
+deleted incarnation at that generation or above count for none). With `from` 0 (a service's
+first generation, or an apply over one that failed), a rollout that fails under `on_failure:
+rollback` has nothing to roll back to and stays `failed`, owing no rollback, as a failed rollback
+does; so does one whose automatic rollback the API refused (ZC-E0127, ZC-E0128; slice 8). A record that
+contradicts itself is refused by every reader (ZC-E0301): `to` 0, `from` not below `to`, a
+deadline or `evidence_from_ms` before `started_at_ms`, `reason` `rollback` or phase
+`rolling_back` with `from` 0, `progressing` with reason `rollback` or `rolling_back` with `apply`,
+`paused_at_ms` or `paused_by` set exactly when not `paused`, a pause before `evidence_from_ms`.
+`budget` is how many new
 replicas the replica controller may start now, how many ready old ones it may retire (`retire`,
 the count that keeps `max_unavailable`) and how many old ones that are not ready it may retire
 (`retire_unready`, optional, 0 when absent; a replica that is ready when the controller acts is

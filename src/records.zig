@@ -796,28 +796,6 @@ pub const Rollout = struct {
     budget_revision: u64 = 0,
     budget_next: ?u64 = null,
     budget_old: u32 = 0,
-
-    /// Whether the record is one the rollout controller could have written: a record that
-    /// contradicts itself is refused at decode (ZC-E0301), never asserted on
-    /// (docs/decisions/2026-11-14-c3-slice7-controller.md).
-    pub fn valid(rollout: *const Rollout) bool {
-        if (rollout.reason == .rollback and rollout.from == 0) return false;
-        if (rollout.from >= rollout.to) return false;
-        if (rollout.deadline_at_ms < rollout.started_at_ms) return false;
-        const evidence_from = rollout.evidence_from_ms orelse rollout.started_at_ms;
-        if (evidence_from < rollout.started_at_ms) return false;
-        const paused = rollout.phase == .paused;
-        if (paused != (rollout.paused_at_ms != null)) return false;
-        if (paused != (rollout.paused_by != null)) return false;
-        if (rollout.paused_at_ms) |at| {
-            if (at < evidence_from) return false;
-        }
-        return switch (rollout.phase) {
-            .progressing => rollout.reason == .apply,
-            .rolling_back => rollout.reason == .rollback,
-            .paused, .complete, .failed => true,
-        };
-    }
 };
 
 /// Whether `rollout` is the rollout of the service whose key was created at
@@ -1268,13 +1246,41 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         if (!job_valid(record)) return malformed(diag, kv.key, @typeName(T));
     }
     if (T == Assigned and !assigned_valid(record)) return malformed(diag, kv.key, @typeName(T));
-    if (T == Rollout and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobStatus and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobObserved and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobAdmission and !admission_valid(record)) {
         return malformed(diag, kv.key, @typeName(T));
     }
+    if (T == Rollout and !rollout_valid(&record)) return malformed(diag, kv.key, @typeName(T));
     return record;
+}
+
+/// Whether a rollout record agrees with itself: its target is a generation, `from` (the
+/// generation the service last ran to completion, 0 if none) is older than it, its deadline is
+/// not before its start, and a rollback has a generation to roll back to. The rollout controller
+/// writes no other kind; one that contradicts itself is refused here (ZC-E0301), never asserted
+/// on by the plan (docs/decisions/2026-11-14-c3-rollout-from-rule.md).
+fn rollout_valid(record: *const Rollout) bool {
+    if (record.to == 0) return false;
+    if (record.from >= record.to) return false;
+    if (record.deadline_at_ms < record.started_at_ms) return false;
+    if (record.phase == .rolling_back and record.from == 0) return false;
+    // Slice 7's members: what `State.assert_valid` and `begin` assert
+    // (docs/decisions/2026-11-14-c3-rollout-from-rule.md, rule 2).
+    if (record.reason == .rollback and record.from == 0) return false;
+    const evidence_from = record.evidence_from_ms orelse record.started_at_ms;
+    if (evidence_from < record.started_at_ms) return false;
+    const paused = record.phase == .paused;
+    if (paused != (record.paused_at_ms != null)) return false;
+    if (paused != (record.paused_by != null)) return false;
+    if (record.paused_at_ms) |at| {
+        if (at < evidence_from) return false;
+    }
+    return switch (record.phase) {
+        .progressing => record.reason == .apply,
+        .rolling_back => record.reason == .rollback,
+        .paused, .complete, .failed => true,
+    };
 }
 
 /// Whether a pull record names at most `pull_peers_max` peers in each list and every one is a
@@ -1931,6 +1937,48 @@ test "C3: history and rollout records encode and read back" {
     try testing.expect(!rollout_of(&rollout_back, null));
 }
 
+test "C3: a rollout record that contradicts itself is refused when read" {
+    // Goal: the plan's asserts never meet a contradicting record (docs/decisions/
+    // 2026-11-14-c3-rollout-from-rule.md). Method: read each contradiction, then a first
+    // generation's rollout, which is none.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    // A record that contradicts itself is refused when read (ZC-E0301), so the plan's asserts
+    // never meet it: a rollback with nothing to roll back to, `from` not older than `to`, a
+    // deadline before the start, no target.
+    const contradictions = [_][]const u8{
+        \\{"v":1,"service":"hello","service_created":40,"from":0,"to":7,"phase":"rolling_back",
+        \\"started_at_ms":10,"deadline_at_ms":600010}
+        ,
+        \\{"v":1,"service":"hello","service_created":40,"from":7,"to":7,"phase":"progressing",
+        \\"started_at_ms":10,"deadline_at_ms":600010}
+        ,
+        \\{"v":1,"service":"hello","service_created":40,"from":6,"to":7,"phase":"failed",
+        \\"started_at_ms":10,"deadline_at_ms":9}
+        ,
+        \\{"v":1,"service":"hello","service_created":40,"from":0,"to":0,"phase":"progressing",
+        \\"started_at_ms":10,"deadline_at_ms":600010}
+        ,
+    };
+    for (contradictions) |bytes| {
+        var refused: Diag = undefined;
+        refused.reset();
+        const result = read(Rollout, arena, kv_of("/rollouts/hello", bytes), &refused);
+        try testing.expectError(error.Malformed, result);
+        try testing.expect(refused.code == .E0301);
+    }
+    // A first generation's rollout (`from` 0) that is not a rollback is a rollout.
+    const first =
+        \\{"v":1,"service":"hello","service_created":40,"from":0,"to":1,"phase":"failed",
+        \\"started_at_ms":10,"deadline_at_ms":600010}
+    ;
+    const first_back = try read(Rollout, arena, kv_of("/rollouts/hello", first), &diag);
+    try testing.expectEqual(@as(u64, 0), first_back.from);
+}
+
 test "C3: a history key names one generation, in decimal, with no leading zero" {
     try testing.expectEqual(@as(?u64, 12), history_generation("/history/hello/12"));
     try testing.expectEqual(@as(?u64, null), history_generation("/history/hello/012"));
@@ -2195,7 +2243,7 @@ test "the version a record is written in is the version the reader accepts" {
         // A service or replica is written at version 4 only with a health check (`encode`).
         if (T == Service or T == Replica) value.health = test_health;
         if (T == Observed) value.health = .healthy;
-        // A rollout goes from an older generation to a newer one: `read` refuses `from >= to`.
+        // A rollout has a target generation (`read` refuses one with `to` 0).
         if (T == Rollout) value.to = 1;
         const bytes = try encode(arena, value, &diag);
         const prefix = try std.fmt.allocPrint(arena, "{{\"v\":{d},", .{version_current(T)});

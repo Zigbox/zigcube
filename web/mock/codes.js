@@ -355,7 +355,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "external",
     "summary": "a stored record can't be read",
-    "explanation": "A controller, the agent or the API read a value from the store that is\nnot a record of the kind its key says: not JSON, a field of the wrong\ntype, or a name that breaks the naming rules. The API validates what it\nwrites, so something else wrote this key, or the store was edited by hand.\n\nThe cause line names the key. Fix or delete that key (zcube get shows\nit); the controller skips nothing silently and tries again on its next\npass."
+    "explanation": "A controller, the agent or the API read a value from the store that is\nnot a record of the kind its key says: not JSON, a field of the wrong\ntype, a name that breaks the naming rules, or fields that contradict each\nother (a rollout back to generation 0). Zigcube validates what it writes,\nso something else wrote this key, or the store was edited by hand.\n\nThe cause line names the key. Fix or delete that key (zcube get shows\nit); the controller skips nothing silently and tries again on its next\npass."
   },
   {
     "code": "ZC-E0302",
@@ -397,7 +397,7 @@ export const ZC_CODES = [
     "severity": "warning",
     "blame": "user",
     "summary": "a rollout paused itself after a failure",
-    "explanation": "The service's rollout policy says `on_failure: pause`, and the rollout\nfailed (ZC-E0304, ZC-E0305 or ZC-E0306). It stopped where it was:\nreplicas of both generations keep running, and nothing is started or\nretired until you act.\n\n`zcube rollout status <service>` shows both generations. Resume with\n`zcube rollout resume <service>`, roll back with `zcube rollback\n<service>`, or apply a fixed release."
+    "explanation": "The service's rollout policy says `on_failure: pause`, and the rollout\nfailed (ZC-E0304, ZC-E0305 or ZC-E0306). It stopped where it was:\nreplicas of both generations keep running, and nothing is started or\nretired until you act.\n\n`zcube rollout status <service>` shows both generations. Resume with\n`zcube rollout resume <service>`, roll back with `zcube rollback\n<service>` (if it ran an earlier generation), or apply a fixed release."
   },
   {
     "code": "ZC-W0305",

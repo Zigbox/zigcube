@@ -24,7 +24,8 @@ Choices the brief left open, or where this slice differs from it or from slice 6
    held could end only at its deadline, with one replica too many meanwhile (sim-c3 seed 63,
    `--profile=bad_release`: "a service lacks replicas"). `rollout_plan.failure_of` now returns
    `.held` whenever `Facts.new_held_at_ms` is set, whatever the window; its test and the fuzz
-   model changed with it. The way out of a held release is a new apply (or slice 8's rollback).
+   model changed with it, and so did slice 6's later test "a first generation keeps owing
+   nothing across pause and resume" (merged from the from-rule fix). The way out of a held release is a new apply (or slice 8's rollback).
 5. **A halted rollout keeps its surge.** While a rollout is paused or failed and has stale
    replicas, the replica controller's scale-down keeps up to `replicas + max_surge`, not
    `replicas`: otherwise a pause would delete the new replica it paused on, which is the step it
@@ -67,18 +68,23 @@ Choices the brief left open, or where this slice differs from it or from slice 6
 18. **`State.earlier` comes from the record** (slice 6's 4d4ec68, merged): a rollout ran before
     when it is a rollback or its `from` is not 0. Slice 7 calls no rollback (item 8); slice 8 must
     not roll back a rollout whose `from` is 0, since there is nothing to go back to.
-19. **`from` is the generation that last completed** (supervisor ruling a, on slice 6's
-    finding 8; the fix session records it in `2026-11-14-c3-rollout-from-rule.md` on slice 6's
-    branch, not merged here yet). `rollout_controller.Run.from_of`: the previous rollout's `to`
-    if it ended `complete`, else its `from`; with no rollout of the service (the first generation
-    has none), the newest generation below the service's that its old replicas run
-    (`View.earlier_generation`: an old replica at the service's generation or above belongs to
-    a deleted incarnation or runs another spec of the same generation, and is no earlier
-    generation, so `from` stays below `to`). `docs/keys.md` says the same.
-20. **A `/rollouts` record that contradicts itself is ZC-E0301 at decode** (ruling b):
-    `records.Rollout.valid`, checked in `records.read`, refuses what `state_of` used to answer
-    with null and what would trip `State.assert_valid` or `begin` (a rollback from 0, `from` not
-    below `to`). No new code: E0301 already means "not a valid record".
-21. **Ruling c is slice 8's.** An auto-rollback the handler refuses (E0127/E0128) ends the
-    rollout `failed`, owing nothing, with the refusal recorded, never retried each pass. Slice 7
-    calls no rollback handler (item 8).
+19. **`from` is the generation that last completed** (supervisor ruling a,
+    `2026-11-14-c3-rollout-from-rule.md` rule 1, merged from slice 6's branch).
+    `rollout_controller.Run.from_of`: the previous rollout's `to` if it ended `complete`, else its
+    `from`. One addition the rule does not state: a service's first generation has no rollout of
+    its own, so with no rollout of the service (or only one of a deleted incarnation) `from` is
+    the newest generation below the service's that its old replicas run
+    (`View.earlier_generation`). Taken literally ("0 if none"), the rule would make every second
+    generation's `from` 0, and no rollout would ever owe a rollback. An old replica at the
+    service's generation or above belongs to a deleted incarnation or runs another spec of the
+    same generation, and is no earlier generation, so `from` stays below `to`. `docs/keys.md`
+    says the same.
+20. **A `/rollouts` record that contradicts itself is ZC-E0301 at decode** (rule 2): slice 6's
+    `records.rollout_valid` now also refuses what `State.assert_valid` and `begin` assert on the
+    members slice 7 added (a rollback from 0, `paused_at_ms`/`paused_by` set exactly while
+    `paused`, `evidence_from_ms` before the start, a pause before the evidence, an active phase
+    that is not the reason's), tested with record text the controller wrote. No new code.
+21. **Rule 3 (a refused auto-rollback ends the rollout `failed`) is left to slice 8.** The rule's
+    file names it slice 7's obligation; the supervisor's ruling to this slice says slice 8's.
+    Slice 7 calls no rollback handler (item 8), so there is nothing yet to refuse; the record
+    member, the `State` field and the `pass` test go with slice 8's handler call.
