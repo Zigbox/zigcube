@@ -484,7 +484,10 @@ test "the server flavours conflict on both formats; only deb replaces, and no rp
     defer arena.deinit();
     const memory = arena.allocator();
     for ([_]Kind{ .server_sqlite, .server_postgres }) |kind| {
-        const other = if (kind == .server_sqlite) "zigcube-server-postgres" else "zigcube-server-sqlite";
+        const other = if (kind == .server_sqlite)
+            "zigcube-server-postgres"
+        else
+            "zigcube-server-sqlite";
         const deb_package = try describe(memory, &sample_inputs, kind, 0, .deb);
         const rpm_package = try describe(memory, &sample_inputs, kind, 0, .rpm);
         try std.testing.expectEqualStrings(other, deb_package.conflicts[0].name);

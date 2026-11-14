@@ -593,11 +593,11 @@ jobs:
   # upgrade that keeps an edited server.zon. The binaries are the runner's, built on glibc 2.39;
   # the release job builds them in a RHEL 9 container so that they run on older systems.
   packages:
-    name: packages (deb and rpm, throwaway key)
+    name: packages (deb and rpm, four distros, throwaway keys)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.packages == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
@@ -605,25 +605,19 @@ jobs:
         uses: ./.github/actions/install-apt
         with:
           packages: libsqlite3-dev libpq-dev
-      - name: Build the executables, one server per store
-        shell: bash
-        run: |
-          mkdir -p zig-out/release-bin
-          arch=$(uname -m)
-          for store in sqlite postgres; do
-            zig build -Doptimize=ReleaseSafe -Dstore="$store" --prefix "zig-out/$store"
-            cp "zig-out/$store/bin/zcube-server" "zig-out/release-bin/zcube-server-$store-$arch"
-          done
-          cp zig-out/sqlite/bin/zcube "zig-out/release-bin/zcube-$arch"
-          cp zig-out/sqlite/bin/zcube-agent "zig-out/release-bin/zcube-agent-$arch"
-      - name: Write and check the packages
-        run: zig build packages-check -Dtest-key=true --summary all
-      - name: Install, run, upgrade and remove them in Ubuntu and Fedora
-        shell: bash
-        run: |
-          for image in ubuntu:24.04 fedora:latest; do
-            docker run --rm -v "$PWD/zig-out/packages:/p:ro" -v "$PWD/.github/packages-install.sh:/t.sh:ro" "$image" bash /t.sh
-          done
+      # zcube and zcube-agent here, both servers in Rocky Linux 9 (the RHEL 9 build).
+      - name: Build the executables
+        run: .github/build-release-bin.sh
+      - name: Write and check the packages (this architecture)
+        run: zig build packages-check -Dtest-key=true -Dpackage-arch=x86_64 --summary all
+      - name: Write the release assets (tarball, SBOM, SHA256SUMS)
+        run: zig build release-assets -Dno-packages -Dpackage-arch=x86_64
+      # Debian 12, Ubuntu 24.04, Fedora 42 and Rocky Linux 9: signed repositories over HTTP,
+      # zigbox-dev by name with zigbox from zigbox.org, an upgrade, a flavour swap, a remove.
+      - name: Install, run, upgrade and remove them in four distributions
+        run: .github/packages-install.sh
+      - name: The release signing path with a generated throwaway gpg key
+        run: .github/release-sign-test-container.sh
 
   # Stock servers (openssl s_server, a JDK 21 SSLServerSocket) against the mTLS client. Test-only
   # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md.

@@ -75,8 +75,7 @@ pub fn build(b: *std.Build) void {
     add_bench_watch_step(b, shared_options);
     add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
-    add_packages_steps(b);
-    add_release_assets_step(b);
+    add_release_assets_step(b, add_packages_steps(b));
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
     add_sim_steps(b, .{
@@ -930,7 +929,16 @@ fn add_store_faults_step(
 /// checks every digest. `-Dbin` holds the executables the release job built (the servers come
 /// from a RHEL 9 container, so the build graph cannot make them). It never runs `gpg`: it prints
 /// the commands (docs/releases/packaging.md).
-fn add_packages_steps(b: *std.Build) void {
+/// The options `packages` declares that `release-assets` shares (`b.option` panics on a second
+/// declaration of a name).
+const PackageOptions = struct {
+    bin: []const u8,
+    arch: ?[]const u8,
+    version: []const u8,
+    packages_dir: ?[]const u8,
+};
+
+fn add_packages_steps(b: *std.Build) PackageOptions {
     const bin = b.option([]const u8, "bin", "Directory of the built executables for `packages`");
     const zigbox_help = "Version of the zigbox package that zigbox-dev depends on " ++
         "(default: the Zigbox tag build.zig.zon pins)";
@@ -950,6 +958,9 @@ fn add_packages_steps(b: *std.Build) void {
         "the install test builds two to upgrade between)";
     const version = b.option([]const u8, "package-version", version_help) orelse
         @import("build.zig.zon").version;
+    const assets_help = "Directory of the units and configuration files (default packaging/; " ++
+        "the install test changes one to exercise the conffile upgrade)";
+    const assets = b.option([]const u8, "package-assets", assets_help) orelse "packaging";
     const tool = package_tool(b);
     var steps: [2]*std.Build.Step.Run = undefined;
     for (&steps, [_]bool{ false, true }) |*slot, checking| {
@@ -959,7 +970,7 @@ fn add_packages_steps(b: *std.Build) void {
         run.stdio = .inherit;
         run.addArgs(&.{ "--version", version });
         run.addArgs(&.{ "--bin", bin orelse "zig-out/release-bin" });
-        run.addArgs(&.{ "--assets", "packaging", "--license", "LICENSE" });
+        run.addArgs(&.{ "--assets", assets, "--license", "LICENSE" });
         run.addArgs(&.{ "--out", "zig-out/packages" });
         if (zigbox_version) |text| run.addArgs(&.{ "--zigbox-version", text });
         if (signatures) |directory| run.addArgs(&.{ "--signatures", directory });
@@ -979,7 +990,12 @@ fn add_packages_steps(b: *std.Build) void {
         .dependOn(&steps[0].step);
     b.step("packages-check", "Place the signatures, then check every package file")
         .dependOn(&steps[1].step);
-    add_redate_step(b, tool, signed_at);
+    return .{
+        .bin = bin orelse "zig-out/release-bin",
+        .arch = arch,
+        .version = version,
+        .packages_dir = add_redate_step(b, tool, signed_at),
+    };
 }
 
 /// The version of the Zigbox tag `build.zig.zon` pins (`.../tags/vX.Y.Z.tar.gz`), which the
@@ -996,7 +1012,11 @@ fn pinned_zigbox_version() ?[]const u8 {
 /// `zig build packages-redate -Dsigned-at=N [-Dpackages-dir=DIR]` rewrites the `Date` and
 /// `Valid-Until` of DIR's apt `Release` (default `zig-out/packages`) and drops the signature
 /// files that no longer match it, without rebuilding any package; the result is signed again.
-fn add_redate_step(b: *std.Build, tool: *std.Build.Step.Compile, signed_at: ?[]const u8) void {
+fn add_redate_step(
+    b: *std.Build,
+    tool: *std.Build.Step.Compile,
+    signed_at: ?[]const u8,
+) ?[]const u8 {
     const packages_help = "Package tree for packages-redate and release-assets";
     const directory = b.option([]const u8, "packages-dir", packages_help);
     const redate_help = "Re-date an existing apt Release (-Dsigned-at, -Dpackages-dir)";
@@ -1012,6 +1032,7 @@ fn add_redate_step(b: *std.Build, tool: *std.Build.Step.Compile, signed_at: ?[]c
         step.dependOn(&b.addFail("packages-redate needs -Dsigned-at=SECONDS").step);
     }
     step.dependOn(&run.step);
+    return directory;
 }
 
 /// `zig build release-assets -Dbin=DIR` writes one tarball of the executables per architecture,
@@ -1020,17 +1041,7 @@ fn add_redate_step(b: *std.Build, tool: *std.Build.Step.Compile, signed_at: ?[]c
 /// run to one architecture (default both). With `-Dpackages-dir=DIR` (the signed tree of the
 /// release script) it adds the debs and rpms of those architectures, and `-Drepos-archive=FILE`
 /// adds the repository archive; without `-Dpackages-dir` the step needs `-Dno-packages`.
-fn add_release_assets_step(b: *std.Build) void {
-    // `-Dbin` is declared by `add_packages_steps`, which shares it with this step; `b.option`
-    // panics on a second declaration, so read the value as the user gave it.
-    var bin: ?[]const u8 = null;
-    if (b.user_input_options.get("bin")) |given| {
-        if (given == .scalar) bin = given.scalar;
-    }
-    const arch_help = "Write the release assets of this architecture only (x86_64 or aarch64)";
-    const arch = b.option([]const u8, "package-arch", arch_help);
-    const packages_help = "Signed package tree to take the debs and rpms from";
-    const packages = b.option([]const u8, "packages-dir", packages_help);
+fn add_release_assets_step(b: *std.Build, shared: PackageOptions) void {
     const no_packages_help = "Write release assets without debs and rpms";
     const no_packages = b.option(bool, "no-packages", no_packages_help) orelse false;
     const archive_help = "zigcube-repos.tar.gz to add to the assets";
@@ -1048,14 +1059,14 @@ fn add_release_assets_step(b: *std.Build) void {
     run.setCwd(b.path("."));
     // A refused run prints one line naming the file; `zig build` must show it.
     run.stdio = .inherit;
-    run.addArgs(&.{ "assets", "--version", @import("build.zig.zon").version });
-    run.addArgs(&.{ "--bin", bin orelse "zig-out/release-bin" });
-    if (arch) |name| run.addArgs(&.{ "--arch", name });
+    run.addArgs(&.{ "assets", "--version", shared.version });
+    run.addArgs(&.{ "--bin", shared.bin });
+    if (shared.arch) |name| run.addArgs(&.{ "--arch", name });
     run.addArgs(&.{ "--license", "LICENSE", "--license-id", "Apache-2.0" });
     run.addArgs(&.{ "--zig-version", @import("builtin").zig_version_string });
     run.addArgs(&.{ "--out", "zig-out/release-assets" });
     if (epoch) |seconds| run.addArgs(&.{ "--source-date-epoch", seconds });
-    if (packages) |directory| run.addArgs(&.{ "--packages", directory });
+    if (shared.packages_dir) |directory| run.addArgs(&.{ "--packages", directory });
     if (no_packages) run.addArg("--no-packages");
     if (archive) |file| run.addArgs(&.{ "--extra", file });
     run.has_side_effects = true;

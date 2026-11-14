@@ -520,8 +520,9 @@ test "arguments: a full build line parses, and each missing piece is refused" {
 test "arguments: --arch names one architecture, --signed-at is seconds" {
     // Goal: the CI subset and the signing time parse, and a value that is neither is refused.
     const words = [_][]const u8{
-        "--version", "1", "--zigbox-version", "0.5.0", "--bin",  "b",       "--assets",    "a",
-        "--license", "L", "--out",            "o",     "--arch", "aarch64", "--signed-at", "1800000000",
+        "--version", "1",       "--zigbox-version", "0.5.0",      "--bin", "b",
+        "--assets",  "a",       "--license",        "L",          "--out", "o",
+        "--arch",    "aarch64", "--signed-at",      "1800000000",
     };
     var iterator: TestIterator = .{ .words = &words };
     const parsed = parse_arguments(&iterator).?;

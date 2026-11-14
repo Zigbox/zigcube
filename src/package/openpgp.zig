@@ -5,6 +5,8 @@
 //! signature code is exercised end to end. It vouches for nothing: a release is signed by the
 //! owner's gpg key, in the two-round flow of `docs/releases/packaging.md`, and this module never
 //! sees that key.
+//!
+//! Copied from Zigbox v0.5.0 (4b3f6f9), `src/package/openpgp.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;

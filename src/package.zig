@@ -1,5 +1,7 @@
 //! The `zigbox_package` module: write `.deb` and `.rpm` packages and the apt and dnf repositories
 //! around them, reproducibly, with the standard library alone.
+//!
+//! Copied from Zigbox v0.5.0 (4b3f6f9), `src/package.zig`; adapted for Zigcube.
 pub const model = @import("package/model.zig");
 pub const deb = @import("package/deb.zig");
 pub const rpm = @import("package/rpm.zig");

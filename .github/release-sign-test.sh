@@ -16,11 +16,11 @@ passphrase=test-only-passphrase
 gpg_home() { GNUPGHOME=$home gpg --batch --no-tty --pinentry-mode loopback \
   --passphrase "$passphrase" "$@" 2> /dev/null; }
 
-gpg_home --quick-generate-key "Zigbox release test <test@invalid>" rsa4096 cert 1d
+gpg_home --quick-generate-key "Zigbox release test <test@invalid>" rsa4096 cert 90d
 primary=$(GNUPGHOME=$home gpg --batch --list-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
 # The public key as checked in before the subkey exists: the script must refuse it.
 GNUPGHOME=$home gpg --batch --export -a "$primary" > "$home/public-without-subkey.asc"
-gpg_home --quick-add-key "$primary" rsa4096 sign 1d
+gpg_home --quick-add-key "$primary" rsa4096 sign 60d
 subkey=$(GNUPGHOME=$home gpg --batch --list-keys --with-colons |
   awk -F: '$1 == "sub" { s = 1; next } $1 == "fpr" && s { print $10; exit }')
 GNUPGHOME=$home gpg --batch --export -a "$primary" > "$home/public.asc"
@@ -51,6 +51,16 @@ ZIGBOX_SIGNING_KEY=$(gpg_home --armor --export-secret-subkeys "${subkey}!")
 ZCUBE_PUBLIC_KEY=$home/public-without-subkey.asc refused "$output/refused" 'does not hold the signing subkey'
 # A fingerprint that is not the key's primary must be refused.
 ZIGBOX_SIGNING_FPR=09991DC39816D3C914E2A22C5AB00BC328B7DBB7 refused "$output/refused" 'not by the primary key'
+
+# A signing subkey that expires within 28 days (21 of Valid-Until, 7 to renew) must be refused.
+gpg_home --quick-set-expire "$primary" 10d "$subkey"
+ZIGBOX_SIGNING_KEY=$(gpg_home --armor --export-secret-subkeys "${subkey}!")
+refused "$output/refused" 'signing subkey expires within 28 days'
+# Valid now, but not 28 days after a signing time two months on.
+gpg_home --quick-set-expire "$primary" 60d "$subkey"
+ZIGBOX_SIGNING_KEY=$(gpg_home --armor --export-secret-subkeys "${subkey}!")
+ZIGBOX_SIGNED_AT=$(($(date +%s) + 40 * 86400)) refused "$output/refused" 'signing subkey expires within 28 days'
+ZIGBOX_SIGNED_AT=12x refused "$output/refused" 'is not Unix seconds'
 
 # The same file the release runs.
 "$(dirname "$0")/release-sign.sh" "$output"

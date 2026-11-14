@@ -64,9 +64,11 @@ classify() {
     # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
     src/zigbox_* | src/relay*.zig) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; return ;;
-    # The package tool and what it packs: the packages job only (the release scripts and
-    # workflows are under .github/, which runs everything).
-    packaging/* | src/package*.zig | src/package/*) want_one packages; return ;;
+    # The package tool, what it packs and the release-assets tool: the packages job only (the
+    # release scripts, the install test and the workflows are under .github/, which runs
+    # everything).
+    packaging/* | src/package*.zig | src/package/* | src/release_assets*.zig)
+      want_one packages; return ;;
     # The mTLS interop harness and its Java server.
     src/mtls_interop.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
     # The smoke's own files.

@@ -2,6 +2,8 @@
 //! control and data members), cpio `newc` (an rpm's payload) and gzip. All output is a pure
 //! function of the arguments: every time is `constants.package_source_date_epoch`, every owner is
 //! `root:root`, and gzip's header carries no time or name.
+//!
+//! Copied from Zigbox v0.5.0 (4b3f6f9), `src/package/archive.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;

@@ -1116,7 +1116,7 @@ pub const package_name_bytes_max: u32 = 64;
 pub const package_summary_bytes_max: u32 = 200;
 /// The long description and the licence text.
 pub const package_description_bytes_max: u32 = 4096;
-/// The most packages one repository holds (six packages, two architectures).
+/// The most packages one repository holds (five packages, two architectures).
 pub const repo_packages_max: u32 = 32;
 /// The most files `zig build packages` writes under `zig-out/packages/`.
 pub const repo_files_max: u32 = 256;

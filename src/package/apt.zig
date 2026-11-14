@@ -2,6 +2,9 @@
 //! `Packages` and `Packages.gz` per architecture and the `Release` file that lists their SHA-256
 //! sums. The signed forms, `InRelease` and `Release.gpg`, are not made here: the owner's gpg (or
 //! the test key, in tests) signs `Release`, and the caller places the results beside it.
+//!
+//! Copied from Zigbox v0.5.0 (4b3f6f9), `src/package/apt.zig`; the signing time,
+//! `date_lines`, `redate` and `Valid-Until` from Zigbox main 74df642.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -179,7 +182,11 @@ fn date_text_buffered(epoch: u64) ?DateBuffer {
 
 /// The whole tree except the signatures: pool, Packages, Packages.gz and Release. `signed_at` is
 /// the signing time in seconds; null keeps the fixed build date and writes no `Valid-Until`.
-pub fn write(memory: Allocator, built: []const model.Built, signed_at: ?u64) Error![]model.TreeFile {
+pub fn write(
+    memory: Allocator,
+    built: []const model.Built,
+    signed_at: ?u64,
+) Error![]model.TreeFile {
     if (built.len == 0 or built.len > constants.repo_packages_max) return error.TooManyFiles;
     const sorted = try memory.dupe(model.Built, built);
     std.mem.sort(model.Built, sorted, {}, built_less);

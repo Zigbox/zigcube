@@ -13,6 +13,9 @@ ExecStart=/usr/bin/zcube-agent --config /etc/zigcube/agent.zon --node %l
 Restart=on-failure
 RestartSec=2
 KillMode=process
+# The state directory holds the node's peer key: systemd creates it, owner-only.
+StateDirectory=zcube-agent
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

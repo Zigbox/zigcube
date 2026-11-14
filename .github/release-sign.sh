@@ -12,6 +12,9 @@
 #                              its subkeys, or the script fails
 #   ZCUBE_BIN_DIR              the built executables (`zig build packages -Dbin`)
 #   ZCUBE_ZIGBOX_VERSION       the oldest zigbox package zigbox-dev accepts
+#   ZIGBOX_SIGNED_AT           optional: the one signing time (Unix seconds) of the release; the
+#                              workflow sets it once. Default: now. (Zigbox's name: the key and
+#                              the time are the same release's.)
 #   ZCUBE_PUBLIC_KEY           the checked-in public key (default docs/releases/zigbox-release-key.asc);
 #                              the signing subkey must be in it, or the script fails
 # Output: OUTPUT_DIR/zigcube-repos.tar.gz. It holds apt/dists/zigcube, apt/pool and rpm/zigcube
@@ -65,22 +68,40 @@ printf '%s\n' "$ZIGBOX_SIGNING_KEY" | gpg_sign --import 2> "$work/import.log" ||
 # Only gpg needed these, once. Unset them so that zig, rpm and tar do not inherit them.
 unset ZIGBOX_SIGNING_KEY ZIGBOX_SIGNING_PASSPHRASE
 
+# One signing time for every round: the `Release` Date and its Valid-Until (21 days later) are in
+# the signed bytes, so the three builds must agree. ZIGBOX_SIGNED_AT (Unix seconds) is for tests.
+signed_at=${ZIGBOX_SIGNED_AT:-$(date +%s)}
+case "$signed_at" in *[!0-9]* | "") fail "ZIGBOX_SIGNED_AT is not Unix seconds" ;; esac
+
+# A key must stay valid this long after the signing time: Valid-Until (21 days,
+# constants.apt_valid_seconds) plus 7 days to renew it. The same rule and messages as Zigbox's.
+renew_seconds=2419200
+
 # The one signing subkey, which must belong to the primary key named by ZIGBOX_SIGNING_FPR.
 # A colon listing: `sec` opens the key (field 15 is `#` when the primary secret is a stub), then
 # `fpr` is its fingerprint; `ssb` opens a subkey (field 2 validity, field 3 bits, field 4
-# algorithm, field 12 capabilities), then its `fpr`. The policy is RSA 4096 (algorithm 1) for
-# both, as published.
+# algorithm, field 7 expiry, field 12 capabilities), then its `fpr`. The policy is RSA 4096
+# (algorithm 1) for both, as published.
 listing=$(GNUPGHOME=$signing_home gpg --batch --list-secret-keys --with-colons 2>/dev/null)
-subkey=$(awk -F: -v primary="$primary" '
-  $1 == "sec" { section = "sec"; if ($3 != 4096 || $4 != 1) weak = 1; if ($15 != "#") plain = 1; next }
-  $1 == "ssb" { section = ($2 == "e" || $2 == "r") ? "bad" : (index($12, "s") ? "sign" : "other")
+subkey=$(awk -F: -v primary="$primary" -v at="$signed_at" -v window="$renew_seconds" '
+  function dead(validity, expiry) { return validity == "e" || validity == "r" || (expiry != "" && expiry + 0 <= at) }
+  function short(expiry) { return expiry != "" && expiry + 0 <= at + window }
+  $1 == "sec" { section = "sec"; if ($3 != 4096 || $4 != 1) weak = 1; if ($15 != "#") plain = 1
+                if (dead($2, $7)) lapsed = 1; else if (short($7)) brief = 1; next }
+  $1 == "ssb" { section = dead($2, $7) ? "bad" : (index($12, "s") ? (short($7) ? "brief" : "sign") : "other")
+                if (section == "brief") briefsub = 1
                 if (section == "sign" && ($3 != 4096 || $4 != 1)) weak = 1; next }
   $1 == "fpr" && section == "sec" { top = $10; section = ""; next }
-  $1 == "fpr" && section == "sign" { print $10; section = "" }
-  END { if (top != primary) print "WRONG-PRIMARY"; if (weak) print "WEAK"; if (plain) print "PRIMARY-SECRET" }
+  $1 == "fpr" && section == "sign" { print $10; signs++; section = "" }
+  END { if (top != primary) print "WRONG-PRIMARY"; if (weak) print "WEAK"; if (plain) print "PRIMARY-SECRET"
+        if (lapsed) print "LAPSED-PRIMARY"; if (brief) print "SHORT-PRIMARY"
+        if (briefsub && !signs) print "SHORT-SUBKEY" }
 ' <<< "$listing")
 case "$subkey" in
   *WRONG-PRIMARY*) fail "the imported key is not by the primary key ZIGBOX_SIGNING_FPR" ;;
+  *LAPSED-PRIMARY*) fail "the primary key is revoked or expired; the owner must renew or replace it" ;;
+  *SHORT-PRIMARY*) fail "the primary key expires within 28 days of the signing time (21 days of Valid-Until plus 7 to renew); the owner must renew it" ;;
+  *SHORT-SUBKEY*) fail "the signing subkey expires within 28 days of the signing time (21 days of Valid-Until plus 7 to renew); the owner must renew it" ;;
   *PRIMARY-SECRET*) fail "the imported key holds the secret primary key; export the subkey alone with --export-secret-subkeys (docs/releases/packaging.md)" ;;
   *WEAK*) fail "the primary and the signing subkey must be RSA 4096 (docs/releases/packaging.md)" ;;
   "") fail "the imported key has no usable (unexpired, unrevoked) signing subkey" ;;
@@ -101,7 +122,10 @@ grep -qx "$subkey" <<< "$published" ||
   fail "$public_key does not hold the signing subkey ${subkey: -16}; check in the renewed public key"
 
 sign_with() { gpg_sign -u "${subkey}!" "$@"; }
-build() { zig build "$@" -Dbin="$ZCUBE_BIN_DIR" -Dzigbox-version="$ZCUBE_ZIGBOX_VERSION"; }
+build() {
+  zig build "$@" -Dbin="$ZCUBE_BIN_DIR" -Dzigbox-version="$ZCUBE_ZIGBOX_VERSION" \
+    -Dsigned-at="$signed_at"
+}
 
 # Round 1: each rpm's header, a binary detached signature named <rpm>.header.sig.
 rm -rf "$packages"

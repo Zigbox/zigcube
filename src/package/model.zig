@@ -1,5 +1,7 @@
 //! What a package is, as its caller describes it, and the directory entries that follow from its
 //! files. Nothing here knows about `zbx`: a package is a name, a version, files and text.
+//!
+//! Copied from Zigbox v0.5.0 (4b3f6f9), `src/package/model.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -125,8 +127,8 @@ pub fn describe(err: Error) []const u8 {
         error.FileTooLarge => "a file is larger than the bound allows",
         error.PayloadTooLarge => "the files together are larger than the bound allows",
         error.TooManyRecommends => "the package names more weak dependencies than the bound allows",
-        error.BadRelation => "a dependency, conflict, replace, obsolete or provide names a bad package or " ++
-            "version, or the package lists more than the bound allows",
+        error.BadRelation => "a dependency, conflict, replace, obsolete or provide names a bad " ++
+            "package or version, or the package lists more than the bound allows",
         error.OutOfMemory => "out of memory",
         error.WriteFailed => "an output buffer could not grow",
         error.BadRelease => "a Release file has no Date line, or the signing time is out of range",

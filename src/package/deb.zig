@@ -1,6 +1,8 @@
 //! The `.deb` writer: an `ar` archive of `debian-binary`, `control.tar.gz` and `data.tar.gz`.
 //! Control files follow deb-control(5); `md5sums` is the one place MD5 appears, because dpkg
 //! reads it that way.
+//!
+//! Copied from Zigbox v0.5.0 (4b3f6f9), `src/package/deb.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;

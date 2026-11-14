@@ -7,6 +7,8 @@
 //! build host knows (colors, classes). The payload digest is SHA-256 of the compressed payload
 //! (`RPMTAG_PAYLOADDIGEST`); file digests are SHA-256. A header signature (`RPMSIGTAG_RSA`, 268)
 //! goes in the signature header only, so it changes neither the main header nor its digest.
+//!
+//! Copied from Zigbox v0.5.0 (4b3f6f9), `src/package/rpm.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;

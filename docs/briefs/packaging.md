@@ -135,14 +135,14 @@ The release workflow cannot run for real until the owner sets the secrets (below
    `-Dtest-key` pipeline, and a `packages-test` job that signs with a throwaway RSA 4096 key
    made like the release key, serves the trees over a local file or HTTP source, and in four
    containers (Debian 12, Ubuntu 24.04, Fedora, Rocky 9) installs `zigbox-dev` (and each server flavour in turn), runs `zcube
-   --version`, starts `zcube-server --help` and checks `ldd`, `apt remove` or `dnf remove`
+   version` (the command has no `--version` flag; decision file), starts `zcube-server --help` and checks `ldd`, `apt remove` or `dnf remove`
    leaving `/var/lib/zigcube`, and a second install from an older package keeping an edited
    `server.zon`. `systemd-analyze verify` on both units. Not tested here: a booted systemd (the
    c3 demo's VM; stays C3).
 2. **macOS.** `zig build mac-release` ported: both architectures, `lipo`, hardened runtime, no
    entitlement, notarize, the zip, its `.sha256`, `Formula/zigcube.rb` from a template.
    `mac-check-zip` copied. A `mac-test` job on `macos-15`: a throwaway self-signed identity in a
-   temporary keychain, no notarization, `zcube --version`, `zcube --help`, `zcube local` refusing
+   temporary keychain, no notarization, `zcube version`, `zcube --help`, `zcube local` refusing
    in one line, and the unit tests that build on macOS. Zigcube has no macOS job today, so this
    job is new, and `ci-changes.sh` gets a rule and a row in its table test.
 3. **The release workflow.** `.github/workflows/release.yml`: `plan`, `mac-check`, `preflight`,

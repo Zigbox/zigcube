@@ -84,11 +84,16 @@ const shell_allowlist = [_][]const u8{
     "src/testdata/x509/gen.sh",
     // The release's signing glue (docs/releases/packaging.md), ported from Zigbox's: the program
     // that signs is gpg, and the glue only drives it between two runs of `zig build packages`.
-    // The release workflow and its test job run the same file; the test sits beside it.
-    // Drives apt and dnf in a clean container to install, swap, reinstall and remove the packages.
-    ".github/packages-install.sh",
+    // The release workflow and its test job run the same file; the test sits beside it, and
+    // its wrapper runs it in a Fedora container, which has rpm.
     ".github/release-sign.sh",
     ".github/release-sign-test.sh",
+    ".github/release-sign-test-container.sh",
+    // Drives docker, apt and dnf: installs, upgrades, swaps and removes the packages in four
+    // distributions' containers.
+    ".github/packages-install.sh",
+    // Drives docker: the servers are built in a Rocky Linux 9 container (the RHEL 9 build).
+    ".github/build-release-bin.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).

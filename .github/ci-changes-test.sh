@@ -113,7 +113,9 @@ check $PR x "" "src/demo_b1.zig src/demo_c1.zig" TFFTTFFFFF
 # workflows are under .github/ and run everything.
 check $PR x "" "packaging/zigcube.zon src/package_check.zig src/package/rpm.zig" TFFFFFFFFT
 check $PR x "" "src/package_release.zig docs/releases/packaging.md" TFFFFFFFFT
+check $PR x "" "src/release_assets.zig src/release_assets_main.zig" TFFFFFFFFT
 check $PR x "" ".github/release-sign.sh" TTTTTTTTTT
+check $PR x "" ".github/packages-install.sh .github/build-release-bin.sh" TTTTTTTTTT
 check $PR x "" "docs/releases/packaging.md" FFFFFFFFFF
 
 if [ "$failed" -ne 0 ]; then

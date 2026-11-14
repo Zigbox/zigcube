@@ -2,6 +2,9 @@
 //! `primary.xml.gz`, `filelists.xml.gz`, `other.xml.gz` and `repomd.xml`, every sum SHA-256. The
 //! metadata files are named by their checksum, as `createrepo_c` names them. `repomd.xml.asc` is
 //! signed by the owner's gpg and placed by the caller.
+//!
+//! Copied from Zigbox v0.5.0 (4b3f6f9), `src/package/dnf.zig`; the repomd revision
+//! and timestamps from the signing time as Zigbox main 74df642 has them.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -354,7 +357,8 @@ test "repomd.xml's revision and timestamps are the signing time, else the build 
     const built = [_]model.Built{.{ .package = sample, .bytes = bytes }};
     const signed = (try write(memory, .x86_64, &built, 1_800_000_000))[4].bytes;
     try std.testing.expect(std.mem.indexOf(u8, signed, "<revision>1800000000</revision>") != null);
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, signed, ">1800000000</timestamp>"));
+    const stamps = std.mem.count(u8, signed, ">1800000000</timestamp>");
+    try std.testing.expectEqual(@as(usize, 3), stamps);
     const plain = (try write(memory, .x86_64, &built, null))[4].bytes;
     try std.testing.expect(std.mem.indexOf(u8, plain, "<revision>315532800</revision>") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "1800000000") == null);
