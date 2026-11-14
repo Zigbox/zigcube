@@ -30,10 +30,15 @@ follow-ups that B4 keeps open. The slice's own decisions are in
   brings it to `constants.zig`; on that merge, use the constant and delete the local one.
   No container of the cluster simulation ever entered `.stopping` (`random_fault` never draws
   `slow_stop`), so the tooth could not fail: a first 240-seed sweep caught nothing. Half the
-  relayed runs now ignore TERM, chosen by a hash of the job's name when their certificate is
-  issued (no draw). Their stops take the run's grace (under 2 s), the node counts as wedged
-  meanwhile (`wedged_now`, as for any `slow_stop` container), and R7 has something to judge. This
-  changes the `strong` world only, and only for relayed runs.
+  relayed runs now take their grace when told to stop (`SimRuntime`'s `stop_takes_grace`, chosen
+  by a hash of the job's name when their certificate is issued, no draw): a `stop` puts them in
+  `.stopping` for the run's grace (under 2 s), and R7 has something to judge. A TERM signal still
+  ends them at once, unlike `slow_stop`. The first try made them ignore TERM (`slow_stop`): the
+  fence's TERM then did nothing, and a node that learned late that its lease was gone ran such a
+  run up to `fence_stop_ms` past it; 3 of 240 `--strong --c1` seeds (27, 90, 94) failed I1b's
+  "self-fencing failed" bound (lost grace + 2 checks, 3 s). That bound and the fence's KILL delay
+  are not this slice's to change, so TERM keeps its old effect. This changes the `strong` world
+  only, and only for relayed runs.
 - **Docs (NITs).** `docs/core.md` and the header of `sim_certs.zig` say when each check is judged:
   R4 and R5 once, at issue; R6 at every committed revision under `--c1` and from `safety()` (every
   `check_interval_ms` and after every operation) with or without it; R7 from `safety()`.
@@ -81,6 +86,18 @@ follow-ups that B4 keeps open. The slice's own decisions are in
    approves, and the refusal rate for `lifetime` is reported; a tooth that draws skew past the
    bound must fail R5. The NTP dependence (slice decision, "The issuer's now") goes to the owner
    with it.
+
+4. **A TERM-ignoring container and a late fence** (found by this fix session, not a review
+   item). The cluster simulation never draws `slow_stop` (`random_fault` has no such kind), so no
+   simulated container ignores the fence's TERM. When relayed runs ignored it, seeds 27, 90 and 94
+   (240 seeds, drawn operations, `--profile=auto`, `--c1 --strong`) failed I1b's "self-fencing
+   failed": on seed 90, node1's `/nodes/` key had been gone 3,076 ms with `jb-10-job` still
+   running, TERM ignored, the fence's KILL not yet due. Either the agent fenced late (it learned
+   the lease was gone after the server dropped it, and its KILL waits `fence_stop_ms`), or the
+   check's bound (`lost_grace_ms` + 2 checks) assumes TERM works. A real workload may ignore TERM.
+   *Acceptance:* the cluster simulation draws `slow_stop` in its runtime faults; the cause on
+   seed 90 is found, and the agent or the bound (an owner's call: `lost_grace_ms` is user-visible)
+   is changed so that sim-c1 holds with it.
 
 ## Not changed
 

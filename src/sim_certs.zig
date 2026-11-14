@@ -325,11 +325,12 @@ pub fn supervise(
                 .epoch = subject.placement_epoch,
                 .not_after_ms = subject.lifetime.not_after_ms,
             };
-            // Half the relayed runs ignore TERM (`slow_stop`), by a hash of the job's name and
-            // not a draw: a stop then takes the run's grace, and R7 judges that its connections
+            // Half the relayed runs take their grace when told to stop (`stop_takes_grace`), by
+            // a hash of the job's name and not a draw; R7 then judges that their connections
             // closed when the stop came, not at the end. Without it no container of the cluster
-            // ever enters `.stopping`, and `relay_stop_leak` could not fail.
-            if (std.hash.Wyhash.hash(0, job) & 1 == 1) container.ignores_stop = true;
+            // ever enters `.stopping`, and `relay_stop_leak` could not fail. A TERM (the fence)
+            // still ends them at once, so I1b's bound is unchanged.
+            if (std.hash.Wyhash.hash(0, job) & 1 == 1) container.stop_takes_grace = true;
         }
     }
     forge_one(state, ctx, nodes);

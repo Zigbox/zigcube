@@ -543,8 +543,8 @@ There are four checks:
 - **R7.** No relayed connection stays open more than `relay_cancel_ms_max` (2 x `relay_poll_ms`,
   100 ms) after its container was told to stop, whether it is still in its grace or has since
   ended (a sticky flag, so a stop and its end between two checks cannot hide a late close). Judged
-  from `safety()`. Half the relayed runs ignore TERM (a hash of the job's name, no draw), so their
-  stops take the run's grace and R7 has a window to judge.
+  from `safety()`. Half the relayed runs take their grace when told to stop (a hash of the job's name, no
+  draw), so R7 has a window to judge; a TERM, the fence's, still ends them at once.
 
 R6 and R7 test the simulated runtime's connection counters and the agent's ordering of stop, end
 and report, not slice 2's relay (`relay_pump.zig`), whose own tests do that.

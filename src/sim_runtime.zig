@@ -112,6 +112,10 @@ const Container = struct {
     /// When its supervisor was told to stop it (B4, R7), while it runs out its grace; null if it
     /// was never told, or ended at once.
     stop_requested_ms: ?u64 = null,
+    /// B4: a `stop` of this container takes its grace (it enters `.stopping`), though a TERM
+    /// signal still ends it at once, unlike `ignores_stop`: so the fence is unchanged and only
+    /// a run told to stop has a window in which R7 judges its connections.
+    stop_takes_grace: bool = false,
 };
 
 /// B4: a supervisor told to stop ends the run's relayed connections within this long (the brief's
@@ -570,7 +574,8 @@ pub const SimRuntime = struct {
         switch (container.phase) {
             .stopped => return,
             .running => {
-                if (!container.ignores_stop) return self.end(container, .{ .signaled = 15 });
+                const slow = container.ignores_stop or container.stop_takes_grace;
+                if (!slow) return self.end(container, .{ .signaled = 15 });
                 if (grace_ms == 0) return self.end(container, .{ .signaled = 9 });
                 container.phase = .{ .stopping = now + grace_ms };
                 container.stop_requested_ms = now;

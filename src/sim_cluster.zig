@@ -3088,6 +3088,7 @@ fn hash_node(hasher: *std.hash.Wyhash, node: *Node) void {
         hasher.update(container.image);
         hash_value(hasher, .{ container.phase, container.pid, container.started_at_ms });
         hash_value(hasher, container.ignores_stop);
+        hash_value(hasher, container.stop_takes_grace);
     }
     // The agent's files: names and bytes, and how much of each a host crash would keep.
     for (node.sim.files.files.items) |file| {
