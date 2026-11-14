@@ -10,6 +10,9 @@ const POLL_MS = 2000;
 const STALE_AFTER_MS = 10000;
 const DECISIONS_KEPT = 500;
 const STORE_CODES = new Set(["ZC-E0201", "ZC-E0202"]);
+// The caller's certificate does not allow the request (403): retrying will not help, the
+// certificate's scope must change (a browser needs `--scope admin`, docs/mtls.md).
+const FORBIDDEN_CODE = "ZC-E0822";
 const RELIST_CODES = new Set(["ZC-E0203", "ZC-E0204"]);
 
 const sleep = (ms, signal) => new Promise(res => { const t = setTimeout(res, ms); signal?.addEventListener("abort", () => { clearTimeout(t); res(); }); });
@@ -73,6 +76,7 @@ export class Model {
   get connState() {
     if (!this.loaded && !this.error) return "connecting";
     if (this.error) {
+      if (this.error.diagnostics[0].code === FORBIDDEN_CODE) return "forbidden";
       if (STORE_CODES.has(this.error.diagnostics[0].code)) return "stale";
       return Date.now() - this.error.since > STALE_AFTER_MS ? "stale" : "reconnecting";
     }
@@ -176,6 +180,7 @@ export class Model {
       } catch (e) {
         if (e?.name === "AbortError") return;
         if (e.diagnostics && STORE_CODES.has(e.diagnostics[0].code)) this.store = { ok: false, diagnostic: e.diagnostics[0] };
+        if (e.diagnostics && e.diagnostics[0].code === FORBIDDEN_CODE) this.fail(e);
       }
       await sleep(POLL_MS, this.abort.signal);
     }

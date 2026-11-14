@@ -1,5 +1,7 @@
 //! A seeded fuzzer for the TLS server's handshake (`tls_server.zig`, docs/mtls.md): a scripted
-//! client (`tls_testclient.zig`) sends a ClientHello and a last flight, either correct or wrong in
+//! client (`tls_testclient.zig`), in a third of the runs a browser (P-256 only, against a server
+//! with a browser identity, so the P-256 CertificateRequest, Certificate and CertificateVerify are
+//! fuzzed too), sends a ClientHello and a last flight, either correct or wrong in
 //! one of its knobs (the hello's, the chain, the CertificateVerify, the Finished, the context, the
 //! records around them), and in a part of the runs the hello or the flight is then damaged at the
 //! record level in one of eleven ways and fed to the server in pieces of random size. A flight
@@ -21,6 +23,8 @@ const testclient = @import("tls_testclient.zig");
 const tls_server = @import("tls_server.zig");
 const x509 = @import("x509.zig");
 const x509_test = @import("x509_test.zig");
+const p256 = @import("x509_p256.zig");
+const p256_test = @import("x509_p256_test.zig");
 
 const assert = std.debug.assert;
 const testing = std.testing;
@@ -58,6 +62,14 @@ const World = struct {
     server_certificate: x509.Der,
     ca_certificate: x509.Der,
     chain: [2][]const u8,
+    /// The run takes the browser path: the server has a browser identity and the client offers
+    /// no ed25519, with a P-256 certificate from the browser CA.
+    browser: bool,
+    browser_ca: p256.KeyPair,
+    browser_key: p256.KeyPair,
+    browser_certificate: x509.Der,
+    browser_ca_certificate: x509.Der,
+    browser_chain: [2][]const u8,
     sent: [buffer_bytes]u8,
     sent_length: u32,
     original: [buffer_bytes]u8,
@@ -283,6 +295,8 @@ fn setup(world: *World, random: std.Random) !void {
     });
     try x509.issue_ca(&world.ca_certificate, world.ca, x509_test.window);
     world.chain = .{ world.server_certificate.slice(), world.ca_certificate.slice() };
+    world.browser = random.uintLessThan(u32, 3) == 0;
+    if (world.browser) try setup_browser(world);
     var server_random: [32]u8 = undefined;
     var server_secret: [32]u8 = undefined;
     random.bytes(&server_random);
@@ -296,15 +310,22 @@ fn setup(world: *World, random: std.Random) !void {
             .certificates = &world.chain,
             .signer = tls_server.key_pair_signer(&world.server_key),
         },
-        .client_kinds = .initOne(.workload),
+        // The browser path admits client certificates; the API's server takes node and client.
+        .client_kinds = if (world.browser) .initMany(&.{ .node, .client }) else .initOne(.workload),
+        .browser = if (world.browser) .{
+            .anchor = p256.point_of(world.browser_ca),
+            .certificates = &world.browser_chain,
+            .key = &world.browser_key,
+        } else null,
     });
     var client_random: [32]u8 = undefined;
     var client_secret: [32]u8 = undefined;
     random.bytes(&client_random);
     random.bytes(&client_secret);
-    const faults = random_faults(random, &world.knobs_good, &world.knobs_ccs);
+    const faults = random_faults(random, world.browser, &world.knobs_good, &world.knobs_ccs);
     try world.client.init(.{
         .ca = world.ca,
+        .browser = if (world.browser) world.browser_ca else null,
         .random = client_random,
         .secret = client_secret,
         .faults = faults,
@@ -316,34 +337,48 @@ fn setup(world: *World, random: std.Random) !void {
     world.data_events = 0;
 }
 
+/// The server's P-256 chain for the browser path (as `tls_server_test`'s rig makes it).
+fn setup_browser(world: *World) !void {
+    world.browser_ca = try p256_test.ca_key();
+    world.browser_key = try p256_test.key(0x22);
+    try p256.issue_server(&world.browser_certificate, world.browser_ca, &.{
+        .dns_name = server_name,
+        .sans = &.{},
+        .subject_key = p256.point_of(world.browser_key),
+        .lifetime = x509_test.window,
+    });
+    try p256.issue_ca(&world.browser_ca_certificate, world.browser_ca, x509_test.window);
+    world.browser_chain = .{
+        world.browser_certificate.slice(),
+        world.browser_ca_certificate.slice(),
+    };
+}
+
 /// The client's knobs: those a server must take drawn freely; in half the runs one more is
-/// wrong, which no server may take.
-fn random_faults(random: std.Random, good: *bool, ccs_only: *bool) testclient.Faults {
+/// wrong, which no server may take. A browser offers Chromium's signature algorithms (no
+/// ed25519) unless that knob is the wrong one.
+fn random_faults(
+    random: std.Random,
+    browser: bool,
+    good: *bool,
+    ccs_only: *bool,
+) testclient.Faults {
     ccs_only.* = false;
     var faults: testclient.Faults = .{
         .ccs = random.uintLessThan(u32, 2),
         .one_record = random.boolean(),
     };
     faults.hello.session_id = random.boolean();
+    if (browser) faults.hello.signature_algorithms = .chrome;
     good.* = random.boolean();
     if (good.*) return faults;
     // A wrong knob drawn as its correct value (a key of 32 bytes, a `good` enum) changes nothing.
-    switch (random.uintLessThan(u32, 21)) {
-        0 => faults.hello.tls13 = false,
-        1 => faults.hello.extensions = false,
-        2 => faults.hello.suite = false,
-        3 => faults.hello.x25519 = false,
-        4 => {
-            faults.hello.key_bytes = random.uintLessThan(u16, 64);
-            good.* = faults.hello.key_bytes == 32;
-        },
-        5 => faults.hello.low_order = true,
-        6 => faults.hello.signature_algorithms = if (random.boolean()) .other else .absent,
-        7 => faults.hello.compression = random.intRangeAtMost(u8, 1, 255),
-        8 => faults.hello.duplicate = true,
-        9 => faults.hello.early_data = true,
-        10 => faults.hello.psk_not_last = true,
-        11 => faults.hello.duplicate_group = true,
+    const knob = random.uintLessThan(u32, 21);
+    if (knob < 12) {
+        wrong_hello(random, browser, knob, &faults.hello, good);
+        return faults;
+    }
+    switch (knob) {
         12 => {
             faults.ccs = random.intRangeAtMost(u32, 2, 3);
             ccs_only.* = true;
@@ -356,7 +391,8 @@ fn random_faults(random: std.Random, good: *bool, ccs_only: *bool) testclient.Fa
         },
         14 => {
             faults.chain = random.enumValue(testclient.Chain);
-            good.* = faults.chain == .good;
+            // On the browser path `browser_client` is the good chain itself.
+            good.* = faults.chain == .good or (browser and faults.chain == .browser_client);
         },
         15 => faults.context = "x",
         16 => {
@@ -379,6 +415,39 @@ fn random_faults(random: std.Random, good: *bool, ccs_only: *bool) testclient.Fa
         else => faults.swapped = true,
     }
     return faults;
+}
+
+/// One wrong knob of the ClientHello, `knob` in 0..11 (`random_faults`).
+fn wrong_hello(
+    random: std.Random,
+    browser: bool,
+    knob: u32,
+    hello: *testclient.Hello,
+    good: *bool,
+) void {
+    assert(knob < 12);
+    switch (knob) {
+        0 => hello.tls13 = false,
+        1 => hello.extensions = false,
+        2 => hello.suite = false,
+        3 => hello.x25519 = false,
+        4 => {
+            hello.key_bytes = random.uintLessThan(u16, 64);
+            good.* = hello.key_bytes == 32;
+        },
+        5 => hello.low_order = true,
+        6 => {
+            hello.signature_algorithms = if (random.boolean()) .other else .absent;
+            // `.other` is ecdsa_secp256r1_sha256 alone: a browser server's path, so no fault there.
+            good.* = browser and hello.signature_algorithms == .other;
+        },
+        7 => hello.compression = random.intRangeAtMost(u8, 1, 255),
+        8 => hello.duplicate = true,
+        9 => hello.early_data = true,
+        10 => hello.psk_not_last = true,
+        11 => hello.duplicate_group = true,
+        else => unreachable, // The assert above.
+    }
 }
 
 fn collect(world: *World) void {

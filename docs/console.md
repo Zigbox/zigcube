@@ -239,6 +239,7 @@ The console lists once and then follows the watch, the same way an agent does.
    | ◐ Resyncing | relisting after a compaction | blue, no banner |
    | ◐ Reconnecting | a request failed less than 10 s ago | blue, banner with the diagnostic |
    | ▲ Stale, as of 14:02:31 | failing for over 10 s, or the store is down | amber, banner; the data stays on screen |
+   | ✕ Not allowed | the server refused the certificate's scope (`403`, `ZC-E0822`) | banner with the diagnostic and the fix: a client certificate of scope `admin`; retrying will not help |
    | ◌ Connecting | first load | |
 
    The pill opens a small log of the recent events. While not Live, data is never blanked: it is

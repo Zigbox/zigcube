@@ -449,6 +449,106 @@ test "ECDSA: a certificate whose signature has a high S is refused" {
     try testing.expectError(error.BadSignature, p256.parse(out.slice()));
 }
 
+/// The P-256 group order n, as the near misses below need it (`x509_p256.order` is private).
+const order_bytes = [32]u8{
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
+};
+
+/// A DER signature of r and s, each 32 bytes written as a 33-byte INTEGER (a zero first: n's top
+/// bit is set) or, when null, as the one-byte INTEGER 1.
+fn signature_der(out: *[72]u8, r: ?[32]u8, s: ?[32]u8) []const u8 {
+    var at: usize = 2;
+    for ([_]?[32]u8{ r, s }) |value| {
+        out[at] = 0x02;
+        if (value) |v| {
+            out[at + 1] = 33;
+            out[at + 2] = 0x00;
+            out[at + 3 ..][0..32].* = v;
+            at += 35;
+        } else {
+            out[at + 1] = 1;
+            out[at + 2] = 1;
+            at += 3;
+        }
+    }
+    out[0] = 0x30;
+    out[1] = @intCast(at - 2);
+    return out[0..at];
+}
+
+test "ECDSA: r or s equal to n or n + 1 is refused, though each is canonical DER" {
+    // Goal: the range check (r and s below n) has teeth on its edge, where the DER itself is
+    // canonical. Method: r = n, r = n + 1, s = n, s = n + 1 under the lenient rule; then n - 1,
+    // which passes the parse (it is in range), so the rows fail only on the range.
+    var n_plus_one = order_bytes;
+    n_plus_one[31] += 1;
+    var n_minus_one = order_bytes;
+    n_minus_one[31] -= 1;
+    var buffer: [72]u8 = undefined;
+    for ([_][32]u8{ order_bytes, n_plus_one }) |edge| {
+        const r_edge = signature_der(&buffer, edge, null);
+        try testing.expectError(error.BadSignature, p256.signature_parse(r_edge, .any_s));
+        const s_edge = signature_der(&buffer, null, edge);
+        try testing.expectError(error.BadSignature, p256.signature_parse(s_edge, .any_s));
+    }
+    _ = try p256.signature_parse(signature_der(&buffer, n_minus_one, null), .any_s);
+    _ = try p256.signature_parse(signature_der(&buffer, null, n_minus_one), .any_s);
+}
+
+test "browser near miss: a subject key with y off by one is no point, and is refused" {
+    // Goal: the on-curve check of the SubjectPublicKeyInfo has teeth. Method: add one to the last
+    // byte of a good client's y (no other change); parse refuses it as malformed.
+    var good: p256.Der = .{};
+    try make_client(&good);
+    const parsed = try p256.parse(good.slice());
+    var buffer: [constants.x509_cert_bytes_max]u8 = undefined;
+    const bytes = buffer[0..good.slice().len];
+    @memcpy(bytes, good.slice());
+    const last = parsed.public_key.end - 1;
+    try testing.expect(bytes[last] != 0xFF); // One more is y + 1, with no carry.
+    bytes[last] += 1;
+    try testing.expectError(error.Malformed, p256.parse(bytes));
+}
+
+test "browser verification: a CA certificate with the anchor's name and another key is refused" {
+    // Goal: a CA certificate must hold the anchor's own key, not only its name and signature.
+    // Method: the anchor's CA certificate with another subject key, signed again by the anchor's
+    // key (so name and signature are right); verify refuses it as the wrong issuer.
+    var good: p256.Der = .{};
+    try make_ca(&good);
+    const original = try p256.parse(good.slice());
+    var buffer: [constants.x509_cert_bytes_max]u8 = undefined;
+    const swapped = buffer[0..good.slice().len];
+    @memcpy(swapped, good.slice());
+    const other = p256.point_of(try key(0xB3));
+    @memcpy(swapped[original.public_key.start..original.public_key.end], &other);
+    const parsed = try p256.parse(swapped);
+    var signature_buffer: [p256.signature_der_bytes_max]u8 = undefined;
+    const signature = p256.sign(try ca_key(), parsed.tbs.of(swapped));
+    var resigned: p256.Der = .{};
+    const der_bytes = p256.signature_write(&signature_buffer, signature);
+    try p256.reencode_signed(&resigned, swapped, &parsed, der_bytes);
+    const anchor = p256.point_of(try ca_key());
+    const expect: p256.Expect = .{ .kind = .ca, .name = null };
+    _ = try p256.verify(good.slice(), anchor, now, expect);
+    const result = p256.verify(resigned.slice(), anchor, now, expect);
+    try testing.expectError(error.WrongIssuer, result);
+}
+
+test "browser verification: expiry is at not_after plus the skew, not a millisecond later" {
+    // Goal: the window's end is exclusive (`now >= not_after + skew` is expired). Method: verify
+    // a good client one millisecond before that instant and at it.
+    var client: p256.Der = .{};
+    try make_client(&client);
+    const parsed = try p256.parse(client.slice());
+    const anchor = p256.point_of(try ca_key());
+    const expect: p256.Expect = .{ .kind = .client, .name = null };
+    const end = parsed.not_after_ms + constants.peer_clock_skew_ms;
+    _ = try p256.verify(client.slice(), anchor, end - 1, expect);
+    try testing.expectError(error.Expired, p256.verify(client.slice(), anchor, end, expect));
+}
+
 // ---- Fuzz ----------------------------------------------------------------------------------
 
 const seeds = if (builtin.os.tag == .wasi) struct {} else @import("fuzz_seeds.zig");
