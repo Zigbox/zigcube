@@ -2,6 +2,7 @@
 // installed (never `playwright install`; no npm dependency is added to this repository).
 //
 //   node tools/browser_check.mjs <base-url> [--mode sim|server|mock] [--seed-hello] [--shots <dir>]
+//                                [--tls] [--api <url>]
 //
 // sim:    opens <base>/?sim=c0, plays the C0 scenario through the panel at 8x and checks what the
 //         real core, running as WebAssembly, tells: the `why service broken` chain, hello at 2/2,
@@ -12,6 +13,13 @@
 // mock:   opens <base>/?mock=b1&at=3 (the JavaScript mock, B1's jobs, docs/console.md "Jobs"):
 //         the list, the state filter, one job page per ending cause, the logs placeholder (and no
 //         log request), and that no environment value or input text is on any page.
+// --tls:  the base is the server's mTLS listener (B7 slice 6, docs/mtls.md "Browsers"): Chrome
+//         itself is launched (not the headless shell, which never sends a client certificate),
+//         and it must trust the browser CA and hold the client's .p12 already: an NSS database in
+//         $HOME/.pki/nssdb (certutil -A -t C,, the <stem>-browser.crt; pk12util -i the .p12) and
+//         the AutoSelectCertificateForUrls policy for the base in Chrome for Testing's managed
+//         policy directory. --api <url> (the loopback --insecure-listen) takes the requests
+//         this script makes itself, which hold no certificate.
 // All: no request leaves the origin, no page error, no console error.
 // Prints one PASS/FAIL line per check and exits non-zero if any failed.
 
@@ -25,7 +33,7 @@ const flag = name => args.includes(name);
 const option = name => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
 const mode = option("--mode") || "sim";
 const shots = option("--shots");
-if (!base || !["sim", "server", "mock"].includes(mode)) { console.error("usage: node tools/browser_check.mjs <base-url> [--mode sim|server|mock] [--seed-hello] [--shots <dir>]"); process.exit(2); }
+if (!base || !["sim", "server", "mock"].includes(mode)) { console.error("usage: node tools/browser_check.mjs <base-url> [--mode sim|server|mock] [--seed-hello] [--shots <dir>] [--tls] [--api <url>]"); process.exit(2); }
 if (shots) mkdirSync(shots, { recursive: true });
 
 let failures = 0;
@@ -35,7 +43,8 @@ async function check(name, fn) {
 const must = (cond, message) => { if (!cond) throw new Error(message); };
 const origin = new URL(base).origin;
 
-const browser = await chromium.launch();
+const browser = await chromium.launch(flag("--tls") ? { channel: "chromium", args: ["--no-proxy-server"] } : {});
+const api = (option("--api") || base).replace(/\/$/, "");
 const observed = { external: [], errors: [] };
 async function open(viewport, url) {
   const context = await browser.newContext({ viewport });
@@ -191,12 +200,12 @@ if (mode === "sim") {
 } else {
   if (flag("--seed-hello")) {
     const body = { name: "hello", image: "b3:51aa9c03", replicas: 2, command: ["sh", "-c", "while true; do sleep 1; done"], applied_by: "browser-check" };
-    const r = await fetch(`${base}/v1/apply`, { method: "POST", body: JSON.stringify(body) });
+    const r = await fetch(`${api}/v1/apply`, { method: "POST", body: JSON.stringify(body) });
     if (!r.ok) { console.log(`FAIL seed: POST /v1/apply answered ${r.status}`); failures++; }
   }
   const page = await open({ width: 1280, height: 900 }, `${base}/`);
   await check("server: the page title and the environment tag", async () => {
-    const served = await (await fetch(`${base}/`)).text(); // the router retitles the page, so read what the server sent
+    const served = await (await fetch(`${api}/`)).text(); // the router retitles the page, so read what the server sent
     must(/<title>Zigcube console<\/title>/.test(served), "GET / is not the console page");
     must((await page.title()).includes("Zigcube"), `title is ${await page.title()}`);
     must((await page.textContent("#env-tag")) === "server", "env tag is not 'server'");

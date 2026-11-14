@@ -34,6 +34,7 @@ pub const usage =
     \\                    [--create-store] [--new-ca]
     \\                    [--verbose] [--quiet]
     \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]
+    \\       zcube-server ca issue-client NAME --scope jobs|admin --p12 FILE [--password-file F]
     \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
     \\       zcube-server ca issue-node NAME [--out DIR] [--replace]
     \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
@@ -75,6 +76,13 @@ pub const usage =
     \\valid for 7 days: run it again with --replace (by hand or from cron) to re-issue; without
     \\--replace an existing NAME.key or NAME.crt is refused. A name in the revoked file is
     \\refused.
+    \\
+    \\ca issue-client --p12 FILE writes one PKCS#12 file instead, for a browser to import: a P-256
+    \\key and a certificate from the store's browser CA (the server makes that CA when it starts),
+    \\with the same name, scope, revoked file and 7 days. Its password is read from
+    \\--password-file (mode 0600), else from stdin (one line); never from the command line. The
+    \\file is mode 0600 and never overwritten: remove it to re-issue. The browser also needs the
+    \\browser CA's certificate, <stem>-browser.crt in the state directory, as a trusted root.
     \\
     \\ca issue-node signs a node certificate the same way, for a new agent's --cert and --key:
     \\it may join and act as NAME only. Once joined, the agent presents its own node.crt.
@@ -131,6 +139,10 @@ pub const Issue = struct {
     out_dir: []const u8 = ".",
     /// Replace an existing `NAME.key` and `NAME.crt` (`--replace`); refused otherwise.
     replace: bool = false,
+    /// `--p12 FILE`: one PKCS#12 file from the browser CA instead of the pair (a client only).
+    p12: ?[]const u8 = null,
+    /// `--password-file F`: the PKCS#12 password; stdin without it.
+    password_file: ?[]const u8 = null,
 
     pub const Subject = union(enum) { client: Scope, node };
 };
@@ -262,14 +274,42 @@ fn load_ca(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) 
             out = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, args[index], "--replace")) {
             request.replace = true;
+        } else if (std.mem.eql(u8, args[index], "--p12")) {
+            if (request.p12 != null) return bad(diag, "--p12 is given twice", .{}, "give it once");
+            request.p12 = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, args[index], "--password-file")) {
+            if (request.password_file != null) {
+                return bad(diag, "--password-file is given twice", .{}, "give it once");
+            }
+            request.password_file = try value_of(args, &index, diag);
         } else {
             try rest.append(arena, args[index]);
         }
     }
     if (out) |directory| request.out_dir = directory;
     request.subject = try subject_of(node, scope, diag);
+    try p12_check(&request, out != null, diag);
     request.config = try issue_config(arena, io, rest.items, diag);
     return .{ .ca_issue = request };
+}
+
+/// `--p12` is a client's alone, names its whole path (no `--out`) and never overwrites (no
+/// `--replace`); `--password-file` goes with it.
+fn p12_check(request: *const Issue, out: bool, diag: *Diag) Error!void {
+    const file = request.p12 orelse {
+        if (request.password_file == null) return;
+        return bad(diag, "--password-file goes with --p12", .{}, "add --p12 FILE");
+    };
+    if (request.subject == .node) {
+        const problem = "a node certificate has no --p12: it is for browsers";
+        return bad(diag, problem, .{}, "leave it out");
+    }
+    if (out) return bad(diag, "--p12 names the whole path: there is no --out", .{}, "drop --out");
+    if (request.replace) {
+        const problem = "--p12 never overwrites a file, so there is no --replace";
+        return bad(diag, problem, .{}, "remove the old file first");
+    }
+    if (file.len == 0) return bad(diag, "--p12 needs a file name", .{}, "give one");
 }
 
 fn scope_of(args: []const []const u8, index: *usize, diag: *Diag) Error!Scope {
@@ -826,6 +866,7 @@ test "ca issue-client and issue-node take a name, a scope (a client's), --out an
     try testing.expectEqual(Issue.Subject.node, for_node.subject);
     try testing.expectEqualStrings("node-1", for_node.name);
     try testing.expectEqualStrings("/n", for_node.out_dir);
+    try testing.expectEqual(null, for_node.p12);
     // `--help` anywhere after `ca` is the help, not a refusal.
     const helps = [_][]const []const u8{
         &.{ "ca", "--help" },
@@ -851,6 +892,36 @@ test "ca issue-client and issue-node take a name, a scope (a client's), --out an
         &.{ "ca", "issue-node", "--out", "x" },
         &.{ "ca", "issue-node", "node-1", "--scope", "jobs" },
         &.{ "ca", "issue-node", "node-1", "--create-store" },
+    };
+    for (refusals) |args| {
+        diag.reset();
+        try expect_bad(load(arena, io, args, &diag), &diag);
+    }
+}
+
+test "ca issue-client --p12 takes a file and a password file, and nothing that conflicts" {
+    // Goal: --p12's parsing (B7 slice 6). Method: a full command, then a node given --p12, a
+    // password file without --p12, --p12 twice, with --out, with --replace and with no value,
+    // each ZC-E0106.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    var diag: Diag = undefined;
+    diag.reset();
+    const p12 = [_][]const u8{
+        "ca", "issue-client", "web-1", "--scope", "jobs", "--p12", "w.p12", "--password-file", "pw",
+    };
+    const for_browser = (try load(arena, io, &p12, &diag)).ca_issue;
+    try testing.expectEqualStrings("w.p12", for_browser.p12.?);
+    try testing.expectEqualStrings("pw", for_browser.password_file.?);
+    const refusals = [_][]const []const u8{
+        &.{ "ca", "issue-node", "node-1", "--p12", "n.p12" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--password-file", "pw" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--p12", "a", "--p12", "b" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--p12", "a", "--out", "o" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--p12", "a", "--replace" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--p12" },
     };
     for (refusals) |args| {
         diag.reset();

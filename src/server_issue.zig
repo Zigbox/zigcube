@@ -87,7 +87,7 @@ pub fn issue(
 }
 
 /// Opens the CA of the store `config` names, the way the server does, but never makes one.
-fn open_ca(
+pub fn open_ca(
     ca: *peer_ca.Ca,
     gpa: Allocator,
     io: std.Io,
@@ -121,7 +121,7 @@ fn open_ca(
 }
 
 /// The CA key's file name for `store`, as `Server.guard` works it out.
-fn key_name_of(
+pub fn key_name_of(
     gpa: Allocator,
     io: std.Io,
     store: config_mod.Store,
@@ -179,7 +179,7 @@ fn make_key(io: std.Io, seed: *[32]u8, diag: *Diag) Error!Ed25519.KeyPair {
     }
 }
 
-fn refused(
+pub fn refused(
     diag: *Diag,
     request: *const config_mod.Issue,
     err: peer_ca.IssueCertificateError,

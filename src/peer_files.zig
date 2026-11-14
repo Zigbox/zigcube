@@ -17,7 +17,7 @@ const Dir = std.Io.Dir;
 pub const Error = error{Failed};
 
 /// What `write` adds to a name for its temporary file: a dot, 16 hex digits and ".tmp".
-const temp_suffix_bytes = 1 + 16 + 4;
+pub const temp_suffix_bytes = 1 + 16 + 4;
 
 /// Who may touch a file we read: `secret` is ours alone (no group or other access); `anchor`
 /// is public but a trust anchor, so nobody else may write it; `plain` is not checked.

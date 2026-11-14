@@ -108,6 +108,8 @@ comptime {
     _ = @import("server_ca.zig");
     _ = @import("server_issue.zig");
     _ = @import("server_browser_ca.zig");
+    _ = @import("pkcs12.zig");
+    _ = @import("server_issue_p12.zig");
     _ = @import("agent_run.zig");
     _ = @import("demo_c2_check.zig");
     _ = @import("job_api.zig");
