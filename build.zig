@@ -46,12 +46,11 @@ pub fn build(b: *std.Build) void {
     };
     const built = add_executables(b, shared_options);
     add_unit_tests(b, shared_options, built);
-    const built_debug = add_debug_executables(b, shared_options);
 
     // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
     const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
     const seed = b.option(u64, "seed", seed_help);
-    add_store_and_demo_steps(b, .{ built, built_debug }, seed, .{
+    add_store_and_demo_steps(b, built, seed, .{
         .target = target,
         .optimize = optimize,
         .zigbox = zigbox_module,
@@ -91,8 +90,7 @@ const Shared = struct {
 
 /// The steps that run against a real store. `-Dbackend` and `-Dpostgres` are shared by two of
 /// them, so they are declared once, here: test-store (default memory) and demo-c0 (default sqlite).
-fn add_store_and_demo_steps(b: *std.Build, sets: [2]Built, seed: ?u64, shared: Shared) void {
-    const built, const built_debug = sets;
+fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Shared) void {
     const backend = b.option(Backend, "backend", "Store backend for test-store and demo-c0");
     const postgres = postgres_conninfo(b);
     const store_help = "Run the store conformance suite (-Dbackend=...)";
@@ -130,7 +128,6 @@ fn add_store_and_demo_steps(b: *std.Build, sets: [2]Built, seed: ?u64, shared: S
     };
     add_demo_step(b, .{
         .built = built,
-        .built_debug = built_debug,
         .backend = demo_backend,
         .postgres = postgres,
         .target = shared.target,
@@ -253,13 +250,6 @@ const Built = struct {
 /// demo-b3's server and agent, Debug whatever `-Doptimize` says, never installed: until B4 slice 4
 /// the zigbox runtime speaks no TLS to a relay's upstream, so the demo relays to a plain test
 /// upstream, which only a Debug build serves (docs/decisions/2026-11-13-b4-slice2-fixes.md).
-fn add_debug_executables(b: *std.Build, shared_options: ExecutablesOptions) Built {
-    var debug_options = shared_options;
-    debug_options.optimize = .Debug;
-    debug_options.install = false;
-    return add_executables(b, debug_options);
-}
-
 fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built {
     const build_options = executables_options.options.createModule();
     var built: Built = undefined;
@@ -603,8 +593,6 @@ fn add_pg_dev_steps(b: *std.Build) *std.Build.Step.Compile {
 
 const DemoStepOptions = struct {
     built: Built,
-    /// The same executables built Debug and not installed: demo-b3's server and agent.
-    built_debug: Built,
     backend: Backend,
     postgres: []const u8,
     target: std.Build.ResolvedTarget,
@@ -778,43 +766,79 @@ fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     b.step("demo-c2", help).dependOn(&run.step);
 }
 
-/// `zig build demo-b3 [-Dtranscript=FILE]`: B3's demo, run for real (src/demo_b3.zig): the server
-/// on the host with one relay, one QEMU guest with `zcube-agent --runtime zigbox`, a relayed job
-/// that tries to reach the world. Skips unless `ZCUBE_REAL_HOST=1`.
+/// `zig build demo-b3|demo-b4 [-Dtranscript=FILE]`: B3's and B4's demos, run for real
+/// (src/demo_b3.zig, `--demo b3|b4`): the server on the host with one TLS relay, one QEMU guest
+/// with `zcube-agent --runtime zigbox` and a stock TLS upstream, relayed jobs. ReleaseSafe server
+/// and agent when the build is (CI passes `-Doptimize=ReleaseSafe`). Skip unless
+/// `ZCUBE_REAL_HOST=1`.
 fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
     const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
+    const zigbox_vm = b.dependency("zigbox", .{}).module("zigbox_vm");
+    const imports: []const std.Build.Module.Import = &.{
+        .{ .name = "zigbox", .module = step_options.zigbox },
+        .{ .name = "zigbox_vm", .module = zigbox_vm },
+    };
     const exe = b.addExecutable(.{
         .name = "demo_b3",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/demo_b3.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
-            .imports = &.{
-                .{ .name = "zigbox", .module = step_options.zigbox },
-                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
-            },
+            .imports = imports,
         }),
     });
-    // demo-b3 runs only on KVM hosts, so `check` compiles it (no run) and runs the tests of its
-    // script (the job's command line must fit the CLI's argument limit): what a comptime assert,
-    // a type error or an over-long argument would otherwise show only in CI's demo-b3 job.
-    const script_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/demo_b3_script.zig"),
-            .target = b.graph.host,
-            .optimize = .ReleaseSafe,
-            .imports = &.{
-                .{ .name = "zigbox", .module = step_options.zigbox },
-                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
-            },
-        }),
-    });
-    const build_step = b.step("demo-b3-build", "Compile demo-b3 and test its script, no run");
+    // The demos run only on KVM hosts, so `check` compiles them (no run) and runs the tests of
+    // their scripts (a job's command line must fit the CLI's argument limit): what a comptime
+    // assert, a type error or an over-long argument would otherwise show only in CI.
+    const build_step = b.step("demo-b3-build", "Compile demo-b3 and demo-b4, test their scripts");
     build_step.dependOn(&exe.step);
-    build_step.dependOn(&b.addRunArtifact(script_tests).step);
-    // demo-b3 runs Debug binaries for its plain test upstream until B4 slice 4; these prove, in
-    // the mode Zigcube ships, that the server refuses `.plain` and the zigbox supervisor refuses
-    // to serve it (the tests named `relay plain:`).
+    add_demo_script_tests(b, build_step, imports, step_options.zigbox);
+    const demos = [_][3][]const u8{
+        .{ "b3", "demo-b3", "Run B3's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)" },
+        .{ "b4", "demo-b4", "Run B4's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)" },
+    };
+    const built = step_options.built;
+    for (demos) |demo| {
+        const run = b.addRunArtifact(exe);
+        run.has_side_effects = true;
+        run.addArgs(&.{ "--demo", demo[0], "--zcube" });
+        run.addArtifactArg(built.cli);
+        run.addArg("--server");
+        run.addArtifactArg(built.server);
+        run.addArg("--agent");
+        run.addFileArg(stripped(b, built.agent));
+        run.addArg("--zbx");
+        run.addFileArg(stripped(b, zigbox.artifact("zbx")));
+        run.addArg("--guest-script");
+        run.addFileArg(b.path("ops/demo-b3/guest.sh"));
+        if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+        b.step(demo[1], demo[2]).dependOn(&run.step);
+    }
+}
+
+/// The tests `demo-b3-build` runs: the demos' scripts and the `relay plain:` tests in ReleaseSafe.
+fn add_demo_script_tests(
+    b: *std.Build,
+    build_step: *std.Build.Step,
+    imports: []const std.Build.Module.Import,
+    zigbox: *std.Build.Module,
+) void {
+    const roots = [_][]const u8{
+        "src/demo_b3_script.zig", "src/demo_b4_script.zig", "src/demo_relay_tls.zig",
+    };
+    for (roots) |root| {
+        const script_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(root),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+                .imports = imports,
+            }),
+        });
+        build_step.dependOn(&b.addRunArtifact(script_tests).step);
+    }
+    // The tests named `relay plain:` prove, in the mode Zigcube ships, that the server refuses
+    // `.plain` and the zigbox supervisor refuses to serve it.
     for ([_][]const u8{ "src/server_config.zig", "src/zigbox_supervisor.zig" }) |root| {
         const release_tests = b.addTest(.{
             .filters = &.{"relay plain:"},
@@ -822,29 +846,11 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
                 .root_source_file = b.path(root),
                 .target = b.graph.host,
                 .optimize = .ReleaseSafe,
-                .imports = &.{.{ .name = "zigbox", .module = step_options.zigbox }},
+                .imports = &.{.{ .name = "zigbox", .module = zigbox }},
             }),
         });
         build_step.dependOn(&b.addRunArtifact(release_tests).step);
     }
-    const run = b.addRunArtifact(exe);
-    run.has_side_effects = true;
-    const built = step_options.built;
-    // Debug server and agent until B4 slice 4: the plain test upstream (see `built_debug`).
-    const debug = step_options.built_debug;
-    run.addArg("--zcube");
-    run.addArtifactArg(built.cli);
-    run.addArg("--server");
-    run.addArtifactArg(debug.server);
-    run.addArg("--agent");
-    run.addFileArg(stripped(b, debug.agent));
-    run.addArg("--zbx");
-    run.addFileArg(stripped(b, zigbox.artifact("zbx")));
-    run.addArg("--guest-script");
-    run.addFileArg(b.path("ops/demo-b3/guest.sh"));
-    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
-    const help = "Run B3's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
-    b.step("demo-b3", help).dependOn(&run.step);
 }
 
 /// The settings of the Postgres the demo runs against, and the commands that stop and start it.

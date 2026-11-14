@@ -1,7 +1,7 @@
 //! demo-b3's script (docs/demos/b3.md): a relayed job that tries to reach everything but its
 //! relay, and a second relayed job beside it, both on the one node.
 //!
-//!   1. start: the server with the relay `botpike`, one guest with the agent and a test upstream;
+//!   1. start: the server with the relay `botpike`, one guest with the agent and a TLS upstream;
 //!   2. a bystander job with a relay of its own runs on the node, so the hostile job has "another
 //!      job's relay" to aim at;
 //!   3. the hostile job runs: it reaches the world on eight counts, and the upstream (which it
@@ -13,17 +13,15 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const state = @import("demo_b1_state.zig");
 const steps = @import("demo_c2_steps.zig");
+const relay_tls = @import("demo_relay_tls.zig");
 const vms = @import("demo_c2_vms.zig");
 
 const Demo = steps.Demo;
 
-/// The relay `botpike`'s upstream as the agent reaches it (the guest's loopback; the test
-/// upstream of ops/demo-b3/guest.sh).
-pub const upstream = "127.0.0.1:9090";
 /// The Python image of demo-c2 (docs/decisions/2026-11-04-demo-c2-images.md): it has `python`.
 const image_ref = steps.v1_ref;
 
-const job_wait_ms: u32 = 5 * 60 * 1000;
+pub const job_wait_ms: u32 = 5 * 60 * 1000;
 const hostile = "hostile";
 const bystander = "bystander";
 
@@ -57,7 +55,7 @@ const hostile_python =
     \\ ("node", t(lambda: c(n, 22))),
     \\ ("metadata", t(lambda: c("169.254.169.254", 80))),
     \\ ("server", t(lambda: c(e["SERVER_HOST"], int(e["SERVER_PORT"])))),
-    \\ ("upstream_direct", t(lambda: c("127.0.0.1", 9090))),
+    \\ ("upstream_direct", t(lambda: c("127.0.0.1", 9443))),
     \\ ("other_relay", t(lambda: c(n, 8080))),
     \\ ("dns", t(lambda: k.getaddrinfo("example.com", 443))),
     \\ ("raw", t(r)),
@@ -73,7 +71,7 @@ const hostile_python =
 ;
 
 pub fn run(demo: *Demo) !void {
-    try start(demo);
+    try start(demo, hostile ++ "," ++ bystander);
     try bystander_runs(demo);
     try hostile_runs(demo);
     try node_is_clean(demo);
@@ -82,19 +80,18 @@ pub fn run(demo: *Demo) !void {
 
 // ---- 1. Start ----
 
-fn start(demo: *Demo) !void {
+/// The server with the relay `botpike`, one guest with the agent, and botpike's TLS upstream,
+/// which admits the jobs named in `jobs` (comma separated). Shared with demo-b4.
+pub fn start(demo: *Demo, jobs: []const u8) !void {
     const host = demo.host;
-    host.section("0. Start: zcube-server with the relay botpike, one guest, a test upstream");
-    host.say("  Debug builds of zcube-server and zcube-agent until B4 slice 4: the zigbox " ++
-        "runtime speaks no TLS to a relay's upstream yet, so botpike is a plain-TCP test " ++
-        "upstream (`.plain = true`), which release builds refuse", .{});
+    host.section("0. Start: zcube-server with the relay botpike, one guest, a TLS upstream");
     _ = try host.zcube(&.{"version"});
     try host.start_server(30 * 1000);
     host.say("  zcube-server is up on 127.0.0.1:{d} (SQLite); the guest reaches it at {s}", .{
         host.port, demo.server,
     });
     _ = try demo.guest(0, "setup-root", .{});
-    _ = try demo.guest(0, "upstream", .{});
+    try relay_tls.upstream_up(demo, jobs);
     const learned = try demo.guest(0, "learn {s}", .{image_ref});
     const at = std.mem.indexOf(u8, learned, "tree b3:") orelse
         return host.fail("no tree learned for {s}", .{image_ref});
@@ -121,20 +118,20 @@ fn node_joined(_: void, demo: *Demo) !bool {
 
 // ---- Jobs ----
 
-const Want = struct { name: []const u8, state: []const u8 };
+pub const Want = struct { name: []const u8, state: []const u8 };
 
-fn in_state(want: Want, demo: *Demo) !bool {
+pub fn in_state(want: Want, demo: *Demo) !bool {
     const view = (try state.job_view(demo.host, want.name)) orelse return false;
     return std.mem.eql(u8, view.state, want.state);
 }
 
-fn has_ended(want: Want, demo: *Demo) !bool {
+pub fn has_ended(want: Want, demo: *Demo) !bool {
     const view = (try state.job_view(demo.host, want.name)) orelse return false;
     return view.end_kind != null;
 }
 
 /// `zcube job run NAME --image TREE --relay botpike <extra> --command python -c <source>`.
-fn run_job(demo: *Demo, name: []const u8, extra: []const []const u8, source: []const u8) !void {
+pub fn run_job(demo: *Demo, name: []const u8, extra: []const []const u8, source: []const u8) !void {
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(demo.arena(), &.{
         "job", "run", name, "--image", demo.v1_tree, "--relay", "botpike",
@@ -182,6 +179,9 @@ fn hostile_runs(demo: *Demo) !void {
     });
     demo.expect(std.mem.count(u8, log, "GET /report?") == 1, "the test upstream received " ++
         "the job's request through the relay, exactly once", .{});
+    const identity = "uri=spiffe://" ++ relay_tls.cluster ++ "/job/" ++ hostile ++ " ";
+    demo.expect(std.mem.indexOf(u8, log, identity) != null, "the upstream saw the relay's " ++
+        "client certificate name the job: {s}", .{identity[0 .. identity.len - 1]});
     for (checks) |name| {
         const reached = try std.fmt.allocPrint(demo.arena(), "{s}=REACHED", .{name});
         const failed = try std.fmt.allocPrint(demo.arena(), "{s}=failed", .{name});

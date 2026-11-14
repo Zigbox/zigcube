@@ -416,6 +416,11 @@ fn peer_address(buffer: *[64]u8, advertise: ?std.Io.net.IpAddress) []const u8 {
     return std.fmt.bufPrint(buffer, "{f}", .{address}) catch unreachable;
 }
 
+/// Where the certificate step finds the runtime's relay files.
+fn relay_dir(kind: @TypeOf(@as(config_mod.Config, undefined).runtime)) []const u8 {
+    return if (kind == .zigbox) agent_records.dir_zigbox else agent_records.dir_containers;
+}
+
 /// Runs the agent until it is told to stop. Returns the process's exit code.
 pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const io = init.io;
@@ -481,13 +486,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .boot_id = boot_id,
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
-        .relay_certs = .{
-            .node = config.node,
-            .dir = if (config.runtime == .zigbox)
-                agent_records.dir_zigbox
-            else
-                agent_records.dir_containers,
-        },
+        .relay_certs = .{ .node = config.node, .dir = relay_dir(config.runtime) },
     };
     defer shell.arena.deinit();
     announce(io, config);

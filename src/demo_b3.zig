@@ -1,6 +1,9 @@
-//! `zig build demo-b3`: B3's demo, run for real (docs/demos/b3.md). The server runs on the host
-//! over SQLite with one relay in its configuration, `botpike`, whose upstream is a test server on
-//! the guest's loopback. One QEMU guest (the rig of src/demo_c2_vms.zig, one guest of it) runs
+//! `zig build demo-b3` and `demo-b4`: B3's and B4's demos, run for real (docs/demos/b3.md,
+//! docs/demos/b4.md; `--demo b3|b4` picks the script, `demo_b3_script.zig` or
+//! `demo_b4_script.zig`). The server runs on the host over SQLite with one relay in its
+//! configuration, `botpike`, whose upstream is a stock TLS server on the guest's loopback that
+//! pins the cluster CA (`demo_relay_tls.zig`). One QEMU guest (the rig of src/demo_c2_vms.zig,
+//! one guest of it) runs
 //! `zcube-agent --runtime zigbox` as root. A job with `--relay botpike` runs a Python image with
 //! no network but the relay (`supervise-zigbox` passes `listen`), and tries to reach the world:
 //! 1.1.1.1:443, the node's address, the metadata address, zcube-server, the upstream itself and
@@ -13,19 +16,24 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const demo_host = @import("demo_host.zig");
+const relay_tls = @import("demo_relay_tls.zig");
 const script = @import("demo_b3_script.zig");
+const script_b4 = @import("demo_b4_script.zig");
 const steps = @import("demo_c2_steps.zig");
 const vms = @import("demo_c2_vms.zig");
 
 const Host = demo_host.Host;
 
+const Which = enum { b3, b4 };
+
 const usage =
-    \\usage: demo_b3 --zcube EXE --server EXE --agent EXE --zbx EXE --guest-script FILE
-    \\               [--transcript FILE]
+    \\usage: demo_b3 [--demo b3|b4] --zcube EXE --server EXE --agent EXE --zbx EXE
+    \\               --guest-script FILE [--transcript FILE]
     \\
 ;
 
 const Options = struct {
+    demo: Which = .b3,
     zcube: []const u8 = "",
     server: []const u8 = "",
     agent: []const u8 = "",
@@ -41,6 +49,9 @@ fn parse_options(args: []const []const u8) ?Options {
         if (index + 1 >= args.len) return null;
         const value = args[index + 1];
         const name = args[index];
+        if (std.mem.eql(u8, name, "--demo")) {
+            options.demo = std.meta.stringToEnum(Which, value) orelse return null;
+        }
         if (std.mem.eql(u8, name, "--zcube")) options.zcube = value;
         if (std.mem.eql(u8, name, "--server")) options.server = value;
         if (std.mem.eql(u8, name, "--agent")) options.agent = value;
@@ -56,20 +67,23 @@ fn parse_options(args: []const []const u8) ?Options {
 
 pub fn main(init: std.process.Init) u8 {
     const stdout = std.Io.File.stdout();
-    const real = init.minimal.environ.getPosix("ZCUBE_REAL_HOST") orelse "";
-    if (!std.mem.eql(u8, real, "1")) {
-        const skipped = "demo-b3: skipped (set ZCUBE_REAL_HOST=1; it boots a QEMU guest)\n";
-        stdout.writeStreamingAll(init.io, skipped) catch {}; // Nowhere else to say it.
-        return 0;
-    }
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return 2;
     const options = parse_options(args) orelse {
-        std.Io.File.stderr().writeStreamingAll(init.io, usage) catch {}; // As above.
+        std.Io.File.stderr().writeStreamingAll(init.io, usage) catch {}; // Nowhere else to say it.
         return 2;
     };
+    const real = init.minimal.environ.getPosix("ZCUBE_REAL_HOST") orelse "";
+    if (!std.mem.eql(u8, real, "1")) {
+        const skipped = switch (options.demo) {
+            .b3 => "demo-b3: skipped (set ZCUBE_REAL_HOST=1; it boots a QEMU guest)\n",
+            .b4 => "demo-b4: skipped (set ZCUBE_REAL_HOST=1; it boots a QEMU guest)\n",
+        };
+        stdout.writeStreamingAll(init.io, skipped) catch {}; // As above.
+        return 0;
+    }
     var host: Host = undefined;
     prepare(&host, init, options) catch |err| {
-        std.debug.print("demo-b3: setup failed: {s}\n", .{@errorName(err)});
+        std.debug.print("demo-{t}: setup failed: {s}\n", .{ options.demo, @errorName(err) });
         return 2;
     };
     defer host.arena_state.deinit();
@@ -116,8 +130,8 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
     host.config.server_exe = try cwd.realPathFileAlloc(init.io, options.server, arena);
     host.config.cli_exe = try cwd.realPathFileAlloc(init.io, options.zcube, arena);
     const base = init.environ_map.get("TMPDIR") orelse "/tmp";
-    host.work = try std.fmt.allocPrint(arena, "{s}/zcube-demo-b3-{d}-{d}", .{
-        base, std.os.linux.getpid(), stamp,
+    host.work = try std.fmt.allocPrint(arena, "{s}/zcube-demo-{t}-{d}-{d}", .{
+        base, options.demo, std.os.linux.getpid(), stamp,
     });
     host.state = try std.fmt.allocPrint(arena, "{s}/state", .{host.work});
     try cwd.createDirPath(init.io, host.state);
@@ -130,16 +144,9 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
         host.port,
     }));
     host.config.store = try std.fmt.allocPrint(arena, "sqlite:{s}/store.db", .{host.work});
-    // The relay `botpike` and where it leads, as the agent (on the guest) reaches it: the plain
-    // test upstream, `.plain = true`, which only the Debug server and agent this demo runs accept
-    // (until B4 slice 4 brings TLS to the zigbox runtime's relay; build.zig, `built_debug`).
-    const config_path = try host.path_in_work("server.zon");
-    const config_text = try std.fmt.allocPrint(arena,
-        \\.{{ .relays = .{{ .botpike = .{{ .address = "{s}", .plain = true }} }} }}
-        \\
-    , .{script.upstream});
-    try cwd.writeFile(init.io, .{ .sub_path = config_path, .data = config_text });
-    host.config.server_config = config_path;
+    // The relay `botpike` and where it leads, as the agent (on the guest) reaches it: a TLS
+    // upstream whose CA the server pins (B4 slice 4).
+    host.config.server_config = try relay_tls.prepare(host, stamp);
     if (options.transcript) |path| host.transcript = try cwd.createFile(init.io, path, .{});
 }
 
@@ -159,7 +166,7 @@ fn run(demo: *steps.Demo, init: std.process.Init, options: Options) u8 {
     demo.guests.deinit(host.io);
     host.say("  the server is stopped and the guest is powered off", .{});
     std.Io.Dir.cwd().deleteTree(host.io, host.work) catch {}; // Best effort: it is in /tmp.
-    host.say("\n{s}", .{if (ok) "demo-b3 PASSED" else "demo-b3 FAILED"});
+    host.say("\ndemo-{t} {s}", .{ options.demo, if (ok) "PASSED" else "FAILED" });
     return if (ok) 0 else 1;
 }
 
@@ -174,7 +181,10 @@ fn boot_and_run(demo: *steps.Demo, init: std.process.Init, options: Options) !vo
     const started = host.now_ms();
     try demo.guests.boot(init, bodies);
     host.say("  the guest booted and was provisioned in {d} ms", .{host.now_ms() - started});
-    try script.run(demo);
+    switch (options.demo) {
+        .b3 => try script.run(demo),
+        .b4 => try script_b4.run(demo),
+    }
 }
 
 /// What the guest's agent, relays and upstream logged, for a failed run.
