@@ -57,6 +57,7 @@ jobs:
       demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
       mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
       demo_b3: ${{ steps.pick.outputs.demo_b3 || 'true' }}
+      packages: ${{ steps.pick.outputs.packages || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -584,6 +585,45 @@ jobs:
             demo-b3.txt
             demo-b3-transcript.txt
           if-no-files-found: warn
+
+  # The Zigcube packages (docs/briefs/packaging.md): build the .deb and .rpm files with the
+  # tool's fixed test key (never a release key), check the written tree, then install them in an
+  # Ubuntu and a Fedora container (installed with the distro's own tools, on the runner's docker):
+  # `zcube version`, each server flavour starting and refusing its wrong store, a remove, an
+  # upgrade that keeps an edited server.zon. The binaries are the runner's, built on glibc 2.39;
+  # the release job builds them in a RHEL 9 container so that they run on older systems.
+  packages:
+    name: packages (deb and rpm, throwaway key)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.packages == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: Build the executables, one server per store
+        shell: bash
+        run: |
+          mkdir -p zig-out/release-bin
+          arch=$(uname -m)
+          for store in sqlite postgres; do
+            zig build -Doptimize=ReleaseSafe -Dstore="$store" --prefix "zig-out/$store"
+            cp "zig-out/$store/bin/zcube-server" "zig-out/release-bin/zcube-server-$store-$arch"
+          done
+          cp zig-out/sqlite/bin/zcube "zig-out/release-bin/zcube-$arch"
+          cp zig-out/sqlite/bin/zcube-agent "zig-out/release-bin/zcube-agent-$arch"
+      - name: Write and check the packages
+        run: zig build packages-check -Dtest-key=true --summary all
+      - name: Install, run, upgrade and remove them in Ubuntu and Fedora
+        shell: bash
+        run: |
+          for image in ubuntu:24.04 fedora:latest; do
+            docker run --rm -v "$PWD/zig-out/packages:/p:ro" -v "$PWD/.github/packages-install.sh:/t.sh:ro" "$image" bash /t.sh
+          done
 
   # Stock servers (openssl s_server, a JDK 21 SSLServerSocket) against the mTLS client. Test-only
   # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md.

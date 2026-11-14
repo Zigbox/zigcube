@@ -85,6 +85,8 @@ const shell_allowlist = [_][]const u8{
     // The release's signing glue (docs/releases/packaging.md), ported from Zigbox's: the program
     // that signs is gpg, and the glue only drives it between two runs of `zig build packages`.
     // The release workflow and its test job run the same file; the test sits beside it.
+    // Drives apt and dnf in a clean container to install, swap, reinstall and remove the packages.
+    ".github/packages-install.sh",
     ".github/release-sign.sh",
     ".github/release-sign-test.sh",
 };
