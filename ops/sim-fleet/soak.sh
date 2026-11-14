@@ -89,16 +89,29 @@ take_binaries() {
 
 # One seed: soaks it, keeps its output in $SOAK/last.log (the round before in last-1.log), and
 # hands the verdict to the reporter. A run that died is recorded as `CRASHED` with a replay of
-# the operations its last epoch line reached plus one epoch.
+# the operations its last epoch line reached plus one epoch. Two exits are not the seed's and
+# are logged, not reported, as run.sh does: 2 (the runner refused its environment or its
+# arguments) and 137 (killed by signal 9: the host's out-of-memory killer, or an operator).
+# The children get no copy of the lock's descriptor (8>&-), so a runner left behind does not
+# hold the lock.
 soak_round() {
     seed=${SIM_SOAK_SEED:-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')}
     if [ -f "$SOAK/last.log" ]; then mv "$SOAK/last.log" "$SOAK/last-1.log"; fi
     log "soaking seed $seed for $SIM_SOAK_MINUTES minutes at $built"
     code=0
     "$SOAK/bin/sim_cluster" "$seed" soak --soak-minutes="$SIM_SOAK_MINUTES" \
-        --soak-epoch="$SIM_SOAK_EPOCH" >"$SOAK/last.log" 2>"$SOAK/last.err" || code=$?
+        --soak-epoch="$SIM_SOAK_EPOCH" >"$SOAK/last.log" 2>"$SOAK/last.err" 8>&- || code=$?
     case $code in
-    0 | 1) cp "$SOAK/last.log" "$SOAK/verdict" ;;
+    0 | 1) verdict_of_run >"$SOAK/verdict" ;;
+    2)
+        log "sim_cluster exited 2 on seed $seed (its environment or arguments): not reported"
+        sed -n '1,3s/^/  /p' "$SOAK/last.err"
+        return 0
+        ;;
+    137)
+        log "sim_cluster on seed $seed was killed (out of memory?): the host's, not reported"
+        return 0
+        ;;
     *)
         log "sim_cluster exited $code on seed $seed; recording a crash"
         crash_record "$seed" "$code" >"$SOAK/verdict"
@@ -106,6 +119,19 @@ soak_round() {
     esac
     tail -n 1 "$SOAK/verdict" | sed 's/^/  /'
     ingest || true
+}
+
+# The verdict of a run that ended (0 or 1): its output, with a note before the summary line when
+# it wrote to stderr (the first line, cut to 200 bytes), which the reporter carries in the trace.
+verdict_of_run() {
+    if [ ! -s "$SOAK/last.err" ]; then
+        cat "$SOAK/last.log"
+        return 0
+    fi
+    sed '$d' "$SOAK/last.log"
+    first=$(head -n1 "$SOAK/last.err" | tr -d '\r' | cut -b1-200)
+    printf '  soak: stderr not empty: %s\n' "$first"
+    tail -n1 "$SOAK/last.log"
 }
 
 # The verdict of a soak of seed $1 that exited $2: the panic or the signal, the operations its
@@ -141,7 +167,7 @@ ingest() {
     fi
     code=0
     timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SOAK/bin/sim_fleet" "$@" <"$SOAK/verdict" \
-        >"$SOAK/ingest.out" || code=$?
+        >"$SOAK/ingest.out" 8>&- || code=$?
     cat "$SOAK/ingest.out"
     if [ "$code" -eq 0 ]; then return 0; fi
     cp "$SOAK/verdict" "$SOAK/last-failed-verdict.txt"

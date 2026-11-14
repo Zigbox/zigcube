@@ -135,8 +135,16 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
 
+/// The long soak's leak (`sim_cluster <seed> soak`, src/sim_soak.zig): every operation takes
+/// `soak_leak_bytes` from the run's allocator and never gives them back (must fail the soak's
+/// teardown check, "memory still held after the world was torn down"). Only
+/// `src/sim_soak_teeth_main.zig` declares it; `ops/sim-fleet/test-soak.sh` runs it.
+pub const soak_leak = declared("c1_teeth_soak_leak");
+pub const soak_leak_bytes: usize = if (soak_leak) 16 * 1024 else 0;
+
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
+    soak_leak;

@@ -7,7 +7,8 @@
 //!                 [--profile=NAME|auto] [--lease-ttl-ms=N] [--replicas-pct=N]
 //!                 [--expect-fail] [--trace-steps]
 //!     sim-cluster <seed> soak [<nodes>] (--soak-minutes=M | --soak-operations=N)
-//!                 [--soak-epoch=E] [--profile=NAME] [--jobs=true|false] [--strong]
+//!                 [--soak-epoch=E] [--soak-bytes=B] [--profile=NAME] [--jobs=true|false]
+//!                 [--strong]
 //!
 //! `<nodes>` 0 lets the seed pick. Liveness is on by default (src/sim_cluster.zig says what it
 //! is). `--heal-at=N` makes the faults end before operation N instead of where the seed chose.
@@ -44,7 +45,8 @@
 //!
 //! `soak` for `<operations>` runs the long soak (src/sim_soak.zig says what it checks): one seed,
 //! liveness off, until `--soak-minutes=M` of wall clock or `--soak-operations=N` (a replay), with
-//! a `soak:` line every `--soak-epoch=E` operations (500).
+//! a `soak:` line every `--soak-epoch=E` operations (500), or until its live bytes reach
+//! `--soak-bytes=B` at an epoch (1.5 GiB), which ends it as held.
 //!
 //! Exit code 0 if every check held (or, with `--expect-fail`, one failed), 1 if one did not (or,
 //! with `--expect-fail`, none did), and 2 for a usage error. A simulation, not a demo.
@@ -67,7 +69,7 @@ const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
     "[--replicas-pct=N] [--jobs=true|false] [--strong] [--expect-fail] [--trace-steps]\n" ++
     "       sim-cluster <seed> soak [<nodes>] (--soak-minutes=M | --soak-operations=N) " ++
-    "[--soak-epoch=E] [--profile=NAME] [--jobs=true|false] [--strong]\n";
+    "[--soak-epoch=E] [--soak-bytes=B] [--profile=NAME] [--jobs=true|false] [--strong]\n";
 
 /// What the command line asked for.
 const Args = struct {
@@ -92,6 +94,7 @@ const Args = struct {
     soak_minutes: ?u32 = null,
     soak_operations: ?u32 = null,
     soak_epoch: ?u32 = null,
+    soak_bytes: ?u64 = null,
 };
 
 /// Null if the arguments are not a valid command line.
@@ -128,7 +131,7 @@ fn parse(args: []const []const u8) ?Args {
     if (std.mem.eql(u8, positional[skip], "soak")) {
         parsed.soak = soak_plan(&parsed) orelse return null;
     } else if (parsed.soak_minutes != null or parsed.soak_operations != null or
-        parsed.soak_epoch != null)
+        parsed.soak_epoch != null or parsed.soak_bytes != null)
     {
         return null; // Soak flags need a soak.
     } else if (!std.mem.eql(u8, positional[skip], "auto")) {
@@ -156,10 +159,13 @@ fn soak_plan(parsed: *const Args) ?sim_soak.Plan {
     if (parsed.soak_operations) |operations| {
         if (operations == 0 or operations % epoch != 0) return null;
     }
+    const bytes_max = parsed.soak_bytes orelse sim_soak.bytes_max_default;
+    if (bytes_max == 0) return null;
     return .{
         .epoch_operations = epoch,
         .minutes = parsed.soak_minutes,
         .operations = parsed.soak_operations,
+        .bytes_max = bytes_max,
     };
 }
 
@@ -224,6 +230,9 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.soak_operations = parse_count(arg["--soak-operations=".len..]) orelse return false;
     } else if (std.mem.startsWith(u8, arg, "--soak-epoch=")) {
         parsed.soak_epoch = parse_count(arg["--soak-epoch=".len..]) orelse return false;
+    } else if (std.mem.startsWith(u8, arg, "--soak-bytes=")) {
+        const text = arg["--soak-bytes=".len..];
+        parsed.soak_bytes = std.fmt.parseInt(u64, text, 10) catch return false;
     } else if (std.mem.eql(u8, arg, "--trace-steps")) {
         parsed.trace_steps = true;
     } else if (std.mem.startsWith(u8, arg, "--heal-at=")) {
@@ -536,9 +545,15 @@ fn print_soak_end(
 ) !void {
     const operations = report.operations_run;
     const what = if (report.failed) symptom(report) else sim_soak.failure(soak) orelse {
-        return out.print("soak: held for {d} operations, {d} epochs, peak {d} bytes\n", .{
+        try out.print("soak: held for {d} operations, {d} epochs, peak {d} bytes", .{
             operations, soak.epochs, soak.counting.peak,
         });
+        if (soak.budget_reached) |live| {
+            try out.print(", budget reached ({d} live bytes, limit {d})", .{
+                live, soak.plan.bytes_max,
+            });
+        }
+        return out.print("\n{s}\n", .{sim_soak.world_hash(report)});
     };
     try out.print("seed {d}: FAILED: {s}\n", .{ seed, what });
     try out.print("  step: {s}\n", .{if (report.failed) step_of(report) else "soak"});
@@ -552,7 +567,12 @@ fn print_soak_end(
     if (report.failed) {
         // The simulation's own check: the same world cut at the same operation.
         try print_replay(out, seed, operations, options, null);
-        return print_trace(out, report);
+        try print_trace(out, report);
+        // A soak check that failed too (the teardown, after a failing world): evidence only.
+        if (sim_soak.failure(soak)) |also| {
+            try out.print("  soak: also {s}: {s}\n", .{ also, sim_soak.failure_detail(soak) });
+        }
+        return;
     }
     // A soak check: the soak again, stopped by count where this one stopped.
     try out.print("  replay: zig-out/bin/sim_cluster {d} soak {d} --soak-operations={d} " ++
@@ -643,6 +663,24 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--nope" }) == null);
     const traced = parse(&.{ "sim", "--seeds", "1..1", "60", "--trace-steps" }).?;
     try std.testing.expect(traced.trace_steps);
+}
+
+test "the soak's command line: one way to end, a byte budget, flags only with a soak" {
+    const timed = parse(&.{ "sim", "7", "soak", "--soak-minutes=5" }).?;
+    try std.testing.expectEqual(@as(?u32, 5), timed.soak.?.minutes);
+    try std.testing.expectEqual(sim_soak.bytes_max_default, timed.soak.?.bytes_max);
+    const counted = parse(&.{
+        "sim", "7", "soak", "--soak-operations=1000", "--soak-epoch=250", "--soak-bytes=4096",
+    }).?;
+    try std.testing.expectEqual(@as(?u32, 1000), counted.soak.?.operations);
+    try std.testing.expectEqual(@as(u64, 4096), counted.soak.?.bytes_max);
+    try std.testing.expect(parse(&.{ "sim", "7", "soak", "--soak-minutes=5", "--soak-bytes=0" }) ==
+        null);
+    try std.testing.expect(parse(&.{ "sim", "7", "100", "--soak-bytes=4096" }) == null);
+    try std.testing.expect(parse(&.{ "sim", "7", "soak" }) == null);
+    try std.testing.expect(parse(&.{
+        "sim", "7", "soak", "--soak-operations=1000", "--soak-epoch=300",
+    }) == null);
 }
 
 test "a shrunk run is the run: the heal point held, the same symptom" {

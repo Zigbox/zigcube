@@ -517,8 +517,9 @@ const RunError = issue.ParseError || state_file.ParseError || IngestError ||
 fn explain(err: RunError) []const u8 {
     return switch (err) {
         error.NoSummary => "stdin has no summary line of --kind (`sim-cluster: seeds A..B`, " ++
-            "`sim-cluster --c1: seeds A..B` or `sim-swarm: seeds A..B`), or a failure after " ++
-            "the last one; feed it that producer's --seeds output (run.sh does)",
+            "`sim-cluster --c1: seeds A..B`, `sim-swarm: seeds A..B` or " ++
+            "`sim-cluster --soak: seeds A..B`), or a failure after the last one; feed it " ++
+            "that producer's output unchanged (run.sh and soak.sh do)",
         error.BadLine => "stdin has a line sim_fleet cannot read, batches of different " ++
             "operation counts, or a summary whose count of failed seeds is not the number of " ++
             "`seed N:` records before it; feed it unchanged --seeds output",

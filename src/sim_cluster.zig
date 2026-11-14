@@ -899,7 +899,9 @@ pub const Cluster = struct {
     operations_done: u32 = 0,
     on_epoch: ?*const fn (epoch: *const Epoch) bool = null,
     epoch_operations: u32 = 1000,
-    /// Decisions the last decisions check listed (the soak's history size).
+    /// Decisions the last complete decisions check listed (the soak's history size). The check
+    /// is skipped while the store is faulty (`store_faulty`) and when the revision has not
+    /// moved, so an epoch reports the count of the last pass, which may be a little stale.
     decisions_listed: u32 = 0,
 
     /// The trace and the soak's fields (`OpTrace`, `Options.on_epoch`), as a run starts.
@@ -2135,7 +2137,8 @@ const OpTrace = struct {
             .op = op,
             .service = @intCast(service),
         };
-        trace.count +|= 1;
+        assert(trace.count < std.math.maxInt(u32)); // One per operation, a `u32`.
+        trace.count += 1;
     }
 
     /// `trace: op <index> at <ms> ms: <op> [<service>]`, one line per operation kept. A service
@@ -2177,6 +2180,14 @@ fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
     unreachable; // `pick` is below the total.
 }
 
+/// The soak's leak tooth (`src/sim_soak_teeth_main.zig`): memory taken every operation and never
+/// given back, which the soak's teardown check must catch. A full allocator only skips it.
+fn soak_leak_tooth(c: *Cluster) void {
+    comptime assert(c1_teeth.soak_leak);
+    const leaked = c.gpa.alloc(u8, c1_teeth.soak_leak_bytes) catch return;
+    @memset(leaked, 0x5a);
+}
+
 fn operation(c: *Cluster) void {
     const random = c.prng.random();
     const service = random.uintLessThan(u32, service_names.len);
@@ -2184,6 +2195,7 @@ fn operation(c: *Cluster) void {
     const op = pick_op(&c.swarm, random, c.fault_totals == null);
     c.ops_drawn[@backingInt(op)] += 1;
     c.trace.add(c.operations_done - 1, c.manual.ms - epoch_ms, op, service);
+    if (c1_teeth.soak_leak) soak_leak_tooth(c);
     switch (op) {
         .advance => {
             c.advance(100 + random.uintLessThan(u32, 6000));
@@ -3811,6 +3823,74 @@ test "a node count can be asked for" {
     simulate(testing.allocator, 5, 10, .{ .nodes = 3 }, &report);
     try testing.expect(!report.failed);
     try testing.expect(std.mem.indexOf(u8, report.text(), "swarm: nodes=3 ") != null);
+}
+
+test "the trace keeps the last operations, oldest first, and all of a short run" {
+    // Goal: `OpTrace` prints what it was given in order, wraps after `trace_ops_max`, and names a
+    // service only for the operations that act on one.
+    var report: Report = .{};
+    var trace: OpTrace = .{};
+    for (0..5) |n| trace.add(@intCast(n), n * 10, .advance, 0);
+    trace.print(&report);
+    try testing.expectEqualStrings(
+        \\trace: op 0 at 0 ms: advance
+        \\trace: op 1 at 10 ms: advance
+        \\trace: op 2 at 20 ms: advance
+        \\trace: op 3 at 30 ms: advance
+        \\trace: op 4 at 40 ms: advance
+        \\
+    , report.text());
+
+    report = .{};
+    trace = .{};
+    const operations = 30;
+    for (0..operations) |n| trace.add(@intCast(n), n * 10, if (n % 2 == 0) .apply else .advance, 2);
+    trace.print(&report);
+    var expected: [trace_ops_max * 48]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&expected);
+    for (operations - trace_ops_max..operations) |n| {
+        const what = if (n % 2 == 0) "apply gamma" else "advance";
+        try writer.print("trace: op {d} at {d} ms: {s}\n", .{ n, n * 10, what });
+    }
+    try testing.expectEqualStrings(writer.buffered(), report.text());
+}
+
+test "a failure's trace is the run's last operations, numbered and timed as they ran" {
+    // Goal: each `trace:` line names the operation's index in the run (from 0), the virtual time
+    // it began at and what it drew. Method: run 30 operations as `run_steps` does, noting each
+    // one's start and draw, then fail a check and read the trace it printed.
+    var report: Report = .{};
+    const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
+    defer c.destroy();
+    const operations = 30;
+    var started: [operations]u64 = undefined;
+    var drawn: [operations]Op = undefined;
+    for (0..operations) |index| {
+        c.operations_done = @intCast(index + 1);
+        started[index] = c.manual.ms - epoch_ms;
+        const before = c.ops_drawn;
+        operation(c);
+        try testing.expect(!report.failed);
+        const op = for (0..op_count) |o| {
+            if (c.ops_drawn[o] != before[o]) break o;
+        } else return error.TestUnexpectedResult;
+        drawn[index] = @fromBackingInt(@intCast(op));
+    }
+    try testing.expectError(error.StepFailed, check(c, false, "the trace's own test"));
+    var lines = std.mem.splitScalar(u8, report.text(), '\n');
+    var index: usize = operations - trace_ops_max;
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "trace: ")) continue;
+        try testing.expect(index < operations);
+        var buffer: [96]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&buffer, "trace: op {d} at {d} ms: {s}", .{
+            index, started[index], @tagName(drawn[index]),
+        });
+        try testing.expect(std.mem.startsWith(u8, line, prefix));
+        try testing.expect(line.len == prefix.len or line[prefix.len] == ' ');
+        index += 1;
+    }
+    try testing.expectEqual(@as(usize, operations), index);
 }
 
 test "the fencing check fires on a node that runs containers long after it lost its lease" {

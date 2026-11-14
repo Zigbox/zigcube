@@ -8,8 +8,17 @@
 //! know. Every `E` operations (`--soak-epoch`, default 500) the run stops at an epoch
 //! (`sim_cluster.Options.on_epoch`) and this prints one `soak:` line of what it has grown to and
 //! judges it (`judge`). `--soak-minutes` ends the run at the first epoch past the wall-clock
-//! budget; `--soak-operations` at a count, which is how a soak's failure replays. Either way the
-//! simulation's end checks then run, as for a run of that many operations.
+//! budget; `--soak-operations` at a count, which is how a soak's failure replays; and the first
+//! epoch whose live bytes reach `--soak-bytes` (`bytes_max_default`, below the fleet unit's
+//! `MemoryMax`) ends it as held, "budget reached". Either way the simulation's end checks then
+//! run, as for a run of that many operations, and once the world is torn down every byte it
+//! took must have come back (`finish`).
+//!
+//! The memory checks, and what they cannot see (docs/decisions/2026-11-14-c3-soak-leak-judge.md):
+//! memory never given back fails at the teardown, whatever its rate; memory held until the
+//! teardown fails at an epoch only when, after the warm-up, it outgrows the history the world
+//! keeps (the ratio and the slope, `judge`). A hoard steady from the first operation is in both
+//! baselines and runs on until the byte budget.
 //!
 //! A failure prints the block a `--seeds` range prints (`seed N: FAILED: ...`, `step:`, the
 //! replay, the trace) and the summary `sim-cluster --soak: seeds N..N, K operations: 1 of 1
@@ -38,6 +47,18 @@ pub const warmup_epochs: u32 = 4;
 /// The leak check: live bytes per retained history item may grow at most this many times over
 /// the baseline's.
 pub const leak_factor: u64 = 4;
+
+/// The slope check: the bytes added per history item added since the warm-up may be at most this
+/// many times the baseline slope (the first epoch after the warm-up, and never less than the
+/// warm-up's own bytes per item). Growing arrays double, so a healthy world's slope stays within
+/// about three times its true cost once the history has doubled since the warm-up, which is
+/// when the check starts (measured: seed 7, 4,000 operations, at most 0.4 of the baseline).
+pub const slope_factor: u64 = 4;
+
+/// The live bytes that end a soak as held (`--soak-bytes`): below `MemoryMax=2G` of
+/// `ops/sim-fleet/sim-soak.service`, with room for what the allocator holds beyond them and for
+/// the peak between two epochs, so that a long healthy soak stops itself and is not killed.
+pub const bytes_max_default: u64 = 1536 * 1024 * 1024;
 
 /// The counter check: a fixed-width counter past this fraction of its range fails the soak, long
 /// before ReleaseSafe's overflow panic would.
@@ -105,6 +126,8 @@ pub const Plan = struct {
     /// One of these ends the run: the wall-clock budget, or an operation count (a replay).
     minutes: ?u32 = null,
     operations: ?u32 = null,
+    /// Live bytes at an epoch that end the run as held (`bytes_max_default`).
+    bytes_max: u64 = bytes_max_default,
 };
 
 /// A soak in progress: what the epoch hook judges against. One per process (the hook has no
@@ -119,6 +142,12 @@ pub const Soak = struct {
     last: ?sim_cluster.Epoch = null,
     /// Live bytes per retained history item at the end of the warm-up (`leak_factor`).
     baseline_per_item: ?u64 = null,
+    /// Live bytes and history items at the end of the warm-up, and the slope of the first epoch
+    /// after it (`slope_factor`).
+    warm: ?struct { live: u64, items: u64 } = null,
+    baseline_slope: ?u64 = null,
+    /// The live bytes at the epoch that ended the run because they reached `plan.bytes_max`.
+    budget_reached: ?u64 = null,
     /// The failure a check found (`fail`), and the operations of the epoch it found it at.
     failure: [96]u8 = undefined,
     failure_len: u32 = 0,
@@ -148,6 +177,18 @@ pub fn run(
     defer active = null;
     const operations = soak.plan.operations orelse std.math.maxInt(u32);
     sim_cluster.simulate(soak.counting.allocator(), seed, operations, soaked, report);
+    finish(soak, report.operations_run);
+}
+
+/// The teardown check, on every way a soak ends: the world is gone, so is all it held.
+fn finish(soak: *Soak, operations: u32) void {
+    if (soak.counting.live == 0) return;
+    if (soak.failure_len > 0) return; // The first failure is the one replayed.
+    soak.failed_at = operations;
+    const what = "soak: memory still held after the world was torn down";
+    fail(soak, what, .{}, "{d} bytes after a run of {d} operations", .{
+        soak.counting.live, operations,
+    });
 }
 
 fn on_epoch(epoch: *const sim_cluster.Epoch) bool {
@@ -158,6 +199,10 @@ fn on_epoch(epoch: *const sim_cluster.Epoch) bool {
     soak.last = epoch.*;
     if (soak.failure_len > 0) {
         soak.failed_at = epoch.operations;
+        return false;
+    }
+    if (soak.counting.live >= soak.plan.bytes_max) {
+        soak.budget_reached = soak.counting.live;
         return false;
     }
     if (soak.plan.operations) |operations| return epoch.operations < operations;
@@ -202,7 +247,8 @@ fn judge(soak: *Soak, epoch: *const sim_cluster.Epoch) void {
             });
         }
     }
-    const per_item = soak.counting.live / history_items(epoch);
+    const items = history_items(epoch);
+    const per_item = soak.counting.live / items;
     if (soak.epochs == warmup_epochs) soak.baseline_per_item = @max(per_item, 1);
     if (soak.baseline_per_item) |baseline| {
         if (per_item > baseline * leak_factor) {
@@ -211,6 +257,33 @@ fn judge(soak: *Soak, epoch: *const sim_cluster.Epoch) void {
                 "limit {d} times";
             return fail(soak, what, .{}, detail, .{ per_item, baseline, leak_factor });
         }
+    }
+    judge_slope(soak, items);
+}
+
+/// The slope check (`slope_factor`): the bytes the world added per history item it added since
+/// the warm-up, against the first epoch after it.
+fn judge_slope(soak: *Soak, items: u64) void {
+    const live = soak.counting.live;
+    if (soak.epochs == warmup_epochs) {
+        soak.warm = .{ .live = live, .items = items };
+        return;
+    }
+    const warm = soak.warm orelse return;
+    // Retention may shrink the history: there is no slope until it has grown.
+    if (items <= warm.items) return;
+    const slope = (live -| warm.live) / (items - warm.items);
+    const baseline = soak.baseline_slope orelse {
+        soak.baseline_slope = @max(slope, warm.live / warm.items, 1);
+        return;
+    };
+    // Until the history has doubled, one array's doubling may outweigh what it added.
+    if (items - warm.items < warm.items) return;
+    if (slope > baseline * slope_factor) {
+        const what = "soak: memory grew faster than the history it holds since the warm-up";
+        const detail = "{d} bytes per history item added, {d} in the first epoch after the " ++
+            "warm-up, limit {d} times";
+        return fail(soak, what, .{}, detail, .{ slope, baseline, slope_factor });
     }
 }
 
@@ -280,7 +353,7 @@ test "the counting allocator follows what is held" {
     try std.testing.expectEqual(@as(u64, 0), counting.live);
 }
 
-fn world_hash(report: *const sim_cluster.Report) []const u8 {
+pub fn world_hash(report: *const sim_cluster.Report) []const u8 {
     const text = report.text();
     const start = std.mem.indexOf(u8, text, "world hash: ") orelse return "";
     const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
@@ -317,6 +390,173 @@ test "a soak stopped at an epoch is the plain run of that many operations" {
     @memcpy(soaked_hash[0..soaked.len], soaked);
     sim_cluster.simulate(gpa, 7, 120, .{ .liveness = false }, report);
     try std.testing.expectEqualStrings(soaked_hash[0..soaked.len], world_hash(report));
+}
+
+fn test_soak(counting: *Counting, out: *std.Io.Writer) Soak {
+    return .{
+        .plan = .{ .operations = 1000 },
+        .counting = counting,
+        .io = std.testing.io,
+        .out = out,
+        .started = std.Io.Clock.boot.now(std.testing.io),
+    };
+}
+
+test "each counter fails past half its range and holds at half" {
+    var buffer: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var counting: Counting = .{ .child = std.testing.allocator };
+    const cases = .{
+        .{ "operations", "operations", std.math.maxInt(u32) },
+        .{ "transactions", "transactions", std.math.maxInt(u32) },
+        .{ "agent_steps", "agent steps", std.math.maxInt(u32) },
+        .{ "server_steps", "server steps", std.math.maxInt(u32) },
+        .{ "decisions", "decisions", sim_cluster.decisions_read_max },
+        .{ "jobs_created", "jobs", std.math.maxInt(u32) },
+        .{ "job_ledger", "start ledger", sim_jobs.ledger_max },
+    };
+    inline for (cases) |case| {
+        var epoch: sim_cluster.Epoch = std.mem.zeroes(sim_cluster.Epoch);
+        epoch.virtual_ms = 1000;
+        epoch.revision = 10;
+        @field(epoch, case[0]) = case[2] / 2;
+        var soak = test_soak(&counting, &out);
+        judge(&soak, &epoch);
+        try std.testing.expect(failure(&soak) == null);
+        @field(epoch, case[0]) = case[2] / 2 + 1;
+        judge(&soak, &epoch);
+        try std.testing.expectEqualStrings("soak: " ++ case[1] ++ " past half its range", failure(&soak).?);
+    }
+}
+
+test "a world that stood still over an epoch fails: its clock, its store's revision" {
+    var buffer: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var counting: Counting = .{ .child = std.testing.allocator };
+    var epoch: sim_cluster.Epoch = std.mem.zeroes(sim_cluster.Epoch);
+    epoch.virtual_ms = 1000;
+    epoch.revision = 10;
+
+    var soak = test_soak(&counting, &out);
+    soak.last = epoch;
+    epoch.virtual_ms += 1;
+    epoch.revision += 1;
+    judge(&soak, &epoch);
+    try std.testing.expect(failure(&soak) == null);
+
+    soak.last = epoch;
+    epoch.virtual_ms += 1;
+    judge(&soak, &epoch);
+    try std.testing.expectEqualStrings(
+        "soak: the store's revision stood still over an epoch",
+        failure(&soak).?,
+    );
+    try std.testing.expectEqualStrings("at revision 11", failure_detail(&soak));
+
+    soak = test_soak(&counting, &out);
+    soak.last = epoch;
+    epoch.revision += 1;
+    judge(&soak, &epoch);
+    try std.testing.expectEqualStrings(
+        "soak: virtual time stood still over an epoch",
+        failure(&soak).?,
+    );
+}
+
+test "the slope: memory added per history item after the warm-up against the first epoch" {
+    var buffer: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var counting: Counting = .{ .child = std.testing.allocator };
+    var soak = test_soak(&counting, &out);
+    // 100 items of 10 bytes at the warm-up, then 30 bytes per item added (an array doubled).
+    soak.epochs = warmup_epochs;
+    counting.live = 1000;
+    judge_slope(&soak, 100);
+    soak.epochs += 1;
+    counting.live = 1000 + 50 * 30;
+    judge_slope(&soak, 150);
+    try std.testing.expectEqual(@as(?u64, 30), soak.baseline_slope);
+    // Steep, but the history has not doubled since the warm-up: not judged yet.
+    soak.epochs += 1;
+    counting.live = 1000 + 90 * 200;
+    judge_slope(&soak, 190);
+    try std.testing.expect(failure(&soak) == null);
+    // Doubled, at four times the baseline: holds.
+    soak.epochs += 1;
+    counting.live = 1000 + 100 * 120;
+    judge_slope(&soak, 200);
+    try std.testing.expect(failure(&soak) == null);
+    // Past it: fails.
+    soak.epochs += 1;
+    counting.live = 1000 + 100 * 121;
+    judge_slope(&soak, 200);
+    try std.testing.expectEqualStrings(
+        "soak: memory grew faster than the history it holds since the warm-up",
+        failure(&soak).?,
+    );
+    try std.testing.expectEqualStrings(
+        "121 bytes per history item added, 30 in the first epoch after the warm-up, " ++
+            "limit 4 times",
+        failure_detail(&soak),
+    );
+    counting.live = 0;
+
+    // A first epoch that added nearly nothing does not make the baseline nearly nothing: it is
+    // at least the warm-up's own bytes per item.
+    soak = test_soak(&counting, &out);
+    soak.epochs = warmup_epochs;
+    counting.live = 1000;
+    judge_slope(&soak, 100);
+    soak.epochs += 1;
+    judge_slope(&soak, 150);
+    try std.testing.expectEqual(@as(?u64, 10), soak.baseline_slope);
+    counting.live = 0;
+}
+
+test "the teardown: a byte still held after the run fails the soak, unless it already failed" {
+    var buffer: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var counting: Counting = .{ .child = std.testing.allocator };
+    var soak = test_soak(&counting, &out);
+    finish(&soak, 300);
+    try std.testing.expect(failure(&soak) == null);
+    counting.live = 1;
+    finish(&soak, 300);
+    try std.testing.expectEqualStrings(
+        "soak: memory still held after the world was torn down",
+        failure(&soak).?,
+    );
+    try std.testing.expectEqualStrings("1 bytes after a run of 300 operations", failure_detail(&soak));
+    try std.testing.expectEqual(@as(u32, 300), soak.failed_at);
+    // The first failure stays the one replayed.
+    soak = test_soak(&counting, &out);
+    fail(&soak, "soak: first", .{}, "", .{});
+    finish(&soak, 300);
+    try std.testing.expectEqualStrings("soak: first", failure(&soak).?);
+    counting.live = 0;
+}
+
+test "the byte budget ends a soak as held at the first epoch that reaches it" {
+    const gpa = std.testing.allocator;
+    const report = try gpa.create(sim_cluster.Report);
+    defer gpa.destroy(report);
+    var buffer: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var counting: Counting = .{ .child = gpa };
+    var soak: Soak = .{
+        .plan = .{ .epoch_operations = 20, .minutes = 60, .bytes_max = 1 },
+        .counting = &counting,
+        .io = std.testing.io,
+        .out = &out,
+        .started = std.Io.Clock.boot.now(std.testing.io),
+    };
+    run(&soak, 7, .{}, report);
+    try std.testing.expect(!report.failed);
+    try std.testing.expect(soak.budget_reached.? >= 1);
+    try std.testing.expect(failure(&soak) == null);
+    try std.testing.expectEqual(@as(u32, 20), report.operations_run);
+    try std.testing.expectEqual(@as(u32, 1), soak.epochs);
+    try std.testing.expectEqual(@as(u64, 0), counting.live);
 }
 
 test "the checks: a counter past half its range, memory outgrowing its history, a stuck clock" {
