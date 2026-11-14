@@ -44,8 +44,11 @@ const Fixture = struct {
     plane: control_plane.ControlPlane,
     api: controller.DecisionSource,
     interleave: Interleave = .none,
-    /// The retirement `interleave` wrote before, and whether it committed.
+    /// The write `interleave` wrote before, and whether it committed. A write is known by the
+    /// decision key it creates (a retry makes a new decision; its arena may reuse the address).
     interleaved: ?[*]const store.Op = null,
+    interleaved_decision: [128]u8 = undefined,
+    interleaved_decision_len: u8 = 0,
     interleaved_committed: bool = false,
 
     fn start(self: *Fixture) !void {
@@ -56,6 +59,7 @@ const Fixture = struct {
         self.tap.before = interleave_before;
         self.interleave = .none;
         self.interleaved = null;
+        self.interleaved_decision_len = 0;
         self.interleaved_committed = false;
         self.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         self.diag.reset();
@@ -211,8 +215,12 @@ const Fixture = struct {
     fn committed(pointer: *anyopaque, request_done: ?store.TxnRequest, _: store.Revision) void {
         const self: *Fixture = @ptrCast(@alignCast(pointer));
         const done = request_done orelse return;
-        const ops = self.interleaved orelse return;
-        if (done.on_success.ptr == ops) self.interleaved_committed = true;
+        if (self.interleaved == null) return;
+        const decision = self.interleaved_decision[0..self.interleaved_decision_len];
+        assert(decision.len > 0);
+        for (done.compares) |compare| {
+            if (std.mem.eql(u8, compare.key, decision)) self.interleaved_committed = true;
+        }
     }
 
     /// Writes `interleave` straight to the memory store, on an arena of its own (the
@@ -227,6 +235,14 @@ const Fixture = struct {
         const what = self.interleave;
         self.interleave = .none;
         self.interleaved = txn_request.on_success.ptr;
+        for (txn_request.compares) |compare| {
+            if (!std.mem.startsWith(u8, compare.key, "/decisions/")) continue;
+            assert(compare.key.len <= self.interleaved_decision.len);
+            @memcpy(self.interleaved_decision[0..compare.key.len], compare.key);
+            self.interleaved_decision_len = @intCast(compare.key.len);
+            break;
+        }
+        assert(self.interleaved_decision_len > 0);
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         var diag: Diag = undefined;
@@ -345,6 +361,43 @@ test "a pause between the read and the commit fails the retirement" {
     try testing.expect(!fixture.interleaved_committed);
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
     try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+}
+
+test "a pause between the read and the commit fails a replacement at the new spec" {
+    // Goal: seam b. Every write of the replica controller compares `/rollouts/<service>` as it
+    // read it, not only a retirement: a replacement it judged on the active rollout (a dead old
+    // replica comes back at the new spec) fails if a pause lands before the commit, and the next
+    // pass replaces it at its own generation (R4). Method: an old replica stops while the rollout
+    // progresses; the pause lands inside the replacement's transaction.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try testing.expectEqual(records.RolloutPhase.progressing, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    const old = (try fixture.replicas())[0];
+    try testing.expectEqual(@as(u64, 1), old.rec.generation);
+    const old_id = try testing.allocator.dupe(u8, old.rec.id);
+    defer testing.allocator.free(old_id);
+    const observed: records.Observed = .{
+        .replica = old_id,
+        .node = "node1",
+        .generation = 1,
+        .status = .stopped,
+        .reported_at_ms = fixture.manual.ms,
+    };
+    const key = records.observed_key("node1", old_id);
+    try fixture.put(.{ .agent = "node1" }, key.slice(), observed);
+    fixture.interleave = .pause;
+    try fixture.settle();
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+    for (try fixture.replicas()) |replica| {
+        try testing.expect(!std.mem.eql(u8, replica.rec.id, old_id));
+    }
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
 }
 
 test "an apply over a rollout still progressing starts from the generation that completed" {

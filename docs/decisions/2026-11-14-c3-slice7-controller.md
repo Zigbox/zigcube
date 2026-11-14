@@ -64,7 +64,11 @@ Choices the brief left open, or where this slice differs from it or from slice 6
     compared exactly while it fits in a transaction and as far as it fits past that;
     `docs/decisions/2026-11-14-c3-rolling-floor-compares.md`. Every write of `/rollouts/<service>`
     and every retirement compares the rollout record's revision, so a pause between a read and
-    a commit fails the commit.
+    a commit fails the commit. That holds for every write of the replica controller (seam b of
+    slice 11's review): a start, a replacement, a scale up and a scale down compare the
+    `/rollouts/<service>` revision `roll_of` read (0 when absent), since each rests on the
+    rollout's phase. Test "a pause between the read and the commit fails a replacement at the new
+    spec": the test fails without the compare.
 18. **`State.earlier` comes from the record** (slice 6's 4d4ec68, merged): a rollout ran before
     when it is a rollback or its `from` is not 0. Slice 7 calls no rollback (item 8); slice 8 must
     not roll back a rollout whose `from` is 0, since there is nothing to go back to.

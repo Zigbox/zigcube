@@ -200,7 +200,19 @@ const Roll = struct {
     starts: bool = true,
     /// The rollout is paused: nothing new starts.
     paused: bool = false,
+    /// `/rollouts/<service>` and its revision as read (0: absent). Every write of the service's
+    /// replicas compares it (`expect_rollout`): what the write does rests on the rollout's phase
+    /// (starts, replacements, the surge kept while halted), so a pause, a failure or a new
+    /// rollout that lands between the read and the commit fails the commit (c3.md, seam b).
+    rollout_key: []const u8 = "",
+    rollout_revision: u64 = 0,
 };
+
+/// Compares the service's `/rollouts` record as `roll_of` read it (absent: revision 0).
+fn expect_rollout(batch: *Batch, roll: *const Roll) void {
+    assert(roll.rollout_key.len > 0);
+    batch.expect(roll.rollout_key, roll.rollout_revision);
+}
 
 const Run = struct {
     rc: *ReplicaController,
@@ -255,7 +267,7 @@ const Run = struct {
         const halted = plan.stale > 0 and roll.rollout != null;
         const wanted = service.rec.replicas + if (halted) roll.policy.max_surge else 0;
         if (keep < service.rec.replicas) return run.scale_up(service, keep, &roll);
-        if (keep > wanted) return run.scale_down(service, &plan, wanted);
+        if (keep > wanted) return run.scale_down(service, &plan, &roll, wanted);
     }
 
     // ---- Reading ----
@@ -447,6 +459,7 @@ const Run = struct {
 
         var batch: Batch = .{};
         batch.expect(service.kv.key, service.kv.mod_revision);
+        expect_rollout(&batch, roll);
         var first_dead: ?DecisionId = null;
         for (removed[0..removed_count]) |item| {
             if (item.class != .dead) continue;
@@ -489,6 +502,8 @@ const Run = struct {
         const key = records.rollout_key(service.rec.name);
         const ctx = run.ctx;
         const got = try ctx.store.get(ctx.arena, key.slice(), run.snap.revision, ctx.diag);
+        roll.rollout_key = try controller.key_copy(ctx, &key);
+        roll.rollout_revision = if (got.kv) |found| found.mod_revision else 0;
         const kv = got.kv orelse return roll;
         const rec = try records.read(records.Rollout, run.ctx.arena, kv, run.ctx.diag);
         if (!records.rollout_of(&rec, service.kv.create_revision)) return roll;
@@ -533,7 +548,7 @@ const Run = struct {
         if (!run.budget()) return;
         var batch: Batch = .{};
         batch.expect(service.kv.key, service.kv.mod_revision);
-        if (!c1_teeth.rollout_budget) batch.expect(rollout.kv.key, rollout.kv.mod_revision);
+        if (!c1_teeth.rollout_budget) expect_rollout(&batch, roll);
         const why = if (retired_count > 0)
             try run.replace_reason(service, plan, retired[0..retired_count], keep)
         else
@@ -1022,6 +1037,7 @@ const Run = struct {
         if (!run.budget()) return;
         var batch: Batch = .{};
         batch.expect(service.kv.key, service.kv.mod_revision);
+        expect_rollout(&batch, roll);
         const reason = try controller.format(run.ctx, "service {s} wants {d} {s} and {d} exist", .{
             service.rec.name, wanted, plural(wanted, "replica", "replicas"), keep,
         });
@@ -1045,6 +1061,7 @@ const Run = struct {
         run: *Run,
         service: *const ServiceEntry,
         plan: *const ServicePlan,
+        roll: *const Roll,
         wanted: u32,
     ) Error!void {
         assert(wanted >= service.rec.replicas);
@@ -1062,6 +1079,7 @@ const Run = struct {
 
         var batch: Batch = .{};
         batch.expect(service.kv.key, service.kv.mod_revision);
+        expect_rollout(&batch, roll);
         var names: std.ArrayList(u8) = .empty;
         for (victims[0..taken], 0..) |item, index| {
             if (index > 0) names.appendSlice(run.ctx.arena, ", ") catch return nomem(run.ctx);
