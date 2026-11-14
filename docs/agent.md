@@ -252,15 +252,16 @@ the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
   default `api_tls_client.server_name_default`), presenting the node's own `node.crt` with its
   `peer.key` from the state directory, else `--cert` and `--key` (paths: the key never goes on
   the command line). Both runtimes pass the agent's own `--ca`, `--tls-name`, `--cert` and
-  `--key`. Over TLS a node may list `/node-store/` only (mtls.md, "Scopes"), so the fetch skips
-  O5's fetchers and wait below. A read that fails, or that the server refuses, is one line in
+  `--key`. Over TLS a node may list `/node-store/` only (mtls.md, "Scopes"); O5's fetchers come
+  from the server's node-scoped endpoint below, over TLS or not. A read that fails, or that the server refuses, is one line in
   `fetch.log`, and the fetch goes on with the peers named by `--peer`; a TLS setup that cannot
   be loaded is one line too, and the server is then not read at all (never in the clear).
 - `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and
   the plan strikes it if it lies.
 - **Who pulls from the registry first (O5, docs/briefs/c2.md).** With `--server` and a full digest,
-  the fetch first reads which nodes fetch the tree: the nodes of `/assigned/<node>/<id>` whose
-  replica (`/replicas/<service>/<id>`) has that image. If a peer's `/node-store/` record lists the
+  the fetch first asks which nodes fetch the tree, `GET /v1/agent/nodes/<self>/fetchers/<digest>`:
+  the server answers the nodes of `/assigned/<node>/<id>` whose replica (`/replicas/<service>/<id>`)
+  has that image, names only (decisions/2026-11-14-b7-slice7-o5-over-tls.md). If a peer's `/node-store/` record lists the
   tree whole (`trees`) and has a `peer` address, it goes on as above. Else the node with the
   lowest `fetch_plan.registry_rank(node, tree)` (BLAKE3 of the two; ties to the lower name) goes
   on at once (no peer holds the tree, so it ends at the registry), and every other node re-reads `/node-store/` every

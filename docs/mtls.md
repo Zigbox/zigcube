@@ -141,7 +141,7 @@ reply closes the connection.
 
 | Caller | May call |
 |---|---|
-| `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only; and `GET /v1/list` with `prefix` exactly `/node-store/` and no parameter but `limit`, `at` and `continue` (the swarm fetch's discovery, B7 slice 7) |
+| `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only (its `fetchers/<digest>` answers node names only, B7 slice 7); and `GET /v1/list` with `prefix` exactly `/node-store/` and no parameter but `limit`, `at` and `continue` (the swarm fetch's discovery, B7 slice 7) |
 | `client`, scope `jobs` | `/v1/jobs` and below, and `GET /v1/why/job/<name>` |
 | `client`, scope `admin` | everything but the credential endpoint |
 | `local` (`--insecure-listen`) | everything |
