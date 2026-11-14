@@ -1831,7 +1831,10 @@ pub const registry = [_]Entry{
         \\On a zcube server, this is a client that came without a certificate: it
         \\sent an empty Certificate, and the server answered certificate_required.
         \\The server takes no connection without one. Give the client a
-        \\certificate from this cluster's CA.
+        \\certificate from this cluster's CA. A browser (a client that offers
+        \\no Ed25519) is told so by name: it needs a certificate from the
+        \\cluster's browser CA, imported from the .p12 that zcube-server ca
+        \\issue-client NAME --scope admin --p12 FILE writes (docs/mtls.md).
         ,
     },
     .{
