@@ -1383,6 +1383,29 @@ const c1_teeth_roots = [_]struct {
         .seeds = 186,
         .ops = 300,
     },
+    // C3 slice 7: the rollout checks run only under `--c1` (they judge each transaction before
+    // it commits), so these teeth have no plain run. The symptoms are full text: B3's relay
+    // checks are also named R1 to R3. Measured 2026-11-14 over seeds 1 to 40: at 100 operations
+    // budget 40, pause 14 and history 40 fail; at 150, budget 40 (all R1), pause 20 (18 R4, two
+    // the halted-surge convergence check) and history 40 (all R6). Each is caught at seed 1.
+    .{
+        .name = "rollout_budget",
+        .root = "src/sim_c1_teeth_rollout_budget_main.zig",
+        .symptom = "R1: a retirement",
+        .canary_seeds = 10,
+    },
+    .{
+        .name = "rollout_pause",
+        .root = "src/sim_c1_teeth_rollout_pause_main.zig",
+        .symptom = "R4: a paused rollout",
+        .canary_seeds = 20,
+    },
+    .{
+        .name = "rollout_history",
+        .root = "src/sim_c1_teeth_rollout_history_main.zig",
+        .symptom = "R6: a history",
+        .canary_seeds = 10,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1402,7 +1425,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 23 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the 26 negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1435,7 +1458,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 23 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 26 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),

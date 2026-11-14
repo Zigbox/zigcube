@@ -147,5 +147,6 @@ pub const rollout_budget = declared("c1_teeth_rollout_budget");
 /// The rollout controller keeps a progressing budget while a rollout is paused or failed (C3 slice
 /// 7; must break R4).
 pub const rollout_pause = declared("c1_teeth_rollout_pause");
-/// A rollback writes the history entry it restores over again (C3 slice 7; must break R6).
+/// An apply also writes its history record over the newest older generation's (C3 slice 7; must
+/// break R6).
 pub const rollout_history = declared("c1_teeth_rollout_history");

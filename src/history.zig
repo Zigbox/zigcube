@@ -6,6 +6,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
@@ -134,9 +135,11 @@ pub fn put(
     const existing = try stored(ctx, record.service);
     const key = records.history_key(record.service, record.generation);
     const key_copy = try controller.key_copy(ctx, &key);
-    batch.put(key_copy, try records.encode(ctx.arena, record.*, ctx.diag));
+    const value = try records.encode(ctx.arena, record.*, ctx.diag);
+    batch.put(key_copy, value);
     const low = if (owner) |service| usable_low(existing, service) else null;
     const seeded = if (owner != null and low == null) try put_seed(ctx, batch, owner.?) else null;
+    if (c1_teeth.rollout_history) rewrite_older(batch, existing, record, value);
     var kept: u32 = if (seeded == null) 1 else 2;
     for (existing) |entry| {
         if (entry.generation == record.generation) continue; // Replaced by the put.
@@ -155,6 +158,24 @@ pub fn put(
         if (!delete_room(batch)) return;
         batch.delete(entry.key);
         excess -= 1;
+    }
+}
+
+/// The `rollout_history` tooth: the new record's bytes also go over the newest older generation's
+/// key, so a stored record changes under its generation (R6 must fail).
+fn rewrite_older(
+    batch: *controller.Batch,
+    existing: []const Stored,
+    record: *const records.History,
+    value: []const u8,
+) void {
+    if (!delete_room(batch)) return;
+    var index = existing.len;
+    while (index > 0) {
+        index -= 1;
+        if (existing[index].generation >= record.generation) continue;
+        batch.put(existing[index].key, value);
+        return;
     }
 }
 
