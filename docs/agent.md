@@ -235,7 +235,8 @@ status other than 200, or nothing.
 **Zigbox mode (slice 8).** With `--runtime zigbox` and `--peer-listen`, no `--images-dir` is needed: at start the agent finds the node's Zigbox store (`XDG_DATA_HOME` or `HOME`, as `zigbox pull` does), makes it if it is not there yet, and the peer server serves its trees as bundles (`GET /v1/peer/bundle/<digest>`, docs/peer.md) and its chunks. The server's unused chunk directory is `<state-dir>/peer-chunks`. The agent's summary pass (the trees and chunk filter it reports, which the scheduler's locality uses) reads the same Zigbox store on the agent's thread (`ZigboxImages`), so a tree `pull` or a swarm fetch puts there is reported at the next summary; the store is opened in Zigbox mode whether or not `--peer-listen` is given.
 
 `zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
-[--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
+[--server HOST:PORT [--ca FILE [--tls-name NAME] [--cert FILE --key FILE]]]
+[--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
 registry (plain HTTP, `/trees/<digest>`, `/chunks/<hex>`) and the peers. It exits 0 when the tree is
 whole in the store and 3 (`exit_external`) with ZC-E0601 when it is not; 1 and 2 are this node's own
 setup. The node O5 designates to pull from the registry first does not wait: it notes so in
@@ -247,6 +248,14 @@ the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
   `/v1/list?prefix=/node-store/` in pages of `discover_page_nodes` (following `continue`), for each node's `peer` address and hex `filter` (keys.md,
   api.md). It leaves out its own node and any node with a bad name, no `peer` or no filter, says
   how many on one line of stderr, and ranks the rest by the chunks their filters claim.
+- `--ca FILE` (B7 slice 7) reads `--server` over TLS, checked against that CA (`--tls-name`,
+  default `api_tls_client.server_name_default`), presenting the node's own `node.crt` with its
+  `peer.key` from the state directory, else `--cert` and `--key` (paths: the key never goes on
+  the command line). Both runtimes pass the agent's own `--ca`, `--tls-name`, `--cert` and
+  `--key`. Over TLS a node may list `/node-store/` only (mtls.md, "Scopes"), so the fetch skips
+  O5's fetchers and wait below. A read that fails, or that the server refuses, is one line in
+  `fetch.log`, and the fetch goes on with the peers named by `--peer`; a TLS setup that cannot
+  be loaded is one line too, and the server is then not read at all (never in the clear).
 - `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and
   the plan strikes it if it lies.
 - **Who pulls from the registry first (O5, docs/briefs/c2.md).** With `--server` and a full digest,

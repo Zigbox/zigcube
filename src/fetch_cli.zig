@@ -1704,9 +1704,9 @@ const Begun = struct {
 };
 
 /// O5 (docs/briefs/c2.md, owner 2026-11-03): before the peers are chosen, reads which nodes fetch
-/// the tree and, unless a peer holds it or this node ranks lowest among them, re-reads
-/// `/node-store/` every `fetch_peer_poll_ms` for up to `fetch_peer_wait_ms` until a peer holds
-/// it. `arena` holds the fetchers; `poll` is reset before each read and holds the last.
+/// the tree (not over TLS) and, unless a peer holds it or this node ranks lowest among them,
+/// re-reads `/node-store/` every `fetch_peer_poll_ms` for up to `fetch_peer_wait_ms` until a peer
+/// holds it. `arena` holds the fetchers; `poll` is reset before each read and holds the last.
 fn begin(
     arena: std.mem.Allocator,
     poll: *std.heap.ArenaAllocator,
@@ -1716,7 +1716,12 @@ fn begin(
 ) Begun {
     const scratch = arena.alloc(u8, discover_page_bytes_max) catch
         return .{ .stores = null, .start = .peers, .fetchers = 0, .waited_ms = 0 };
-    const fetchers = fetching_nodes(arena, getter, scratch, parsed.digest);
+    // Over TLS a node may read `/node-store/` only (api_scope.zig): no fetchers, so no wait,
+    // as before O5 (decisions/2026-11-14-b7-slice7-node-store-read.md).
+    const fetchers = if (net.server_tls != null)
+        &.{}
+    else
+        fetching_nodes(arena, getter, scratch, parsed.digest);
     const started = net.clock_ms();
     while (true) {
         _ = poll.reset(.retain_capacity);

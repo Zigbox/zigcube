@@ -116,6 +116,14 @@ truncated page; pass it back with the first page's `at`. **`reverse` is new** (s
 `prefix=/node-store/` and `limit=65` (agent.md, "The chunk store, the peer server and `fetch`").
 It adds no endpoint.
 
+Over `--listen` this endpoint needs a client of scope `admin`, with one exception (B7 slice 7,
+mtls.md "Scopes"): any node's certificate may `GET /v1/list` with `prefix` exactly
+`/node-store/` (percent-encoded or not) and no other parameter but `limit`, `at` and `continue`,
+each at most once. Any other prefix, `reverse`, a repeated parameter or another method is 403
+`ZC-E0822`: a node never reads `/replicas/`, `/assigned/` or `/services/` this way, since a
+spec holds its service's env. So over TLS the fetch reads no fetchers and skips O5's wait
+(decisions/2026-11-14-b7-slice7-node-store-read.md).
+
 ### `GET /v1/watch?prefix=&prefix=&from=&timeout=`
 
 The long-poll watch of HANDOFF. Waits up to `timeout` milliseconds (default and maximum 25000;

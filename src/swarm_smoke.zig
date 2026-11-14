@@ -469,13 +469,24 @@ fn wait_registered(smoke: *Smoke, want: u32) !void {
     try smoke.expect(false, "timed out waiting for {d} nodes to register", .{want});
 }
 
+/// Waits for the node's replica to run and its fetch to end: the agent reports a replica running
+/// once its supervisor started, which with `FakeRuntime` is before the fetch child (and its
+/// summary line, ` chunks N ... registry N `) is done. Over TLS the fetch is slower, so waiting
+/// for the status alone lets the registry counts race the fetch.
 fn wait_running(smoke: *Smoke, at: usize) !void {
     var waited: u32 = 0;
     while (waited < wait_ms) : (waited += 100) {
-        if (try smoke.running_on(at) == 1) return;
+        if (try smoke.running_on(at) == 1 and try fetch_ended(smoke, at)) return;
         try smoke.io.sleep(.fromMilliseconds(100), .awake);
     }
     try smoke.expect(false, "{s} never ran its replica", .{nodes[at]});
+}
+
+/// Whether some container of the node wrote its fetch summary line.
+fn fetch_ended(smoke: *Smoke, at: usize) !bool {
+    const log = try smoke.fetch_log(nodes[at]);
+    const chunks = std.mem.find(u8, log, "chunks ") orelse return false;
+    return std.mem.find(u8, log[chunks..], " registry ") != null;
 }
 
 fn expect_registry(smoke: *Smoke, trees: u32, chunks: u32, step: []const u8) !void {
@@ -506,6 +517,12 @@ fn step_first_from_registry(smoke: *Smoke) !void {
 
 /// node1 has node2 as its only peer: the registry is not asked again.
 fn step_second_from_peer(smoke: *Smoke) !void {
+    // node1 starts once node2's chunk summary is in the store, so its plan sees node2.
+    var waited: u32 = 0;
+    while (waited < wait_ms and try smoke.summaries() < 1) : (waited += 100) {
+        try smoke.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    try smoke.expect(try smoke.summaries() >= 1, "node2 never published its chunks", .{});
     try smoke.start_agent(0);
     try wait_registered(smoke, 2);
     try smoke.apply(2);

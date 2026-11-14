@@ -99,45 +99,13 @@ fn start(demo: *Demo) !void {
     if (learned.len < at + "tree ".len + length) return host.fail("a short tree", .{});
     demo.v1_tree = learned[at + "tree ".len ..][0..length];
     _ = try demo.guest(0, "images {s} {s}", .{ demo.v1_tree, image_ref });
-    try put_tls(demo);
-    _ = try demo.guest(0, "agent {s} {s} {s}", .{ vms.names[0], demo.server, guest_tls_dir });
+    try steps.put_tls(demo, 0);
+    _ = try demo.guest(0, "agent {s} {s} {s}", .{
+        vms.names[0], demo.server, steps.guest_tls_dir,
+    });
     try demo.wait_hard({}, node_joined, "the node to join", steps.join_ms);
     _ = try host.zcube(&.{ "get", "nodes" });
 }
-
-/// Where the guest's agent finds its CA, node certificate and key.
-const guest_tls_dir = "/root/tls";
-
-/// Issues the node's certificate (`ca issue-node`) and writes it, its key and the CA into the
-/// guest (mode 0600): the agent talks to the server's TLS listener (B7 slice 6).
-fn put_tls(demo: *Demo) !void {
-    const host = demo.host;
-    const flags = try host.agent_tls(vms.names[0]);
-    assert(flags.len == 6);
-    const session = &demo.guests.sessions[0];
-    const timeout_s: u32 = 60;
-    const made = try session.run("mkdir -p -m 700 " ++ guest_tls_dir, timeout_s);
-    if (made.status != 0) return host.fail("can't make {s} in the guest", .{guest_tls_dir});
-    const names = [_][]const u8{ "ca.crt", "node.crt", "node.key" };
-    for (names, 0..) |name, index| {
-        const text = try std.Io.Dir.cwd().readFileAlloc(
-            host.io,
-            flags[2 * index + 1],
-            host.arena(),
-            .limited(file_bytes_max),
-        );
-        const path = try std.fmt.allocPrint(host.arena(), guest_tls_dir ++ "/{s}", .{name});
-        try session.put_file(path, text);
-    }
-    const kept = try session.run("chmod 600 " ++ guest_tls_dir ++ "/*", timeout_s);
-    if (kept.status != 0) return host.fail("can't chmod {s} in the guest", .{guest_tls_dir});
-    host.say("  {s}: the CA, node.crt and node.key are in {s} (0600)", .{
-        vms.names[0], guest_tls_dir,
-    });
-}
-
-/// A PEM certificate or key: what `put_file` takes at most.
-const file_bytes_max: usize = 1536;
 
 fn node_joined(_: void, demo: *Demo) !bool {
     const reply = try demo.host.json("/v1/list?prefix=/nodes/");

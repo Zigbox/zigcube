@@ -507,7 +507,7 @@ fn read_body(
 fn refused_unread(caller: api_scope.Caller, parsed: Parsed) bool {
     const announced = parsed.transfer_encoded or (parsed.content_length orelse 0) > 0;
     if (!announced) return false;
-    return api_scope.refusal(caller, parsed.method, parsed.path) != null;
+    return api_scope.refusal(caller, parsed.method, parsed.path, parsed.query) != null;
 }
 
 fn is_read(method: []const u8) bool {

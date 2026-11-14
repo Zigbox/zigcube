@@ -157,7 +157,7 @@ pub const Api = struct {
         if (request.request_id) |sent| {
             if (id_problem(sent)) |problem| return bad_request(ctx, "X-Request-Id", problem);
         }
-        if (api_scope.refusal(request.caller, request.method, request.path)) |need| {
+        if (api_scope.refusal(request.caller, request.method, request.path, request.query)) |need| {
             return not_allowed(ctx, request, need);
         }
         const prefix = "/v1/";
@@ -658,7 +658,7 @@ pub fn raise_not_allowed(
             .sentence = "ask an operator for a client certificate of scope jobs:",
             .command = "zcube-server ca issue-client NAME --scope jobs",
         }),
-        .admin => diag.fix(.{
+        .any_node, .admin => diag.fix(.{
             .sentence = "ask an operator for a client certificate of scope admin:",
             .command = "zcube-server ca issue-client NAME --scope admin",
         }),

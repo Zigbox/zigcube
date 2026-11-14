@@ -222,10 +222,46 @@ fn learn(demo: *Demo, reference: []const u8) ![]const u8 {
 }
 
 pub fn start_agent(demo: *Demo, index: u32) !void {
-    _ = try demo.guest(index, "agent {s} {s} 10.0.2.2:{d}", .{
-        vms.names[index], demo.server, demo.guests.peer_ports[index],
+    try put_tls(demo, index);
+    _ = try demo.guest(index, "agent {s} {s} 10.0.2.2:{d} {s}", .{
+        vms.names[index], demo.server, demo.guests.peer_ports[index], guest_tls_dir,
     });
 }
+
+/// Where the guest's agent finds its CA, node certificate and key.
+pub const guest_tls_dir = "/root/tls";
+
+/// Issues the node's certificate (`ca issue-node`) and writes it, its key and the CA into the
+/// guest (mode 0600): the agent talks to the server's TLS listener (demo-b3 since B7 slice 6,
+/// demo-c2's four guests since slice 7).
+pub fn put_tls(demo: *Demo, index: u32) !void {
+    const host = demo.host;
+    const flags = try host.agent_tls(vms.names[index]);
+    assert(flags.len == 6);
+    const session = &demo.guests.sessions[index];
+    const timeout_s: u32 = 60;
+    const made = try session.run("mkdir -p -m 700 " ++ guest_tls_dir, timeout_s);
+    if (made.status != 0) return host.fail("can't make {s} in the guest", .{guest_tls_dir});
+    const names = [_][]const u8{ "ca.crt", "node.crt", "node.key" };
+    for (names, 0..) |name, slot| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(
+            host.io,
+            flags[2 * slot + 1],
+            host.arena(),
+            .limited(file_bytes_max),
+        );
+        const path = try std.fmt.allocPrint(host.arena(), guest_tls_dir ++ "/{s}", .{name});
+        try session.put_file(path, text);
+    }
+    const kept = try session.run("chmod 600 " ++ guest_tls_dir ++ "/*", timeout_s);
+    if (kept.status != 0) return host.fail("can't chmod {s} in the guest", .{guest_tls_dir});
+    host.say("  {s}: the CA, node.crt and node.key are in {s} (0600)", .{
+        vms.names[index], guest_tls_dir,
+    });
+}
+
+/// A PEM certificate or key: what `put_file` takes at most.
+const file_bytes_max: usize = 1536;
 
 /// `nodes` nodes have a `/node-store/` record (a summary and a peer address).
 pub fn peers_known(nodes: u32, demo: *Demo) !bool {
