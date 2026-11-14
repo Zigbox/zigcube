@@ -324,11 +324,14 @@ pub const Net = struct {
         defer _ = std.os.linux.close(fd);
         var arena_state = std.heap.ArenaAllocator.init(tls.gpa);
         defer arena_state.deinit();
-        var request: [512]u8 = undefined;
-        const form = "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\n" ++
-            "Content-Length: 0\r\n\r\n";
-        const text = std.fmt.bufPrint(&request, form, .{ path, tls.credentials.server_name }) catch
-            return .timeout;
+        assert(path.len <= server_path_bytes_max);
+        const name = tls.credentials.server_name;
+        assert(name.len <= constants.tls_server_name_bytes_max);
+        var request: [https_request_bytes_max]u8 = undefined;
+        // Cannot overflow: the path and the name are bounded above, and the buffer is sized by
+        // `https_request_bytes_max` for both.
+        const text = std.fmt.bufPrint(&request, https_request_form, .{ path, name }) catch
+            unreachable;
         var diag: diag_mod.Diag = undefined;
         diag.reset();
         const done = api_tls_client.exchange(
@@ -1498,7 +1501,7 @@ fn collect_list(
     var first_revision: u64 = 0;
     var after: ?[]const u8 = null;
     for (0..listing.pages_max) |at| {
-        var target: [400]u8 = undefined;
+        var target: [server_path_bytes_max]u8 = undefined;
         const form = "/v1/list?prefix={s}&limit={d}";
         const path = if (after) |key|
             std.fmt.bufPrint(&target, form ++ "&at={d}&continue={s}", .{
@@ -1545,10 +1548,16 @@ pub const ServerTls = struct {
 
     /// One line in the fetch's log, once per fetch: the server's node list could not be read
     /// over TLS, with the code and cause `diag` holds. The fetch goes on without it.
+    /// A failure with no code is a cancelled read (`tls_conn.Error.Canceled`, which raises
+    /// none): it is said too, as cancelled, so the log never drops a failed read.
     fn say(tls: *ServerTls, io: std.Io, diag: *const diag_mod.Diag) void {
-        const code = diag.code orelse return;
         if (tls.said) return;
         tls.said = true;
+        const code = diag.code orelse {
+            note(io, "zcube-agent fetch: the server's node list over TLS: the read was " ++
+                "cancelled; peers: only those named\n");
+            return;
+        };
         var buffer: [400]u8 = undefined;
         const text = std.fmt.bufPrint(&buffer, "zcube-agent fetch: ZC-{t}: the server's node " ++
             "list could not be read over TLS: {s}; peers: only those named\n", .{
@@ -1615,6 +1624,22 @@ pub const ServerTls = struct {
         _ = try api_tls_client.present_node(c, io, node_identity, real_ms(io), diag);
     }
 };
+
+/// The longest path the fetch asks the server for: a `/v1/list` page with its `continue` key,
+/// or the fetchers of a tree (`fetchers_path_bytes_max`).
+const server_path_bytes_max = 400;
+
+const https_request_form = "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\n" ++
+    "Content-Length: 0\r\n\r\n";
+
+/// `https_get`'s request: the form with its longest path and the longest server name.
+const https_request_bytes_max = https_request_form.len + server_path_bytes_max +
+    constants.tls_server_name_bytes_max;
+
+comptime {
+    assert(fetchers_path_bytes_max <= server_path_bytes_max);
+    assert(https_request_bytes_max <= 1024);
+}
 
 /// `collect_pages` over the control plane's HTTP.
 const HttpGetter = struct {

@@ -269,7 +269,7 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .peer_listen = peer_listen,
         .peer_advertise = peer_advertise,
         .registry = registry,
-        .tls = try tls_of(flags, file, diag),
+        .tls = try tls_absolute(arena, io, try tls_of(flags, file, diag), diag),
     };
 }
 
@@ -290,6 +290,30 @@ fn tls_of(flags: Flags, file: File, diag: *Diag) Error!?Tls {
         return bad(diag, "--tls-name {s} is not a DNS name", .{server_name}, "give a DNS name");
     }
     return .{ .ca = ca.?, .cert = cert, .key = key, .server_name = server_name };
+}
+
+/// `tls` with its paths absolute, against the working directory, as `state_dir` is: the agent
+/// hands them to the fetch child, which runs in another directory (B7 slice 7). A file need not
+/// exist yet; its reader says so.
+fn tls_absolute(arena: Allocator, io: std.Io, tls: ?Tls, diag: *Diag) Error!?Tls {
+    const given = tls orelse return null;
+    var buffer: [constants.state_path_bytes_max]u8 = undefined;
+    const length = std.Io.Dir.cwd().realPathFile(io, ".", &buffer) catch
+        return bad(diag, "can't resolve the working directory", .{}, "run from a directory " ++
+            "that exists, or give --ca, --cert and --key as absolute paths");
+    const cwd = buffer[0..length];
+    return .{
+        .ca = try absolute_in(arena, cwd, given.ca),
+        .cert = if (given.cert) |path| try absolute_in(arena, cwd, path) else null,
+        .key = if (given.key) |path| try absolute_in(arena, cwd, path) else null,
+        .server_name = given.server_name,
+    };
+}
+
+fn absolute_in(arena: Allocator, cwd: []const u8, path: []const u8) Error![]const u8 {
+    assert(std.fs.path.isAbsolute(cwd));
+    if (std.fs.path.isAbsolute(path)) return path;
+    return std.fs.path.join(arena, &.{ cwd, path }) catch error.OutOfMemory;
 }
 
 /// The address to publish for peers: the advertised one, else the listen address if it names a
@@ -916,4 +940,29 @@ test "the TLS settings: --ca alone or with --cert and --key, from flags or the f
         diag.reset();
         try expect_bad(tls_of(try parse_flags(args, &diag), empty, &diag), &diag);
     }
+}
+
+test "the TLS paths are made absolute for the fetch child, as the state directory is (B7)" {
+    // Goal: the fetch child runs elsewhere, so a relative --ca, --cert or --key must reach it
+    // absolute. Method: relative paths gain the working directory; an absolute one is kept.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    try testing.expect(try tls_absolute(arena, testing.io, null, &diag) == null);
+    const given: Tls = .{
+        .ca = "ca.crt",
+        .cert = "d/n.crt",
+        .key = "/k/n.key",
+        .server_name = "s",
+    };
+    const got = (try tls_absolute(arena, testing.io, given, &diag)).?;
+    try testing.expect(std.fs.path.isAbsolute(got.ca));
+    try testing.expect(std.mem.endsWith(u8, got.ca, "/ca.crt"));
+    try testing.expect(std.mem.endsWith(u8, got.cert.?, "/d/n.crt"));
+    try testing.expect(std.fs.path.isAbsolute(got.cert.?));
+    try testing.expectEqualStrings("/k/n.key", got.key.?);
+    try testing.expectEqualStrings("s", got.server_name);
+    try testing.expect(diag.code == null);
 }

@@ -92,6 +92,110 @@ pub const Fetch = struct {
     backoff_cap_ms: u32 = constants.fetch_backoff_cap_ms,
 };
 
+/// The fetch's words: the head, `--report`, `--server` and the four TLS flags with their values,
+/// and `--peer` with each fixed peer.
+const fetch_argv_head = 12;
+const fetch_argv_tls = 8;
+const fetch_argv_max = fetch_argv_head + 2 + 2 + fetch_argv_tls + 2 * constants.fetch_peers_max;
+
+comptime {
+    assert(fetch_argv_max == 24 + 2 * constants.fetch_peers_max);
+}
+
+/// What a fetch is of, beside `Fetch`: the supervisor's executable, the state directory, the
+/// image and where its pull record goes.
+const FetchOf = struct {
+    exe: []const u8,
+    state_dir: []const u8,
+    image: []const u8,
+    report: []const u8,
+};
+
+/// The words of `fetch.json`'s fetch: `words` holds them. The TLS flags go only with a server and
+/// a CA, each before its value.
+fn fetch_argv(
+    fetch: Fetch,
+    of: FetchOf,
+    words: *[fetch_argv_max][]const u8,
+) []const []const u8 {
+    assert(fetch.peers.len <= constants.fetch_peers_max);
+    var count: usize = 0;
+    const head = [_][]const u8{
+        of.exe,        "fetch",      "--node",       fetch.node,
+        "--state-dir", of.state_dir, "--images-dir", fetch.images_dir,
+        "--digest",    of.image,     "--registry",   fetch.registry,
+    };
+    comptime assert(head.len == fetch_argv_head);
+    for (head) |word| {
+        words[count] = word;
+        count += 1;
+    }
+    words[count] = "--report";
+    words[count + 1] = of.report;
+    count += 2;
+    if (fetch.server.len > 0) {
+        words[count] = "--server";
+        words[count + 1] = fetch.server;
+        count += 2;
+    }
+    const tls = [_][2][]const u8{
+        .{ "--ca", fetch.ca },     .{ "--tls-name", fetch.tls_name },
+        .{ "--cert", fetch.cert }, .{ "--key", fetch.key },
+    };
+    comptime assert(tls.len * 2 == fetch_argv_tls);
+    for (tls) |pair| {
+        if (pair[1].len == 0 or fetch.server.len == 0 or fetch.ca.len == 0) continue;
+        words[count] = pair[0];
+        words[count + 1] = pair[1];
+        count += 2;
+    }
+    for (fetch.peers) |peer| {
+        words[count] = "--peer";
+        words[count + 1] = peer;
+        count += 2;
+    }
+    return words[0..count];
+}
+
+test "over TLS the fake's fetch is given every word, in order, and none without --ca (B7)" {
+    // Goal: the fetch child reads the server with the agent's own CA, name, certificate and
+    // key, each flag before its value; without a CA it gets no TLS word. Method: the whole
+    // argv, word for word, with one fixed peer; then the same without the CA.
+    var fetch: Fetch = .{
+        .node = "n1",
+        .images_dir = "/images",
+        .registry = "r:1",
+        .server = "s:2",
+        .peers = &.{"n2=10.0.0.2:7"},
+        .ca = "/etc/ca.crt",
+        .tls_name = "api.x",
+        .cert = "/etc/n1.crt",
+        .key = "/etc/n1.key",
+    };
+    const of: FetchOf = .{ .exe = "/bin/a", .state_dir = "/s", .image = "b3:aa", .report = "p" };
+    const want = [_][]const u8{
+        "/bin/a",      "fetch",         "--node",       "n1",
+        "--state-dir", "/s",            "--images-dir", "/images",
+        "--digest",    "b3:aa",         "--registry",   "r:1",
+        "--report",    "p",             "--server",     "s:2",
+        "--ca",        "/etc/ca.crt",   "--tls-name",   "api.x",
+        "--cert",      "/etc/n1.crt",   "--key",        "/etc/n1.key",
+        "--peer",      "n2=10.0.0.2:7",
+    };
+    comptime assert(want.len == 26);
+    var words: [fetch_argv_max][]const u8 = undefined;
+    const argv = fetch_argv(fetch, of, &words);
+    try std.testing.expectEqual(want.len, argv.len);
+    for (want, argv) |expected, got| try std.testing.expectEqualStrings(expected, got);
+    fetch.ca = "";
+    const plain = fetch_argv(fetch, of, &words);
+    try std.testing.expectEqual(@as(usize, 18), plain.len);
+    for (want[0..16], plain[0..16]) |expected, got| {
+        try std.testing.expectEqualStrings(expected, got);
+    }
+    try std.testing.expectEqualStrings("--peer", plain[16]);
+}
+
 const Tag = enum(u8) { starting, running, stopped };
 
 const Known = struct { handle: runtime.Handle, tag: Tag };
@@ -229,47 +333,20 @@ pub const FakeRuntime = struct {
         diag: *Diag,
     ) runtime.Error!void {
         const fetch = self.options.fetch.?;
-        var argv: [12 + 2 + 2 + 8 + 2 * constants.fetch_peers_max][]const u8 = undefined;
-        var count: usize = 0;
+        var words: [fetch_argv_max][]const u8 = undefined;
         var report_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const report = std.fmt.bufPrint(&report_buffer, "{s}/containers/{s}/{s}", .{
             self.options.state_dir, spec.name, files.file_pull,
         }) catch return runtime_failed(diag, "build the pull report's path");
-        const head = [_][]const u8{
-            self.options.supervisor_exe, "fetch",                "--node",       fetch.node,
-            "--state-dir",               self.options.state_dir, "--images-dir", fetch.images_dir,
-            "--digest",                  spec.image,             "--registry",   fetch.registry,
-        };
-        for (head) |word| {
-            argv[count] = word;
-            count += 1;
-        }
-        argv[count] = "--report";
-        argv[count + 1] = report;
-        count += 2;
-        if (fetch.server.len > 0) {
-            argv[count] = "--server";
-            argv[count + 1] = fetch.server;
-            count += 2;
-        }
-        const tls = [_][2][]const u8{
-            .{ "--ca", fetch.ca },     .{ "--tls-name", fetch.tls_name },
-            .{ "--cert", fetch.cert }, .{ "--key", fetch.key },
-        };
-        for (tls) |pair| {
-            if (pair[1].len == 0 or fetch.server.len == 0 or fetch.ca.len == 0) continue;
-            argv[count] = pair[0];
-            argv[count + 1] = pair[1];
-            count += 2;
-        }
-        for (fetch.peers) |peer| {
-            argv[count] = "--peer";
-            argv[count + 1] = peer;
-            count += 2;
-        }
+        const argv = fetch_argv(fetch, .{
+            .exe = self.options.supervisor_exe,
+            .state_dir = self.options.state_dir,
+            .image = spec.image,
+            .report = report,
+        }, &words);
         const record: files.FetchFile = .{
             .digest = spec.image,
-            .argv = argv[0..count],
+            .argv = argv,
             .state_dir = self.options.state_dir,
             .backoff_base_ms = fetch.backoff_base_ms,
             .backoff_cap_ms = fetch.backoff_cap_ms,
