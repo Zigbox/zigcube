@@ -90,12 +90,21 @@ cmd_learn() {
     echo "tree $tree"
 }
 
+# With a third argument, the agent talks to the server's TLS listener with the CA, node
+# certificate and key the demo put in that directory (ca.crt, node.crt, node.key).
 cmd_agent() {
-    [ $# -eq 2 ] || fail "usage: guest.sh agent <node> <server>"
+    [ $# -eq 2 ] || [ $# -eq 3 ] || fail "usage: guest.sh agent <node> <server> [<tls dir>]"
     [ -f "$IMAGES" ] || fail "no $IMAGES: run guest.sh images first"
     mkdir -p "$STATE" "$LOG"
+    tls=""
+    if [ $# -eq 3 ]; then
+        for file in ca.crt node.crt node.key; do
+            [ -f "$3/$file" ] || fail "no $3/$file"
+        done
+        tls="--ca $3/ca.crt --cert $3/node.crt --key $3/node.key"
+    fi
     echo "--runtime zigbox --node $1 --server $2 --state-dir $STATE --cpu-millis 2000" \
-        "--memory-bytes 1073741824 --images $IMAGES --verbose" >"$ARGS"
+        "--memory-bytes 1073741824 --images $IMAGES --verbose $tls" >"$ARGS"
     start_agent
     sleep 1
     agent_pid >/dev/null || fail "the agent exited at once: $(tail -20 "$LOG/agent.log")"
