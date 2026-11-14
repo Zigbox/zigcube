@@ -15,6 +15,7 @@ in the order the supervisor gave. None was already an ancestor of `main`.
 | 5 | `claude/fix-server-ca-615` | 3fb60cf | df9ec8b |
 | 6 | `claude/b5-slice4` | 7c44b31 | f7575fd |
 | 7 | `claude/b6-slice2` | 1668b53 | 97bd1c0 |
+| 8 | `origin/main` (#247, #248) | ebfbac5 | the merge after d8bb53c |
 
 Every merge commit's message lists its conflicts. The summary is below. Each conflict was resolved on
 its merits, and both behaviours were kept. A whole file was never taken from one side.
@@ -75,6 +76,17 @@ its merits, and both behaviours were kept. A whole file was never taken from one
    - **Teeth.** sim-c1 has 26 named teeth in AGENTS.md (31 runners in `build.zig`). B6's two P1
      canary rows follow `job_untrusted`.
    - **Semantic fix.** B6's service-apply test names its caller.
+
+7. **`main` at ebfbac5.** The supervisor moved the base after the bundle was cut, so `main` was
+   merged in.
+   - **The replay runner.** `main` added `c1_teeth.runner` from a root's own `sim_runner`. The bundle
+     had a table of teeth roots and their runners. They are one `runner` now: a root's
+     `sim_runner` wins, then the table, then the burst world, then `sim_cluster`.
+   - **`job_pass_break`.** It joins `any` and the table.
+   - **`build.zig`.** It keeps the bundle's `add_c1_comparison` (strong, signed, tenants) and
+     main's `add_also_seeds`. It installs 32 fault-on runners.
+   - **AGENTS.md.** sim-c1 has 27 named teeth, with main's text on `job_pass_break` and seed 225
+     of `sim-c1-worlds`.
 
 ## Diagnostic codes
 

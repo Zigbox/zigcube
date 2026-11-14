@@ -1,6 +1,6 @@
 .{
     .name = .zigcube,
-    .version = "0.0.0",
+    .version = "0.5.1",
     // Pinned, matching Zigbox and CI (.github/actions/setup-zig). Upgrade only between milestones.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
