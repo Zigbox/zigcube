@@ -104,6 +104,8 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
             .store = "",
             .transcript_path = options.transcript,
             .lease_ttl_ms = state.ttl_text,
+            // B7 slice 6: the demo talks to the TLS listener only, with certificates.
+            .tls_only = true,
         },
         .work = "",
         .state = "",
@@ -225,9 +227,10 @@ fn step_start(demo: *Demo) !void {
         return host.fail("could not empty the Postgres schema before the run", .{});
     };
     try host.start_server(state.start_wait_ms);
-    host.say("  zcube-server is up on 127.0.0.1:{d}, store {s}, lease ttl {d} ms", .{
-        host.port, demo.backend, state.ttl_ms,
+    host.say("  zcube-server is up on 127.0.0.1:{d} ({s}), store {s}, lease ttl {d} ms", .{
+        host.port, host.listener_text(), demo.backend, state.ttl_ms,
     });
+    try host.check_tls_only();
     for (0..fleet_mod.count) |index| try demo.fleet.start_agent(index);
     host.say("  two zcube-agents (FakeRuntime, 1000m CPU each) started", .{});
 }

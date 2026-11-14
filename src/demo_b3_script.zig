@@ -129,8 +129,23 @@ fn put_tls(demo: *Demo) !void {
         const path = try std.fmt.allocPrint(host.arena(), guest_tls_dir ++ "/{s}", .{name});
         try session.put_file(path, text);
     }
-    const kept = try session.run("chmod 600 " ++ guest_tls_dir ++ "/*", timeout_s);
+    // Zigbox's `Session.put_file` takes no mode: it writes under the shell's umask, through
+    // /tmp/put.b64, and makes the file 755. The directory is 700, so nothing else can open the
+    // files meanwhile; the copy in /tmp goes, and each mode is read back before it is claimed.
+    const chmod = "chmod 600 " ++ guest_tls_dir ++ "/* && rm -f /tmp/put.b64";
+    const kept = try session.run(chmod, timeout_s);
     if (kept.status != 0) return host.fail("can't chmod {s} in the guest", .{guest_tls_dir});
+    const modes = try session.run("stat -c %a " ++ guest_tls_dir ++ "/*", timeout_s);
+    var private: u32 = 0;
+    var words = std.mem.tokenizeAny(u8, modes.output, " \r\n");
+    while (words.next()) |word| {
+        if (std.mem.eql(u8, word, "600")) private += 1 else private = names.len + 1;
+    }
+    if (modes.status != 0 or private != names.len) {
+        return host.fail("{s} in the guest has modes {s}, expected 600 each", .{
+            guest_tls_dir, modes.output,
+        });
+    }
     host.say("  {s}: the CA, node.crt and node.key are in {s} (0600)", .{
         vms.names[0], guest_tls_dir,
     });

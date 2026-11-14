@@ -247,9 +247,10 @@ fn step_start(demo: *Demo) !void {
         return host.fail("could not empty the Postgres schema before the run", .{});
     };
     try host.start_server(state.start_wait_ms);
-    host.say("  zcube-server is up on 127.0.0.1:{d} (TLS, --listen), store {s}", .{
-        host.port, demo.backend.name(),
+    host.say("  zcube-server is up on 127.0.0.1:{d} ({s}), store {s}", .{
+        host.port, host.listener_text(), demo.backend.name(),
     });
+    try host.check_tls_only();
     try host.start_agent(state.node);
     const registered = struct {
         fn check(_: void, h: *Host) !bool {

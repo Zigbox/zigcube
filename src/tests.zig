@@ -74,6 +74,7 @@ test {
 test {
     _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
+    _ = @import("harness_tls.zig");
 }
 
 // The files below are imported by a file-level `comptime` block, not by a test: a test that a

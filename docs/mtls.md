@@ -107,10 +107,15 @@ are sorted by key, with no key twice.
 - `--insecure-listen HOST:PORT` serves plain HTTP on a loopback address only (127.0.0.1 or ::1;
   anything else is `ZC-E0106`). It is for the console on the same host (browsers offer no
   Ed25519 and cannot handshake with `--listen` until the browser path of
-  docs/decisions/2026-11-14-b7-slice6-console-over-tls.md is built), the local mode (`zcube local up`) and
-  the tests of this listener. The other harnesses talk to `--listen` with certificates from
-  `ca issue-client` and `ca issue-node` (`src/harness_tls.zig`, B7 slice 6). A request on it is the caller `local`, which may
-  call everything: whoever can reach loopback already runs on the server's host.
+  docs/decisions/2026-11-14-b7-slice6-console-over-tls.md is built), the local mode (`zcube local up`,
+  `local-smoke`, demo-c1's step 6) and the tests of this listener (`demo-b7`). The in-process API
+  tests (`server_test`, `cli_test`, `agent_remote_test`) and `bench-watch` use it too: they test
+  the handlers and the watch fan-out, not the transport. `swarm-smoke` and `demo-c2` use it until
+  B7 slice 7 gives the agent's fetch child TLS. Every other harness (`agent-smoke`, `demo-c0`,
+  `demo-c1`, `demo-b1`, `demo-b3`, the failover runs of `test-store-faults`) talks to `--listen`
+  with certificates from `ca issue-client` and `ca issue-node` (`src/harness_tls.zig`, B7 slice 6)
+  and checks that plain HTTP gets no answer there. A request on it is the caller `local`, which
+  may call everything: whoever can reach loopback already runs on the server's host.
 
 The two listeners share the server's 96 connection slots, but when both run TLS clients take at
 most 88: 8 are kept for `--insecure-listen`, so TLS clients cannot lock out the loopback listener
