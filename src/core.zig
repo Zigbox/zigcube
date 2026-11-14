@@ -79,6 +79,7 @@ pub const modules = .{
     @import("testing/history.zig"),
     @import("text.zig"),
     @import("tls_client.zig"),
+    @import("tls_server.zig"),
     @import("tls_schedule.zig"),
     @import("tls_wire.zig"),
     @import("x509.zig"),
@@ -168,6 +169,7 @@ test {
     // because a `-Dtest-filter` on a TLS test name hides tests inside a named one. The scripted
     // server they use is a fixture and is imported only here.
     _ = @import("tls_client_test.zig");
+    _ = @import("tls_server_test.zig");
     _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
     _ = @import("scheduler_test.zig");

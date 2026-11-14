@@ -1106,7 +1106,7 @@ pub const Client = struct {
     }
 };
 
-fn message_name(kind: u8) []const u8 {
+pub fn message_name(kind: u8) []const u8 {
     return switch (kind) {
         wire.handshake_server_hello => "ServerHello",
         wire.handshake_encrypted_extensions => "EncryptedExtensions",
@@ -1120,7 +1120,7 @@ fn message_name(kind: u8) []const u8 {
     };
 }
 
-fn ed25519_verifies(key: *const [32]u8, content: []const u8, signature: *const [64]u8) bool {
+pub fn ed25519_verifies(key: *const [32]u8, content: []const u8, signature: *const [64]u8) bool {
     const public_key = Ed25519.PublicKey.fromBytes(key.*) catch return false;
     const parsed = Ed25519.Signature.fromBytes(signature.*);
     parsed.verify(content, public_key) catch return false;
@@ -1144,7 +1144,7 @@ fn refuses_certificate(code: u8) bool {
     };
 }
 
-fn certificate_alert(err: x509.Error) wire.Alert {
+pub fn certificate_alert(err: x509.Error) wire.Alert {
     return switch (err) {
         error.WrongIssuer, error.BadSignature => .unknown_ca,
         error.Expired, error.NotYetValid => .certificate_expired,
@@ -1153,7 +1153,7 @@ fn certificate_alert(err: x509.Error) wire.Alert {
     };
 }
 
-fn wire_alert(err: wire.Error) wire.Alert {
+pub fn wire_alert(err: wire.Error) wire.Alert {
     return switch (err) {
         error.Malformed => .decode_error,
         error.IllegalParameter,
@@ -1168,7 +1168,7 @@ fn wire_alert(err: wire.Error) wire.Alert {
     };
 }
 
-fn record_alert(err: schedule.Error) wire.Alert {
+pub fn record_alert(err: schedule.Error) wire.Alert {
     return switch (err) {
         error.BadRecordMac => .bad_record_mac,
         error.RecordOverflow => .record_overflow,
@@ -1180,7 +1180,7 @@ fn record_alert(err: schedule.Error) wire.Alert {
     };
 }
 
-fn wire_reason(err: wire.Error) []const u8 {
+pub fn wire_reason(err: wire.Error) []const u8 {
     return switch (err) {
         error.Malformed => "malformed (cut short or a length that does not add up)",
         error.IllegalParameter => "not allowed here (an illegal value)",

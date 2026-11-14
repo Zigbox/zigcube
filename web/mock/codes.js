@@ -173,7 +173,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "a job is not valid",
-    "explanation": "`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it\nstands. The cause line names the field and the limit it broke: a name that\nis not 1 to 48 bytes of lowercase letters, digits and hyphens (none at\neither end), or the name `watch`, which /v1/jobs/watch reserves, no\ncommand or too many words, a deadline of zero or above 24 hours, a grace\nperiod above 60 seconds, env above 8 KiB, an input above 64 KiB or with a\nNUL byte, a submit time more than an hour ahead, or\nmore labels than a job may carry.\n\nTwo fields are refused because they are not built yet, and the cause says\nso: retries above 0 (a job runs at most once), and relay or placement.\nAccepting a field and ignoring it would say something false about where the\njob runs.\n\nFix the field it names and submit again."
+    "explanation": "`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it\nstands. The cause line names the field and the limit it broke: a name that\nis not 1 to 48 bytes of lowercase letters, digits and hyphens (none at\neither end), or the name `watch`, which /v1/jobs/watch reserves, no\ncommand or too many words, a deadline of zero or above 24 hours, a grace\nperiod above 60 seconds, env above 8 KiB, an input above 64 KiB or with a\nNUL byte, a submit time more than an hour ahead,\nmore labels than a job may carry, a label or env key given twice, or a\n`limits` member outside its range (`cpu_millis` 10 to 1,024,000,\n`memory_bytes` 4 MiB to 2^40, `pids` 1 to 4,194,304).\n\nTwo fields are refused because they are not built yet, and the cause says\nso: retries above 0 (a job runs at most once), and placement. Accepting a\nfield and ignoring it would say something false about where the job runs.\n\nA relay must be the name of one of the relays in the server's `relays`\nsetting; an unknown name is refused, and a job may not set ZCUBE_RELAY in\nits own env, because the relay's supervisor sets it.\n\nFix the field it names and submit again."
   },
   {
     "code": "ZC-E0131",
@@ -561,6 +561,55 @@ export const ZC_CODES = [
     "explanation": "The supervisor of a replica tried to get the image's chunk tree from peers\nfirst, and that fetch ended without it: it did not start, it exited with a\nfailure, or it was killed at its deadline. The cause line says which.\nThe registry pull follows, so the replica can still start; this line\nonly explains why the peers did not supply the tree.\n\nThe fetch's own diagnostic, in the same fetch.log, names the real\nreason when it had one (ZC-E0601 for a tree no peer could give, or the\ncode of this node's disk or memory failing). If the replica did not\nstart, the pull's own diagnostic follows it. If it repeats on every\nstart, check the peers and the network between them."
   },
   {
+    "code": "ZC-E0701",
+    "severity": "error",
+    "blame": "external",
+    "summary": "a relay's upstream refused a connection",
+    "explanation": "A job's relay accepted a connection from the job and tried to connect to\nits upstream, the address the server's configuration names for that relay,\nand the connection was refused or reset, or the address could not be\nreached. The job's connection was closed. Other connections through the\nrelay are not affected.\n\nCheck that the upstream is running and that this node can reach it: the\nrelay connects from the node, not from inside the job. Correct the relay's\naddress in the server's `relays` setting if it is wrong; jobs submitted\nafterwards use the new address, and a job already running keeps the one it\nstarted with."
+  },
+  {
+    "code": "ZC-E0702",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a job's relay could not listen",
+    "explanation": "The supervisor of a job could not set up the relay the job asked for, so the\njob does not run without the route it was promised. The cause line says\nwhich step failed (the socket, the bind, the listen, the relay's address).\n\nOn the fake runtime the job is not started and ends as a start failure. On\nthe real runtime the container has already started, so the supervisor kills\nit: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in\nthe job's `relay.log`.\n\nIf the cause is a socket or file descriptor error, the host may be out of\ndescriptors: check `ulimit -n` and the node's load. If it names the relay's\naddress, correct the relay's address in the server's `relays` setting. Then\nsubmit the job again."
+  },
+  {
+    "code": "ZC-E0703",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "this agent's build cannot serve a job's relay",
+    "explanation": "An assignment names a relay and this node's agent cannot give the job one:\nits runtime has no way to hand a container a listener yet. The job ended as\na start failure instead of running without its relay.\n\nRun the job on nodes whose agent has relay support, or upgrade this agent to\nthe release that carries it. The agent and the server are upgraded\ntogether: the agent first, then the server."
+  },
+  {
+    "code": "ZC-E0704",
+    "severity": "error",
+    "blame": "external",
+    "summary": "a relay's upstream did not answer in time",
+    "explanation": "A job's relay tried to connect to its upstream and nothing answered within\n10 seconds. The job's connection was closed. A black-holed route, a\nfirewall that drops packets or a host that is down all look like this.\n\nCheck the route from this node to the upstream named in the server's\n`relays` setting. The job may connect again; each attempt waits the same\n10 seconds and takes one of the job's 16 connection slots meanwhile."
+  },
+  {
+    "code": "ZC-E0705",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a relayed connection failed in the middle",
+    "explanation": "A connection through a job's relay was open and then a read or a write on\nit failed: the peer reset it, or the host refused the call. Both ends were\nclosed. Bytes already copied were delivered; nothing is retried, because\nthe relay cannot know which request the bytes belonged to.\n\nA reset by the job or the upstream is ordinary and needs no action. If it\nrepeats on every connection, check the node's network and the upstream."
+  },
+  {
+    "code": "ZC-W0701",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a job's relay is at its connection limit",
+    "explanation": "A job opened a seventeenth connection through its relay while sixteen were\nopen. The new connection was closed at once and counted; the open ones are\nnot affected. The limit is per job and fixed.\n\nThe job should reuse connections or close them when it is done with them.\nA connection that sits idle holds its slot for up to five minutes."
+  },
+  {
+    "code": "ZC-W0702",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a relayed connection reached its byte or idle bound",
+    "explanation": "A connection through a job's relay was closed by the relay itself: it had\ncarried 1 GiB in one direction, or neither side had sent a byte for five\nminutes. The cause line says which. The job's other connections are not\naffected.\n\nOpen a new connection to go on. A job that needs a connection quiet for\nlonger than five minutes should send something now and then."
+  },
+  {
     "code": "ZC-E0801",
     "severity": "error",
     "blame": "external",
@@ -656,7 +705,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "external",
     "summary": "the TLS client certificate was not asked for, or was refused",
-    "explanation": "The client was told to present a certificate and the server did not ask\nfor one, or the server refused the one presented (the alert names why:\nbad_certificate, certificate_expired, unknown_ca, certificate_required).\nA client that sends an empty Certificate (it has no certificate, or the\nrequest does not list Ed25519) and is refused by the server is this too,\nand so is a client that must authenticate facing a request without\nEd25519. The connection is closed; a refusal arrives after the client's\nown handshake is done, so data written before the alert was read was\nnot accepted.\n\nA server that never asks cannot learn which workload is calling, so a\nconnection that must prove identity stops. Check that the server is\nconfigured to require client certificates and trusts the cluster CA;\na refused certificate is expired, issued by another CA, or for a\ndifferent workload than the server allows. A signer that fails is a\ndifferent error (ZC-E0820)."
+    "explanation": "The client was told to present a certificate and the server did not ask\nfor one, or the server refused the one presented (the alert names why:\nbad_certificate, certificate_expired, unknown_ca, certificate_required).\nA client that sends an empty Certificate (it has no certificate, or the\nrequest does not list Ed25519) and is refused by the server is this too,\nand so is a client that must authenticate facing a request without\nEd25519. The connection is closed; a refusal arrives after the client's\nown handshake is done, so data written before the alert was read was\nnot accepted.\n\nA server that never asks cannot learn which workload is calling, so a\nconnection that must prove identity stops. Check that the server is\nconfigured to require client certificates and trusts the cluster CA;\na refused certificate is expired, issued by another CA, or for a\ndifferent workload than the server allows. A signer that fails is a\ndifferent error (ZC-E0820).\n\nOn a zcube server, this is a client that came without a certificate: it\nsent an empty Certificate, and the server answered certificate_required.\nThe server takes no connection without one. Give the client a\ncertificate from this cluster's CA."
   },
   {
     "code": "ZC-E0815",
@@ -697,8 +746,8 @@ export const ZC_CODES = [
     "code": "ZC-E0820",
     "severity": "error",
     "blame": "environment",
-    "summary": "the key behind the client certificate did not sign",
-    "explanation": "The server asked for a client certificate and the client has one, but the\nsigner that holds its private key returned no signature, so the proof of\npossession (CertificateVerify) could not be made. The connection is\nclosed with an internal_error alert; nothing was accepted.\n\nThe key never enters the TLS client: it sits behind a signer, in the same\nprocess or in another. This is that signer failing, not the server or the\ncertificate. Check that the process or device holding the key is running\nand reachable, then reconnect."
+    "summary": "the key behind a client's or this server's certificate did not sign",
+    "explanation": "The server asked for a client certificate and the client has one, but the\nsigner that holds its private key returned no signature, so the proof of\npossession (CertificateVerify) could not be made. The connection is\nclosed with an internal_error alert; nothing was accepted.\n\nThe key never enters the TLS client: it sits behind a signer, in the same\nprocess or in another. This is that signer failing, not the server or the\ncertificate. Check that the process or device holding the key is running\nand reachable, then reconnect.\n\nOn a zcube server, this is the server's own signer: it could not sign its\nCertificateVerify, so it sent the client an internal_error alert in the\nclear (the client held no keys yet) and let no client in."
   },
   {
     "code": "ZC-E0821",

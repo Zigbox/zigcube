@@ -1,6 +1,7 @@
-//! TLS 1.3 wire formats for the client (docs/briefs/mtls-client.md, slice 4): a bounded reader,
-//! the one ClientHello the client ever sends, and parsers for the server's messages. Nothing here
-//! keeps state or touches a key; `tls_client.zig` decides what a refusal means.
+//! TLS 1.3 wire formats (docs/briefs/mtls-client.md, slice 4; b7.md, slice 1): a bounded reader,
+//! the one ClientHello the client ever sends, parsers for the server's messages, and the server's
+//! side: a ClientHello parser and the messages of the server's flight. Nothing here keeps state
+//! or touches a key; `tls_client.zig` and `tls_server.zig` decide what a refusal means.
 //!
 //! Core code: no allocation, no clock, no randomness. A parser returns slices into the bytes it
 //! was given and never reads past them: every read is checked against the bytes left.
@@ -513,4 +514,236 @@ fn lists_ed25519(data: []const u8) Error!bool {
         if (std.mem.readInt(u16, list[at..][0..2], .big) == scheme_ed25519) found = true;
     }
     return found;
+}
+
+// ---- The server side (docs/briefs/b7.md, slice 1) ---------------------------------------------
+
+const ext_pre_shared_key: u16 = 41;
+const ext_early_data: u16 = 42;
+
+pub const ClientHello = struct {
+    /// Echoed in the ServerHello; empty or up to 32 bytes.
+    session_id: []const u8,
+    /// The client's x25519 public key.
+    public_key: [32]u8,
+    /// The client offers 0-RTT data, which this server never takes.
+    early_data: bool,
+};
+
+const ClientExtensions = struct {
+    /// supported_versions lists TLS 1.3; null if the extension is absent (a TLS 1.2 client).
+    tls13: ?bool = null,
+    /// The x25519 share, when the client sent one.
+    key: ?[32]u8 = null,
+    /// signature_algorithms lists Ed25519; null if the extension is absent.
+    ed25519: ?bool = null,
+    early_data: bool = false,
+    /// supported_groups was sent; a key_share needs it (section 9.2).
+    supported_groups: bool = false,
+};
+
+/// Reads a ClientHello body (after the four-byte handshake header) for a server that speaks only
+/// TLS 1.3, TLS_AES_128_GCM_SHA256, x25519 and Ed25519, and never sends a HelloRetryRequest. The
+/// order of the checks puts "the client speaks another protocol" first, then the suite, the group
+/// and the signature scheme, so each refusal names the first thing the two sides do not share.
+/// Extensions this server does not use (server_name, pre_shared_key, psk_key_exchange_modes,
+/// ...) are skipped; each type may appear once (RFC 8446 section 4.2).
+pub fn parse_client_hello(body: []const u8) Error!ClientHello {
+    var reader = Reader.init(body);
+    _ = try reader.read_u16(); // legacy_version: supported_versions decides (section 4.1.2).
+    _ = try reader.take(32); // random
+    const session_id = try reader.vector8();
+    if (session_id.len > hello_session_id_bytes) return error.IllegalParameter;
+    const suites = try reader.vector16();
+    if (suites.len == 0) return error.Malformed;
+    if (suites.len % 2 != 0) return error.Malformed;
+    const compression = try reader.vector8();
+    var parsed: ClientExtensions = .{};
+    // A ClientHello with no extensions at all is a TLS 1.2 (or older) one.
+    if (reader.remaining() > 0) {
+        var extensions = Reader.init(try reader.vector16());
+        try read_client_extensions(&extensions, &parsed);
+    }
+    try reader.finish();
+    if (!(parsed.tls13 orelse false)) return error.ProtocolVersion;
+    if (!lists_u16(suites, suite_aes_128_gcm_sha256)) return error.CipherSuite;
+    // TLS 1.3 clients send exactly one compression method, null (section 4.1.2).
+    if (compression.len != 1) return error.IllegalParameter;
+    if (compression[0] != 0) return error.IllegalParameter;
+    const key = parsed.key orelse return error.Group;
+    // A ClientHello with a key_share must carry supported_groups too (section 9.2).
+    if (!parsed.supported_groups) return error.MissingExtension;
+    const ed25519 = parsed.ed25519 orelse return error.MissingExtension;
+    if (!ed25519) return error.SignatureScheme;
+    return .{ .session_id = session_id, .public_key = key, .early_data = parsed.early_data };
+}
+
+fn read_client_extensions(reader: *Reader, parsed: *ClientExtensions) Error!void {
+    var seen: SeenExtensions = .{};
+    var count: u32 = 0;
+    var psk_seen = false;
+    while (reader.remaining() > 0) {
+        const kind = try reader.read_u16();
+        const data = try reader.vector16();
+        try seen.add(kind);
+        count += 1;
+        assert(count <= constants.tls_handshake_message_bytes_max); // Each takes four bytes.
+        // pre_shared_key must be the last extension (section 4.2.11).
+        if (psk_seen) return error.IllegalParameter;
+        switch (kind) {
+            ext_supported_versions => parsed.tls13 = try lists_version(data),
+            ext_key_share => try read_client_key_share(data, parsed),
+            ext_supported_groups => parsed.supported_groups = true,
+            ext_signature_algorithms => parsed.ed25519 = try lists_ed25519(data),
+            ext_early_data => {
+                if (data.len != 0) return error.Malformed;
+                parsed.early_data = true;
+            },
+            ext_pre_shared_key => psk_seen = true,
+            else => {},
+        }
+    }
+}
+
+/// supported_versions in a ClientHello: a one-byte length, then two-byte versions.
+fn lists_version(data: []const u8) Error!bool {
+    var reader = Reader.init(data);
+    const list = try reader.vector8();
+    try reader.finish();
+    if (list.len == 0) return error.Malformed;
+    if (list.len % 2 != 0) return error.Malformed;
+    return lists_u16(list, version_tls13);
+}
+
+/// key_share in a ClientHello: a list of (group, key) entries, each group at most once
+/// (section 4.2.8). Only the x25519 entry is kept; its key must be 32 bytes.
+fn read_client_key_share(data: []const u8, parsed: *ClientExtensions) Error!void {
+    var reader = Reader.init(data);
+    var shares = Reader.init(try reader.vector16());
+    try reader.finish();
+    var groups: SeenExtensions = .{};
+    while (shares.remaining() > 0) {
+        const group = try shares.read_u16();
+        const key = try shares.vector16();
+        if (key.len == 0) return error.Malformed;
+        groups.add(group) catch return error.IllegalParameter;
+        if (group != group_x25519) continue;
+        if (key.len != 32) return error.IllegalParameter;
+        parsed.key = key[0..32].*;
+    }
+}
+
+/// Whether an even-length list of two-byte values holds `wanted`.
+fn lists_u16(list: []const u8, wanted: u16) bool {
+    assert(list.len % 2 == 0);
+    var at: usize = 0;
+    while (at < list.len) : (at += 2) {
+        if (std.mem.readInt(u16, list[at..][0..2], .big) == wanted) return true;
+    }
+    return false;
+}
+
+/// The ServerHello message of this server: TLS 1.3, the one suite, the session id echoed and
+/// the x25519 share. 4 + 2 + 32 + 1 + session id + 2 + 1 + 2 + 6 + 40 bytes.
+pub const server_hello_bytes_max: u32 = 4 + 2 + 32 + 1 + hello_session_id_bytes + 2 + 1 + 2 +
+    (4 + 2) + (4 + 2 + 2 + 32);
+
+pub fn write_server_hello(
+    out: []u8,
+    random: *const [32]u8,
+    session_id: []const u8,
+    public_key: *const [32]u8,
+) []const u8 {
+    assert(session_id.len <= hello_session_id_bytes);
+    assert(out.len >= server_hello_bytes_max);
+    var writer: Writer = .{ .buffer = out, .length = 0 };
+    writer.put_u8(handshake_server_hello);
+    writer.put_bytes(&.{ 0, 0, 0 }); // The length, filled below.
+    writer.put_u16(version_tls12); // legacy_version
+    writer.put_bytes(random);
+    writer.put_u8(@intCast(session_id.len));
+    writer.put_bytes(session_id);
+    writer.put_u16(suite_aes_128_gcm_sha256);
+    writer.put_u8(0); // legacy_compression_method
+    const extensions = writer.open16();
+    write_extension(&writer, ext_supported_versions, &.{ 0x03, 0x04 });
+    writer.put_u16(ext_key_share);
+    writer.put_u16(2 + 2 + 32);
+    writer.put_u16(group_x25519);
+    writer.put_u16(32);
+    writer.put_bytes(public_key);
+    writer.close16(extensions);
+    std.mem.writeInt(u24, writer.buffer[1..4], @intCast(writer.length - 4), .big);
+    assert(writer.length <= server_hello_bytes_max);
+    return out[0..writer.length];
+}
+
+/// EncryptedExtensions with no extension: the server acknowledges nothing (it ignores
+/// server_name, so it sends no empty one back).
+pub const encrypted_extensions_message = [_]u8{ handshake_encrypted_extensions, 0, 0, 2, 0, 0 };
+
+/// CertificateRequest: an empty context (section 4.3.2: empty in the handshake) and
+/// signature_algorithms listing Ed25519 only.
+pub const certificate_request_message = [_]u8{
+    handshake_certificate_request, 0, 0, 11, // type, length
+    0, // certificate_request_context: empty
+    0,    8, // extensions
+    0,    @intCast(ext_signature_algorithms),
+    0,    4,
+    0,    2,
+    0x08, 0x07,
+};
+
+/// Bytes of a Certificate message with an empty context and up to `tls_chain_certificates_max`
+/// certificates of `x509_cert_bytes_max` each, without extensions.
+pub const certificate_bytes_max: u32 = 4 + 1 + 3 +
+    constants.tls_chain_certificates_max * (3 + constants.x509_cert_bytes_max + 2);
+
+/// Writes a Certificate message with an empty context and `certificates` (leaf first).
+pub fn write_certificate(out: []u8, certificates: []const []const u8) []const u8 {
+    assert(certificates.len <= constants.tls_chain_certificates_max);
+    assert(out.len >= certificate_bytes_max);
+    var length: u32 = 4;
+    out[length] = 0; // certificate_request_context
+    length += 1;
+    const list_at = length;
+    length += 3;
+    for (certificates) |certificate| {
+        assert(certificate.len > 0);
+        assert(certificate.len <= constants.x509_cert_bytes_max);
+        std.mem.writeInt(u24, out[length..][0..3], @intCast(certificate.len), .big);
+        @memcpy(out[length + 3 ..][0..certificate.len], certificate);
+        std.mem.writeInt(u16, out[length + 3 + certificate.len ..][0..2], 0, .big);
+        length += @intCast(3 + certificate.len + 2);
+    }
+    std.mem.writeInt(u24, out[list_at..][0..3], @intCast(length - list_at - 3), .big);
+    out[0] = handshake_certificate;
+    std.mem.writeInt(u24, out[1..4], @intCast(length - 4), .big);
+    assert(length <= certificate_bytes_max);
+    return out[0..length];
+}
+
+/// Bytes of an Ed25519 CertificateVerify message.
+pub const certificate_verify_bytes: u32 = 4 + 2 + 2 + 64;
+
+pub fn write_certificate_verify(signature: *const [64]u8) [certificate_verify_bytes]u8 {
+    var out: [certificate_verify_bytes]u8 = undefined;
+    out[0] = handshake_certificate_verify;
+    std.mem.writeInt(u24, out[1..4], 2 + 2 + 64, .big);
+    std.mem.writeInt(u16, out[4..6], scheme_ed25519, .big);
+    std.mem.writeInt(u16, out[6..8], 64, .big);
+    @memcpy(out[8..], signature);
+    return out;
+}
+
+/// Whether a well-formed Certificate body holds no certificate: the client's way of saying it has
+/// none to give (section 4.4.2). A malformed body is not empty; its parse refuses it.
+pub fn certificate_is_empty(body: []const u8) bool {
+    var reader = Reader.init(body);
+    // A request context the server did not send is `parse_certificate`'s illegal_parameter.
+    const context = reader.vector8() catch return false;
+    if (context.len != 0) return false;
+    const list = reader.vector24() catch return false;
+    reader.finish() catch return false;
+    return list.len == 0;
 }
