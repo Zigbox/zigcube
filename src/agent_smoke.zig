@@ -170,27 +170,46 @@ const Smoke = struct {
     }
 
     /// Whether the smoke holds its `admin` credentials: once the server wrote its CA, issues
-    /// them (the first time) and loads them.
+    /// them (the first time) and loads them. Only a CA not yet written is waited for: a failing
+    /// `ca issue-client` or a broken state directory fails the smoke at once.
     fn tls_ready(smoke: *Smoke) !bool {
         if (smoke.credentials != null) return true;
+        // start_server makes the Pki before it starts the server.
+        assert(smoke.pki != null);
         const pki = &smoke.pki.?;
-        if (try pki.find_ca() == null) return false;
-        _ = pki.issue("smoke", "admin") catch {
-            smoke.say("ca issue-client: {s}", .{pki.said});
-            return false;
-        };
-        smoke.credentials = try pki.load("smoke");
+        const ca = pki.find_ca() catch return smoke.pki_failed("the server's CA");
+        if (ca == null) return false;
+        _ = pki.issue("smoke", "admin") catch return smoke.pki_failed("ca issue-client");
+        smoke.credentials = pki.load("smoke") catch return smoke.pki_failed("loading smoke");
         return true;
     }
 
     /// The agent's `--ca`, `--cert` and `--key`: a node certificate issued for it.
     fn agent_tls(smoke: *Smoke) ![6][]const u8 {
+        // The agent starts after the server, and start_server made the Pki.
+        assert(smoke.pki != null);
         const pki = &smoke.pki.?;
-        _ = pki.issue(node, null) catch |err| {
-            smoke.say("ca issue-node: {s}", .{pki.said});
-            return err;
-        };
-        return pki.flags(node);
+        _ = pki.issue(node, null) catch return smoke.pki_failed("ca issue-node");
+        return pki.flags(node) catch return smoke.pki_failed("the agent's flags");
+    }
+
+    fn pki_failed(smoke: *Smoke, comptime what: []const u8) Failed {
+        smoke.failed = true;
+        smoke.say("FAILED: " ++ what ++ ": {s}", .{smoke.pki.?.said});
+        return error.SmokeFailed;
+    }
+
+    /// The server serves TLS only (B7 slice 6): a plain-HTTP `GET /v1/status` gets no answer,
+    /// and the same request with the smoke's certificate gets 200.
+    fn check_tls_only(smoke: *Smoke) !void {
+        const plain = smoke.call_with(null, "GET", "/v1/status", "");
+        const refused = if (plain) |reply| reply.status != 200 else |_| true;
+        try smoke.expect(refused, "a plain-HTTP GET /v1/status answered 200", .{});
+        const reply = try smoke.call("GET", "/v1/status", "");
+        try smoke.expect(reply.status == 200, "GET /v1/status over TLS answered {d}", .{
+            reply.status,
+        });
+        smoke.say("plain HTTP gets no answer; TLS with the smoke's certificate answers 200", .{});
     }
 
     /// SIGTERM, then wait: a clean stop is exit 0.
@@ -209,9 +228,19 @@ const Smoke = struct {
     // ---- The API ----
 
     fn call(smoke: *Smoke, method: []const u8, path: []const u8, body: []const u8) !http.Reply {
-        const address = try net.IpAddress.parse("127.0.0.1", smoke.port);
         const credentials = smoke.credentials orelse return error.ApiUnreachable;
-        const client: http.Client = .{ .io = smoke.io, .address = address, .tls = credentials };
+        return smoke.call_with(credentials, method, path, body);
+    }
+
+    fn call_with(
+        smoke: *Smoke,
+        tls: ?*harness_tls.Credentials,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+    ) !http.Reply {
+        const address = try net.IpAddress.parse("127.0.0.1", smoke.port);
+        const client: http.Client = .{ .io = smoke.io, .address = address, .tls = tls };
         var diag: Diag = undefined;
         diag.reset();
         return client.call(smoke.arena.allocator(), .{
@@ -370,7 +399,8 @@ const Smoke = struct {
 
 fn script(smoke: *Smoke) !void {
     try smoke.start_server();
-    smoke.say("server up on 127.0.0.1:{d}", .{smoke.port});
+    smoke.say("server up on 127.0.0.1:{d} (TLS, --listen)", .{smoke.port});
+    try smoke.check_tls_only();
     try smoke.start_agent();
     const registered = struct {
         fn check(s: *Smoke) !bool {
@@ -520,6 +550,19 @@ fn step_peer_files(smoke: *Smoke) !void {
         try smoke.expect(mode == 0o600, "{s} has mode {o}, expected 600", .{ name, mode });
     }
     smoke.say("the agent joined the cluster CA; peer.key, peer.cred and ca.pub are 0600", .{});
+    // The keys `ca issue-client` and `ca issue-node` wrote for the smoke and the agent.
+    var certs = try std.Io.Dir.cwd().openDir(smoke.io, try smoke.work_file("certs"), .{});
+    defer certs.close(smoke.io);
+    for ([_][]const u8{ "smoke.key", node ++ ".key" }) |name| {
+        const file = certs.openFile(smoke.io, name, .{}) catch |err| {
+            try smoke.expect(false, "certs/{s} is missing: {s}", .{ name, @errorName(err) });
+            return;
+        };
+        defer file.close(smoke.io);
+        const mode = (try file.stat(smoke.io)).permissions.toMode() & 0o777;
+        try smoke.expect(mode == 0o600, "certs/{s} has mode {o}, expected 600", .{ name, mode });
+    }
+    smoke.say("certs/smoke.key and certs/{s}.key are 0600", .{node});
 }
 
 /// A restarted agent adopts what runs and starts nothing.

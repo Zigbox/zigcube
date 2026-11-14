@@ -42,8 +42,12 @@ These arrive with the scaffold; keep this list current as they land.
   `--help` says the rest.
   `--listen` serves TLS 1.3 and every client presents a certificate of the store's CA;
   `--insecure-listen` serves plain HTTP on loopback only, as the caller `local`, which may call
-  everything (B7 slice 3, docs/mtls.md "The API over TLS"; `zcube local`, `local-smoke`, `swarm-smoke`
-  and `demo-b7` use it; the other harnesses issue certificates and use `--listen`, B7 slice 6).
+  everything (B7 slice 3, docs/mtls.md "The API over TLS"). Only these use it: `zcube local` and
+  `local-smoke` (its purpose), demo-c1's step 6 (local mode), `demo-b7` (it tests that listener),
+  the in-process tests of the API (`server_test`, `cli_test`, `agent_remote_test`) and `bench-watch`
+  (watch fan-out, not TLS), and `swarm-smoke` and `demo-c2` until B7 slice 7 converts them. Every
+  other harness issues certificates and uses `--listen` (B7 slice 6; the table is in
+  docs/decisions/2026-11-14-b7-slice6-console-over-tls.md).
   `zcube` and `zcube-agent` take `--ca`, `--cert`, `--key` and `--tls-name` for TLS.
   `zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]` with the server's
   `--store` (and `--state-dir`) writes a client certificate and key (0600) signed by that store's
