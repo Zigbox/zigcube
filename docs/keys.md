@@ -199,12 +199,16 @@ Until C3 slice 11 the API's apply body takes neither member: slice 5 defines and
 ```json
 /mesh-address-next   { "v": 1, "next": 4 }
 /mesh-addresses/00003 { "v": 1, "service": "db" }
-/mesh-addresses/00001 { "v": 1, "service": "old", "released_at_ms": 1761350000123 }
+/mesh-addresses/00001 { "v": 1, "service": "old", "released_at_ms": 1761350000123,
+                        "replicas_below": 3 }
 ```
 
 - `/mesh-address-next` is the counter: the number the next create tries first. Absent means 1.
   `/mesh-addresses/<n>` (`n` the address number, five digits, zero-padded) is the hold: which
-  service has the address, and, once that service is deleted, when it was released.
+  service has the address, and, once that service is deleted, when it was released and which of
+  its replicas were that service's: those numbered below `replicas_below`, the service's replica
+  counter (`/replica-numbers/<service>`, never reset) at the delete. A hold released without it
+  counts every replica of the name.
 - **Assigned in the apply's transaction.** The apply that creates a service reads the counter,
   takes the first number from it on that is free, and writes the counter (one past it) and the
   hold with the service, each compared at the revision read. Two applies that race for a number
@@ -212,14 +216,18 @@ Until C3 slice 11 the API's apply body takes neither member: slice 5 defines and
   services at the same moment can conflict, and one may end in `409` ZC-E0105 (docs/api.md).
   Past 65,534 the counter starts again at 1.
 - **Free** means no hold, or a released hold that is at least a day old
-  (`mesh_address_quarantine_ms`, the decision-retention window) and whose service has no replica
-  left anywhere: no `/replicas/<service>/` record and no `/observed/<node>/<service>-<n>` key (the
-  key names the replica, so one whose value does not read still counts, for its own service only).
+  (`mesh_address_quarantine_ms`, the decision-retention window) and whose deleted service has no
+  replica left anywhere: no `/replicas/<service>/<service>-<n>` record and no
+  `/observed/<node>/<service>-<n>` key with `n` below `replicas_below` (the key names the replica,
+  so one whose value does not read still counts, for its own service only). Replicas of the same
+  name applied again are numbered from the counter on, so they do not keep the old address held
+  (TLA+ finding 9).
   A hold that does not read counts as held. A create probes at most 500 numbers
   (`mesh_address_probes_max`): the first 250 in order from the counter, the other 250 spread over
   the whole block, one every 261 (`mesh_address.probe_number`), so a long run of held numbers
   after the counter does not refuse creates while most of the block is free. If none is free the
-  create is refused with ZC-E0207. With at most 256 services (`services_max`) that happens only if
+  create is refused with ZC-E0207, and the counter moves past the 250 numbers tried in order, so
+  the next create probes others. With at most 256 services (`services_max`) that happens only if
   well over 500 services were deleted within a day or still have replicas.
 - **Released by the delete**, in its own transaction: the hold keeps the service name and gains
   `released_at_ms`. A hold is never deleted, so these keys number at most 65,534. A service
@@ -534,7 +542,9 @@ the cost is a couple of kilobytes per such decision.
 **Grant decisions (C4).** An apply that changes a service's `allow` also writes a `grant`
 decision, in the same transaction: `actor` `api`, subject the destination service, `reason`
 `"alex@laptop changed who may connect to db (request r-0001a4f)"`, `change` the grants that came
-and went, `"web → 5432 added, batch → 80 removed"`, and the same `cause` as the apply. Creating a
+and went, `"web → 5432 added, batch → 80 removed"`, and the same `cause` and `cause_evidence` as
+the apply (`zcube why grant` names `cause_evidence.applied_by` as who changed the grants, and the
+decision's `actor` if a record lacks it). Creating a
 service with grants writes one too; creating one without, or deleting a service, does not. The
 grants themselves are in the service record, so `zcube why grant` reads them there and finds when
 each came by these decisions.

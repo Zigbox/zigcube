@@ -127,7 +127,7 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
     batch.put(service_key_copy, try records.encode(ctx.arena, service, ctx.diag));
     // The grant decision before the history: `history.put` leaves room for one decision only.
     if (grants_changed(planned.existing, input)) {
-        try put_grant_decision(ctx, source, &batch, planned.existing, input, service_key_copy);
+        try put_grant_decision(ctx, source, &batch, planned.existing, &service, service_key_copy);
     }
     try put_history(ctx, &batch, &planned, &service);
     const reason = try controller.format(ctx, "{s} applied {s} (request {s})", .{
@@ -226,47 +226,55 @@ fn grants_changed(existing: ?records.Service, input: Input) bool {
 }
 
 /// The `grant` decision (docs/keys.md): who changed the grants of a service and which came and
-/// went, as one line. The grants themselves are in the service record it causes.
+/// went, as one line. The grants themselves are in the service record it causes; its evidence is
+/// the apply's, so `why grant` reads who applied it from `cause_evidence.applied_by`.
 fn put_grant_decision(
     ctx: *const Context,
     source: *controller.DecisionSource,
     batch: *controller.Batch,
     existing: ?records.Service,
-    input: Input,
+    service: *const records.Service,
     service_key: []const u8,
 ) Error!void {
     assert(batch.has_room(controller.decision_ops));
-    const old: []const records.Grant = if (existing) |service| service.allow else &.{};
-    var text: std.ArrayList(u8) = .empty;
-    for (input.allow) |grant| {
+    const old: []const records.Grant = if (existing) |held| held.allow else &.{};
+    var text: std.Io.Writer.Allocating = .init(ctx.arena);
+    for (service.allow) |grant| {
         if (records.grants_contain(old, grant)) continue;
-        try append_part(ctx, &text, try grant_text(ctx, grant, "added"));
+        try grant_part(ctx, &text, grant, .added);
     }
     for (old) |grant| {
-        if (records.grants_contain(input.allow, grant)) continue;
-        try append_part(ctx, &text, try grant_text(ctx, grant, "removed"));
+        if (records.grants_contain(service.allow, grant)) continue;
+        try grant_part(ctx, &text, grant, .removed);
     }
-    assert(text.items.len > 0);
+    assert(text.written().len > 0);
     const reason = try controller.format(ctx, "{s} changed who may connect to {s} (request {s})", .{
-        input.applied_by, input.name, input.request_id,
+        service.applied_by, service.name, service.request_id,
     });
     _ = try controller.put_decision(ctx, source, .{
         .actor = actor,
         .action = "grant",
-        .subject = .{ .kind = .service, .name = input.name },
+        .subject = .{ .kind = .service, .name = service.name },
         .reason = reason,
-        .change = text.items,
+        .change = text.written(),
         .cause = .{ .kind = .desired, .key = service_key },
+        .cause_evidence = try evidence.service(ctx, service),
     }, batch);
 }
 
-/// "web → 5432 added".
-fn grant_text(
+/// Appends "web → 5432 added" to a `grant` decision's change (`records.grant_change_write`).
+fn grant_part(
     ctx: *const Context,
+    text: *std.Io.Writer.Allocating,
     grant: records.Grant,
-    comptime how: []const u8,
-) Error![]const u8 {
-    return controller.format(ctx, "{s} → {d} " ++ how, .{ grant.from, grant.port });
+    how: records.GrantChange,
+) Error!void {
+    const failures = @import("store_failures.zig");
+    if (text.written().len > 0) {
+        text.writer.writeAll(records.grant_change_separator) catch
+            return failures.no_memory(ctx.diag);
+    }
+    records.grant_change_write(&text.writer, grant, how) catch return failures.no_memory(ctx.diag);
 }
 
 /// Deletes a service and records who did. Its replicas are stopped by the replica controller.
@@ -292,7 +300,7 @@ pub fn delete_service(
     // The address stays held, released, until no replica is left and a day has passed. A record
     // that does not read is still deleted; its address, if any, stays held.
     if (try mesh_address.held_by(ctx, kv.value)) |address| {
-        try mesh_address.release(ctx, &batch, name, address);
+        try mesh_address.release(ctx, &batch, name, address, kv.value);
     }
     const reason = try controller.format(ctx, "{s} deleted {s} (request {s})", .{
         applied_by, name, request_id,

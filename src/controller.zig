@@ -275,6 +275,17 @@ pub fn too_many(ctx: *const Context, prefix: []const u8, count_max: u32) error{N
     return error.NoCapacity;
 }
 
+/// `Snapshot.admission`'s answer.
+pub const Admission = enum {
+    admitted,
+    /// The node has registered again since the report (or its lease ended): another tenure.
+    stale_tenure,
+    /// The report names a placement epoch that is not the replica's assignment now.
+    stale_epoch,
+    /// The node controller has not judged the node `ready`.
+    node_not_ready,
+};
+
 /// Desired and observed state at one revision.
 pub const Snapshot = struct {
     revision: Revision,
@@ -353,6 +364,24 @@ pub const Snapshot = struct {
             if (std.mem.eql(u8, entry.rec.name, node)) return entry;
         }
         return null;
+    }
+
+    /// Whether a controller may act on a replica's observed record (authority.md section 3), and
+    /// if not, the first rule it breaks, in the order checked. A C1 report carries the tenure it
+    /// was written under: the node's `/nodes` record must still have that revision, the report's
+    /// placement epoch (if it names one) must be the assignment's revision, and the node's status
+    /// must be `ready`. A C0 report carries no tenure and is taken as it is.
+    pub fn admission(snapshot: *const Snapshot, entry: *const Entry(records.Observed)) Admission {
+        const tenure = entry.rec.tenure orelse return .admitted;
+        const node = snapshot.node_entry(entry.rec.node) orelse return .stale_tenure;
+        if (node.kv.mod_revision != tenure) return .stale_tenure;
+        if (entry.rec.assignment) |epoch| {
+            const placed = snapshot.assigned_of(entry.rec.replica) orelse return .stale_epoch;
+            if (placed.kv.mod_revision != epoch) return .stale_epoch;
+        }
+        const status = snapshot.status_of(entry.rec.node) orelse return .node_not_ready;
+        if (status.rec.state != .ready) return .node_not_ready;
+        return .admitted;
     }
 
     pub fn service_of(snapshot: *const Snapshot, name: []const u8) ?*const Entry(

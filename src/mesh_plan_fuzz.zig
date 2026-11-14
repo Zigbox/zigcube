@@ -1,13 +1,16 @@
 //! A seeded fuzzer for the mesh plan (`mesh_plan.zig`): random services (some without a mesh
 //! address), random grants (some from services that do not exist), and random replicas across
-//! three nodes with random readiness, endpoints and draining copies. Each node's plan, and `check`
-//! for every grant asked, is held against a plain restatement of the brief's rules:
+//! three nodes in the states `input_of` produces: desired replicas, never draining, with an
+//! endpoint only behind an admitted report, and draining copies of moved or removed ones. Each
+//! node's plan, and `check` for every grant asked, is held against a plain restatement of the
+//! brief's rules:
 //!
 //! - a listener for each local replica of S per compiled grant S -> D:P, and nothing else;
 //! - D's endpoints are exactly its ready, non-draining replicas with an endpoint (M4's plan side),
 //!   and `pick` tries each once, the planning node's first;
 //! - an accept for each local replica of D per compiled grant, open iff ready and not draining;
-//! - `check` grants exactly when the grant compiles and D has an endpoint.
+//! - `check`'s verdict is the first of no_grant, no_source, destination_has_no_address,
+//!   source_has_no_address, no_endpoint that applies, else granted.
 //!
 //! Seeds and replay are in `fuzz_seeds.zig`.
 
@@ -66,37 +69,64 @@ fn world_make(random: std.Random, world: *World) void {
     }
     world.replica_count = 0;
     for (replica_ids, 0..) |id, index| {
-        const replica = replica_make(random, id, endpoint_texts[index]);
-        world.replicas[world.replica_count] = replica;
-        world.replica_count += 1;
-        // Sometimes a draining copy of the same replica on another node (it moved).
-        const node = replica.node orelse continue;
-        if (random.uintLessThan(u8, 4) != 0) continue;
-        var copy = replica;
-        copy.node = node_other(random, node);
-        copy.draining = true;
-        copy.readiness = if (random.boolean()) .ready else .starting;
-        world.replicas[world.replica_count] = copy;
+        const service = service_names[random.uintLessThan(usize, service_names.len)];
+        // Sometimes the replica is no longer desired (scaled down, or its service re-applied with
+        // fewer replicas) and only a copy still running somewhere is left.
+        const desired = random.uintLessThan(u8, 6) != 0;
+        var node: ?[]const u8 = null;
+        if (desired) {
+            const replica = replica_make(random, id, service, endpoint_texts[index]);
+            world.replicas[world.replica_count] = replica;
+            world.replica_count += 1;
+            node = replica.node;
+            // Sometimes a draining copy of the same replica on another node (it moved).
+            if (random.uintLessThan(u8, 4) != 0) continue;
+        }
+        const copy_node = if (node) |assigned|
+            node_other(random, assigned)
+        else
+            node_names[random.uintLessThan(usize, node_names.len)];
+        world.replicas[world.replica_count] = .{
+            .id = id,
+            .service = service,
+            .node = copy_node,
+            .endpoint = if (random.uintLessThan(u8, 5) == 0) null else endpoint_texts[index],
+            .readiness = if (random.boolean()) .ready else .starting,
+            .draining = true,
+        };
         world.replica_count += 1;
     }
     const replicas = world.replicas[0..world.replica_count];
     std.mem.sort(mesh_plan.Replica, replicas, {}, mesh_plan.replica_less);
 }
 
-fn replica_make(random: std.Random, id: []const u8, endpoint: []const u8) mesh_plan.Replica {
-    const service = service_names[random.uintLessThan(usize, service_names.len)];
+/// A desired replica, in a state `input_of` produces: unassigned with nothing else; assigned
+/// with no admitted report (no endpoint); or assigned with an admitted report, whose endpoint may
+/// or may not be published yet. Never draining.
+fn replica_make(
+    random: std.Random,
+    id: []const u8,
+    service: []const u8,
+    endpoint: []const u8,
+) mesh_plan.Replica {
     const node_index = random.uintLessThan(usize, node_names.len + 1);
     if (node_index == node_names.len) {
         return .{ .id = id, .service = service, .node = null, .readiness = .not_assigned };
     }
-    const readiness = random.enumValue(mesh_plan.Readiness);
+    var readiness = random.enumValue(mesh_plan.Readiness);
+    if (readiness == .not_assigned) readiness = .ready;
+    const reported = switch (readiness) {
+        .not_assigned, .not_reported, .stale_report, .node_not_ready => false,
+        .ready, .starting, .stopped, .not_healthy => true,
+    };
+    const published = reported and random.uintLessThan(u8, 5) != 0;
     return .{
         .id = id,
         .service = service,
         .node = node_names[node_index],
-        .endpoint = if (random.uintLessThan(u8, 5) == 0) null else endpoint,
-        .readiness = if (readiness == .not_assigned) .ready else readiness,
-        .draining = random.uintLessThan(u8, 6) == 0,
+        .endpoint = if (published) endpoint else null,
+        .readiness = readiness,
+        .draining = false,
     };
 }
 
@@ -265,10 +295,25 @@ fn check_holds(
     }
     if (result.endpoints.len != endpoints) return error.CheckEndpoints;
     if (result.excluded.len != others) return error.CheckExcluded;
-    const granted = records.grants_contain(to.allow, .{ .from = query.from, .port = query.port });
-    const expect_granted = granted and compiles(input, to, query.from) and endpoints > 0;
-    if ((result.verdict == .granted) != expect_granted) return error.CheckVerdict;
-    if (!granted and result.verdict != .no_grant) return error.CheckNoGrant;
+    if (result.verdict != verdict_expected(input, to, query, endpoints)) {
+        return error.CheckVerdict;
+    }
+}
+
+/// The finer verdicts, in the order the brief gives them: the first that applies is the answer.
+fn verdict_expected(
+    input: *const mesh_plan.Input,
+    to: *const mesh_plan.Service,
+    query: mesh_plan.GrantQuery,
+    endpoints: usize,
+) mesh_plan.Verdict {
+    const grant: records.Grant = .{ .from = query.from, .port = query.port };
+    if (!records.grants_contain(to.allow, grant)) return .no_grant;
+    const source = service_named(input, query.from) orelse return .no_source;
+    if (to.mesh_address == null) return .destination_has_no_address;
+    if (source.mesh_address == null) return .source_has_no_address;
+    if (endpoints == 0) return .no_endpoint;
+    return .granted;
 }
 
 fn plan_once(faults: mesh_plan.Faults, seed: u64) !void {

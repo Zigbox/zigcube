@@ -33,7 +33,7 @@ pub const Error = controller.Error || error{NotFound};
 pub const Attribution = struct {
     decision: []const u8,
     at_ms: u64,
-    /// Who applied the change, as the decision's reason names them.
+    /// Who applied the change: the decision's `cause_evidence.applied_by`, else its actor.
     by: []const u8,
 };
 
@@ -127,6 +127,8 @@ fn readiness_text(readiness: mesh_plan.Readiness) []const u8 {
         .ready => unreachable, // Asserted above: a ready replica is excluded for another reason.
         .not_assigned => "not placed on a node",
         .not_reported => "its node has not reported it yet",
+        .stale_report => "its node's report is from an earlier registration or placement",
+        .node_not_ready => "its node is not ready",
         .starting => "starting",
         .stopped => "stopped",
         .not_healthy => "its health check has not passed",
@@ -135,8 +137,14 @@ fn readiness_text(readiness: mesh_plan.Readiness) []const u8 {
 
 // ---- Who changed the grants ----
 
-/// Fills `result.allows` and `result.removed` from the destination's kept `grant` decisions,
-/// newest first: each grant is attributed to the newest decision that added it.
+/// Fills `result.allows` and `result.removed` from the destination's kept `grant` decisions as
+/// of `result.revision`, newest first: each grant is attributed to the newest decision that added
+/// it (a grant added, removed and added again names the second add), and `removed` to the newest
+/// that removed the asked-for one.
+///
+/// A decision kept from an earlier service of the same name (deleted, then created again) is
+/// read like any other: deleting a service deletes its history but not its decisions, which
+/// retention drops (docs/keys.md). Known, and left to a later slice.
 fn attribute(
     ctx: *const Context,
     allow: []const records.Grant,
@@ -152,6 +160,7 @@ fn attribute(
     const prefix = records.index_prefix(.service, query.to);
     const page = try ctx.store.list(ctx.arena, .{
         .prefix = prefix.slice(),
+        .at_revision = result.revision,
         .limit = constants.decisions_per_subject_max,
         .reverse = true,
     }, ctx.diag);
@@ -159,21 +168,21 @@ fn attribute(
         if (left == 0) break;
         const entry = try records.read(records.IndexEntry, ctx.arena, kv, ctx.diag);
         if (!std.mem.eql(u8, entry.action, "grant")) continue;
-        const decision = try fetch_decision(ctx, entry.id) orelse continue;
+        const decision = try fetch_decision(ctx, entry.id, result.revision) orelse continue;
         const change = decision.change orelse continue;
         const attribution: Attribution = .{
             .decision = decision.id,
             .at_ms = decision.at_ms,
-            .by = by_of(decision),
+            .by = by_of(ctx, decision),
         };
         for (allows) |*allowed| {
             if (allowed.added != null) continue;
             const grant: records.Grant = .{ .from = allowed.from, .port = allowed.port };
-            if (!change_names(change, grant, "added")) continue;
+            if (!records.grant_change_names(change, grant, .added)) continue;
             allowed.added = attribution;
             left -= 1;
         }
-        if (removed_wanted and change_names(change, wanted, "removed")) {
+        if (removed_wanted and records.grant_change_names(change, wanted, .removed)) {
             result.removed = attribution;
             removed_wanted = false;
             left -= 1;
@@ -181,35 +190,29 @@ fn attribute(
     }
 }
 
-fn fetch_decision(ctx: *const Context, id: []const u8) Error!?records.Decision {
+fn fetch_decision(
+    ctx: *const Context,
+    id: []const u8,
+    revision: store.Revision,
+) Error!?records.Decision {
     if (records.decision_id_time(id) == null) return null;
     const key = records.decision_key(id);
-    const got = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
-    const kv = got.kv orelse return null; // Dropped by retention after its index entry was read.
+    const got = try ctx.store.get(ctx.arena, key.slice(), revision, ctx.diag);
+    const kv = got.kv orelse return null; // Dropped by retention after its index entry was written.
     return try records.read(records.Decision, ctx.arena, kv, ctx.diag);
 }
 
-/// Who applied it: the reason is "<who> changed who may connect to <service> (request <id>)"
-/// (apply.zig); any other reason names the actor.
-fn by_of(decision: records.Decision) []const u8 {
+/// Who applied it: `cause_evidence.applied_by` (apply.zig writes the apply's evidence on a grant
+/// decision), else the decision's actor.
+fn by_of(ctx: *const Context, decision: records.Decision) []const u8 {
     assert(std.mem.eql(u8, decision.action, "grant"));
-    const marker = " changed who may connect to ";
-    const end = std.mem.indexOf(u8, decision.reason, marker) orelse return decision.actor;
-    if (end == 0) return decision.actor;
-    return decision.reason[0..end];
-}
-
-/// Whether a decision's change ("web → 5432 added, batch → 80 removed") names `grant` as `how`.
-fn change_names(change: []const u8, grant: records.Grant, comptime how: []const u8) bool {
-    assert(grant.port > 0);
-    var buffer: [constants.service_name_bytes_max + 32]u8 = undefined;
-    const part = std.fmt.bufPrint(&buffer, "{s} → {d} " ++ how, .{ grant.from, grant.port }) catch
-        return false; // A name longer than any service's: no change names it.
-    var parts = std.mem.splitSequence(u8, change, ", ");
-    while (parts.next()) |held| {
-        if (std.mem.eql(u8, held, part)) return true;
-    }
-    return false;
+    const evidence = decision.cause_evidence orelse return decision.actor;
+    const Fields = struct { applied_by: []const u8 = "" };
+    const fields = std.json.parseFromSliceLeaky(Fields, ctx.arena, evidence.text, .{
+        .ignore_unknown_fields = true,
+    }) catch return decision.actor;
+    if (fields.applied_by.len == 0) return decision.actor;
+    return fields.applied_by;
 }
 
 // ---- The words ----
@@ -328,17 +331,28 @@ fn format(ctx: *const Context, comptime pattern: []const u8, args: anytype) Erro
 
 // ---- The diagnostic ----
 
+const self_grant_fix = "ask about a grant from another service; apply refuses one naming " ++
+    "the service itself (ZC-E0135)";
+
 fn diagnostic_of(ctx: *const Context, result: *const Result) Error!?records.Raw {
     return switch (result.verdict) {
-        .no_grant => try diagnostic_text(ctx, .E0707, try format(
-            ctx,
-            "{s} allows no connection from {s} on port {d}",
-            .{ result.to, result.from, result.port },
-        ), try format(
-            ctx,
-            "add {{ .from = \"{s}\", .port = {d} }} to {s}'s allow and apply it",
-            .{ result.from, result.port, result.to },
-        )),
+        .no_grant => if (std.mem.eql(u8, result.from, result.to))
+            // A grant from the service to itself is refused at apply (ZC-E0135): suggest none.
+            try diagnostic_text(ctx, .E0707, try format(
+                ctx,
+                "{s} cannot grant itself: a service does not reach itself through the mesh",
+                .{result.to},
+            ), self_grant_fix)
+        else
+            try diagnostic_text(ctx, .E0707, try format(
+                ctx,
+                "{s} allows no connection from {s} on port {d}",
+                .{ result.to, result.from, result.port },
+            ), try format(
+                ctx,
+                "add {{ .from = \"{s}\", .port = {d} }} to {s}'s allow and apply it",
+                .{ result.from, result.port, result.to },
+            )),
         .no_source => try diagnostic_text(ctx, .W0704, try format(
             ctx,
             "{s} allows {s} on port {d}, and no service {s} exists",
@@ -395,13 +409,17 @@ const sim_world = @import("sim_world.zig");
 const writers = @import("writers.zig");
 
 fn service(name: []const u8, allow: []const records.Grant) apply_mod.Input {
+    return service_by(name, allow, "alex@laptop");
+}
+
+fn service_by(name: []const u8, allow: []const records.Grant, by: []const u8) apply_mod.Input {
     return .{
         .name = name,
         .image = "b3:51aa9c03",
         .replicas = 2,
         .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
         .allow = allow,
-        .applied_by = "alex@laptop",
+        .applied_by = by,
         .request_id = "r-0000001",
     };
 }
@@ -486,13 +504,14 @@ test "why grant: a removed grant says who removed it, a missing source is ZC-W07
     const world = try demo_world(13);
     defer world.destroy();
     const cache_80 = [_]records.Grant{.{ .from = "cache", .port = 80 }};
-    _ = try world.apply(service("db", &cache_80));
+    _ = try world.apply(service_by("db", &cache_80, "sam@ci"));
     var ctx = world.controller_context();
     const removed = try why_grant(&ctx, .{ .from = "web", .to = "db", .port = 5432 });
     try testing.expectEqual(mesh_plan.Verdict.no_grant, removed.verdict);
     try testing.expect(removed.removed != null);
-    try testing.expectEqualStrings("alex@laptop", removed.removed.?.by);
-    const by = "; web → 5432 (removed by alex@laptop at ";
+    try testing.expectEqualStrings("sam@ci", removed.removed.?.by);
+    try testing.expectEqualStrings("sam@ci", removed.allows[0].added.?.by);
+    const by = "; web → 5432 (removed by sam@ci at ";
     try testing.expect(std.mem.indexOf(u8, removed.text, by) != null);
 
     const ghost = try why_grant(&ctx, .{ .from = "cache", .to = "db", .port = 80 });
@@ -502,4 +521,59 @@ test "why grant: a removed grant says who removed it, a missing source is ZC-W07
     const nowhere: mesh_plan.GrantQuery = .{ .from = "web", .to = "nope", .port = 1 };
     try testing.expectError(error.NotFound, why_grant(&ctx, nowhere));
     try testing.expectEqual(codes.Code.E0101, ctx.diag.code.?);
+}
+
+test "why grant: a grant added, removed and added again names the newest of each" {
+    // Goal: attribution is the newest kept decision, for `added` and for `removed`, with a
+    // different actor for each apply so that taking the oldest would fail. Method: db allows web
+    // (alex), then not (sam), then again (kim); batch is added (lee), removed (ada), added (lee)
+    // and removed again (max).
+    const world = try demo_world(14);
+    defer world.destroy();
+    const both = [_]records.Grant{ web_5432[0], .{ .from = "batch", .port = 5432 } };
+    const steps = [_]struct { allow: []const records.Grant, by: []const u8 }{
+        .{ .allow = &.{}, .by = "sam@ci" },
+        .{ .allow = &web_5432, .by = "kim@desk" },
+        .{ .allow = &both, .by = "lee@desk" },
+        .{ .allow = &web_5432, .by = "ada@desk" },
+        .{ .allow = &both, .by = "lee@desk" },
+        .{ .allow = &web_5432, .by = "max@desk" },
+    };
+    for (steps) |step| {
+        world.advance(1000);
+        _ = try world.apply(service_by("db", step.allow, step.by));
+    }
+    var ctx = world.controller_context();
+    const web = try why_grant(&ctx, .{ .from = "web", .to = "db", .port = 5432 });
+    try testing.expectEqualStrings("kim@desk", web.allows[0].added.?.by);
+    const batch = try why_grant(&ctx, .{ .from = "batch", .to = "db", .port = 5432 });
+    try testing.expectEqual(mesh_plan.Verdict.no_grant, batch.verdict);
+    try testing.expectEqual(@as(usize, 1), batch.allows.len);
+    try testing.expectEqualStrings("max@desk", batch.removed.?.by);
+    try testing.expect(batch.removed.?.at_ms > web.allows[0].added.?.at_ms);
+}
+
+test "why grant: a deleted service's replicas, before the controller removes them, are ignored" {
+    // Goal: deleting a service leaves its replicas until the replica controller's next pass;
+    // asking about another grant then answers instead of tripping the plan's input assertion.
+    // Method: delete db and ask about web -> batch at once, with no controller pass between.
+    const world = try demo_world(15);
+    defer world.destroy();
+    _ = try world.delete_service("db");
+    var ctx = world.controller_context();
+    const result = try why_grant(&ctx, .{ .from = "web", .to = "batch", .port = 80 });
+    try testing.expectEqual(mesh_plan.Verdict.no_grant, result.verdict);
+    for (result.excluded) |item| try testing.expect(std.mem.startsWith(u8, item.replica, "batch-"));
+}
+
+test "why grant: asking for a service's grant to itself does not suggest a grant apply refuses" {
+    // Goal: E0707's fix for from == to names ZC-E0135 rather than an `allow` entry apply refuses.
+    const world = try demo_world(16);
+    defer world.destroy();
+    var ctx = world.controller_context();
+    const result = try why_grant(&ctx, .{ .from = "db", .to = "db", .port = 5432 });
+    try testing.expectEqual(mesh_plan.Verdict.no_grant, result.verdict);
+    const text = result.diagnostic.?.text;
+    try testing.expect(std.mem.indexOf(u8, text, "ZC-E0135") != null);
+    try testing.expect(std.mem.indexOf(u8, text, ".from = ") == null);
 }

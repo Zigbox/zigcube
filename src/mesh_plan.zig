@@ -21,11 +21,14 @@
 //! be applied in any order, and compiled once the source is created). `check` says why for one
 //! grant, which is what `zcube why grant` shows.
 //!
-//! **Ready** is the C3 brief's readiness without its `min_ready_ms` timer, which C3's readiness
+//! **Ready** is the C3 brief's readiness without its `min_ready_ms` dwell, which C3's readiness
 //! slice adds (docs/decisions/2026-11-13-c4-mesh-plan.md): reported running by the node it is
-//! assigned to, at its generation, and, with a health check, last reported healthy.
+//! assigned to, at its generation, in a report the controllers may act on (the node's tenure and
+//! the placement's epoch, the node `ready`: `controller.Snapshot.admission`, the replica
+//! controller's own rule) and, with a health check, last reported healthy.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const controller = @import("controller.zig");
 const records = @import("records.zig");
@@ -46,6 +49,11 @@ pub const Readiness = enum {
     not_assigned,
     /// The node it is assigned to has not reported it, at its generation.
     not_reported,
+    /// Its node's report is from another tenure of the node (it has registered again since) or
+    /// names another placement: the controllers do not act on it, nor does the plan.
+    stale_report,
+    /// The node controller has not judged its node `ready` (lost, or not judged yet).
+    node_not_ready,
     starting,
     stopped,
     /// It declares a health check that has not last reported healthy.
@@ -164,10 +172,14 @@ pub const Faults = struct {
 
 /// The rules of `node`.
 pub fn plan(arena: Allocator, input: *const Input, node: []const u8) Allocator.Error!Plan {
-    return plan_with(arena, input, node, .{});
+    return compile(arena, input, node, .{});
 }
 
-pub fn plan_with(
+/// `plan` with test-only faults on (the fuzzer's teeth). It exists only in a test build: in any
+/// other it is `void`, so no production caller can reach the faults.
+pub const plan_with = if (builtin.is_test) compile else {};
+
+fn compile(
     arena: Allocator,
     input: *const Input,
     node: []const u8,
@@ -492,10 +504,19 @@ fn verdict_of(
 
 // ---- From a snapshot ----
 
-/// The plan's input as the store holds it at `snapshot`'s revision. A replica whose
-/// `/replicas/` record is gone while its node still reports it running is draining: the replica
-/// controller has stopped it and its node has not finished. No (id, node) pair repeats: a desired
-/// replica is listed once, and a draining one once per `/observed/<node>/` record.
+/// The plan's input as the store holds it at `snapshot`'s revision.
+///
+/// - A desired replica (`/replicas/`) is listed once, on the node it is assigned to (or none),
+///   with its readiness (`replica_of_snapshot`). One whose service is gone is left out: deleting
+///   a service leaves its replicas until the replica controller's next pass, and the plan knows
+///   only the services that exist.
+/// - A copy that is not stopped and that its node still reports (`/observed/<node>/`), where the
+///   replica is not desired (the replica controller removed it) or is assigned to another node
+///   (it moved), is draining: listed once per (replica, node), never an endpoint, and its
+///   accepts take no new connection. A report on the assigned node at another generation is the
+///   replica itself being replaced in place, not a copy.
+///
+/// So no (id, node) pair repeats.
 pub fn input_of(arena: Allocator, snapshot: *const controller.Snapshot) Allocator.Error!Input {
     const services = try arena.alloc(Service, snapshot.services.len);
     for (snapshot.services, services) |entry, *service| {
@@ -508,12 +529,16 @@ pub fn input_of(arena: Allocator, snapshot: *const controller.Snapshot) Allocato
     var replicas: std.ArrayList(Replica) = .empty;
     var desired: std.StringHashMapUnmanaged(void) = .empty;
     for (snapshot.replicas) |*entry| {
+        if (snapshot.service_of(entry.rec.service) == null) continue; // An orphan.
         try desired.put(arena, entry.rec.id, {});
         try replicas.append(arena, replica_of_snapshot(snapshot, &entry.rec));
     }
     for (snapshot.observed) |*entry| {
-        if (desired.contains(entry.rec.replica)) continue;
         if (entry.rec.status == .stopped) continue;
+        if (desired.contains(entry.rec.replica)) {
+            const assigned = snapshot.node_of(entry.rec.replica);
+            if (assigned != null and std.mem.eql(u8, assigned.?, entry.rec.node)) continue;
+        }
         const service = service_of_replica(services, entry.rec.replica) orelse continue;
         try replicas.append(arena, .{
             .id = entry.rec.replica,
@@ -543,22 +568,30 @@ fn replica_of_snapshot(
         .node = null,
         .readiness = .not_assigned,
     };
-    const assigned = snapshot.assigned_of(replica.id).?;
-    const observed = snapshot.observed_of(replica);
     var result: Replica = .{
         .id = replica.id,
         .service = replica.service,
         .node = node,
         .readiness = .not_reported,
     };
-    // The record on the assigned node, for this generation. A replica's report names no epoch
-    // (only a job's does), so one that does must name this placement's.
-    const entry = observed orelse return result;
-    if (entry.rec.generation != replica.generation) return result;
-    if (entry.rec.assignment) |epoch| {
-        if (epoch != assigned.kv.mod_revision) return result;
+    // The record on the assigned node, if the controllers may act on it, for this generation.
+    const entry = snapshot.observed_of(replica) orelse return result;
+    assert(std.mem.eql(u8, entry.rec.node, node));
+    switch (snapshot.admission(entry)) {
+        .admitted => {},
+        .stale_tenure, .stale_epoch => {
+            result.readiness = .stale_report;
+            return result;
+        },
+        .node_not_ready => {
+            result.readiness = .node_not_ready;
+            return result;
+        },
     }
+    if (entry.rec.generation != replica.generation) return result;
     result.endpoint = entry.rec.endpoint;
+    // TODO(C3 readiness): `min_ready_ms`'s dwell; this switches to C3's readiness function then
+    // (docs/decisions/2026-11-13-c4-mesh-plan.md).
     result.readiness = switch (entry.rec.status) {
         .starting => .starting,
         .stopped => .stopped,
@@ -787,4 +820,286 @@ test "mesh plan: pick tries local endpoints first, then remote, each once, from 
     try testing.expectEqualStrings("db-3", destination.pick(3, 2).?.replica);
     const none: Destination = .{ .service = "db", .address = "x", .local = &.{}, .remote = &.{} };
     try testing.expectEqual(@as(?Endpoint, null), none.pick(9, 0));
+}
+
+// ---- Tests of `input_of`, over a snapshot built by hand ----
+
+const store = @import("store.zig");
+
+/// A `controller.Snapshot` built record by record, each list sorted by key as the store lists it.
+const SnapshotFixture = struct {
+    arena: Allocator,
+    services: std.ArrayList(controller.Entry(records.Service)) = .empty,
+    replicas: std.ArrayList(controller.Entry(records.Replica)) = .empty,
+    observed: std.ArrayList(controller.Entry(records.Observed)) = .empty,
+    nodes: std.ArrayList(controller.Entry(records.Node)) = .empty,
+    assigned: std.ArrayList(controller.Entry(records.Assigned)) = .empty,
+    statuses: std.ArrayList(controller.Entry(records.NodeStatus)) = .empty,
+    by_replica: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    fn kv(fixture: *SnapshotFixture, key: records.Key, revision: u64) !store.KeyValue {
+        return .{
+            .key = try fixture.arena.dupe(u8, key.slice()),
+            .value = "",
+            .create_revision = revision,
+            .mod_revision = revision,
+        };
+    }
+
+    fn service(fixture: *SnapshotFixture, rec: records.Service) !void {
+        const kv_made = try fixture.kv(records.service_key(rec.name), 1);
+        try fixture.services.append(fixture.arena, .{ .kv = kv_made, .rec = rec });
+    }
+
+    /// A node registered at `revision` (its tenure), judged `state` for that tenure.
+    fn node(
+        fixture: *SnapshotFixture,
+        name: []const u8,
+        revision: u64,
+        state: records.NodeState,
+    ) !void {
+        try fixture.nodes.append(fixture.arena, .{
+            .kv = try fixture.kv(records.node_key(name), revision),
+            .rec = .{ .name = name, .capacity = .{ .cpu_millis = 1000, .memory_bytes = 1 << 30 } },
+        });
+        try fixture.statuses.append(fixture.arena, .{
+            .kv = try fixture.kv(records.node_status_key(name), revision + 1),
+            .rec = .{ .state = state, .tenure = revision, .at_ms = 0, .decision = "d" },
+        });
+    }
+
+    fn replica(fixture: *SnapshotFixture, rec: records.Replica) !void {
+        try fixture.replicas.append(fixture.arena, .{
+            .kv = try fixture.kv(records.replica_key(rec.service, rec.id), 2),
+            .rec = rec,
+        });
+    }
+
+    fn assign(
+        fixture: *SnapshotFixture,
+        node_name: []const u8,
+        id: []const u8,
+        revision: u64,
+    ) !void {
+        try fixture.assigned.append(fixture.arena, .{
+            .kv = try fixture.kv(records.assigned_key(node_name, id), revision),
+            .rec = .{
+                .replica = id,
+                .requests = .{ .cpu_millis = 1, .memory_bytes = 1 },
+                .reason = "r",
+            },
+        });
+        try fixture.by_replica.put(fixture.arena, id, node_name);
+    }
+
+    fn observe(fixture: *SnapshotFixture, rec: records.Observed) !void {
+        try fixture.observed.append(fixture.arena, .{
+            .kv = try fixture.kv(records.observed_key(rec.node, rec.replica), 40),
+            .rec = rec,
+        });
+    }
+
+    fn snapshot(fixture: *SnapshotFixture) controller.Snapshot {
+        sort(records.Service, fixture.services.items);
+        sort(records.Replica, fixture.replicas.items);
+        sort(records.Observed, fixture.observed.items);
+        sort(records.Node, fixture.nodes.items);
+        sort(records.Assigned, fixture.assigned.items);
+        sort(records.NodeStatus, fixture.statuses.items);
+        return .{
+            .revision = 50,
+            .services = fixture.services.items,
+            .replicas = fixture.replicas.items,
+            .observed = fixture.observed.items,
+            .nodes = fixture.nodes.items,
+            .assigned = fixture.assigned.items,
+            .statuses = fixture.statuses.items,
+            .node_by_replica = fixture.by_replica,
+        };
+    }
+
+    fn sort(comptime T: type, items: []controller.Entry(T)) void {
+        const Order = struct {
+            fn less(_: void, first: controller.Entry(T), second: controller.Entry(T)) bool {
+                return std.mem.order(u8, first.kv.key, second.kv.key) == .lt;
+            }
+        };
+        std.mem.sort(controller.Entry(T), items, {}, Order.less);
+    }
+};
+
+const health_check: records.Health = .{
+    .command = &.{"true"},
+    .interval_ms = 1000,
+    .timeout_ms = 1000,
+    .failure_threshold = 3,
+    .success_threshold = 1,
+};
+
+fn service_record(
+    name: []const u8,
+    address: []const u8,
+    allow: []const records.Grant,
+) records.Service {
+    return .{
+        .name = name,
+        .image = "b3:51aa9c03",
+        .replicas = 1,
+        .command = &.{"sh"},
+        .generation = 2,
+        .mesh_address = address,
+        .allow = allow,
+    };
+}
+
+fn replica_record(id: []const u8, service: []const u8) records.Replica {
+    return .{
+        .id = id,
+        .service = service,
+        .generation = 2,
+        .image = "b3:51aa9c03",
+        .command = &.{"sh"},
+    };
+}
+
+/// db-1's report on n1 (tenure 10, placement 30), running and healthy at generation 2.
+fn report(replica: []const u8, node: []const u8) records.Observed {
+    return .{
+        .replica = replica,
+        .node = node,
+        .generation = 2,
+        .status = .running,
+        .reported_at_ms = 1,
+        .tenure = 10,
+        .assignment = 30,
+        .health = .healthy,
+        .endpoint = "10.0.0.1:30000",
+    };
+}
+
+test "mesh plan: input_of's readiness, one rule per case" {
+    // Goal: each rule of a replica's readiness from a snapshot (generation, the node's tenure and
+    // the placement epoch, the node `ready`, the health check, the status, the assignment), and
+    // that only a ready replica is an endpoint. Method: one replica of db, assigned to n1 (tenure
+    // 10) at revision 30; each case changes one fact of the base, which is ready.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Case = struct {
+        generation: u64 = 2,
+        tenure: ?u64 = 10,
+        assignment: ?u64 = 30,
+        node_state: records.NodeState = .ready,
+        status: records.ObservedStatus = .running,
+        health: ?records.HealthState = .healthy,
+        check: bool = true,
+        assigned: bool = true,
+        reported: bool = true,
+        readiness: Readiness,
+    };
+    const cases = [_]Case{
+        .{ .readiness = .ready },
+        .{ .generation = 1, .readiness = .not_reported },
+        .{ .assignment = 29, .readiness = .stale_report },
+        .{ .tenure = 9, .readiness = .stale_report },
+        .{ .node_state = .lost, .readiness = .node_not_ready },
+        .{ .node_state = .fenced, .readiness = .node_not_ready },
+        .{ .health = .unhealthy, .readiness = .not_healthy },
+        .{ .health = .unknown, .readiness = .not_healthy },
+        .{ .health = null, .readiness = .not_healthy },
+        .{ .check = false, .health = null, .readiness = .ready },
+        .{ .status = .starting, .readiness = .starting },
+        .{ .status = .stopped, .readiness = .stopped },
+        .{ .assigned = false, .reported = false, .readiness = .not_assigned },
+        .{ .reported = false, .readiness = .not_reported },
+        // A C0 report names no tenure nor epoch, and is taken as it is.
+        .{ .tenure = null, .assignment = null, .node_state = .lost, .readiness = .ready },
+    };
+    const allow = [_]records.Grant{.{ .from = "web", .port = 5432 }};
+    for (cases) |case| {
+        var fixture: SnapshotFixture = .{ .arena = arena };
+        var db = service_record("db", "127.77.0.2", &allow);
+        if (case.check) db.health = health_check;
+        try fixture.service(db);
+        try fixture.service(service_record("web", "127.77.0.1", &.{}));
+        try fixture.node("n1", 10, case.node_state);
+        var replica = replica_record("db-1", "db");
+        replica.health = db.health;
+        try fixture.replica(replica);
+        if (case.assigned) try fixture.assign("n1", "db-1", 30);
+        if (case.reported) {
+            var observed = report("db-1", "n1");
+            observed.generation = case.generation;
+            observed.tenure = case.tenure;
+            observed.assignment = case.assignment;
+            observed.status = case.status;
+            observed.health = case.health;
+            try fixture.observe(observed);
+        }
+        const snapshot = fixture.snapshot();
+        const input = try input_of(arena, &snapshot);
+        try testing.expectEqual(@as(usize, 1), input.replicas.len);
+        const got = input.replicas[0];
+        try testing.expectEqual(case.readiness, got.readiness);
+        try testing.expect(!got.draining);
+        const found = try check(arena, &input, .{ .from = "web", .to = "db", .port = 5432 });
+        const verdict: Verdict = if (case.readiness == .ready) .granted else .no_endpoint;
+        try testing.expectEqual(verdict, found.verdict);
+    }
+}
+
+test "mesh plan: input_of drains removed and moved copies, drops stopped ones and orphans" {
+    // Goal: the copies input_of lists besides the desired replicas: a replica the controller
+    // removed and one that moved drain (never endpoints, accepts closed); a stopped copy and the
+    // replicas of a deleted service (left until the controller's next pass) are not listed, so
+    // nothing reaches `assert_input` with a service it does not know. Method: db-1 moved from n1
+    // to n2, db-2 removed, db-3 removed and stopped, gone-1 and gone-2 of a deleted service.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const allow = [_]records.Grant{.{ .from = "web", .port = 5432 }};
+    var fixture: SnapshotFixture = .{ .arena = arena };
+    try fixture.service(service_record("db", "127.77.0.2", &allow));
+    try fixture.service(service_record("web", "127.77.0.1", &.{}));
+    try fixture.node("n1", 10, .ready);
+    try fixture.node("n2", 20, .ready);
+    try fixture.replica(replica_record("db-1", "db"));
+    try fixture.assign("n2", "db-1", 30);
+    var moved_to = report("db-1", "n2");
+    moved_to.tenure = 20;
+    moved_to.endpoint = "10.0.0.2:30000";
+    try fixture.observe(moved_to);
+    try fixture.observe(report("db-1", "n1"));
+    try fixture.observe(report("db-2", "n1"));
+    var stopped = report("db-3", "n1");
+    stopped.status = .stopped;
+    try fixture.observe(stopped);
+    try fixture.replica(replica_record("gone-1", "gone"));
+    try fixture.assign("n1", "gone-1", 31);
+    try fixture.observe(report("gone-1", "n1"));
+    try fixture.observe(report("gone-2", "n1"));
+    const snapshot = fixture.snapshot();
+    const input = try input_of(arena, &snapshot);
+
+    const Want = struct { id: []const u8, node: []const u8, draining: bool };
+    const wanted = [_]Want{
+        .{ .id = "db-1", .node = "n1", .draining = true },
+        .{ .id = "db-1", .node = "n2", .draining = false },
+        .{ .id = "db-2", .node = "n1", .draining = true },
+    };
+    try testing.expectEqual(wanted.len, input.replicas.len);
+    for (input.replicas, wanted) |got, want| {
+        try testing.expectEqualStrings(want.id, got.id);
+        try testing.expectEqualStrings(want.node, got.node.?);
+        try testing.expectEqual(want.draining, got.draining);
+    }
+    const one = try plan(arena, &input, "n1");
+    try testing.expectEqual(@as(usize, 2), one.accepts.len);
+    for (one.accepts) |accept| try testing.expect(!accept.open);
+    const found = try check(arena, &input, .{ .from = "web", .to = "db", .port = 5432 });
+    try testing.expectEqual(Verdict.granted, found.verdict);
+    try testing.expectEqual(@as(usize, 1), found.endpoints.len);
+    try testing.expectEqualStrings("n2", found.endpoints[0].node);
+    try testing.expectEqual(@as(usize, 2), found.excluded.len);
+    for (found.excluded) |item| try testing.expectEqual(Exclusion.draining, item.exclusion);
 }

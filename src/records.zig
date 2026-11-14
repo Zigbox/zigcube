@@ -672,6 +672,37 @@ pub fn grants_contain(grants: []const Grant, grant: Grant) bool {
     return false;
 }
 
+/// How a `grant` decision's `change` names one grant (docs/keys.md, "Grant decisions").
+pub const GrantChange = enum { added, removed };
+
+/// The parts of a `grant` decision's `change` are joined by this.
+pub const grant_change_separator = ", ";
+
+/// One part of a `grant` decision's `change`: "web → 5432 added". `grant_change_names` reads it.
+pub fn grant_change_write(
+    writer: *std.Io.Writer,
+    grant: Grant,
+    how: GrantChange,
+) std.Io.Writer.Error!void {
+    assert(grant.port > 0);
+    try writer.print("{s} → {d} {s}", .{ grant.from, grant.port, @tagName(how) });
+}
+
+/// Whether a `grant` decision's `change` ("web → 5432 added, batch → 80 removed") names `grant`
+/// as `how`. A service name holds no ", " (`name_problem`), so the parts split cleanly.
+pub fn grant_change_names(change: []const u8, grant: Grant, how: GrantChange) bool {
+    assert(grant.port > 0);
+    var buffer: [constants.service_name_bytes_max + 32]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    // A name longer than any service's: no change names it.
+    grant_change_write(&writer, grant, how) catch return false;
+    var parts = std.mem.splitSequence(u8, change, grant_change_separator);
+    while (parts.next()) |held| {
+        if (std.mem.eql(u8, held, writer.buffered())) return true;
+    }
+    return false;
+}
+
 pub const Service = struct {
     v: u32 = service_version_mesh,
     name: []const u8,
@@ -740,12 +771,19 @@ pub const MeshAddressNext = struct {
 
 /// `/mesh-addresses/<n>`: who holds address `n`. Written by the API with the service that takes
 /// it; marked released when that service is deleted, and replaced only by the allocation that
-/// reuses it, once the quarantine has passed and no replica of `service` remains.
+/// reuses it, once the quarantine has passed and no replica of that incarnation of `service`
+/// remains.
 pub const MeshAddressHold = struct {
     v: u32 = 1,
     service: []const u8,
     /// When the service was deleted; absent while it exists.
     released_at_ms: ?u64 = null,
+    /// Written with `released_at_ms`: the service's replica counter (`/replica-numbers/`) when
+    /// it was deleted. A replica counter is never reset, so the deleted incarnation's replicas
+    /// are exactly `<service>-<n>` with `n` below it, and a service applied again under the
+    /// same name numbers its replicas from it on (TLA+ finding 9). Absent on a release that did
+    /// not record it: every replica of the name then counts.
+    replicas_below: ?u64 = null,
 };
 
 pub const key_mesh_address_next = "/mesh-address-next";
@@ -2423,6 +2461,8 @@ test "the version a record is written in is the version the reader accepts" {
         if (T == Service) value.mesh_address = "127.77.0.1";
         // `read` checks a v5 service's grants against its name, so it needs a valid one.
         if (T == Service) value.name = "s";
+        // `read` refuses a hold that names no valid service (it is held, never reused).
+        if (T == MeshAddressHold) value.service = "s";
         if (T == Observed) value.health = .healthy;
         if (T == Observed) value.endpoint = "node1:30000";
         const bytes = try encode(arena, value, &diag);

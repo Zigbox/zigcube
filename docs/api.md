@@ -214,18 +214,33 @@ plan's, not a re-derivation.
   "excluded": [] }
 ```
 
-- `verdict` is `granted`, `no_grant` (ZC-E0707), `no_source` (the grant names a service that does
-  not exist, ZC-W0704), `destination_has_no_address` or `source_has_no_address` (apply it again) or
-  `no_endpoint` (granted, and no replica of `to` is ready with a mesh endpoint, ZC-E0709). `diagnostic` is present for the
-  three coded verdicts.
-- `allows` is `to`'s whole `allow` list; `added` names the newest `grant` decision that added it,
-  when one survives retention. `removed` (present only for `no_grant`) names the decision that
-  removed the asked-for grant, if one survives.
-- `endpoints` are the replicas the source would be sent to, in the order a source replica with no
-  local endpoint tries them; `excluded` are `to`'s other replicas, each with `exclusion`
-  (`not_ready`, `draining`, `no_endpoint`) and a `text`.
-- A replica is ready when the node it is assigned to reports it running at its generation and,
-  with a health check, last reported it healthy.
+- `verdict` is the first of these that applies, in this order: `no_grant` (`to`'s `allow` has no
+  `{from, port}`, ZC-E0707), `no_source` (the grant names a service that does not exist,
+  ZC-W0704), `destination_has_no_address`, `source_has_no_address` (apply that service again),
+  `no_endpoint` (granted, and no replica of `to` is ready with a mesh endpoint, ZC-E0709); else
+  `granted`. `diagnostic` is present for the three coded verdicts. The two address verdicts carry
+  no code: since C4 slice 1 every apply gives the service a mesh address (a create with none free
+  is `503` ZC-E0207), so a service without one was written before C4 and its remedy, applying it
+  again, is the whole answer; the `text` says so, and a code would name no other fix. For `from` equal to `to` the
+  ZC-E0707 fix names ZC-E0135 (apply refuses a grant from a service to itself) instead of
+  suggesting one.
+- `allows` is `to`'s whole `allow` list; `added` names the newest kept `grant` decision that
+  added it. `removed` (present only for `no_grant`) names the newest kept decision that removed
+  the asked-for grant. Both are read at `revision`, and `by` is the decision's
+  `cause_evidence.applied_by` (who applied the service), else its `actor`.
+- `endpoints` are `to`'s replicas the source may be sent to, each `{replica, node, endpoint}`, in
+  ascending replica id. That is not the order any one source tries them: an agent's `pick` tries
+  its own node's endpoints first, then the others, each once, from a start rotated by a hash of
+  the connection (`Destination.pick`, `src/mesh_plan.zig`). `excluded` are `to`'s other replicas, in the same order, each `{replica, node,
+  exclusion, text}`: `node` is the node it is assigned to (or, for a draining copy, the node it
+  runs on), left out while it is unassigned; `exclusion` is `draining` (a copy left on a node it
+  moved from, or of a replica no longer wanted, which takes no new connection), `not_ready`, or
+  `no_endpoint` (ready, no endpoint published yet); `text` says which readiness rule failed.
+- A replica is ready when the node it is assigned to is `ready` (the node controller's verdict),
+  that node reports the replica at the node's current tenure and for its current assignment (the
+  replica controller's admission rules, authority.md §3), running at the replica's generation
+  and, with a health check, last reported healthy. `min_ready_ms` is not applied yet: C3's
+  readiness brings it.
 - `text` is the sentence the CLI prints. Unknown `to`: `404` ZC-E0101. A bad name or a port
   outside 1 to 65535: `400` ZC-E0104.
 
@@ -336,7 +351,8 @@ The answer is the decision id and the one-line summary (api.md item 5), whether 
   body with `mesh_address` is `ZC-E0104`, an unknown field). It appears with `allow` on
   `/services/<name>` in the read endpoints. When every address is held (by services, or by deleted
   ones whose replicas remain or that were deleted within a day), a create is `503` and
-  `ZC-E0207`.
+  `ZC-E0207`; the service is not written, but the address counter moves on, so a retry probes
+  other numbers.
 
 ### `DELETE /v1/services/{name}[?applied_by=<name>]`
 
