@@ -11,6 +11,7 @@ const agent_state = @import("agent_state.zig");
 const rt = @import("runtime.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const codes = @import("diag/codes.zig");
 const records = @import("records.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
@@ -1465,6 +1466,39 @@ test "a run whose step fails does not hold back the runs after it in the same pa
     try testing.expect(world.sim.has(run_id));
     const seen = (try rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.running, seen.status);
+}
+
+test "a lost answer to an earlier run's write does not hold back a later run's stop (#247)" {
+    // Goal: #247 and #248. A store call of one run that fails with a failure that is not the
+    // runtime's (here the store commits the write and the answer is lost, ZC-E0201) ends the
+    // pass's store calls, but must not skip the stop of a run later in name order whose stop has
+    // committed: J6's linked bound assumes the next pass reaches it. Method: "train-job" runs;
+    // "other-job", which sorts first, is assigned with every write of its observation committed
+    // and its answer lost; "train-job" is cancelled. One step later its cancel is recorded as its
+    // cause and its container is stopped, though that step failed on "other-job".
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const other = records.job_observed_key(sim_world.node_name, "other");
+    world.switched.lost_answer_prefix = other.slice();
+    try assign_other(&rig, "other", "other-job", 60_000);
+    try rig.ask_stop(.cancel, 60_000);
+    _ = world.agent_step();
+    try testing.expect(world.switched.lost_answers > 0);
+    try testing.expectEqual(@as(?codes.Code, .E0201), world.last_failure);
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .cancel), kept.stop_cause);
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+    // Once the answers come back, the cancel is reported as the cause.
+    world.switched.lost_answer_prefix = null;
+    rig.step();
+    rig.step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .cancel), seen.stop_cause);
 }
 
 test "a runtime listing that fails does not fail the step before the heartbeat" {

@@ -40,6 +40,7 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const agent_jobs = @import("agent_jobs.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
 const compare_sets = @import("compare_sets.zig");
@@ -452,7 +453,9 @@ pub const Agent = struct {
     ) u32 {
         var acted: u32 = 0;
         pass.replicas(kept);
-        if (kept.stopped) return acted;
+        // The job pass runs even after a replica's server failure: it then makes one read (the
+        // runs) and no write, and stops the runs whose stop is decided (#247).
+        if (kept.stopped and c1_teeth.job_pass_break) return acted;
         acted += kept.run(agent, ctx, "run the job pass", agent_jobs.pass(
             agent,
             ctx,

@@ -59,6 +59,11 @@ pub const SwitchedStore = struct {
     /// be reached does (ZC-E0201), while every other call is answered; test-only, null in every
     /// simulation.
     down_write_prefix: ?[]const u8 = null,
+    /// A transaction that puts or deletes a key under this prefix is applied, and its answer is
+    /// then lost (ZC-E0201), as a store that committed and dropped the connection; test-only,
+    /// null in every simulation. `lost_answers` counts them.
+    lost_answer_prefix: ?[]const u8 = null,
+    lost_answers: u32 = 0,
     /// A transaction that puts a key under this prefix is answered as a server answers a write
     /// under a tenure that has ended (ZC-E0510); test-only, null in every simulation.
     tenure_ended_put_prefix: ?[]const u8 = null,
@@ -241,7 +246,22 @@ pub const SwitchedStore = struct {
                 break;
             }
         }
-        return self.inner.txn(request, diag);
+        const result = try self.inner.txn(request, diag);
+        if (self.lost_answer_prefix) |prefix| {
+            for (request.on_success) |op| {
+                const key = switch (op) {
+                    .put => |put| put.key,
+                    .delete => |deleted| deleted,
+                };
+                if (!std.mem.startsWith(u8, key, prefix)) continue;
+                self.lost_answers += 1;
+                diag.raise(.E0201);
+                diag.cause("the store committed the write and the connection dropped", .{});
+                diag.fix(.{ .sentence = "none: the next read shows the write" });
+                return error.BackendFailed;
+            }
+        }
+        return result;
     }
 
     fn watch(
