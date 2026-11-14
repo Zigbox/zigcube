@@ -71,7 +71,8 @@ const keys_python =
 
 /// The search of `keys`, given the candidate seeds `K`: `s(name, data)` adds `name` to `H` once
 /// per pattern found in `data`. For each seed and its expanded scalar (SHA-512's first half,
-/// clamped): the raw bytes; hex in lower or upper case, bare or with `:`, `-` or ` ` between bytes; and
+/// clamped): the raw bytes; hex in lower or upper case, bare or with `:`, `-` or ` ` between
+/// bytes; and
 /// base64 in both alphabets at each of the three alignments a 3-byte group allows (a PKCS#8 PEM
 /// puts an Ed25519 seed at DER offset 16), keeping only the 42 characters that depend on the
 /// key alone, searched in the data with line breaks removed (a PEM wraps at 64) and the
@@ -173,7 +174,8 @@ pub fn run(demo: *Demo) !void {
 /// demo-b3's `run_job` with a 10-minute deadline: `zcube job run NAME --image TREE --relay
 /// botpike --deadline 10m <extra> --command python -c SOURCE NAME`.
 fn run_job(demo: *Demo, name: []const u8, extra: []const []const u8, source: []const u8) !void {
-    const args = try std.mem.concat(demo.arena(), []const u8, &.{ &.{ "--deadline", "10m" }, extra });
+    const deadline: []const []const u8 = &.{ "--deadline", "10m" };
+    const args = try std.mem.concat(demo.arena(), []const u8, &.{ deadline, extra });
     try b3.run_job(demo, name, args, source);
 }
 
@@ -431,7 +433,7 @@ fn orphan_row(demo: *Demo) !void {
     const logs = try demo.guest(0, "relay-logs {s}", .{job_orphan});
     demo.expect(std.mem.indexOf(u8, logs, "ZC-E0702") != null and
         std.mem.indexOf(u8, logs, "the job's command was killed") != null, "the orphan's own " ++
-        "relay.log says why: ZC-E0702, the relay's listener stopped and the command was killed", .{});
+        "relay.log says why: ZC-E0702, the listener stopped and the command was killed", .{});
 }
 
 fn summary(demo: *Demo) !void {
@@ -458,7 +460,8 @@ const keys_search_check_python =
     \\
 ++ keys_search_python ++
     \\der = bytes.fromhex("302e020100300506032b657004220420") + k
-    \\pem = b"-----BEGIN PRIVATE KEY-----\n" + base64.b64encode(der) + b"\n-----END PRIVATE KEY-----\n"
+    \\e = b"-----\n"
+    \\pem = b"-----BEGIN PRIVATE KEY" + e + base64.b64encode(der) + b"\n-----END PRIVATE KEY" + e
     \\assert base64.b64encode(k)[:42] not in pem, "the seed sits off the 3-byte grid in a PEM"
     \\a = bytearray(hashlib.sha512(k).digest()[:32]); a[0] &= 248; a[31] = a[31] & 63 | 64
     \\b64 = base64.b64encode(b"x" * 99 + k + b"y" * 7)
