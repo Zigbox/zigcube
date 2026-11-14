@@ -17,6 +17,7 @@ in the order the supervisor gave. None was already an ancestor of `main`.
 | 7 | `claude/b6-slice2` | 1668b53 | 97bd1c0 |
 | 8 | `origin/main` (#247, #248) | ebfbac5 | 9806d67 |
 | 9 | `claude/b6-slice3` | 2120075 | 40a9729 |
+| 10 | `claude/b7-slice6-browser` | 05ed287 | af991b6 |
 
 Every merge commit's message lists its conflicts. The summary is below. Each conflict was resolved on
 its merits, and both behaviours were kept. A whole file was never taken from one side.
@@ -111,6 +112,21 @@ its merits, and both behaviours were kept. A whole file was never taken from one
      table rows were run against the merged rules with their own columns unchanged.
      `ci-changes-test.sh` passes 78 cases.
 
+10. **B7 slice 6, part 1 (the P-256 browser path).**
+   - **The server's CertificateVerify.** It moved into `sign_certificate_verify`, which signs
+     with Ed25519 or P-256 for the handshake's path. The bundle's `write.wipe()` before a failed
+     signer's alert is now in its Ed25519 branch, so that alert still goes in the clear.
+   - **The ClientHello parser.** It records B7 slice 4's `supported_groups` and slice 6's
+     `ecdsa_p256` scheme.
+   - **Tests.** Both sides' TLS server and server-config tests are kept. `load()` reads the trust
+     policy and checks `--tls-san`. `mtls_teeth_runner.zig` expects 41 teeth: the bundle's 39
+     plus slice 6's 2. `zig build mtls-teeth` counts 41.
+   - **The harnesses.** agent-smoke passes the agent's TLS flags, then `--trust-policy` when it
+     has one. The demo-b1 and demo-c1 fleets keep `spawn_in` (the state directory as cwd) and
+     pass slice 6's TLS arguments.
+   - **CI.** The bundle's twelve columns, plus slice 6's run-everything row for
+     `src/harness_tls.zig`. `ci-changes-test.sh` passes 79 cases.
+
 ## Diagnostic codes
 
 There is no collision.
@@ -118,6 +134,7 @@ There is no collision.
 - B4 registered ZC-E0706.
 - B5 uses Zigbox's ZBX-E0905 and ZBX-E0906 and adds no ZC- code.
 - B6 adds none. Slice 3 only rewords ZC-E0505.
+- B7 slice 6, part 1 adds none. It only adds to ZC-E0814's text, which now names the browser CA.
 - #615 only rewords ZC-E0806.
 
 No bound, limit or default was changed by the integration itself.
