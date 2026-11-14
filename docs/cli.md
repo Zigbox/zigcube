@@ -258,7 +258,7 @@ policy:
 
 ```
 hello: generation 2, 3 replicas
-rollout 1 -> 2 (apply): paused, started 3m ago
+rollout 1 → 2 (apply): paused, started 3m ago
   1 new ready, 0 old retired
   paused by user 1m ago; zcube rollout resume continues it
 policy: rolling, surge 1, unavailable 0, min ready 5s, deadline 600s, on failure rollback
@@ -270,6 +270,15 @@ d-7)`, or `hello: already paused, no change`. Without a rollout, or once it is c
 [--to GENERATION]` (slice 8) will apply one of the stored generations again as a new generation
 (users address versions by generation, owner 2026-11-05). The codes these relay, `ZC-E0125` to
 `E0129`, are in [api.md](api.md), "Rollouts and history".
+
+### Upgrading
+
+Upgrade `zcube-server` first, then the command line. A server from before C3 slice 11 does not
+serve these routes: it answers a read with `404` "the API serves nothing at ..." and a pause or
+resume with `400` naming the paths POST is accepted at, without `/v1/services`. The command line
+recognises both and says so as `ZC-E0101` (``zcube-server does not serve `zcube rollout
+pause`: it is older than this zcube``), with the fix "upgrade zcube-server first, then the command
+line", rather than relaying a refusal that reads as a mistake of the user's.
 
 ## explain
 
@@ -379,7 +388,7 @@ reads; with none it is `ZC-E0117`.
 ## Codes the command line raises
 
 `ZC-E0101` to `E0108` are documented in [api.md](api.md); the command line raises `E0101` (a service
-that does not exist), `E0102`, `E0103` and relays the rest from the server, as it relays the
+that does not exist, or a server too old to serve the command: "Upgrading" above), `E0102`, `E0103` and relays the rest from the server, as it relays the
 repair's `ZC-E0401` to `E0403` ([api.md](api.md)).
 
 | Code | Blame | Summary |

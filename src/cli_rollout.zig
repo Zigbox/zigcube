@@ -5,6 +5,7 @@
 //! (src/rollout_steer.zig). The text functions are pure, so each shape is a unit test.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const cli_args = @import("cli_args.zig");
 const cli_commands = @import("cli_commands.zig");
 const cli_data = @import("cli_data.zig");
@@ -39,11 +40,12 @@ pub fn rollout(
     const arena = env.arena;
     report.subject = .{ .kind = .service, .name = name };
     const base = try service_path(arena, name, "/rollout");
+    const command = try std.fmt.allocPrint(arena, "zcube rollout {s}", .{@tagName(action)});
     const reply = switch (action) {
-        .status => try client.get(base, report),
-        .pause, .@"resume" => try client.send("POST", try std.fmt.allocPrint(arena, "{s}/{s}", .{
+        .status => try ask(client, "GET", base, "", command, report),
+        .pause, .@"resume" => try ask(client, "POST", try std.fmt.allocPrint(arena, "{s}/{s}", .{
             base, @tagName(action),
-        }), try steer_body(env), report),
+        }), try steer_body(env), command, report),
     };
     if (options.output == .json) return emit_json(env, reply.body, report);
     const body = try cli_data.parse(arena, reply, report);
@@ -67,7 +69,8 @@ pub fn history(
 ) Error!void {
     const arena = env.arena;
     report.subject = .{ .kind = .service, .name = name };
-    const reply = try client.get(try service_path(arena, name, "/history"), report);
+    const path = try service_path(arena, name, "/history");
+    const reply = try ask(client, "GET", path, "", "zcube history", report);
     if (options.output == .json) return emit_json(env, reply.body, report);
     const body = try cli_data.parse(arena, reply, report);
     if (cli_data.number(body, "revision")) |revision| report.revision = revision;
@@ -76,6 +79,44 @@ pub fn history(
         error.Contract => return cli_data.contract(report, reply.request_id, "is not a history"),
     };
     try cli_commands.emit(env, .stdout, out, report);
+}
+
+/// One request whose refusal is relayed, unless it is the refusal of a server older than these
+/// routes (C3 slice 11): that is said as such, so an operator who upgraded the command first
+/// is told to upgrade the server (docs/cli.md, "Upgrading").
+fn ask(
+    client: *Client,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+    command: []const u8,
+    report: *Report,
+) Error!cli_http.Reply {
+    const reply = try client.attempt(method, path, body, report);
+    if (reply.status >= 200 and reply.status < 300) return reply;
+    if (!older_server(reply)) return client.fail(reply, report);
+    assert(report.diag.code == null);
+    report.diag.raise(.E0101);
+    report.diag.while_("asking zcube-server for {s} {s}", .{ method, path });
+    report.diag.cause("zcube-server does not serve `{s}`: it is older than this zcube", .{
+        command,
+    });
+    report.diag.fix(.{ .sentence = "upgrade zcube-server first, then the command line" });
+    return error.Failed;
+}
+
+/// The refusals a server from before C3 slice 11 gives these routes: a read is 404 "the API
+/// serves nothing at ...", and a POST under /v1/services is 400 naming the paths POST is
+/// accepted at, which then did not include /v1/services.
+pub fn older_server(reply: cli_http.Reply) bool {
+    const body = reply.body;
+    if (reply.status == 404) return std.mem.indexOf(u8, body, "the API serves nothing at") != null;
+    if (reply.status != 400) return false;
+    const where = "POST is accepted at /v1/apply";
+    const at = std.mem.indexOf(u8, body, where) orelse return false;
+    const rest = body[at..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse rest.len;
+    return std.mem.indexOf(u8, rest[0..end], "/v1/services") == null;
 }
 
 fn service_path(arena: Allocator, name: []const u8, suffix: []const u8) Error![]const u8 {
@@ -126,7 +167,7 @@ fn rollout_lines(arena: Allocator, w: *Writer, record: Value, now_ms: u64) TextE
     const started = cli_data.number(record, "started_at_ms") orelse return error.Contract;
     const deadline = cli_data.number(record, "deadline_at_ms") orelse return error.Contract;
     const reason = cli_data.text(record, "reason") orelse "apply";
-    w.print("rollout {d} -> {d} ({s}): {s}, started {s} ago\n", .{
+    w.print("rollout {d} → {d} ({s}): {s}, started {s} ago\n", .{
         from, to, reason, phase, try cli_view.age_text(arena, started, now_ms),
     }) catch return oom;
     w.print("  {d} new ready, {d} old retired", .{
@@ -177,7 +218,7 @@ fn seconds(arena: Allocator, ms: u64) TextError![]const u8 {
     return cli_view.seconds_text(arena, ms) catch error.OutOfMemory;
 }
 
-/// `hello: progressing -> paused (decision d-...)`, or `hello: already paused, no change`.
+/// `hello: progressing → paused (decision d-...)`, or `hello: already paused, no change`.
 pub fn steer_text(arena: Allocator, body: Value) TextError![]const u8 {
     const name = cli_data.text(body, "name") orelse return error.Contract;
     const action = cli_data.text(body, "action") orelse return error.Contract;
@@ -258,7 +299,7 @@ test "rollout status: none, progressing, paused by a user" {
     const text = try status_text(arena, running, 181_000);
     try testing.expect(std.mem.startsWith(u8, text,
         \\hello: generation 2, 3 replicas
-        \\rollout 1 -> 2 (apply): progressing, started 3m ago
+        \\rollout 1 → 2 (apply): progressing, started 3m ago
         \\  1 new ready, 0 old retired, deadline in 7m
         \\
     ));

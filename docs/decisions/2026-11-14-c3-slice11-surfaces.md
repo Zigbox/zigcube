@@ -62,7 +62,8 @@ cards. Rollback is slice 8's. It is built against the records of slices 5 and 6 
     `rollback` decisions; demo-c3 (slice 12) asserts both. `zcube rollout status <name>` is
     what shows a rollout until then. Recorded in `docs/demos/c3.md`, "Cuts".
 11. **A new `zcube` against a server before slice 11.** Such a server answers the new routes
-    with 404 ZC-E0101 "serves nothing", and refuses an apply body with `health` or `rollout`. The
-    CLI recognises the 404 on `rollout` and `history` and says the server does not serve the
-    command (ZC-E0101 with that cause; no new code). The order is in `docs/cli.md`: upgrade the
+    with 404 ZC-E0101 "serves nothing" (a read) or 400 ZC-E0104 naming the POST paths without
+    `/v1/services` (pause, resume), and refuses an apply body with `health` or `rollout`. The CLI
+    recognises both refusals on `rollout` and `history` (`cli_rollout.older_server`) and says the
+    server does not serve the command (ZC-E0101 with that cause; no new code). The order is in `docs/cli.md`: upgrade the
     server first.
