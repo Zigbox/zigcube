@@ -18,6 +18,7 @@ const assert = std.debug.assert;
 const net = std.Io.net;
 const agent_api = @import("agent_api.zig");
 const api_tls_client = @import("api_tls_client.zig");
+const api_tls_guard = @import("api_tls_guard.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 
@@ -38,6 +39,9 @@ pub const Client = struct {
     /// The API over TLS (docs/mtls.md): the CA pinned and the certificate presented, which the
     /// agent switches to its own `node.crt` once it has one. Null: plain HTTP.
     tls: ?*api_tls_client.Credentials = null,
+    /// Checks `tls`'s certificate before each connection (B7 slice 5): an expired one is not
+    /// presented (`--cert` takes its place, or the call fails with ZC-E0811).
+    guard: ?*api_tls_guard.Guard = null,
 
     /// Sends the request and returns the reply, whatever its status. `Unreachable` and `BadReply`
     /// leave a diagnostic in `diag`.
@@ -55,6 +59,9 @@ pub const Client = struct {
         }
         const io_ms = request.timeout_ms orelse client.io_timeout_ms;
         const end_ms = client.now_ms() + request.hold_ms + io_ms;
+        if (client.tls) |tls| if (client.guard) |guard| {
+            guard.check(tls, diag) catch return error.Unreachable;
+        };
         var stream = try client.connect(end_ms, diag);
         defer stream.close(client.io);
         if (client.tls) |tls| return client.call_tls(tls, arena, &stream, request, end_ms, diag);

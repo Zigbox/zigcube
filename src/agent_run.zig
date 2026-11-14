@@ -43,6 +43,7 @@ const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const agent_peer = @import("agent_peer.zig");
 const api_tls_client = @import("api_tls_client.zig");
+const api_tls_guard = @import("api_tls_guard.zig");
 const dir_images = @import("dir_images.zig");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_server_mod = @import("peer_server.zig");
@@ -94,6 +95,8 @@ const Shell = struct {
     peer_transport: remote_mod.client.Transport,
     /// The API's TLS client when `--ca` is given; it presents the new `node.crt` after a join.
     tls: ?*api_tls_client.Credentials = null,
+    /// The check of `tls`'s certificate before each connection; told how each renewal went.
+    guard: ?*api_tls_guard.Guard = null,
 
     /// Joins the cluster CA or renews the credential when it is due. A failure never stops the
     /// agent: it is shown once per streak and tried again after `peer_join_retry_ms`.
@@ -118,6 +121,7 @@ const Shell = struct {
         const had = shell.peer.credential != null;
         const arena = shell.arena.allocator();
         shell.peer.step(shell.peer_transport, arena, lease, now_ms, timeout_ms, &shell.diag) catch {
+            if (shell.guard) |guard| guard.renewal_failed(&shell.diag);
             if (!shell.peer.reported) {
                 shell.peer.reported = true;
                 shell.show("\n", &shell.diag, "zcube-agent: running on; it will try again\n");
@@ -125,6 +129,7 @@ const Shell = struct {
             shell.diag.reset();
             return;
         };
+        if (shell.guard) |guard| guard.renewed();
         if (shell.tls) |credentials| {
             // The CA of `--ca` issued it (the server is pinned to it), so it is presented; one
             // that is not usable keeps the certificate presented so far.
@@ -405,6 +410,9 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         return fail(io, &diag, config.verbose);
     http_transport.client.tls = tls;
     defer if (config.tls != null) credentials.deinit();
+    var file_fallback: api_tls_guard.FileFallback = undefined;
+    var guard = tls_guard(io, config, real.clock(), &file_fallback);
+    if (tls != null) http_transport.client.guard = &guard;
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     var peer_buffer: [64]u8 = undefined;
@@ -432,6 +440,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
         .tls = http_transport.client.tls,
+        .guard = http_transport.client.guard,
     };
     defer shell.arena.deinit();
     announce(io, config);
@@ -687,6 +696,22 @@ fn open_peer(io: std.Io, config: config_mod.Config, diag: *Diag) union(enum) {
             error.Failed => return .{ .exit = fail(io, diag, config.verbose) },
         };
     return .{ .opened = opened };
+}
+
+/// The check of the presented certificate before each connection (B7 slice 5), judged by `wall`.
+/// `--cert` and `--key`, if given, are read again from `file` when it is no longer valid.
+fn tls_guard(
+    io: std.Io,
+    config: config_mod.Config,
+    wall: @import("clock.zig").Clock,
+    file: *api_tls_guard.FileFallback,
+) api_tls_guard.Guard {
+    var guard: api_tls_guard.Guard = .{ .io = io, .wall = wall, .fallback = null, .silent = false };
+    const tls = config.tls orelse return guard;
+    const cert = tls.cert orelse return guard;
+    file.* = .{ .io = io, .cert = cert, .key = tls.key.?, .node = config.node };
+    guard.fallback = file.fallback();
+    return guard;
 }
 
 /// The API's TLS client (B7, docs/mtls.md): pins the CA of `--ca` and presents the node's own

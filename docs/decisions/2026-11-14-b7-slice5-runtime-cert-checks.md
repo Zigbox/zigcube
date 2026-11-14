@@ -30,10 +30,11 @@ a name added to `revoked` took effect only after a restart. Slice 5 closes both 
    replace with a simulated one.
 4. **Reloading `revoked`.**
    - The HTTP watchdog runs every `http_watchdog_ms` (500 ms). On each tick it compares the
-     file's inode, size and modification time with what it last saw. When they differ, it reads
-     the file and parses it into a scratch set.
+     file's inode, size and modification time with what it last saw. When they differ, it waits
+     for one more tick with them unchanged (so a file being written is not read half written),
+     then reads the file and parses it into a scratch set. An edit applies within two ticks.
    - **The file parses.** The new set replaces the old one, and the server logs one line,
-     `zcube-server: revoked reloaded (N names)`.
+     `zcube-server: the revoked file was reloaded: N revoked names`.
    - **The file does not parse, or cannot be read.** The old set stays and the server logs one
      line naming the problem. It does not log again until the file changes again.
    - **The file is absent.** The set becomes empty. This is what the server does at start, when
@@ -68,17 +69,23 @@ a name added to `revoked` took effect only after a restart. Slice 5 closes both 
    - **What counts as the last renewal error.** It is the cause of the agent's latest failed
      credential step: the peer join or renewal that issues `node.crt`. A successful renewal
      clears it.
-7. **Teeth.** Each check has a test-only switch that skips it (`fault_skip_*`). Each switch
-   has a teeth test that turns the switch on and asserts that the matching test then fails.
+   - **Once per certificate.** The 3/4 line and the `--cert` note are keyed on the presented
+     certificate's `not_after`, so a renewed certificate arms each again.
+7. **Teeth.** Each check has a test-only switch that skips it: `server_tls` `recheck_expiry`
+   and `recheck_revoked`, `server_revoked` `reload`, and `api_tls_guard` `check`. Each has a
+   teeth test (`zig build mtls-teeth`, now 30) that turns it on and asserts that the matching
+   check then misses.
 
 ## Where
 
-- `src/server_tls.zig`: the per-request check, and the lock around `caller`.
+- `src/server_tls.zig`: the per-request check (`recheck`), and the lock around `caller`;
+  `src/server_tls_test.zig` its tests.
 - `src/tls_server.zig`: the peer's `not_after` and `not_before`.
 - `src/server_http.zig`: the check before each request.
 - `src/server_revoked.zig`: the watch.
 - `src/server.zig`: its wiring.
-- `src/api_tls_client.zig`: the agent's check.
+- `src/api_tls_guard.zig`: the agent's check (`Guard`, and `FileFallback` for `--cert`);
+  `src/api_tls_guard_test.zig` its table tests.
 - `src/agent_http.zig`: where the agent calls the check, before each connection.
 - `src/agent_run.zig`: where the agent records the last renewal error.
 - `docs/mtls.md` and `docs/agent.md`.

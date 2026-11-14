@@ -185,9 +185,21 @@ So an agent that was down past its certificate's 7 days, or whose state director
 another node, does not offer a certificate the server would refuse. **Recovery:** on the server
 host run `zcube-server ca issue-node NAME --replace` (with the server's `--store` and
 `--state-dir`), copy `NAME.crt` and `NAME.key` to the node, and start the agent with them as
-`--cert` and `--key`. It joins again and the next renewal replaces `node.crt`. These checks run
-at start-up only: a `node.crt` that expires while the agent runs is renewed at half its life,
-long before.
+`--cert` and `--key`. It joins again and the next renewal replaces `node.crt`.
+
+While it runs, the agent renews `node.crt` at half its life and tries again on failure. It also
+checks the certificate it presents before each new API connection (B7 slice 5,
+`api_tls_guard.zig`), by the same window and minute of skew as above:
+
+- Once 3/4 of the certificate's life has passed, one stderr line names its expiry and the last
+  renewal error (`none` if the last step succeeded). A renewed certificate arms the line again.
+- Once the certificate is outside its window, it is no longer presented. If `--cert` and `--key`
+  were given, they are read again from their files and, if they pass the start-up checks now,
+  presented in its place until the next renewal, with one stderr note. Otherwise the call fails
+  with `ZC-E0811`, whose causes name the expiry, the last renewal error and why `--cert` was not
+  used; the agent's loop shows it once per streak and paces its retries as for a server it
+  cannot reach. Recovery is as above: issue the node a new certificate and give it to the agent
+  as `--cert` and `--key` (the files are read when needed, so a restart is not required).
 
 ## The chunk store, the peer server and `fetch` (C2 slice 6b)
 
