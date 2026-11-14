@@ -24,33 +24,50 @@ Node3's trace, true time:
 
 The second half is a real agent bug: one slow read held back a stop that the agent already
 knew. With a store that answers keepalives and times out that read again and again, the stop
-waits for as long as that goes on. #247 fixed the same problem for failures before the pass and
-inside its loop. This read, between the two, was left out.
+waits for as long as that goes on. #247 fixed the same problem for a failure inside the stages
+(a replica stage, the job pass's loop). Two other places had it too, and the review of this
+fix found them: the read of the reports, between the runs read and the loop, and every call of
+the step between the keepalive and the stages, `publish_store` (the image summary) and
+`Pass.load` (replicas, `/assigned/<node>/`, replica observed). A step that failed there
+returned before the job pass, so it never read the runs at all.
 
 ## Fix
 
-A failed read of the reports is kept (`Kept.stage`), as #247 keeps an earlier stage's failure:
-the pass has no reports and makes no write, and every subject goes through `stop_only` from the
-runs it read. The bounds do not change. Test: `a failed read of the runs' reports does not hold
-back a stop the runs already show (#142)` (`agent_jobs_test.zig`) fails the list once through
-`SwitchedStore.down_list_prefix` (test-only). It fails without the fix. Seed 2821617909 now
-passes, with the worst stop at 5,514 ms.
+Each of those failures is kept like a stage's (`Kept.stage`) when it is not the runtime's: the
+pass reads the runs, makes no write, and every subject goes through `stop_only` from the runs it
+read. After a failed loading nothing is loaded (`Pass.load` sets its fields after its last read),
+so no replica is reconciled and the subjects come from the listings and the start records alone.
+The bounds do not change.
 
-The f49041a line (`4242675264 145 4 --c1 --strong --profile=partitions ...`) has the same shape,
-but its next step failed on `assigned`, before the pass. That is #247's case: it fails on
-f49041a and passes on ebfbac5 without this change. Both lines are in `c1_regressions`.
+`Kept` keeps as the step's error, the one `why` shows, the first failure that stopped the
+stages: a runtime failure kept earlier no longer hides the server failure that cut the step
+short (it is described as a later failure instead).
+
+Tests (`agent_jobs_test.zig`, each fails with its half of the fix reverted): `a failed read of
+the runs' reports does not hold back a stop the runs already show (#142)`, `a failed read of the
+node's assignments does not hold back a run's stop (#142)` (the list of `/assigned/<node>/`
+fails) and `a failed write of the image summary does not hold back a run's stop (#142)`. The
+failures go through `SwitchedStore.down_list_prefix` and `down_write_prefix` (test-only). Seed
+2821617909 now passes.
+
+Both lines are in `c1_regressions`. The f49041a line (`4242675264 145 4 --c1 --strong
+--profile=partitions ...`) has the shape of the loading half: its next step failed on
+`assigned`. It is a record, not a guard: it passes on ebfbac5 too, where that failure still
+ended the step. #247 does not explain that (it covers failures inside the stages only); the
+world the line draws changed between f49041a and ebfbac5, and the run no longer meets the cut
+there. The unit test of the
+assignments read is the guard.
 
 ## Still open (for the supervisor)
 
 - If the read of `runs` itself keeps failing while keepalives succeed, the agent cannot know about
-  the stop. J6's fenced term assumes that renewals stop when reads do. This fix does not change
-  that, and no seed has shown it yet. Ways to close it, if wanted: renew only after the step's
-  `runs` read succeeds, or have the fence count a run of failed reads. Either one changes the
-  fence's behaviour, so it is for the owner to decide.
+  the stop, and J6 has no bound. The tooth `sim-c1-teeth-job_runs_unread` shows it, and
+  docs/decisions/2026-11-14-j6-runs-unread-gap.md sets out the two ways to close it for the
+  owner.
 - A step answers reads at its start's true time while its clock runs ahead (the coarseness noted
   above). That stretches the window between a stop committing and the next read by up to one
   step. It hides nothing in the safety direction, but it makes this class of failure easier to
   reach in the simulator than on a real host.
 
-Where: `src/agent_jobs.zig` (`pass`), `src/agent_jobs_test.zig`, `src/sim_world.zig`,
-`build.zig` (`c1_regressions`).
+Where: `src/agent.zig` (`reconcile`, `Pass.load`, `Kept`), `src/agent_jobs.zig` (`pass`),
+`src/agent_jobs_test.zig`, `src/sim_world.zig`, `build.zig` (`c1_regressions`).

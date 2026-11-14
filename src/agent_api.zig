@@ -429,6 +429,8 @@ const Call = struct {
             const run = records.read(records.JobRun, ctx.arena, kv, ctx.diag) catch
                 return propagate(ctx);
             if (!std.mem.eql(u8, run.id, entry.rec.replica)) continue;
+            // Test-only (`c1_teeth.job_runs_unread`): the whole read fails while a stop is asked.
+            if (c1_teeth.job_runs_unread and run.stop != null) return runs_unread(ctx);
             if (try call.job_ended(job, given.revision)) continue;
             const run_entry: controller.Entry(records.JobRun) = .{ .kv = kv, .rec = run };
             mine.append(ctx.arena, item_of(records.JobRun, run_entry)) catch
@@ -1116,6 +1118,15 @@ fn number_slot(numbers: *Numbers, name: []const u8) ?*?u64 {
 }
 
 // ---- Failures ----------------------------------------------------------------------------------
+
+/// Test-only (`c1_teeth.job_runs_unread`): the store did not answer the read of the runs.
+fn runs_unread(ctx: *const Context) Failure {
+    assert(c1_teeth.job_runs_unread);
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0201);
+    ctx.diag.cause("test-only: the read of a run whose stop is asked is cut", .{});
+    return error.Failed;
+}
 
 /// I2: the registration the agent wrote under is not the node's current one.
 fn tenure_ended(ctx: *const Context, node: []const u8) Failure {
