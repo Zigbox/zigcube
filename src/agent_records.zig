@@ -42,6 +42,10 @@ const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 
 pub const dir_containers = "containers/";
+/// Where `--runtime zigbox` keeps a container's directory (`zigbox_launch.dir_name`): the
+/// supervisor's relay files (`relay.pub`, `relay.crt`, `relay.log`) are there, not under
+/// `containers/` (B4 slice 4).
+pub const dir_zigbox = "zigbox/";
 pub const file_spec = "spec.json";
 pub const file_run = "run.json";
 pub const file_child = "child.pid";
@@ -127,9 +131,20 @@ pub fn path(
     container: []const u8,
     file: []const u8,
 ) []const u8 {
+    return path_in(buffer, dir_containers, container, file);
+}
+
+/// `path` under `dir`, one of `dir_containers` and `dir_zigbox`.
+pub fn path_in(
+    buffer: *[agent_state.name_bytes_max]u8,
+    dir: []const u8,
+    container: []const u8,
+    file: []const u8,
+) []const u8 {
     assert(runtime.name_problem(container) == null);
     assert(file.len > 0);
-    return std.fmt.bufPrint(buffer, "{s}{s}/{s}", .{ dir_containers, container, file }) catch
+    assert(dir.len <= dir_containers.len);
+    return std.fmt.bufPrint(buffer, "{s}{s}/{s}", .{ dir, container, file }) catch
         unreachable; // The comptime check above sizes the buffer for the longest file name.
 }
 

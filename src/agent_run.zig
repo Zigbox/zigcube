@@ -43,6 +43,7 @@ const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const agent_peer = @import("agent_peer.zig");
 const agent_relay_certs = @import("agent_relay_certs.zig");
+const agent_records = @import("agent_records.zig");
 const dir_images = @import("dir_images.zig");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_server_mod = @import("peer_server.zig");
@@ -50,6 +51,12 @@ const failures = @import("store_failures.zig");
 const store = @import("store.zig");
 
 const Diag = diag_mod.Diag;
+
+comptime {
+    // The certificate step finds `--runtime zigbox`'s relay files where its supervisor puts them.
+    const launch_dir = @import("zigbox_launch.zig").dir_name ++ "/";
+    std.debug.assert(std.mem.eql(u8, agent_records.dir_zigbox, launch_dir));
+}
 
 /// Set by the signal handler, read by the loop.
 var stop_requested: std.atomic.Value(bool) = .init(false);
@@ -474,7 +481,13 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .boot_id = boot_id,
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
-        .relay_certs = .{ .node = config.node },
+        .relay_certs = .{
+            .node = config.node,
+            .dir = if (config.runtime == .zigbox)
+                agent_records.dir_zigbox
+            else
+                agent_records.dir_containers,
+        },
     };
     defer shell.arena.deinit();
     announce(io, config);

@@ -1062,6 +1062,7 @@ test "a stop closes relayed connections at once; one left open past the bound is
         const labels = labels_of.one(name);
         var spec = spec_for(name, "b3:51aa9c03", &labels);
         spec.relay = "127.0.0.1:9";
+        spec.network = .loopback; // A relayed run has the loopback only (B4 slice 2).
         _ = try rt.start(&spec, &diag);
         try sim.inject(name, .slow_stop);
     }

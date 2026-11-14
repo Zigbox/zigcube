@@ -27,6 +27,7 @@ const pull_report = @import("pull_report.zig");
 const records = @import("records.zig");
 const relay_module = @import("relay.zig");
 const relay_tls = @import("relay_tls.zig");
+const relay_secure = @import("relay_secure.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -531,13 +532,26 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     };
     // The relay's threads connect upstream with `init.io`, after the start: the single-threaded
     // `io` above is for the namespace work only.
-    const relay_ctx: RelayContext = .{ .gpa = init.gpa, .io = init.io, .dir_path = dir_path };
+    const relay_ctx: RelayContext = .{
+        .gpa = init.gpa,
+        .io = init.io,
+        .dir_io = io,
+        .dir = dir,
+        .dir_path = dir_path,
+    };
     return supervise(io, dir, real.interface(), storage, &spec, arena_state.allocator(), relay_ctx);
 }
 
 /// What the job's relay needs that the start does not: memory, an `Io` for the upstream
-/// connections, and where `relay.log` goes.
-const RelayContext = struct { gpa: Allocator, io: std.Io, dir_path: []const u8 };
+/// connections and the run's key, and the container's directory (`dir`, opened with `dir_io`),
+/// where `relay.log`, `relay.pub` and the agent's `relay.crt` go.
+const RelayContext = struct {
+    gpa: Allocator,
+    io: std.Io,
+    dir_io: std.Io,
+    dir: Dir,
+    dir_path: []const u8,
+};
 
 fn supervise(
     io: std.Io,
@@ -604,9 +618,10 @@ fn open_relay(
     const taken = handle.session.take_listener() orelse
         return kill_unrelayed(ctx, handle, "the container gave no listener");
     const listener: std.os.linux.fd_t = @intCast(taken);
-    if (relay_refused(spec)) |cause| {
+    const plan = relay_plan(spec);
+    if (plan == .refused) {
         _ = std.os.linux.close(listener);
-        return kill_unrelayed(ctx, handle, cause);
+        return kill_unrelayed(ctx, handle, plan.refused);
     }
     const upstream = relay_module.Upstream.parse(spec.relay) orelse {
         _ = std.os.linux.close(listener);
@@ -625,6 +640,26 @@ fn open_relay(
         constants.relay_port,
         log_path,
     ) catch return kill_unrelayed(ctx, handle, "there was no memory for the relay");
+    if (plan == .tls) {
+        const labels = spec.labels;
+        const secured = relay_secure.secure(
+            ctx.io,
+            ctx.dir_io,
+            ctx.dir,
+            relay,
+            plan.tls,
+            labels,
+            spec.tree,
+        );
+        if (secured) |cause| {
+            relay.stop();
+            return kill_unrelayed(ctx, handle, cause);
+        }
+    }
+    // A run never outlives its relay (#228): if the relay's listener stops while the container
+    // lives, the relay kills the container's PID 1, which takes every process of its namespace.
+    assert(handle.pid > 1);
+    relay.command_pid = @intCast(handle.pid);
     relay.run() catch {
         relay.stop();
         return kill_unrelayed(ctx, handle, "the relay's thread could not start");
@@ -632,19 +667,25 @@ fn open_relay(
     return relay;
 }
 
-/// Why this supervisor will not serve the relay, or null. It speaks only B3's plain TCP to an
-/// upstream until B4 slice 4 brings TLS here, and a release build serves no plain upstream: a
-/// relay that names a TLS server, or that is not a Debug build's plain one, is refused rather
-/// than connected in plaintext without the run's identity (fail closed, #228).
-fn relay_refused(spec: *const launch.Spec) ?[]const u8 {
+/// How this supervisor serves a job's relay: over TLS to the server its relay entry names, with
+/// the run's own key and certificate (B4); over plain TCP only in a Debug build that asked for
+/// the test-only plain upstream; else not at all, and why (fail closed, #228: a relay is never
+/// connected in plaintext without the run's identity).
+const RelayPlan = union(enum) { tls: relay_tls.Tls, plain, refused: []const u8 };
+
+fn relay_plan(spec: *const launch.Spec) RelayPlan {
     assert(spec.relay.len > 0);
     if (spec.relay_server_name.len > 0) {
-        return "the zigbox runtime does not speak TLS to a relay's upstream yet (B4 slice 4)";
+        const tls = relay_tls.tls_of(spec.relay_server_name, spec.relay_server_anchor) orelse
+            return .{ .refused = "the relay's upstream CA is not 64 hex digits" };
+        return .{ .tls = tls };
     }
-    if (!spec.relay_plain) return "the relay names no upstream server name and CA " ++
-        "(a job submitted before B4: submit it again)";
-    if (!relay_tls.plain_allowed) return "a release build serves no plain-TCP relay upstream";
-    return null;
+    if (!spec.relay_plain) return .{ .refused = "the relay names no upstream server name and " ++
+        "CA (a job submitted before B4: submit it again)" };
+    if (!relay_tls.plain_allowed) {
+        return .{ .refused = "a release build serves no plain-TCP relay upstream" };
+    }
+    return .plain;
 }
 
 fn relay_log_path(buffer: *[std.fs.max_path_bytes:0]u8, ctx: RelayContext) ?[:0]const u8 {
@@ -776,11 +817,12 @@ test "a job with a relay gets no network, one listener on the relay port and ZCU
     try std.testing.expectEqualStrings(constants.relay_env_name, relayed.env_names[1]);
 }
 
-test "relay plain: the zigbox supervisor refuses a TLS relay and a release build's plain one" {
+test "relay plain: the zigbox supervisor serves TLS, and plain only in a Debug build" {
     // #228. `demo-b3-build` also runs this test in ReleaseSafe, where the plain one is refused.
-    // Goal: fail closed until B4 slice 4 brings TLS here. Method: a relay naming a server name is
-    // refused (never connected in plaintext), so is one that is neither TLS nor plain, and a
-    // plain one only in a build that admits plain upstreams.
+    // Goal: a relay is never connected in plaintext without the run's identity. Method: a relay
+    // naming a server name and a CA is TLS; one whose CA is not 64 hex digits is refused, so is
+    // one that is neither TLS nor plain, and a plain one is served only in a build that admits
+    // plain upstreams. The server name wins over `plain`: TLS is never downgraded.
     var spec: launch.Spec = .{
         .name = "job-1",
         .tree = "b3:aa",
@@ -791,13 +833,20 @@ test "relay plain: the zigbox supervisor refuses a TLS relay and a release build
         .relay = "botpike:443",
         .launched = 1,
     };
-    try std.testing.expect(relay_refused(&spec) != null);
+    try std.testing.expect(relay_plan(&spec) == .refused);
     spec.relay_server_name = "broker.botpike.test";
     spec.relay_plain = true;
-    const tls = relay_refused(&spec).?;
-    try std.testing.expect(std.mem.indexOf(u8, tls, "TLS") != null);
+    try std.testing.expect(relay_plan(&spec) == .refused); // No CA.
+    var anchor: [64]u8 = @splat('a');
+    spec.relay_server_anchor = &anchor;
+    const tls = relay_plan(&spec);
+    try std.testing.expectEqualStrings("broker.botpike.test", tls.tls.server_name);
+    try std.testing.expectEqual(@as(u8, 0xaa), tls.tls.anchor[31]);
+    anchor[63] = 'z';
+    try std.testing.expect(relay_plan(&spec) == .refused);
     spec.relay_server_name = "";
-    try std.testing.expectEqual(relay_tls.plain_allowed, relay_refused(&spec) == null);
+    spec.relay_server_anchor = "";
+    try std.testing.expectEqual(relay_tls.plain_allowed, relay_plan(&spec) == .plain);
 }
 
 test "a relay that cannot be served is written to relay.log after what is there (ZC-E0702)" {

@@ -27,9 +27,8 @@ const backoff = @import("fetch_backoff.zig");
 const relay_module = @import("relay.zig");
 const Relay = relay_module.Relay;
 const relay_tls = @import("relay_tls.zig");
-const secure_random = @import("secure_random.zig");
+const relay_secure = @import("relay_secure.zig");
 const runtime = @import("runtime.zig");
-const job_cert = @import("job_cert.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -349,7 +348,9 @@ fn open_relay(
         });
     };
     if (tls) |upstream_tls| {
-        if (secure_relay(init, dir, relay, upstream_tls, spec)) |cause| {
+        const labels = spec.labels;
+        const io = init.io;
+        if (relay_secure.secure(io, io, dir, relay, upstream_tls, labels, spec.image)) |cause| {
             relay.stop();
             return relay_failed(cause);
         }
@@ -368,53 +369,6 @@ fn open_relay(
         return relay_failed("relay.port could not be written");
     };
     return .{ .opened = relay };
-}
-
-/// Makes the run's key, gives it to the relay and writes its public half to `relay.pub` for the
-/// agent, which asks the server for the certificate. The key itself never leaves this process.
-fn secure_relay(
-    init: std.process.Init,
-    dir: Dir,
-    relay: *Relay,
-    tls: relay_tls.Tls,
-    spec: *const files.SpecFile,
-) ?[]const u8 {
-    const job = label_of(spec, runtime.label_job) orelse return "the run has no job label";
-    const created = label_of(spec, runtime.label_created) orelse
-        return "the run has no placement epoch label";
-    const epoch = std.fmt.parseInt(u64, created, 10) catch
-        return "the run's placement epoch label is not a number";
-    if (epoch == 0) return "the run's placement epoch label is 0";
-    if (job.len == 0 or job.len > constants.service_name_bytes_max) {
-        return "the run's job label is not a job name";
-    }
-    const digest = job_cert.image_digest(spec.image) orelse
-        return "the run's image is not pinned by digest (b3:<64 hex digits>)";
-    var seed = secure_random.random_seed(init.io) catch
-        return "no randomness for the run's key";
-    defer std.crypto.secureZero(u8, &seed);
-    var key = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch
-        return "the run's key could not be made";
-    // `secure` keeps its own copy; this one is not left on the stack.
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&key.secret_key));
-    relay.secure(tls, key, dir.handle) catch return "there was no memory for the run's key";
-    const request: relay_tls.Request = .{
-        .key = key.public_key.toBytes(),
-        .epoch = epoch,
-        .image_digest = digest,
-        .job = job,
-    };
-    var text: [relay_tls.Request.bytes_max]u8 = undefined;
-    files.write_atomic(init.io, dir, files.file_relay_public, request.format(&text)) catch
-        return "relay.pub could not be written";
-    return null;
-}
-
-fn label_of(spec: *const files.SpecFile, key: []const u8) ?[]const u8 {
-    for (spec.labels) |pair| {
-        if (std.mem.eql(u8, pair[0], key)) return pair[1];
-    }
-    return null;
 }
 
 fn relay_failed(cause: []const u8) RelayOpening {
