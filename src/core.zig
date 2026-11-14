@@ -87,6 +87,7 @@ pub const modules = .{
     @import("x509.zig"),
     @import("x509_der.zig"),
     @import("x509_identity.zig"),
+    @import("x509_p256.zig"),
     @import("why.zig"),
     @import("writers.zig"),
 };
@@ -154,6 +155,7 @@ test "the X.509 tests are in this root" {
     // import their tests; they use no file, clock or environment.
     _ = @import("x509_test.zig");
     _ = @import("x509_foreign_test.zig");
+    _ = @import("x509_p256_test.zig");
 }
 
 test "the TLS key schedule and record layer tests are in this root" {
