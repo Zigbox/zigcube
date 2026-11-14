@@ -15,7 +15,7 @@ in the order the supervisor gave. None was already an ancestor of `main`.
 | 5 | `claude/fix-server-ca-615` | 3fb60cf | df9ec8b |
 | 6 | `claude/b5-slice4` | 7c44b31 | f7575fd |
 | 7 | `claude/b6-slice2` | 1668b53 | 97bd1c0 |
-| 8 | `origin/main` (#247, #248) | ebfbac5 | the merge after d8bb53c |
+| 8 | `origin/main` (#247, #248) | ebfbac5 | 9806d67 |
 
 Every merge commit's message lists its conflicts. The summary is below. Each conflict was resolved on
 its merits, and both behaviours were kept. A whole file was never taken from one side.
@@ -87,6 +87,17 @@ its merits, and both behaviours were kept. A whole file was never taken from one
      main's `add_also_seeds`. It installs 32 fault-on runners.
    - **AGENTS.md.** sim-c1 has 27 named teeth, with main's text on `job_pass_break` and seed 225
      of `sim-c1-worlds`.
+8. **Two tests that held only in a Debug build.** In the bundle, B5's `server_config.zig` reaches
+   `x509_test.zig`, so `demo-b5-build`'s test binary, which is ReleaseSafe, now also runs the
+   B4 and B7 tests it imports. Two of them failed there and passed in `zig build test` (Debug).
+   Neither fails on its source branch, where that binary does not reach them.
+   - **`x509_near_miss`, "serial negative"** (from `main`, #170). The row pointed the certificate
+     at an array on its own stack frame, which ReleaseSafe reuses: the parser saw garbage
+     (`Malformed`, not `BadSerial`). The serial is now built in the scratch, as its neighbours
+     are.
+   - **`server_config`, "relays are a table"** (B4 slice 2). Its good table had a `.plain`
+     relay, which only a Debug build accepts (`relay_plain_allowed`). That relay is now in the
+     table only where it is allowed.
 
 ## Diagnostic codes
 

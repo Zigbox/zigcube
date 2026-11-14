@@ -173,10 +173,11 @@ fn no_version(parts: *Parts, _: *Scratch) void {
 fn version_four(parts: *Parts, _: *Scratch) void {
     parts.tbs[0] = &.{ 0xA0, 0x03, 0x02, 0x01, 0x03 };
 }
-fn serial_negative(parts: *Parts, _: *Scratch) void {
-    var serial: [18]u8 = @splat(0x11);
-    serial[0..3].* = .{ 0x02, 0x10, 0x80 };
-    parts.tbs[1] = &serial;
+fn serial_negative(parts: *Parts, scratch: *Scratch) void {
+    // In the scratch, not on this frame's stack: a ReleaseSafe build reuses the frame.
+    var content: [16]u8 = @splat(0x11);
+    content[0] = 0x80;
+    parts.tbs[1] = scratch.tlv(der.tag_integer, &content);
 }
 fn serial_empty(parts: *Parts, _: *Scratch) void {
     parts.tbs[1] = &.{ 0x02, 0x00 };

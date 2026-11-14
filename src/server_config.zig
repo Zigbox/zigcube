@@ -1094,17 +1094,21 @@ test "relays are a table of names and addresses; every malformed entry is ZC-E01
     const arena = arena_state.allocator();
     var diag: Diag = undefined;
     diag.reset();
+    // A release build (demo-b5-build's tests run ReleaseSafe) refuses `.plain`: the second relay
+    // is there only where it may be.
+    const plain_entry = if (relay_plain_allowed) ", .b2 = .{ .address = \"127.0.0.1:9\"," ++
+        " .plain = true }" else "";
     const good = ".{ .cluster = \"prod.example\", .relays = .{ .botpike = .{" ++
         " .address = \"broker.botpike.com:8443\", .server_name = \"broker.botpike.com\"," ++
-        " .server_ca = \"ca.pem\" }, .b2 = .{ .address = \"127.0.0.1:9\", .plain = true } } }";
+        " .server_ca = \"ca.pem\" }" ++ plain_entry ++ " } }";
     const file = try parse_zon(arena, good, "server.zon", &diag);
     const config = try merge(.{}, file, &diag);
-    try testing.expectEqual(@as(usize, 2), config.relays.len);
+    try testing.expectEqual(@as(usize, if (relay_plain_allowed) 2 else 1), config.relays.len);
     try testing.expectEqualStrings("botpike", config.relays[0].name);
     try testing.expectEqualStrings("broker.botpike.com:8443", config.relays[0].address);
     try testing.expectEqualStrings("broker.botpike.com", config.relays[0].server_name);
     try testing.expectEqualStrings("ca.pem", file.relay_cas[0]);
-    try testing.expect(config.relays[1].plain);
+    if (relay_plain_allowed) try testing.expect(config.relays[1].plain);
     try testing.expectEqualStrings("prod.example", config.cluster);
     const none = try merge(.{}, try parse_zon(arena, ".{}", "server.zon", &diag), &diag);
     try testing.expectEqual(@as(usize, 0), none.relays.len);
