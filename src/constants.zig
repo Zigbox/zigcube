@@ -1133,6 +1133,18 @@ pub const openpgp_signature_bytes_max: u32 = 1024;
 pub const armor_line_bytes: u32 = 64;
 /// `SOURCE_DATE_EPOCH` for every package: 1980-01-01, the same instant as Zigbox's.
 pub const package_source_date_epoch: u64 = 315_532_800;
+/// The apt `Release` of a signed release carries `Date` = the signing time and `Valid-Until` =
+/// `Date` plus this: a client refuses metadata after it, so a replayed or frozen `InRelease` is
+/// detected. Zigcube's refresh re-signs its suite weekly, as Zigbox's does (Zigbox's value).
+pub const apt_valid_seconds: u64 = 21 * 24 * 60 * 60;
+/// A signing time outside these (2020-01-01 to 2100-01-01, UTC) is a mistaken argument.
+pub const apt_signed_at_min: u64 = 1_577_836_800;
+pub const apt_signed_at_max: u64 = 4_102_444_800;
+
+comptime {
+    assert(apt_signed_at_min > package_source_date_epoch);
+    assert(apt_signed_at_max + apt_valid_seconds < (1 << 40));
+}
 /// The `Maintainer` of the Zigcube packages.
 pub const package_maintainer = "Zigbox project <packages@zigbox.org>";
 /// The user id of the fixed test key (the package writer's own signer; vouches for nothing).

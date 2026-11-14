@@ -410,7 +410,7 @@ fn dependency_tags(h: *Header, memory: Allocator, package: *const model.Package)
     const conflict_tags = [3]u32{ tag.conflict_name, tag.conflict_flags, tag.conflict_version };
     try relation_tags(h, memory, conflict_tags, package.conflicts);
     const obsolete_tags = [3]u32{ tag.obsolete_name, tag.obsolete_flags, tag.obsolete_version };
-    try relation_tags(h, memory, obsolete_tags, package.replaces);
+    try relation_tags(h, memory, obsolete_tags, package.obsoletes);
     const weak = package.recommends_rpm;
     if (weak.len == 0) return;
     const weak_senses = try memory.alloc(u32, weak.len);

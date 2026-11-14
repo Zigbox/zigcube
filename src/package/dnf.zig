@@ -167,7 +167,7 @@ fn package_xml(
     try provides_xml(memory, writer, package);
     try relations_xml(writer, "requires", package.depends_rpm);
     try relations_xml(writer, "conflicts", package.conflicts);
-    try relations_xml(writer, "obsoletes", package.replaces);
+    try relations_xml(writer, "obsoletes", package.obsoletes);
     if (package.recommends_rpm.len > 0) {
         try put(writer, "    <rpm:recommends>\n");
         for (package.recommends_rpm) |name| {
@@ -262,7 +262,11 @@ pub fn write(
     memory: Allocator,
     architecture: model.Architecture,
     built: []const model.Built,
+    signed_at: ?u64,
 ) Error![]model.TreeFile {
+    // The revision and timestamps are the signing time of a signed release, so a mirror or cache
+    // can tell a newer repomd.xml from an older one; with none, the fixed build epoch.
+    const stamp = signed_at orelse constants.package_source_date_epoch;
     if (built.len == 0 or built.len > constants.repo_packages_max) return error.TooManyFiles;
     const sorted = try memory.dupe(model.Built, built);
     std.mem.sort(model.Built, sorted, {}, built_less);
@@ -274,7 +278,7 @@ pub fn write(
     try print(
         &repomd.writer,
         "  <revision>{d}</revision>\n",
-        .{constants.package_source_date_epoch},
+        .{stamp},
     );
     for (sorted) |item| {
         assert(item.package.architecture == architecture);
@@ -304,7 +308,7 @@ pub fn write(
         try print(
             &repomd.writer,
             "    <timestamp>{d}</timestamp>\n",
-            .{constants.package_source_date_epoch},
+            .{stamp},
         );
         try print(
             &repomd.writer,
@@ -329,7 +333,7 @@ test "the tree has the rpm, three checksum-named metadata files and repomd.xml" 
     const sample = &@import("deb.zig").sample;
     const bytes = try rpm.write(memory, sample, .{});
     const built = [_]model.Built{.{ .package = sample, .bytes = bytes }};
-    const files = try write(memory, .x86_64, &built);
+    const files = try write(memory, .x86_64, &built, null);
     try std.testing.expectEqual(@as(usize, 5), files.len);
     try std.testing.expectEqualStrings("sample-1.2.3-1.x86_64.rpm", files[0].path);
     const repomd = files[4].bytes;
@@ -338,4 +342,20 @@ test "the tree has the rpm, three checksum-named metadata files and repomd.xml" 
         try std.testing.expect(std.mem.indexOf(u8, repomd, sum) != null);
         try std.testing.expect(std.mem.indexOf(u8, file.path, sum) != null);
     }
+}
+
+test "repomd.xml's revision and timestamps are the signing time, else the build epoch" {
+    // Goal: a signed tree's repomd.xml says when it was signed; an unsigned one stays reproducible.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    const sample = &@import("deb.zig").sample;
+    const bytes = try rpm.write(memory, sample, .{});
+    const built = [_]model.Built{.{ .package = sample, .bytes = bytes }};
+    const signed = (try write(memory, .x86_64, &built, 1_800_000_000))[4].bytes;
+    try std.testing.expect(std.mem.indexOf(u8, signed, "<revision>1800000000</revision>") != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, signed, ">1800000000</timestamp>"));
+    const plain = (try write(memory, .x86_64, &built, null))[4].bytes;
+    try std.testing.expect(std.mem.indexOf(u8, plain, "<revision>315532800</revision>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "1800000000") == null);
 }

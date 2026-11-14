@@ -46,7 +46,7 @@ pub const File = struct {
 /// How a relation compares versions. `any` names the package with no version.
 pub const Sense = enum { any, ge, eq };
 
-/// One entry of `Depends`, `Conflicts`, `Replaces` (rpm: `Obsoletes`) or `Provides`.
+/// One entry of `Depends`, `Conflicts`, `Replaces`, `Obsoletes` or `Provides`.
 pub const Relation = struct {
     name: []const u8,
     sense: Sense = .any,
@@ -71,9 +71,15 @@ pub const Package = struct {
     /// `Depends` for each format; names and versions differ (`libpq5`, `libpq`).
     depends_deb: []const Relation = &.{},
     depends_rpm: []const Relation = &.{},
-    /// Packages this one cannot be installed beside, and the ones it replaces (rpm: Obsoletes).
+    /// Packages this one cannot be installed beside (both formats).
     conflicts: []const Relation = &.{},
+    /// deb only: packages whose files this one may overwrite. dpkg's swap of two conflicting
+    /// flavours needs it; rpm has no such field.
     replaces: []const Relation = &.{},
+    /// rpm only: a real rename. dnf installs an obsoleting package in place of the obsoleted one
+    /// even when asked for the other by name, so two flavours never obsolete each other (that is
+    /// `dnf swap`'s job). Each entry carries a version (`check` refuses one without).
+    obsoletes: []const Relation = &.{},
     /// Virtual names this package stands for besides its own.
     provides: []const Relation = &.{},
     /// A package with no files is a metapackage: only its dependencies.
@@ -100,6 +106,9 @@ pub const Error = error{
     OutOfMemory,
     /// The writer ran out of room or hit a bound the caller's data should not reach.
     WriteFailed,
+    /// A `Release` file lacks the `Date` line a re-date replaces, or a signing time is outside
+    /// `constants.apt_signed_at_min` to `apt_signed_at_max`.
+    BadRelease,
 };
 
 /// One line saying what a package problem is, for the build tool to print after `package: `.
@@ -116,10 +125,11 @@ pub fn describe(err: Error) []const u8 {
         error.FileTooLarge => "a file is larger than the bound allows",
         error.PayloadTooLarge => "the files together are larger than the bound allows",
         error.TooManyRecommends => "the package names more weak dependencies than the bound allows",
-        error.BadRelation => "a dependency, conflict, replace or provide names a bad package or " ++
+        error.BadRelation => "a dependency, conflict, replace, obsolete or provide names a bad package or " ++
             "version, or the package lists more than the bound allows",
         error.OutOfMemory => "out of memory",
         error.WriteFailed => "an output buffer could not grow",
+        error.BadRelease => "a Release file has no Date line, or the signing time is out of range",
     };
 }
 
@@ -212,6 +222,10 @@ pub fn validate(package: *const Package) Error!void {
     try check_relations(package.depends_rpm);
     try check_relations(package.conflicts);
     try check_relations(package.replaces);
+    try check_relations(package.obsoletes);
+    for (package.obsoletes) |relation| {
+        if (relation.sense == .any) return error.BadName; // An unversioned Obsoletes is for ever.
+    }
     try check_relations(package.provides);
     if (package.files.len > constants.package_files_max / 2) return error.TooManyFiles;
     var payload_bytes: u64 = 0;

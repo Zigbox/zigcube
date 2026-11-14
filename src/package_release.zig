@@ -73,7 +73,20 @@ pub const Options = struct {
     signatures: Signatures = .{},
     /// Sign everything with the fixed test key instead (CI; the key vouches for nothing).
     test_key: bool = false,
+    /// The signing time (Unix seconds): the apt `Release` gets this `Date` and a `Valid-Until`
+    /// 21 days later, and repomd.xml this revision. Null (the test key, round one) keeps the
+    /// fixed build date and no `Valid-Until`.
+    signed_at: ?u64 = null,
+    /// One architecture only (CI builds the host's; a runner cannot build the other's server).
+    /// Null, both: a release always builds both.
+    only: ?model.Architecture = null,
 };
+
+/// Whether the architecture at `index` is built under `only`.
+pub fn included(only: ?model.Architecture, index: usize) bool {
+    const architecture = only orelse return true;
+    return architectures[index] == architecture;
+}
 
 pub const apt_release_path = "apt/dists/" ++ apt.suite ++ "/Release";
 pub const apt_in_release_path = "apt/dists/" ++ apt.suite ++ "/InRelease";
@@ -234,7 +247,9 @@ fn describe_relations(
             try depends.append(memory, relation(library, .any, ""));
             const other = if (sqlite) server_names[1] else server_names[0];
             result.conflicts = try memory.dupe(model.Relation, &.{other});
-            result.replaces = result.conflicts;
+            // deb: Replaces lets dpkg swap the flavours. rpm: Conflicts alone; an Obsoletes
+            // here made dnf install the other flavour when asked for this one (`dnf swap`).
+            if (flavor == .deb) result.replaces = result.conflicts;
             result.provides = try memory.dupe(model.Relation, &.{.{ .name = "zigcube-server" }});
         },
         .agent => {
@@ -328,6 +343,7 @@ pub fn build(memory: Allocator, inputs: *const Inputs, options: Options) Error![
     var debs: std.ArrayList(model.Built) = .empty;
     const key = openpgp.test_key();
     for (architectures, 0..) |architecture, index| {
+        if (!included(options.only, index)) continue;
         var rpms: std.ArrayList(model.Built) = .empty;
         for (kinds) |kind| {
             const deb_package = try describe(memory, inputs, kind, index, .deb);
@@ -351,9 +367,10 @@ pub fn build(memory: Allocator, inputs: *const Inputs, options: Options) Error![
             "rpm/" ++ rpm_directory ++ "/{s}/",
             .{architecture.rpm_name()},
         );
-        try add_tree(memory, &files, prefix, try dnf.write(memory, architecture, rpms.items));
+        const tree = try dnf.write(memory, architecture, rpms.items, options.signed_at);
+        try add_tree(memory, &files, prefix, tree);
     }
-    try add_tree(memory, &files, "apt/", try apt.write(memory, debs.items));
+    try add_tree(memory, &files, "apt/", try apt.write(memory, debs.items, options.signed_at));
     try add_signatures(memory, &files, options);
     return files.items;
 }
@@ -383,6 +400,7 @@ fn add_signatures(
         }
     }
     for (0..architectures.len) |index| {
+        if (!included(options.only, index)) continue;
         const path = try repomd_path(memory, index);
         const signature_path = try std.fmt.allocPrint(memory, "{s}.asc", .{path});
         if (options.test_key) {
@@ -398,10 +416,11 @@ fn add_signatures(
 /// How far along the two rounds of signing a build is, for the commands the tool prints next.
 pub const Round = enum { trees, done };
 
-pub fn round_of(files: []const model.TreeFile) Round {
+pub fn round_of(files: []const model.TreeFile, only: ?model.Architecture) Round {
     if (find(files, apt_in_release_path) == null) return .trees;
     if (find(files, apt_release_gpg_path) == null) return .trees;
     for (0..architectures.len) |index| {
+        if (!included(only, index)) continue;
         var buffer: [128]u8 = undefined;
         const format = "rpm/" ++ rpm_directory ++ "/{s}/repodata/repomd.xml.asc";
         const path = std.fmt.bufPrint(&buffer, format, .{
@@ -452,8 +471,53 @@ test "build gives the same bytes twice and names the files of both architectures
         "apt/dists/zigcube/Release",
     };
     for (wanted) |path| try std.testing.expect(find(first, path) != null);
-    try std.testing.expectEqual(Round.done, round_of(first));
+    try std.testing.expectEqual(Round.done, round_of(first, null));
     const unsigned = try build(memory, &sample_inputs, .{});
-    try std.testing.expectEqual(Round.trees, round_of(unsigned));
+    try std.testing.expectEqual(Round.trees, round_of(unsigned, null));
     try std.testing.expect(find(unsigned, apt_in_release_path) == null);
+}
+
+test "the server flavours conflict on both formats; only deb replaces, and no rpm obsoletes" {
+    // Goal: dnf installs the flavour asked for by name. An rpm Obsoletes between the flavours
+    // made `dnf install zigcube-server-sqlite` install the Postgres one (review of slice 1).
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    for ([_]Kind{ .server_sqlite, .server_postgres }) |kind| {
+        const other = if (kind == .server_sqlite) "zigcube-server-postgres" else "zigcube-server-sqlite";
+        const deb_package = try describe(memory, &sample_inputs, kind, 0, .deb);
+        const rpm_package = try describe(memory, &sample_inputs, kind, 0, .rpm);
+        try std.testing.expectEqualStrings(other, deb_package.conflicts[0].name);
+        try std.testing.expectEqualStrings(other, deb_package.replaces[0].name);
+        try std.testing.expectEqualStrings(other, rpm_package.conflicts[0].name);
+        try std.testing.expectEqual(@as(usize, 0), rpm_package.replaces.len);
+        try std.testing.expectEqual(@as(usize, 0), rpm_package.obsoletes.len);
+        const bytes = try rpm.write(memory, rpm_package, .{});
+        const parts = rpm.split(bytes).?;
+        try std.testing.expect(std.mem.indexOf(u8, parts.main_header, other) != null);
+    }
+    for (kinds) |kind| {
+        const rpm_package = try describe(memory, &sample_inputs, kind, 1, .rpm);
+        try std.testing.expectEqual(@as(usize, 0), rpm_package.obsoletes.len);
+    }
+}
+
+test "one architecture builds only its packages, trees and signatures" {
+    // Goal: the CI subset leaves the other architecture out entirely, and is done when signed.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    var inputs = sample_inputs;
+    inputs.zcube[1] = "";
+    inputs.agent[1] = "";
+    const files = try build(memory, &inputs, .{ .test_key = true, .only = .x86_64 });
+    for (files) |file| {
+        try std.testing.expect(std.mem.indexOf(u8, file.path, "aarch64") == null);
+        try std.testing.expect(std.mem.indexOf(u8, file.path, "arm64") == null);
+    }
+    try std.testing.expect(find(files, "rpm/zigcube/x86_64/repodata/repomd.xml.asc") != null);
+    try std.testing.expectEqual(Round.done, round_of(files, .x86_64));
+    try std.testing.expectEqual(Round.trees, round_of(files, null));
+    const release_text = find(files, apt_release_path).?;
+    try std.testing.expect(std.mem.indexOf(u8, release_text, "Architectures: amd64\n") != null);
 }
