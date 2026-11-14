@@ -133,6 +133,10 @@ jobs:
       # agent restart, a server restart, an unknown digest). It cleans up what it starts.
       - name: Agent smoke (real processes)
         run: zig build agent-smoke --summary all
+      # Two agents, each with one of the relay's fail-closed checks removed: the fake runtime's
+      # tests must catch both (docs/agent.md, "The relay over TLS").
+      - name: Relay teeth (fail closed)
+        run: zig build relay-teeth --summary all
 
       # Not demo-c0: `zcube local up` and `down` on the installed executables, in a scratch
       # directory, with real containers. It cleans up what it starts.

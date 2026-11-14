@@ -9,16 +9,27 @@
 //!     .create_store = false, // true on the first start: a mistyped path is an error otherwise
 //!     // The upstreams a job's `relay` may name (docs/briefs/b3.md): at most `relays_max`. A job
 //!     // names one; it never gives an address.
-//!     .relays = .{ .botpike = .{ .address = "broker.botpike.com:8443" } },
+//!     // B4: the relay connects with TLS, as the run (a certificate the cluster CA signs for
+//!     // `spiffe://<cluster>/job/<name>`), and checks the upstream's name against `server_ca`.
+//!     // `.cluster` has no default: until it is set the certificate endpoint answers 404, and a
+//!     // TLS relay without it is ZC-E0106 (docs/decisions/2026-11-13-b4-cluster-setting.md).
+//!     .cluster = "prod.example",
+//!     .relays = .{ .botpike = .{
+//!         .address = "broker.botpike.com:8443",
+//!         .server_name = "broker.botpike.com",
+//!         .server_ca = "/etc/zcube/botpike-ca.pem",
+//!     } },
 //! }
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
+const x509 = @import("x509.zig");
+const x509_identity = @import("x509_identity.zig");
 const fencing = @import("fencing.zig");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
-const x509_identity = @import("x509_identity.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -39,7 +50,10 @@ pub const usage =
     \\       zcube-server --version | --help
     \\
     \\  --config FILE     a ZON file with .listen, .insecure_listen, .tls_name, .store,
-    \\                    .create_store and .relays (the upstreams a job's relay may name)
+    \\                    .create_store, .relays (the upstreams a job's relay may name) and
+    \\                    .cluster (the trust domain of a relayed run's certificate,
+    \\                    spiffe://<cluster>/job/<name>; required with any TLS relay, and
+    \\                    runs get no certificate until it is set)
     \\  --listen ADDR     where to serve the API over TLS, an IP address and a port (default
     \\                    127.0.0.1:7070 unless --insecure-listen is given). Every client
     \\                    presents a certificate of this server's CA: an agent its node's
@@ -110,6 +124,9 @@ pub const Config = struct {
     lost_grace_ms: u32 = constants.lost_grace_ms,
     /// The relays a job may name, in the file's order; none by default.
     relays: []const Relay = &.{},
+    /// The SPIFFE trust domain of a relayed run's certificate (`spiffe://<cluster>/job/<name>`,
+    /// B4). Required when a relay has an upstream to check; empty otherwise.
+    cluster: []const u8 = "",
 };
 
 pub const Command = union(enum) { run: Config, ca_issue: Issue, version, help };
@@ -144,7 +161,11 @@ const File = struct {
     lease_ttl_ms: ?u32 = null,
     lost_grace_ms: ?u32 = null,
     state_dir: ?[]const u8 = null,
+    cluster: ?[]const u8 = null,
     relays: []const Relay = &.{},
+    /// Each relay's `server_ca` path, index for index with `relays`; read by `read_file`, which
+    /// puts the key it names in the relay's `server_anchor`.
+    relay_cas: []const []const u8 = &.{},
 };
 
 /// What a ZON file may set apart from `relays`. Unknown fields are refused (`parse_zon` checks
@@ -158,6 +179,7 @@ const Fields = struct {
     lease_ttl_ms: ?u32 = null,
     lost_grace_ms: ?u32 = null,
     state_dir: ?[]const u8 = null,
+    cluster: ?[]const u8 = null,
 };
 
 /// The flags as typed, before they are merged over the file.
@@ -293,7 +315,27 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .lease_ttl_ms = try lease_ttl_of(flags.lease_ttl_ms orelse file.lease_ttl_ms, diag),
         .lost_grace_ms = try lost_grace_of(flags.lost_grace_ms orelse file.lost_grace_ms, diag),
         .relays = try relays_valid(file.relays, diag),
+        .cluster = try cluster_of(file.cluster, file.relays, diag),
     };
+}
+
+/// The trust domain, checked as a DNS name (ZC-E0106), and required when a relay checks its
+/// upstream: a relayed run's certificate names it.
+fn cluster_of(given: ?[]const u8, relays: []const Relay, diag: *Diag) Error![]const u8 {
+    const fix = "set .cluster = \"example.org\", the trust domain of relayed runs' certificates";
+    const cluster = given orelse "";
+    if (cluster.len == 0) {
+        for (relays) |relay| {
+            if (!relay.plain) {
+                return bad(diag, "relay {s} needs .cluster to be set", .{relay.name}, fix);
+            }
+        }
+        return "";
+    }
+    if (x509_identity.dns_problem(cluster, constants.x509_cluster_bytes_max)) {
+        return bad(diag, "the cluster {s} is not a DNS name of at most 63 bytes", .{cluster}, fix);
+    }
+    return cluster;
 }
 
 /// ZC-E0106 for a grace outside its range: at most `lost_grace_ms_max`.
@@ -402,7 +444,61 @@ fn read_file(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error!
         error.StreamTooLong => bad(diag, "{s} is larger than 16384 bytes", .{path}, "trim it"),
         else => bad(diag, "can't read {s}", .{path}, "check that the file exists and is readable"),
     };
-    return parse_zon(arena, source, path, diag);
+    var file = try parse_zon(arena, source, path, diag);
+    try read_anchors(arena, io, &file, diag);
+    return file;
+}
+
+/// Puts the Ed25519 key of each relay's `server_ca` certificate in its `server_anchor`, as 64 hex
+/// digits. A file that cannot be read, or is not one PEM certificate with an Ed25519 key, is
+/// ZC-E0106 naming the relay.
+fn read_anchors(arena: Allocator, io: std.Io, file: *File, diag: *Diag) Error!void {
+    assert(file.relay_cas.len == file.relays.len);
+    const relays = arena.dupe(Relay, file.relays) catch return error.OutOfMemory;
+    for (relays, file.relay_cas) |*relay, path| {
+        if (path.len == 0) continue;
+        const limit: std.Io.Limit = .limited(constants.config_bytes_max);
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, limit) catch
+            return bad(diag, "relay {s}: can't read the server_ca file {s}", .{
+                relay.name, path,
+            }, "check that the file exists and is readable");
+        const anchor = pem_anchor(text) orelse
+            return bad(diag, "relay {s}: {s} is not a PEM certificate with an Ed25519 key", .{
+                relay.name, path,
+            }, "give the PEM certificate of the CA that signs the upstream's certificate");
+        relay.server_anchor = std.fmt.allocPrint(arena, "{x}", .{&anchor}) catch
+            return error.OutOfMemory;
+    }
+    file.relays = relays;
+}
+
+/// The subject key of the first certificate in a PEM text, or null. Any line length and either
+/// line ending; the key must be Ed25519 (the certificate is parsed as a foreign one).
+pub fn pem_anchor(text: []const u8) ?[32]u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    const start = (std.mem.find(u8, text, begin) orelse return null) + begin.len;
+    const stop = start + (std.mem.find(u8, text[start..], end) orelse return null);
+    var base64: [constants.x509_cert_bytes_max * 2]u8 = undefined;
+    var length: usize = 0;
+    for (text[start..stop]) |byte| {
+        if (byte == '\n' or byte == '\r' or byte == ' ' or byte == '\t') continue;
+        if (length == base64.len) return null;
+        base64[length] = byte;
+        length += 1;
+    }
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(base64[0..length]) catch return null;
+    var der_bytes: [constants.x509_cert_bytes_max * 2]u8 = undefined;
+    if (size > der_bytes.len) return null;
+    decoder.decode(der_bytes[0..size], base64[0..length]) catch return null;
+    var detail: x509.Detail = .{};
+    // A CA of the upstream's own (the foreign profile) or one made like the cluster CA.
+    const parsed = x509.parse_profile(der_bytes[0..size], .foreign_server, &detail) catch
+        x509.parse_profile(der_bytes[0..size], .cluster, &detail) catch return null;
+    const key = parsed.public_key.of(der_bytes[0..size]);
+    if (key.len != 32) return null;
+    return key[0..32].*;
 }
 
 pub fn parse_zon(arena: Allocator, source: [:0]const u8, name: []const u8, diag: *Diag) Error!File {
@@ -429,7 +525,7 @@ pub fn parse_zon(arena: Allocator, source: [:0]const u8, name: []const u8, diag:
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => return bad(diag, shape, .{name}, "see zcube-server --help"),
     };
-    var file: File = .{ .relays = relays };
+    var file: File = .{ .relays = relays.relays, .relay_cas = relays.cas };
     inline for (@typeInfo(Fields).@"struct".field_names) |field| {
         @field(file, field) = @field(fields, field);
     }
@@ -452,7 +548,7 @@ fn parse_tree(
 
 const known_settings = [_][]const u8{
     "listen",       "insecure_listen", "tls_name",  "store",  "create_store",
-    "lease_ttl_ms", "lost_grace_ms",   "state_dir", "relays",
+    "lease_ttl_ms", "lost_grace_ms",   "state_dir", "relays", "cluster",
 };
 
 /// The relays of the file's root struct, after its field names are checked. A relay is
@@ -462,11 +558,11 @@ fn relays_of(
     zoir: *const std.zig.Zoir,
     file_name: []const u8,
     diag: *Diag,
-) Error![]const Relay {
+) Error!RelayList {
     const root = std.zig.Zoir.Node.Index.root.get(zoir);
     const names, const values = switch (root) {
         .struct_literal => |literal| .{ literal.names, literal.vals },
-        .empty_literal => return &.{},
+        .empty_literal => return .{},
         else => return bad(diag, "{s} is not a struct of settings", .{file_name}, "see --help"),
     };
     var found: ?std.zig.Zoir.Node.Index = null;
@@ -481,19 +577,21 @@ fn relays_of(
         }
         if (std.mem.eql(u8, text, "relays")) found = values.at(@intCast(index));
     }
-    const node = found orelse return &.{};
+    const node = found orelse return .{};
     return relay_list(arena, zoir, node, diag);
 }
+
+const RelayList = struct { relays: []const Relay = &.{}, cas: []const []const u8 = &.{} };
 
 fn relay_list(
     arena: Allocator,
     zoir: *const std.zig.Zoir,
     node: std.zig.Zoir.Node.Index,
     diag: *Diag,
-) Error![]const Relay {
+) Error!RelayList {
     const names, const values = switch (node.get(zoir)) {
         .struct_literal => |literal| .{ literal.names, literal.vals },
-        .empty_literal => return &.{},
+        .empty_literal => return .{},
         else => return bad(diag, "relays is not a struct of relays", .{}, relay_fix),
     };
     // Checked before anything is read, so a file with a hundred relays is refused by its count.
@@ -503,42 +601,105 @@ fn relay_list(
         }, "name at most " ++ relays_max_text ++ " relays");
     }
     const list = arena.alloc(Relay, names.len) catch return error.OutOfMemory;
-    for (names, list, 0..) |name_node, *slot, index| {
+    const cas = arena.alloc([]const u8, names.len) catch return error.OutOfMemory;
+    for (names, list, cas, 0..) |name_node, *slot, *ca, index| {
         // The Zoir is freed when `parse_zon` returns, so the text is copied out of it.
         const name = arena.dupe(u8, name_node.get(zoir)) catch return error.OutOfMemory;
-        const address = try relay_address(zoir, values.at(@intCast(index)), name, diag);
-        const kept = arena.dupe(u8, address) catch return error.OutOfMemory;
-        slot.* = .{ .name = name, .address = kept };
         if (relay_name_problem(name)) |problem| {
             return bad(diag, "relay {s}: the name {s}", .{ name, problem }, relay_fix);
         }
+        const entry = try relay_entry(zoir, values.at(@intCast(index)), name, diag);
+        slot.* = .{
+            .name = name,
+            .address = arena.dupe(u8, entry.address) catch return error.OutOfMemory,
+            .server_name = arena.dupe(u8, entry.server_name) catch return error.OutOfMemory,
+            .plain = entry.plain,
+        };
+        ca.* = arena.dupe(u8, entry.server_ca) catch return error.OutOfMemory;
     }
-    return list;
+    return .{ .relays = list, .cas = cas };
 }
 
 const relays_max_text = "8";
-const relay_fix = "write it as .relays = .{ .name = .{ .address = \"host:port\" } }";
+const relay_fix = "write it as .relays = .{ .name = .{ .address = \"host:port\", " ++
+    ".server_name = \"upstream.example\", .server_ca = \"ca.pem\" } }";
 
-fn relay_address(
+const RelayEntry = struct {
+    address: []const u8 = "",
+    server_name: []const u8 = "",
+    server_ca: []const u8 = "",
+    plain: bool = false,
+};
+
+/// Whether a configuration may say `.plain = true`: only a Debug build's (the fake-runtime tests
+/// that predate B4). A release build refuses it, so no deployed relay is plain TCP.
+pub const relay_plain_allowed = builtin.mode == .debug;
+
+fn relay_entry(
     zoir: *const std.zig.Zoir,
     node: std.zig.Zoir.Node.Index,
     name: []const u8,
     diag: *Diag,
-) Error![]const u8 {
+) Error!RelayEntry {
     const fields = switch (node.get(zoir)) {
         .struct_literal => |literal| literal,
         else => return bad(diag, "relay {s} is not .{{ .address = ... }}", .{name}, relay_fix),
     };
-    if (fields.names.len != 1) {
-        return bad(diag, "relay {s} must have an .address and nothing else", .{name}, relay_fix);
+    var entry: RelayEntry = .{};
+    for (fields.names, 0..) |field_node, index| {
+        const field = field_node.get(zoir);
+        const value = fields.vals.at(@intCast(index)).get(zoir);
+        if (std.mem.eql(u8, field, "plain")) {
+            if (!relay_plain_allowed) {
+                return bad(diag, "relay {s}: .plain is for tests only", .{name}, relay_fix);
+            }
+            entry.plain = switch (value) {
+                .true => true,
+                .false => false,
+                else => return bad(diag, "relay {s}: .plain is not a bool", .{name}, relay_fix),
+            };
+            continue;
+        }
+        const text = switch (value) {
+            .string_literal => |text| text,
+            else => {
+                const format = "relay {s}: .{s} is not a string";
+                return bad(diag, format, .{ name, field }, relay_fix);
+            },
+        };
+        if (std.mem.eql(u8, field, "address")) {
+            entry.address = text;
+        } else if (std.mem.eql(u8, field, "server_name")) {
+            entry.server_name = text;
+        } else if (std.mem.eql(u8, field, "server_ca")) {
+            entry.server_ca = text;
+        } else {
+            return bad(diag, "relay {s} sets .{s}, which a relay does not have", .{
+                name, field,
+            }, relay_fix);
+        }
     }
-    if (!std.mem.eql(u8, fields.names[0].get(zoir), "address")) {
-        return bad(diag, "relay {s} must have an .address and nothing else", .{name}, relay_fix);
+    if (entry.address.len == 0) {
+        return bad(diag, "relay {s} has no .address", .{name}, relay_fix);
     }
-    return switch (fields.vals.at(0).get(zoir)) {
-        .string_literal => |text| text,
-        else => bad(diag, "relay {s}: .address is not a string", .{name}, relay_fix),
-    };
+    if (entry.plain) {
+        if (entry.server_name.len > 0 or entry.server_ca.len > 0) {
+            return bad(diag, "relay {s} is .plain and names a server", .{name}, relay_fix);
+        }
+        return entry;
+    }
+    if (entry.server_name.len == 0 or entry.server_ca.len == 0) {
+        return bad(diag, "relay {s} needs .server_name and .server_ca", .{name}, relay_fix);
+    }
+    if (x509_identity.dns_problem(entry.server_name, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "relay {s}: .server_name {s} is not a DNS name", .{
+            name, entry.server_name,
+        }, relay_fix);
+    }
+    if (entry.server_ca.len > constants.config_path_bytes_max) {
+        return bad(diag, "relay {s}: .server_ca is longer than 1024 bytes", .{name}, relay_fix);
+    }
+    return entry;
 }
 
 /// A relay name is what a job writes: lowercase letters, digits and '-', not at either end.
@@ -866,22 +1027,41 @@ test "relays are a table of names and addresses; every malformed entry is ZC-E01
     const arena = arena_state.allocator();
     var diag: Diag = undefined;
     diag.reset();
-    const good = ".{ .relays = .{ .botpike = .{ .address = \"broker.botpike.com:8443\" }," ++
-        " .b2 = .{ .address = \"127.0.0.1:9\" } } }";
+    const good = ".{ .cluster = \"prod.example\", .relays = .{ .botpike = .{" ++
+        " .address = \"broker.botpike.com:8443\", .server_name = \"broker.botpike.com\"," ++
+        " .server_ca = \"ca.pem\" }, .b2 = .{ .address = \"127.0.0.1:9\", .plain = true } } }";
     const file = try parse_zon(arena, good, "server.zon", &diag);
     const config = try merge(.{}, file, &diag);
     try testing.expectEqual(@as(usize, 2), config.relays.len);
     try testing.expectEqualStrings("botpike", config.relays[0].name);
     try testing.expectEqualStrings("broker.botpike.com:8443", config.relays[0].address);
+    try testing.expectEqualStrings("broker.botpike.com", config.relays[0].server_name);
+    try testing.expectEqualStrings("ca.pem", file.relay_cas[0]);
+    try testing.expect(config.relays[1].plain);
+    try testing.expectEqualStrings("prod.example", config.cluster);
     const none = try merge(.{}, try parse_zon(arena, ".{}", "server.zon", &diag), &diag);
     try testing.expectEqual(@as(usize, 0), none.relays.len);
 
     const bad_files = [_][:0]const u8{
         ".{ .relays = .{ .x = .{ .address = \"a:1\", .extra = 1 } } }",
+        // B4: a relay checks its upstream, and its runs' certificates name a cluster.
+        ".{ .cluster = \"c.example\", .relays = .{ .x = .{ .address = \"a:1\" } } }",
+        ".{ .cluster = \"c.example\", .relays = .{ .x = .{ .address = \"a:1\"," ++
+            " .server_name = \"a\" } } }",
+        ".{ .cluster = \"c.example\", .relays = .{ .x = .{ .address = \"a:1\"," ++
+            " .server_ca = \"ca.pem\" } } }",
+        ".{ .cluster = \"c.example\", .relays = .{ .x = .{ .address = \"a:1\"," ++
+            " .server_name = \"not a name\", .server_ca = \"ca.pem\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:1\", .server_name = \"a\"," ++
+            " .server_ca = \"ca.pem\" } } }",
+        ".{ .cluster = \"no cluster\", .relays = .{ .x = .{ .address = \"a:1\"," ++
+            " .server_name = \"a\", .server_ca = \"ca.pem\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:1\", .plain = true, .server_name = \"a\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:1\", .plain = 1 } } }",
         ".{ .relays = .{ .x = .{} } }",
-        ".{ .relays = .{ .x = .{ .address = \"no-port\" } } }",
-        ".{ .relays = .{ .x = .{ .address = \"a:0\" } } }",
-        ".{ .relays = .{ .x = .{ .address = \"\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"no-port\", .plain = true } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:0\", .plain = true } } }",
+        ".{ .relays = .{ .x = .{ .address = \"\", .plain = true } } }",
         ".{ .relays = 3 }",
         ".{ .relays = .{ .x = 3 } }",
         ".{ .relays = .{ .@\"a b\" = .{ .address = \"a:1\" } } }",
@@ -925,4 +1105,52 @@ test "--insecure-listen is loopback only, and --tls-name is a DNS name (B7)" {
         diag.reset();
         try expect_bad(tls_name_of(input, &diag), &diag);
     }
+}
+
+test "relay plain: only a Debug build's configuration may say .plain" {
+    // Goal: the plain test upstream demo-b3 relies on is never configurable in a release build.
+    // Method: the same file in each mode; `demo-b3-build` also runs this test in ReleaseSafe.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const text = ".{ .relays = .{ .botpike = .{ .address = \"127.0.0.1:9090\", .plain = true } } }";
+    const parsed = parse_zon(arena, text, "server.zon", &diag);
+    if (builtin.mode == .debug) {
+        const config = try merge(.{}, try parsed, &diag);
+        try testing.expect(config.relays[0].plain);
+    } else {
+        try testing.expectError(error.BadConfig, parsed);
+        try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0106), diag.code);
+    }
+}
+
+test "a relay's server_ca is a PEM certificate whose Ed25519 key becomes the anchor" {
+    // Goal: `pem_anchor` reads the subject key of a PEM certificate in any line layout, and
+    // refuses anything else. Method: a CA certificate encoded with 64- and 76-byte lines and
+    // CRLF; then a truncated block, no block, and garbage base64.
+    const x509_test = @import("x509_test.zig");
+    const pair = try x509_test.ca_pair();
+    var der_buffer: x509.Der = undefined;
+    try x509_test.make_ca(&der_buffer);
+    const der_bytes = der_buffer.slice();
+    var encoded: [constants.x509_cert_bytes_max * 2]u8 = undefined;
+    const base64 = std.base64.standard.Encoder.encode(&encoded, der_bytes);
+    inline for (.{ 64, 76 }) |width| {
+        var text: [constants.x509_cert_bytes_max * 3]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&text);
+        try writer.writeAll("-----BEGIN CERTIFICATE-----\r\n");
+        var at: usize = 0;
+        while (at < base64.len) : (at += width) {
+            try writer.print("{s}\r\n", .{base64[at..@min(at + width, base64.len)]});
+        }
+        try writer.writeAll("-----END CERTIFICATE-----\n");
+        const anchor = pem_anchor(writer.buffered()).?;
+        try testing.expectEqualSlices(u8, &pair.public_key.toBytes(), &anchor);
+    }
+    try testing.expect(pem_anchor("-----BEGIN CERTIFICATE-----\nMIIB\n") == null);
+    try testing.expect(pem_anchor("no certificate here") == null);
+    try testing.expect(pem_anchor("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----") ==
+        null);
 }

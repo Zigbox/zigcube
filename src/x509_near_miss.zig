@@ -251,10 +251,66 @@ fn san_two_uris(parts: *Parts, scratch: *Scratch) void {
     const value = scratch.tlv(der.tag_sequence, content[0 .. first.len + second.len]);
     parts.ext[3] = scratch.extension(&oid_san, null, value);
 }
-fn san_job_path(parts: *Parts, scratch: *Scratch) void {
-    const uri = "spiffe://prod.example/job/broker-1";
+/// A SAN of one URI `uri` on the workload's certificate, whose subject stays `broker-1`.
+fn repeat(comptime byte: u8, comptime count: usize) *const [count]u8 {
+    const filled: [count]u8 = @splat(byte);
+    return &filled;
+}
+
+fn san_uri(parts: *Parts, scratch: *Scratch, uri: Slice) void {
     const value = scratch.tlv(der.tag_sequence, scratch.tlv(0x86, uri));
     parts.ext[3] = scratch.extension(&oid_san, null, value);
+}
+fn san_job_other_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/other");
+}
+fn san_job_empty(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/");
+}
+fn san_job_nested(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/broker-1/x");
+}
+fn san_job_upper_path(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/Job/broker-1");
+}
+fn san_job_plural(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/jobs/broker-1");
+}
+fn san_job_no_slash(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job");
+}
+fn san_job_upper_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/Broker-1");
+}
+fn san_job_underscore(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/broker_1");
+}
+fn san_job_query(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/broker-1?run=2");
+}
+fn san_job_fragment(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/broker-1#run");
+}
+fn san_job_port(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example:443/job/broker-1");
+}
+fn san_job_userinfo(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://u@prod.example/job/broker-1");
+}
+fn san_job_dot_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/..");
+}
+fn san_job_hyphen_edge(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/-broker");
+}
+fn san_job_too_long(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/" ++ repeat('a', 64));
+}
+fn san_job_bad_cluster(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://Prod.example/job/broker-1");
+}
+fn san_job_in_server(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/x");
 }
 fn swap_first_two(parts: *Parts, _: *Scratch) void {
     std.mem.swap(Slice, &parts.ext[0], &parts.ext[1]);
@@ -391,10 +447,6 @@ fn donor_extension(scratch: *Scratch, kind: Kind, index: usize) Slice {
     @memcpy(buffer[0..piece.len], piece);
     return buffer[0..piece.len];
 }
-fn san_uri(parts: *Parts, scratch: *Scratch, uri: Slice) void {
-    const value = scratch.tlv(der.tag_sequence, scratch.tlv(0x86, uri));
-    parts.ext[3] = scratch.extension(&oid_san, null, value);
-}
 fn node_add_identity(parts: *Parts, scratch: *Scratch) void {
     parts.push_ext(donor_extension(scratch, .workload, 4));
 }
@@ -500,7 +552,23 @@ const rows = [_]Row{
     row("san bad path", .workload, san_bad_path, error.BadSan),
     row("san other service", .workload, san_other_service, error.BadName),
     row("san two uris", .workload, san_two_uris, error.BadSan),
-    row("san job path", .workload, san_job_path, error.BadSan),
+    row("san job other name", .workload, san_job_other_name, error.BadName),
+    row("san job empty name", .workload, san_job_empty, error.BadSan),
+    row("san job nested", .workload, san_job_nested, error.BadSan),
+    row("san Job path", .workload, san_job_upper_path, error.BadSan),
+    row("san jobs path", .workload, san_job_plural, error.BadSan),
+    row("san job no slash", .workload, san_job_no_slash, error.BadSan),
+    row("san job upper name", .workload, san_job_upper_name, error.BadSan),
+    row("san job underscore", .workload, san_job_underscore, error.BadSan),
+    row("san job query", .workload, san_job_query, error.BadSan),
+    row("san job fragment", .workload, san_job_fragment, error.BadSan),
+    row("san job port", .workload, san_job_port, error.BadSan),
+    row("san job userinfo", .workload, san_job_userinfo, error.BadSan),
+    row("san job dot name", .workload, san_job_dot_name, error.BadSan),
+    row("san job hyphen edge", .workload, san_job_hyphen_edge, error.BadSan),
+    row("san job name 64 bytes", .workload, san_job_too_long, error.BadSan),
+    row("san job upper cluster", .workload, san_job_bad_cluster, error.BadSan),
+    row("san job on server", .server, san_job_in_server, error.BadSan),
     row("eku code signing", .server, eku_code_signing, error.BadExtension),
     row("eku not critical", .server, eku_not_critical, error.BadExtension),
     row("ku extra bits", .server, ku_extra_bits, error.BadExtension),

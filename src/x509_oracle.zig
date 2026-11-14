@@ -233,6 +233,7 @@ fn uri_kind(uri: []const u8) ?x509.Kind {
     const second = std.mem.indexOfScalar(u8, after, '/') orelse return null;
     const segment = after[0..second];
     if (std.mem.eql(u8, segment, "service")) return .workload;
+    if (std.mem.eql(u8, segment, "job")) return .workload;
     if (std.mem.eql(u8, segment, "node")) return .node;
     if (std.mem.eql(u8, segment, "client")) return .client;
     return null;

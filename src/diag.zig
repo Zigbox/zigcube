@@ -113,6 +113,10 @@ pub const Diag = struct {
     /// COMMIT): the write may have applied. A structural signal, so rewording a cause cannot
     /// change how a caller treats the failure; it is never rendered.
     write_outcome_unknown: bool,
+    /// True when an environment refusal rests on state that is still settling (a run not yet
+    /// reported running, B4): the API answers 503, not the code's usual status, so the asker
+    /// tries again. Structural, like `write_outcome_unknown`; never rendered.
+    settling: bool,
 
     /// Initialises in place: the struct is several kilobytes.
     pub fn reset(diag: *Diag) void {
@@ -123,6 +127,7 @@ pub const Diag = struct {
         diag.fixes.reset();
         diag.saved = .{};
         diag.write_outcome_unknown = false;
+        diag.settling = false;
         assert(diag.saved.len == 0);
         assert(diag.causes.count == 0);
         assert(diag.code == null);

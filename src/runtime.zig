@@ -111,6 +111,16 @@ pub const Spec = struct {
     /// give a container a relay must not start it without one; every runtime serves relays since
     /// slice 4, so nothing refuses a spec that names one. (B3 slice 2.)
     relay: []const u8 = "",
+    /// B4: the upstream's TLS, from the job's relay entry: the DNS name its certificate carries
+    /// and the 64 hex digits of its CA's Ed25519 key. Both empty on a job stored before B4: its
+    /// supervisor then refuses to open the relay (fail closed). `relay_plain` is test-only.
+    relay_server_name: []const u8 = "",
+    relay_server_anchor: []const u8 = "",
+    relay_plain: bool = false,
+    /// What network the container may use. A relayed run's is `loopback`: its relay is its only
+    /// way out (`docs/decisions/2026-11-12-openshell-fence-comparison.md`, row 2), and a spec that
+    /// names a relay and asks for more is refused.
+    network: Network = .host,
     /// Must include `label_replica`.
     labels: []const Label,
 };
@@ -282,7 +292,11 @@ pub fn name_problem(name: []const u8) ?NameProblem {
     return null;
 }
 
+/// `host`: whatever the runtime gives a service. `loopback`: no interface but loopback.
+pub const Network = enum { host, loopback };
+
 pub const SpecProblem = enum {
+    relay_network_open,
     bad_name,
     bad_image,
     bad_command,
@@ -305,6 +319,7 @@ pub fn spec_problem(spec: *const Spec) ?SpecProblem {
     if (spec.source.len > constants.source_bytes_max) return .bad_source;
     if (spec.env.len > constants.runtime_env_count_max) return .too_many_env;
     if (spec.labels.len > constants.runtime_labels_max) return .too_many_labels;
+    if (spec.relay.len > 0 and spec.network != .loopback) return .relay_network_open;
     var has_replica = false;
     for (spec.labels) |label| {
         if (label.key.len == 0) return .bad_label;
@@ -358,6 +373,11 @@ test "a spec needs a name, an image, a command and the replica label" {
     try testing.expect(spec_problem(&bad) == null);
     bad.source = repeat('a', constants.source_bytes_max + 1);
     try testing.expectEqual(SpecProblem.bad_source, spec_problem(&bad).?);
+    bad = good;
+    bad.relay = "10.0.0.5:443";
+    try testing.expectEqual(SpecProblem.relay_network_open, spec_problem(&bad).?);
+    bad.network = .loopback;
+    try testing.expect(spec_problem(&bad) == null);
     bad = good;
     bad.labels = &.{.{ .key = "other", .value = "x" }};
     try testing.expectEqual(SpecProblem.missing_replica_label, spec_problem(&bad).?);

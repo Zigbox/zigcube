@@ -344,6 +344,40 @@ be interrupted, so stopping a relay whose upstream name is black-holed can wait 
 
 The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a run by its id.
 
+### The relay over TLS (B4 slice 2)
+
+A relay entry names its upstream's `server_name` and `server_ca`; the relay dials the upstream
+over TLS 1.3 with a client certificate and verifies the upstream against that CA and name. The
+files in the container's directory:
+
+| File | Written by | Holds |
+| --- | --- | --- |
+| `relay.pub` | the supervisor, at start | `<key hex> <epoch> <digest hex> <job>`: the run's fresh Ed25519 public key (the private key never leaves the supervisor's memory) |
+| `relay.crt` | the agent | the DER certificate the server signed for that key (`agent_relay_certs.zig`) |
+| `relay.refused` | the agent | the ZC-E0706 refusal line; the agent asks no more |
+| `relay.fault` | the fake runtime | the test fault `relay_open` (below) |
+
+The agent asks for the certificate once per run, and only once it knows the server holds the
+run's `running` report (the server signs only a started claim). It asks again after
+`peer_join_retry_ms` when the server is unreachable or answers anything but 200 or a 409
+ZC-E0706; a 503 ZC-E0706 (no claim with a start yet) is asked again without a word. Each
+container waits out its own retry, so one failing run never holds back another's certificate. A
+step asks at most `relay_cert_asks_per_step_max` (8) times, each within what is left of
+`relay_cert_step_ms_max` and the time before the agent's fence, so a slow server cannot hold the
+agent past its lease. It takes a certificate only if it is for the run's key. The relay waits for `relay.crt`: **no certificate, no dial**. A connection the job opens
+before then waits at most `relay_connect_timeout_ms` and is closed (ZC-E0705); after a refusal it
+is closed at once (`relay.log` says ZC-E0706). When the job ends its side, the relay
+sends close_notify and drops what the upstream sends after it.
+
+**Fail closed.** A relay that cannot be opened starts no command (ZC-E0702, a start failure). A
+relay whose listener stops while the job runs kills the command and logs ZC-E0702. Two test
+faults, written into `<state-dir>/faults/<run id>`: `relay_open` (the fake runtime writes
+`relay.fault` before the supervisor starts, so the relay cannot open) and `relay_stop` (the next
+`list` sends SIGUSR1 to the supervisor, which shuts the listener down). `zig build relay-teeth`
+builds two agents with each fail-closed check removed and passes only if the tests catch both.
+
+The Zigbox runtime's relay is still plain TCP until B4 slice 4.
+
 ## What survives what
 
 | Event | Containers | The agent's work |

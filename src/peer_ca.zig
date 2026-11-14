@@ -139,7 +139,7 @@ pub const Ca = struct {
         assert(out.slice().len <= constants.x509_cert_bytes_max);
     }
 
-    /// A client certificate for `request.service` in `request.cluster`, valid from now for
+    /// A client certificate for `request.name` in `request.cluster`, valid from now for
     /// `request.ttl_ms` (at most `x509_leaf_ttl_ms_max`). The workload's private key stays with
     /// the caller; only its public half is certified, and a point that no honest key is (off the
     /// curve, or in a small subgroup) is `BadKey`, as for a node credential.
@@ -152,10 +152,30 @@ pub const Ca = struct {
         const lifetime = try lifetime_from(ca.wall.now_ms(), request.ttl_ms);
         try x509.issue_workload(out, ca.key, &.{
             .cluster = request.cluster,
-            .service = request.service,
+            .path = request.path,
+            .name = request.name,
             .subject_key = request.subject_key,
             .identity = request.identity,
             .lifetime = lifetime,
+        });
+        assert(out.slice().len <= constants.x509_cert_bytes_max);
+    }
+
+    /// A relayed run's certificate (B4): `spiffe://<cluster>/job/<name>`, for exactly the
+    /// lifetime `job_cert.decide` gave. Same key rule as the workload's.
+    pub fn issue_job_certificate(
+        ca: *const Ca,
+        out: *x509.Der,
+        request: *const JobArgs,
+    ) CertificateError!void {
+        try ca.check_leaf_key(request.subject_key);
+        try x509.issue_workload(out, ca.key, &.{
+            .cluster = request.cluster,
+            .path = .job,
+            .name = request.name,
+            .subject_key = request.subject_key,
+            .identity = request.identity,
+            .lifetime = request.lifetime,
         });
         assert(out.slice().len <= constants.x509_cert_bytes_max);
     }
@@ -278,7 +298,8 @@ pub fn reason(err: CertificateError) []const u8 {
 
 pub const WorkloadArgs = struct {
     cluster: []const u8,
-    service: []const u8,
+    path: x509_identity.Path = .service,
+    name: []const u8,
     subject_key: [32]u8,
     identity: x509_identity.Identity,
     ttl_ms: u64,
@@ -300,6 +321,14 @@ pub const ClientArgs = struct {
     scope: x509.Scope,
     subject_key: [32]u8,
     ttl_ms: u64,
+};
+
+pub const JobArgs = struct {
+    cluster: []const u8,
+    name: []const u8,
+    subject_key: [32]u8,
+    identity: x509_identity.Identity,
+    lifetime: x509.Lifetime,
 };
 
 pub const ServerArgs = struct {
@@ -462,7 +491,7 @@ test "the CA issues a CA, a workload and a server certificate that verify at the
     var workload_der: x509.Der = .{};
     try ca.issue_workload_certificate(&workload_der, &.{
         .cluster = "prod.example",
-        .service = "broker-1",
+        .name = "broker-1",
         .subject_key = try test_key(9),
         .identity = test_identity,
         .ttl_ms = constants.x509_leaf_ttl_ms_max,
@@ -508,7 +537,7 @@ test "the CA refuses lifetimes over the bound, overflow, bad names and bad subje
     try std.testing.expectError(error.IssueLifetime, ca.issue_ca_certificate(&out, 0));
     var args: WorkloadArgs = .{
         .cluster = "prod.example",
-        .service = "broker-1",
+        .name = "broker-1",
         .subject_key = try test_key(9),
         .identity = test_identity,
         .ttl_ms = constants.x509_leaf_ttl_ms_max,
@@ -517,9 +546,9 @@ test "the CA refuses lifetimes over the bound, overflow, bad names and bad subje
     args.ttl_ms += 1000;
     try std.testing.expectError(error.IssueLifetime, ca.issue_workload_certificate(&out, &args));
     args.ttl_ms = 1000;
-    args.service = "Bad Name";
+    args.name = "Bad Name";
     try std.testing.expectError(error.BadServiceName, ca.issue_workload_certificate(&out, &args));
-    args.service = "broker-1";
+    args.name = "broker-1";
     args.subject_key = @splat(0xff); // Not a point on the curve.
     try std.testing.expectError(error.BadKey, ca.issue_workload_certificate(&out, &args));
     var identity_point: [32]u8 = @splat(0);
@@ -591,7 +620,7 @@ test "a credential's signed message and a certificate's are disjoint, and signat
     try ca.issue_ca_certificate(&ca_der, 1000);
     try ca.issue_workload_certificate(&workload_der, &.{
         .cluster = "prod.example",
-        .service = "a",
+        .name = "a",
         .subject_key = try test_key(9),
         .identity = test_identity,
         .ttl_ms = 1000,

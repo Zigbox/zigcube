@@ -564,6 +564,11 @@ pub const peer_join_request_bytes_max: u32 = 512;
 pub const peer_join_retry_ms: u32 = 5 * 1000;
 /// One join call waits this long at most (less near the lease's fence).
 pub const peer_join_timeout_ms: u32 = 3 * 1000;
+/// Relayed runs' certificates asked for in one step of the agent's loop (B4 slice 2). With
+/// `relay_cert_step_ms_max` it bounds how long the step can hold back a keepalive.
+pub const relay_cert_asks_per_step_max: u32 = 8;
+/// All the asks of one step together take at most this long (and never past the fence).
+pub const relay_cert_step_ms_max: u32 = peer_join_timeout_ms;
 /// Handshakes the peer server starts for one source address in one window; the next is refused.
 /// It bounds unauthenticated public-key work (a few hundred microseconds each), and is sized for
 /// a whole cluster behind one NAT address: every fetch connection to this server carries
@@ -784,6 +789,9 @@ comptime {
     // 256 names of the longest length, a newline each, fit the file bound.
     assert(peer_revoked_max * (node_name_bytes_max + 1) <= peer_file_bytes_max);
     assert(peer_join_timeout_ms < agent_io_timeout_ms);
+    assert(relay_cert_asks_per_step_max > 0);
+    assert(relay_cert_asks_per_step_max <= agent_node_runs_max);
+    assert(relay_cert_step_ms_max <= peer_join_timeout_ms);
 }
 
 comptime {
@@ -996,6 +1004,10 @@ pub const job_limit_pids_max: u32 = 4_194_304;
 /// creation) ends `failed deadline`. A job with no deadline is a service, so 0 is refused.
 pub const job_deadline_ms_max: u64 = 24 * 60 * 60 * 1000;
 pub const job_grace_ms_max: u32 = 60 * 1000;
+/// A run's certificate (docs/briefs/b4.md) expires this long after the run's deadline and grace
+/// have passed, so a job that runs to its deadline still holds a valid certificate while it is
+/// stopped.
+pub const workload_cert_slack_ms: u64 = 60 * 1000;
 /// `submit_by_ms` may be at most this far ahead of the server's clock at receipt, and a retained
 /// ended job is never younger than `job_finished_age_ms_min` when deleted, so a retried POST
 /// inside the window finds the job it created.
@@ -1050,6 +1062,8 @@ comptime {
     assert(job_run_id_bytes_max <= 63);
     assert(job_deadline_ms_max <= x509_leaf_ttl_ms_max); // A leaf of a job outlives its deadline.
     assert(job_grace_ms_max <= job_deadline_ms_max);
+    // The longest run certificate: start, deadline, grace and slack, under the leaf bound.
+    assert(job_deadline_ms_max + job_grace_ms_max + workload_cert_slack_ms < x509_leaf_ttl_ms_max);
     assert(job_submit_window_ms_max <= job_finished_age_ms_min);
     assert(job_finished_age_ms_min <= job_finished_age_ms_max);
     // 73 h: the start backstop, the deadline, retention and an hour's submit window.
@@ -1092,6 +1106,10 @@ pub const relay_connect_timeout_ms: u32 = 10_000;
 pub const relay_buffer_bytes: u32 = 16 * 1024;
 /// How often the relay's loop looks at its stop flag when nothing else wakes it.
 pub const relay_poll_ms: u32 = 50;
+/// `Relay.stop` returns within this, whatever its connections wait for (a connect, a handshake
+/// record, a write): it shuts their sockets down, and every other wait is a poll of
+/// `relay_poll_ms`.
+pub const relay_cancel_ms_max: u32 = 2 * relay_poll_ms;
 /// The relay's own log in the container directory (`relay.log`): at most this many bytes.
 pub const relay_log_bytes_max: u32 = 8 * 1024;
 
@@ -1101,6 +1119,7 @@ comptime {
     assert(relay_connections_max > 0);
     assert(relay_connect_timeout_ms < relay_idle_ms);
     assert(relay_poll_ms < relay_connect_timeout_ms);
+    assert(relay_cancel_ms_max <= 100); // The brief's bound on cancelling a relay.
     assert(relay_connection_bytes_max > relay_buffer_bytes);
     assert(relay_port >= 1024); // The job is unprivileged, and so is the listener.
 }

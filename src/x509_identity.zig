@@ -35,13 +35,13 @@ pub const Error = error{
     BadLabel,
     /// The cluster part of a SPIFFE ID is not a sequence of lowercase DNS labels.
     BadCluster,
-    /// The service name is not a name (`records.name_problem`).
+    /// The service or job name is not a name (`records.name_problem`).
     BadServiceName,
     /// The node name is not a name.
     BadNodeName,
     /// The client name is not a name.
     BadClientName,
-    /// Not `spiffe://<cluster>/<service|node|client>/<name>`.
+    /// Not `spiffe://<cluster>/<service|job|node|client>/<name>`.
     BadSpiffe,
     /// Not a lowercase DNS name without wildcard.
     BadDnsName,
@@ -274,12 +274,14 @@ fn all_digits(label: []const u8) bool {
     return true;
 }
 
-/// The three path kinds of a SPIFFE ID (decision file 2026-11-04-spiffe-service-path.md for
-/// `/service/`; docs/briefs/b7.md is the decision that adds `/node/` and `/client/`). No other
-/// path kind is accepted; one would need its own decision.
+/// The four path kinds of a SPIFFE ID (decision file 2026-11-04-spiffe-service-path.md for
+/// `/service/`; docs/briefs/b4.md adds `/job/`, docs/briefs/b7.md `/node/` and `/client/`). No
+/// other path kind is accepted; one would need its own decision.
 pub const Path = enum {
     /// A workload: `<name>` is the service name.
     service,
+    /// A run of a job (B4): `<name>` is the job name.
+    job,
     /// A node's agent (B7): `<name>` is the node name.
     node,
     /// A client of the API (B7): `<name>` is the name `ca issue-client` was given.
@@ -288,6 +290,7 @@ pub const Path = enum {
     pub fn text(path: Path) []const u8 {
         return switch (path) {
             .service => "/service/",
+            .job => "/job/",
             .node => "/node/",
             .client => "/client/",
         };
@@ -295,7 +298,7 @@ pub const Path = enum {
 
     fn name_error(path: Path) Error {
         return switch (path) {
-            .service => error.BadServiceName,
+            .service, .job => error.BadServiceName,
             .node => error.BadNodeName,
             .client => error.BadClientName,
         };
@@ -530,11 +533,13 @@ test "decode refuses a damaged extension value" {
 }
 
 test "SPIFFE IDs and DNS names have exactly one shape" {
-    // Goal: the near misses are refused; `/service/`, `/node/` and `/client/` are the only paths.
+    // Goal: the near misses are refused; `/service/`, `/job/`, `/node/` and `/client/` are the
+    // only paths.
     // Method: a table, and each path kind written and parsed back.
     var buffer: [constants.x509_spiffe_bytes_max]u8 = @splat(0xAA);
     const good = [_]struct { path: Path, uri: []const u8 }{
         .{ .path = .service, .uri = "spiffe://prod.example/service/broker-1" },
+        .{ .path = .job, .uri = "spiffe://prod.example/job/broker-1" },
         .{ .path = .node, .uri = "spiffe://prod.example/node/broker-1" },
         .{ .path = .client, .uri = "spiffe://prod.example/client/broker-1" },
     };
@@ -555,7 +560,7 @@ test "SPIFFE IDs and DNS names have exactly one shape" {
         "spiffe://prod/service/",      "spiffe://prod/service/a/b",
         "spiffe://prod/service/a?x=1", "spiffe://prod/service/a#f",
         "spiffe://u@prod/service/a",   "spiffe://prod:80/service/a",
-        "spiffe://prod/job/a",         "spiffe://prod/nodes/a",
+        "spiffe://prod/jobs/a",        "spiffe://prod/nodes/a",
         "spiffe://prod/node/",         "spiffe://prod/node/a/b",
         "spiffe://prod/node/A",        "spiffe://prod/Node/a",
         "spiffe://prod/client/",       "spiffe://prod/clients/a",
@@ -572,8 +577,29 @@ test "SPIFFE IDs and DNS names have exactly one shape" {
         "spiffe://10.0.0.1/service/a", "spiffe://prod.2024/service/a",
     };
     for (bad) |text| try testing.expect(std.meta.isError(spiffe_parse(text)));
+    const bad_jobs = [_][]const u8{
+        "spiffe://prod/job/",          "spiffe://prod/job",
+        "spiffe://prod/job/a/b",       "spiffe://prod/job/a?x=1",
+        "spiffe://prod/job/a#f",       "spiffe://u@prod/job/a",
+        "spiffe://prod:80/job/a",      "spiffe://prod/jobs/a",
+        "spiffe://prod/Job/a",         "spiffe://prod/job/A",
+        "spiffe://prod/job/.",         "spiffe://prod/job/..",
+        "spiffe://prod//job/a",        "spiffe:///job/a",
+        "spiffe://Prod/job/a",         "spiffe://pr..od/job/a",
+        "spiffe://-prod/job/a",        "spiffe://prod./job/a",
+        "spiffe://*.prod/job/a",       "http://prod/job/a",
+        "spiffe://prod/job/a/",        "SPIFFE://prod/job/a",
+        "spiffe://10.0.0.1/job/a",     "spiffe://prod/job/-a",
+        "spiffe://prod/job/a-",        "spiffe://prod/job/a_b",
+        "spiffe://prod/job/a%2Fb",     "spiffe://prod/job/service/a",
+        "spiffe://prod/service/job/a", "spiffe://prod/job/job/a",
+        "spiffe://prod/job/" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    for (bad_jobs) |text| try testing.expect(std.meta.isError(spiffe_parse(text)));
     try testing.expectError(error.BadCluster, spiffe_write(&buffer, .node, "", "a"));
     try testing.expectError(error.BadServiceName, spiffe_write(&buffer, .service, "prod", "a_b"));
+    try testing.expectError(error.BadServiceName, spiffe_write(&buffer, .job, "prod", "a_b"));
     try testing.expectError(error.BadNodeName, spiffe_write(&buffer, .node, "prod", "a_b"));
     try testing.expectError(error.BadClientName, spiffe_write(&buffer, .client, "prod", "A"));
     try testing.expectError(error.BadNodeName, spiffe_parse("spiffe://prod/node/a.b"));

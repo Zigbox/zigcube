@@ -127,19 +127,9 @@ pub const Kinds = std.EnumSet(Kind);
 
 pub const Scope = identity_mod.Scope;
 
-/// The SPIFFE path of a clientAuth kind.
-fn path_of(kind: Kind) identity_mod.Path {
-    return switch (kind) {
-        .workload => .service,
-        .node => .node,
-        .client => .client,
-        .ca, .server => unreachable,
-    };
-}
-
 fn kind_of(path: identity_mod.Path) Kind {
     return switch (path) {
-        .service => .workload,
+        .service, .job => .workload,
         .node => .node,
         .client => .client,
     };
@@ -617,7 +607,10 @@ pub fn issue_ca(out: *Der, ca: Ed25519.KeyPair, lifetime: Lifetime) Error!void {
 
 pub const WorkloadRequest = struct {
     cluster: []const u8,
-    service: []const u8,
+    /// Which kind of workload: a service or a run of a job (B4).
+    path: identity_mod.Path = .service,
+    /// The service or job name: the last part of the SPIFFE ID, and the subject's commonName.
+    name: []const u8,
     /// The workload's public key: the caller holds the private half (it signs `CertificateVerify`).
     subject_key: [32]u8,
     identity: Identity,
@@ -631,8 +624,9 @@ pub fn issue_workload(out: *Der, ca: Ed25519.KeyPair, request: *const WorkloadRe
     try identity_mod.encode(&identity_writer, &request.identity);
     try issue_spiffe(out, ca, &.{
         .kind = .workload,
+        .path = request.path,
         .cluster = request.cluster,
-        .name = request.service,
+        .name = request.name,
         .subject_key = request.subject_key,
         .identity = identity_writer.written(),
         .lifetime = request.lifetime,
@@ -651,6 +645,7 @@ pub const NodeRequest = struct {
 pub fn issue_node(out: *Der, ca: Ed25519.KeyPair, request: *const NodeRequest) Error!void {
     try issue_spiffe(out, ca, &.{
         .kind = .node,
+        .path = .node,
         .cluster = request.cluster,
         .name = request.node,
         .subject_key = request.subject_key,
@@ -674,6 +669,7 @@ pub fn issue_client(out: *Der, ca: Ed25519.KeyPair, request: *const ClientReques
     try identity_mod.encode_client(&identity_writer, request.scope);
     try issue_spiffe(out, ca, &.{
         .kind = .client,
+        .path = .client,
         .cluster = request.cluster,
         .name = request.client,
         .subject_key = request.subject_key,
@@ -685,6 +681,8 @@ pub fn issue_client(out: *Der, ca: Ed25519.KeyPair, request: *const ClientReques
 /// What the three SPIFFE kinds share.
 const SpiffeLeaf = struct {
     kind: Kind,
+    /// The SPIFFE path: `.service` or `.job` for a workload (B4), else the kind's own.
+    path: identity_mod.Path,
     cluster: []const u8,
     name: []const u8,
     subject_key: [32]u8,
@@ -697,8 +695,8 @@ fn issue_spiffe(out: *Der, ca: Ed25519.KeyPair, leaf: *const SpiffeLeaf) Error!v
     assert(is_spiffe(leaf.kind));
     assert((leaf.kind == .node) == (leaf.identity.len == 0));
     var uri_buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
-    const path = path_of(leaf.kind);
-    const uri = try identity_mod.spiffe_write(&uri_buffer, path, leaf.cluster, leaf.name);
+    assert(kind_of(leaf.path) == leaf.kind);
+    const uri = try identity_mod.spiffe_write(&uri_buffer, leaf.path, leaf.cluster, leaf.name);
     const lifetime = leaf.lifetime;
     const seconds = try lifetime_seconds(leaf.kind, lifetime.not_before_ms, lifetime.not_after_ms);
     var serial: [constants.x509_serial_bytes_max]u8 = undefined;
@@ -1144,7 +1142,7 @@ fn read_san(bytes: []const u8, value: Span, client_auth: bool) Error!Named {
 }
 
 /// The names fit the kind: the issuer is always a CA name; the subject is the CA's own name, the
-/// name at the end of the SPIFFE ID (a service, a node or a client), or the DNS name.
+/// name at the end of the SPIFFE ID (a service, a job, a node or a client), or the DNS name.
 fn check_names(bytes: []const u8, parsed: *const Parsed, detail: *Detail) Error!void {
     const issuer = parsed.issuer_cn.of(bytes);
     const subject = parsed.subject_cn.of(bytes);
@@ -1158,7 +1156,7 @@ fn check_names(bytes: []const u8, parsed: *const Parsed, detail: *Detail) Error!
         .workload, .node, .client => {
             // `read_san` already parsed this name with the same function, so it cannot fail here.
             const spiffe = identity_mod.spiffe_parse(parsed.name.of(bytes)) catch unreachable;
-            assert(spiffe.path == path_of(parsed.kind));
+            assert(kind_of(spiffe.path) == parsed.kind);
             if (!std.mem.eql(u8, spiffe.name, subject)) return error.BadName;
         },
         .server => {
@@ -1487,10 +1485,11 @@ pub fn reason(err: Error) []const u8 {
         error.LabelsNotSorted => "label keys are not sorted and unique",
         error.BadLabel => "a label has a byte or a character that is not allowed",
         error.BadCluster => "the cluster name is not a lowercase DNS name",
-        error.BadServiceName => "the service name is not a valid name",
+        error.BadServiceName => "the service or job name is not a valid name",
         error.BadNodeName => "the node name is not a valid name",
         error.BadClientName => "the client name is not a valid name",
-        error.BadSpiffe => "the SPIFFE ID is not spiffe://<cluster>/<service|node|client>/<name>",
+        error.BadSpiffe => "the SPIFFE ID is not" ++
+            " spiffe://<cluster>/<service|job|node|client>/<name>",
         error.BadDnsName => "the DNS name is not lowercase, has a wildcard or an all-digit label",
         error.IssueLifetime => "the lifetime is empty, over the bound or out of range",
     };

@@ -25,6 +25,7 @@ pub const modules = .{
     @import("api_scope.zig"),
     @import("auditor.zig"),
     @import("job_api.zig"),
+    @import("job_cert.zig"),
     @import("apply.zig"),
     @import("chunk_summary.zig"),
     @import("mtls_smoke.zig"),

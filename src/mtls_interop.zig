@@ -114,7 +114,7 @@ const Pki = struct {
     ) !void {
         const request: x509.WorkloadRequest = .{
             .cluster = cluster,
-            .service = service,
+            .name = service,
             .subject_key = pki.client_key.public_key.toBytes(),
             .identity = identity,
             .lifetime = lifetime,

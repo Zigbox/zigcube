@@ -37,7 +37,7 @@ pub fn sample_identity() identity_mod.Identity {
 pub fn workload_request(key: [32]u8) x509.WorkloadRequest {
     return .{
         .cluster = "prod.example",
-        .service = "broker-1",
+        .name = "broker-1",
         .subject_key = key,
         .identity = sample_identity(),
         .lifetime = window,
@@ -52,6 +52,21 @@ pub fn make_ca(out: *x509.Der) !void {
 
 pub fn make_workload(out: *x509.Der) !void {
     const request = workload_request(try subject_key(1));
+    try x509.issue_workload(out, try ca_pair(), &request);
+}
+
+pub const job_uri = "spiffe://prod.example/job/nightly-7";
+
+/// A run's certificate: the `/job/` path and the job's name.
+pub fn job_request(key: [32]u8, name: []const u8) x509.WorkloadRequest {
+    var request = workload_request(key);
+    request.path = .job;
+    request.name = name;
+    return request;
+}
+
+pub fn make_job(out: *x509.Der) !void {
+    const request = job_request(try subject_key(1), "nightly-7");
     try x509.issue_workload(out, try ca_pair(), &request);
 }
 
@@ -131,6 +146,33 @@ test "a workload certificate carries its SPIFFE ID, its identity and its key" {
     try testing.expectEqual(@as(u64, 42), decoded.placement_epoch);
     try testing.expectEqual(@as(u32, 2), decoded.labels_count);
     try testing.expectEqual(@as(u8, 0x5A), decoded.image_digest[0]);
+}
+
+test "a job certificate carries /job/<name>, its identity and its key" {
+    // Goal: B4's certificate says which run is calling. Method: issue, verify with the SPIFFE ID
+    // as the name, then with the service path of the same name, which must not match.
+    var certificate: x509.Der = .{};
+    try make_job(&certificate);
+    const bytes = certificate.slice();
+    const ca = try ca_pair();
+    const expect: x509.Expect = .{ .kind = .workload, .name = job_uri };
+    const parsed = try x509.verify(bytes, ca.public_key.toBytes(), now, expect);
+    try testing.expectEqualStrings("nightly-7", parsed.subject_cn.of(bytes));
+    try testing.expectEqualStrings(job_uri, parsed.name.of(bytes));
+    const decoded = try identity_mod.decode(parsed.identity.of(bytes));
+    try testing.expectEqual(@as(u64, 42), decoded.placement_epoch);
+    const service_name = "spiffe://prod.example/service/nightly-7";
+    try testing.expectError(error.WrongName, x509.verify(
+        bytes,
+        ca.public_key.toBytes(),
+        now,
+        .{ .kind = .workload, .name = service_name },
+    ));
+    var again: x509.Der = .{};
+    try x509.reencode(&again, bytes, &parsed);
+    try testing.expectEqualSlices(u8, bytes, again.slice());
+    var request = job_request(try subject_key(1), "Nightly");
+    try testing.expectError(error.BadServiceName, x509.issue_workload(&again, ca, &request));
 }
 
 test "a server certificate names one DNS name and nothing else" {
@@ -233,7 +275,7 @@ test "the largest certificate the writer makes fits the size limit" {
     }
     var request = workload_request(try subject_key(1));
     request.cluster = cluster;
-    request.service = service;
+    request.name = service;
     request.identity.labels = &labels;
     request.lifetime = .{
         .not_before_ms = 2_600_000_000_000,
@@ -312,9 +354,9 @@ test "the writer refuses what the bounds forbid" {
     request.lifetime = .{ .not_before_ms = now, .not_after_ms = 253_402_300_800_000 };
     try testing.expectError(error.IssueLifetime, x509.issue_workload(&certificate, ca, &request));
     request = workload_request(try subject_key(1));
-    request.service = "Broker";
+    request.name = "Broker";
     try testing.expectError(error.BadServiceName, x509.issue_workload(&certificate, ca, &request));
-    request.service = "broker";
+    request.name = "broker";
     request.cluster = "*.prod";
     try testing.expectError(error.BadCluster, x509.issue_workload(&certificate, ca, &request));
     const server: x509.ServerRequest = .{
@@ -491,7 +533,7 @@ test "serials: certificates differing only in subject name, or any other field, 
     );
 
     var renamed = workload_request(key);
-    renamed.service = "broker-2";
+    renamed.name = "broker-2";
     var other_cluster = workload_request(key);
     other_cluster.cluster = "dev.example";
     var other_epoch = workload_request(key);

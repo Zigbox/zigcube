@@ -85,6 +85,8 @@ comptime {
     _ = @import("relay_pump.zig");
     _ = @import("relay_fuzz.zig");
     _ = @import("relay.zig");
+    _ = @import("relay_tls_test.zig");
+    _ = @import("agent_relay_certs_test.zig");
     _ = @import("tls_fuzz.zig"); // The same.
     _ = @import("tls_server_fuzz.zig"); // The same.
     _ = @import("tls_conn.zig"); // Sockets and the real clock: native only.
@@ -109,6 +111,7 @@ comptime {
     _ = @import("agent_run.zig");
     _ = @import("demo_c2_check.zig");
     _ = @import("job_api.zig");
+    _ = @import("job_cert.zig");
 }
 
 test {

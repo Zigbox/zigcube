@@ -143,7 +143,10 @@ const hello_digest = "b3:51aa9c03";
 const sim_relays = [_]records.JobRelay{.{ .name = "sim-relay", .address = "127.0.0.1:9" }};
 const next_digest = "b3:9d20c4f1";
 const broken_digest = "b3:00ff" ++ repeat('0', 55).* ++ "e1";
-const fixtures = [_][]const u8{ hello_digest, next_digest };
+/// A relayed job's image is a full digest (B4: its certificate attests it).
+const relay_digest = "b3:" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++
+    "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03";
+const fixtures = [_][]const u8{ hello_digest, next_digest, relay_digest };
 const images = [_][]const u8{ hello_digest, next_digest, broken_digest };
 const service_names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
 
@@ -1614,7 +1617,7 @@ pub const Cluster = struct {
             40_000;
         _ = job_api.create(&ctx, &c.api_source, .{
             .name = name,
-            .image = hello_digest,
+            .image = if (relayed) relay_digest else hello_digest,
             .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
             .limits = .{
                 .cpu_millis = if (unplaceable) 100_000 else 10,

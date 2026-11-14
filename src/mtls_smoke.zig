@@ -52,7 +52,7 @@ pub fn run() Step {
     }) catch return .issue;
     ca.issue_workload_certificate(&workload, &.{
         .cluster = cluster,
-        .service = service,
+        .name = service,
         .subject_key = leaf.public_key.toBytes(),
         .identity = .{ .image_digest = @splat(7), .placement_epoch = 3, .labels = &.{} },
         .ttl_ms = ttl_ms,

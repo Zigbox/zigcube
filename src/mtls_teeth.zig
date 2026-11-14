@@ -6,6 +6,7 @@
 
 test {
     _ = @import("peer_test.zig");
+    _ = @import("job_cert.zig");
     _ = @import("tls_client_test.zig");
     _ = @import("tls_fuzz.zig");
     _ = @import("tls_fuzz_teeth.zig");

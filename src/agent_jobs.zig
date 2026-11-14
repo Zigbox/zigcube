@@ -609,6 +609,9 @@ const Work = struct {
                 .epoch = current.epoch,
                 .started_at_ms = current.started_at_ms,
             });
+        } else if (seen) |held| {
+            // Reported by an earlier pass or process: the run's certificate may be asked for.
+            if (held.status == .running) work.agent.note_running_reported(subject.id);
         }
         if (current.stop_cause == null) {
             // The report above is a store call, which enforces a deadline that came due during
@@ -910,6 +913,10 @@ const Work = struct {
             .image = run.image,
             .source = run.source,
             .relay = relay_address(run),
+            .relay_server_name = if (run.relay) |relay| relay.server_name else "",
+            .relay_server_anchor = if (run.relay) |relay| relay.server_anchor else "",
+            .relay_plain = if (run.relay) |relay| relay.plain else false,
+            .network = if (run.relay != null) .loopback else .host,
             .command = run.command,
             .env = env,
             .limits = .{
@@ -1085,6 +1092,7 @@ const Work = struct {
         const agent = work.agent;
         assert(wanted.epoch > 0);
         if (work.seen_of(wanted.run)) |existing| {
+            if (existing.status == .running) agent.note_running_reported(wanted.run);
             if (same(existing, wanted)) return;
         }
         const value: records.JobObserved = .{
@@ -1116,6 +1124,9 @@ const Work = struct {
         }
         const outcome = try work.commit(value, set.compares());
         if (outcome == .refused) agent.job_reports_refused += 1;
+        if (outcome == .applied and wanted.status == .running) {
+            agent.note_running_reported(wanted.run);
+        }
     }
 
     const store_compare = @import("store.zig").Compare;
@@ -1249,6 +1260,10 @@ pub fn raise_spec(diag: *Diag, run: []const u8, problem: runtime.SpecProblem) vo
             .{ run, c.label_key_bytes_max, c.label_value_bytes_max },
         ),
         .missing_replica_label => diag.cause("labels: {s} lacks the replica label", .{run}),
+        .relay_network_open => diag.cause(
+            "network: {s} has a relay, so its network must be loopback only",
+            .{run},
+        ),
     }
     diag.fix(.{ .sentence = "submit the job again with that field corrected, and report this " ++
         "with the diagnostic bundle: the API should have refused it" });
