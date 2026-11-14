@@ -26,6 +26,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fault_proxy = @import("testing/fault_proxy.zig");
+const harness_tls = @import("harness_tls.zig");
 const host_procs = @import("host_procs.zig");
 const http = @import("agent_http.zig");
 const node_store = @import("node_store.zig");
@@ -168,6 +169,10 @@ const Smoke = struct {
     /// The exit code of a failure: `exit_unverified` once the plan let a corrupt chunk through
     /// to the store, which is what `swarm-smoke-teeth` waits for.
     exit_code: u8 = 1,
+    /// The API over TLS (`--listen`, B7 slice 6): the CA, the certificates and the smoke's own
+    /// `admin` credentials, loaded once the server has written its CA.
+    pki: ?harness_tls.Pki = null,
+    credentials: ?*harness_tls.Credentials = null,
 
     fn say(smoke: *Smoke, comptime format: []const u8, args: anytype) void {
         var buffer: [512]u8 = undefined;
@@ -217,15 +222,26 @@ const Smoke = struct {
     fn start_server(smoke: *Smoke) !void {
         const arena = smoke.arena.allocator();
         const listen = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{smoke.port});
-        const store = try smoke.path("store.db");
+        const store = try std.fmt.allocPrint(arena, "sqlite:{s}", .{try smoke.path("store.db")});
+        const state_dir = try smoke.path("server-state");
         const args = [_][]const u8{
-            "--insecure-listen", listen,
-            "--store",           try std.fmt.allocPrint(arena, "sqlite:{s}", .{store}),
-            "--create-store",    "--quiet",
+            "--listen",       listen,
+            "--store",        store,
+            "--state-dir",    state_dir,
+            "--create-store", "--quiet",
+        };
+        if (smoke.pki == null) smoke.pki = .{
+            .io = smoke.io,
+            .arena = arena,
+            .server_exe = smoke.server_exe,
+            .store = store,
+            .state_dir = state_dir,
+            .certs = try smoke.path("certs"),
         };
         smoke.server = try smoke.spawn(smoke.server_exe, &args, "server.log");
         const ready = struct {
             fn check(s: *Smoke) !bool {
+                if (!try s.tls_ready()) return false;
                 const reply = s.call("GET", "/v1/status", "") catch return false;
                 return reply.status == 200;
             }
@@ -253,9 +269,33 @@ const Smoke = struct {
             "--peer-listen",  mine,
             "--address",      mine,
             "--registry",     try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{registry_port}),
-        };
+        } ++ try smoke.agent_tls(nodes[at]);
         const log = try std.fmt.allocPrint(arena, "agent-{s}.log", .{nodes[at]});
         smoke.agents[at] = try smoke.spawn(smoke.agent_exe, &args, log);
+    }
+
+    /// Whether the smoke holds its `admin` credentials: once the server wrote its CA, issues
+    /// them (the first time) and loads them.
+    fn tls_ready(smoke: *Smoke) !bool {
+        if (smoke.credentials != null) return true;
+        const pki = &smoke.pki.?;
+        if (try pki.find_ca() == null) return false;
+        _ = pki.issue("smoke", "admin") catch {
+            smoke.say("ca issue-client: {s}", .{pki.said});
+            return false;
+        };
+        smoke.credentials = try pki.load("smoke");
+        return true;
+    }
+
+    /// The agent's `--ca`, `--cert` and `--key`: a node certificate issued for `node`.
+    fn agent_tls(smoke: *Smoke, node: []const u8) ![6][]const u8 {
+        const pki = &smoke.pki.?;
+        _ = pki.issue(node, null) catch |err| {
+            smoke.say("ca issue-node: {s}", .{pki.said});
+            return err;
+        };
+        return pki.flags(node);
     }
 
     fn set_fault(smoke: *Smoke, state: []const u8, name: []const u8) !void {
@@ -270,7 +310,8 @@ const Smoke = struct {
 
     fn call(smoke: *Smoke, method: []const u8, target: []const u8, body: []const u8) !http.Reply {
         const address = try net.IpAddress.parse("127.0.0.1", smoke.port);
-        const client: http.Client = .{ .io = smoke.io, .address = address };
+        const credentials = smoke.credentials orelse return error.ApiUnreachable;
+        const client: http.Client = .{ .io = smoke.io, .address = address, .tls = credentials };
         var diag: Diag = undefined;
         diag.reset();
         return client.call(smoke.arena.allocator(), .{
