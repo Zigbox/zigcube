@@ -14,7 +14,8 @@
 //! seed: operations (40 to 800), nodes (unless given), lease ttl, replica counts.
 //! `--profile=auto` draws which fault classes are on (`mixed` is today's mix and the default,
 //! so a command line without these flags runs what it always ran; `partitions`, `skew`,
-//! `crash_heavy`, `slow_store` and `bad_release` switch the other classes off). A flag given beats the draw.
+//! `crash_heavy`, `slow_store` and `bad_release` switch the other classes off). A flag given
+//! beats the draw.
 //! The report and each failure say what ran, and the replay line is concrete: it names the
 //! drawn values, so it needs no draw to reproduce.
 //!

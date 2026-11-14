@@ -1466,10 +1466,23 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(native_report);
         step.dependOn(&node.step);
     }
+    add_teeth_steps(b, sim);
+    add_offline_step(b, sim);
+    add_burst_step(b, sim);
+    add_worlds_step(b, sim);
+    add_reuse_step(b, sim);
+    add_regress_step(b, sim);
+    add_regressions_step(b, sim);
+    add_fencing_teeth_step(b, sim);
+}
+
+/// `sim-c1-teeth`, `sim-c3-teeth` and one step per tooth (`c1_teeth_roots`).
+fn add_teeth_steps(b: *std.Build, sim: SimStepOptions) void {
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
     const c3_teeth = b.step("sim-c3-teeth", "Run the sim-c3 negative tests (budget, pause, " ++
         "history); each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 26 fault-on sim-c1 and sim-c3 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 26 fault-on sim-c1 and sim-c3 " ++
+        "runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1501,13 +1514,6 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
     }
-    add_offline_step(b, sim);
-    add_burst_step(b, sim);
-    add_worlds_step(b, sim);
-    add_reuse_step(b, sim);
-    add_regress_step(b, sim);
-    add_regressions_step(b, sim);
-    add_fencing_teeth_step(b, sim);
 }
 
 /// The same fault in a plain run (no `--c1`): the job checks need no per-revision tap.

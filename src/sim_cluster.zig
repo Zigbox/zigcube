@@ -949,13 +949,9 @@ pub const Cluster = struct {
         c.jobs_on = false;
         c.jobs = .{};
         c.jobs_watch = .{};
-        c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
-        c.rollout_prng = .init(seed ^ 0x9a05_e7e5_0c3);
-        c.c3 = false;
-        c.rollout_pauses = 0;
-        c.rollout_resumes = 0;
         c.job_next = 1;
         c.init_reuse();
+        c.init_rollouts(seed);
         c.strong = options.strong or c1_teeth.strong_world;
         c.host_crashes = 0;
         c.init_c1(gpa);
@@ -964,6 +960,26 @@ pub const Cluster = struct {
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// The C3 world (`--c3`) is off until `run` turns it on; the job world's watch draws too.
+    fn init_rollouts(c: *Cluster, seed: u64) void {
+        c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
+        c.rollout_prng = .init(seed ^ 0x9a05_e7e5_0c3);
+        c.c3 = false;
+        c.rollout_pauses = 0;
+        c.rollout_resumes = 0;
+    }
+
+    /// The sim-c3 line: how often each rollout check judged, and the pauses and resumes asked.
+    fn report_c3(c: *const Cluster, report: anytype) void {
+        report.print("sim-c3 R1 retirements={d} R2 surges={d} R3 versions={d} " ++
+            "R4 paused={d} R6 history={d}; pauses={d} resumes={d}\n", .{
+            c.c3_tally.retirements_judged, c.c3_tally.surges_judged,
+            c.c3_tally.versions_judged,    c.c3_tally.paused_judged,
+            c.c3_tally.history_judged,     c.rollout_pauses,
+            c.rollout_resumes,
+        });
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -3230,7 +3246,7 @@ pub fn simulate(
         c.swarm.replicas_pct,
     });
     c.liveness = options.liveness;
-    assert(!options.c3 or options.c1);
+    if (options.c3) assert(options.c1);
     c.c1 = options.c1;
     c.c3 = options.c3;
     c.jobs_on = options.jobs;
@@ -3482,13 +3498,7 @@ fn print_summary(c: *Cluster) void {
             c.c1_tally.facts_other,
         });
         report.print("sim-c1 L1: placements judged={d}\n", .{c.c1_tally.placements_judged});
-        if (c.c3) report.print("sim-c3 R1 retirements={d} R2 surges={d} R3 versions={d} R4 paused={d} " ++
-            "R6 history={d}; pauses={d} resumes={d}\n", .{
-            c.c3_tally.retirements_judged, c.c3_tally.surges_judged,
-            c.c3_tally.versions_judged,    c.c3_tally.paused_judged,
-            c.c3_tally.history_judged,     c.rollout_pauses,
-            c.rollout_resumes,
-        });
+        if (c.c3) c.report_c3(report);
         const n = c.recorder.counts;
         report.print("sim-c1 acceptance: decisions={d} complete={d} truncated={d} dropped={d} " ++
             "keys deleted={d} changed={d}\n", .{

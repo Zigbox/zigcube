@@ -151,7 +151,8 @@ const Fixture = struct {
                 .status = status,
                 .reported_at_ms = self.manual.ms,
             };
-            try self.put(.{ .agent = "node1" }, records.observed_key("node1", id).slice(), observed);
+            const key = records.observed_key("node1", id);
+            try self.put(.{ .agent = "node1" }, key.slice(), observed);
         }
         return count;
     }
