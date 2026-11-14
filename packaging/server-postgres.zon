@@ -3,9 +3,10 @@
 .{
     // The server's writes are unauthenticated: listen on a loopback or private address.
     .listen = "127.0.0.1:7070",
-    // The store is not chosen for you: without a line here the server keeps its state in memory
-    // and loses it when it stops. Name your database, for example:
+    // The store is not chosen for you. The server refuses to start until you name your database
+    // here (a server that kept its state in memory would lose it when it stops), for example:
     //   .store = "postgres:host=db.internal dbname=zigcube user=zigcube",
     //   .state_dir = "/var/lib/zigcube",
     //   .create_store = true,
+    .store = "postgres:",
 }

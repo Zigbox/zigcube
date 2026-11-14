@@ -44,3 +44,14 @@ numbers behind the server's baseline (static `zcube`, `zcube-agent`; dynamic `zc
 failed cross build) are in the brief.
 
 Where: `docs/briefs/packaging.md`; later `docs/releases/automation.md` and `packaging.md`.
+
+## Defaults of the shipped packages (supervisor, 2026-11-14)
+
+- The agent's config sets `.runtime = .zigbox`. Accepted.
+- The Postgres flavour ships `.store = "postgres:"`, never `memory`: a database package that kept
+  its state in memory would lose it on restart. The server refuses that setting with its existing
+  ZC-E0106 ("postgres: needs connection settings"); the comment above it says what to write. No new
+  code. (The server's own default with no `.store` is memory, so leaving the line out would not
+  have refused.)
+- Units ship disabled; `zigbox-dev` depends on the SQLite server only; no maintainer scripts; the
+  package tool is built in ReleaseSafe. All accepted.
