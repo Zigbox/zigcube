@@ -1,8 +1,7 @@
 # B7 slice 6: the console and the harnesses over TLS
 
-*Decided 2026-11-14. The owner approved the slice. The cut in part 1 is the slice's
-conservative choice and is on the **owner list**: the supervisor gave no answer within 20
-minutes.*
+*Decided 2026-11-14. The owner approved the slice, and chose the browser path (A) below on the
+same day, through the supervisor.*
 
 ## The slice
 
@@ -12,7 +11,7 @@ The owner approved adding slice 6 to B7 (docs/briefs/b7.md):
 2. The harnesses talk to `--listen` as an operator would. `--insecure-listen` stays for
    `zcube local` and for the tests of that listener.
 
-## Part 1, the console in a browser: cut (owner list)
+## Part 1, the console in a browser: the owner's decision (A)
 
 **Evidence.** We captured the ClientHello that Chromium 153.0.8010.12 (the Playwright build in
 the container) sends to a raw socket:
@@ -26,29 +25,41 @@ the container) sends to a raw socket:
 - Cipher suites include TLS_AES_128_GCM_SHA256. ALPN offers h2 and http/1.1.
 
 The cluster PKI is Ed25519 only: the CA, the server certificate and the CertificateVerify
-(B7 fixed decisions). Chromium cannot verify any of it, and cannot sign a CertificateVerify
-with an Ed25519 client key. So no browser handshake can succeed against `--listen`, whatever
-the server does about ALPN or groups. The PKCS#12 bundle, the SANs and the Playwright test
-would all serve a handshake that cannot happen.
+(B7 fixed decisions). Chromium can neither verify any of it nor sign a CertificateVerify with
+an Ed25519 client key. So no browser handshake can succeed against `--listen`, whatever the
+server does about ALPN or groups.
 
-**Choices put to the supervisor:**
+**The owner chose (A), a browser-only ECDSA P-256 path** (the alternatives were (B), the whole
+PKI on P-256, and (C), cutting part 1). What is approved:
 
-- **(A), recommended.** A browser-only ECDSA P-256 path:
-  - a second, per-cluster P-256 "browser CA";
-  - a P-256 server certificate, presented when the ClientHello offers no ed25519;
-  - `ca issue-client NAME --scope S --p12 FILE`, which writes a P-256 client certificate in
-    PKCS#12;
-  - the server accepts either chain, and a CertificateVerify with ecdsa_secp256r1_sha256.
+- **A browser CA.** A second per-cluster CA, on P-256, beside the cluster CA.
+- **A P-256 server certificate**, presented only when the ClientHello does not list ed25519.
+- **`ca issue-client NAME --scope jobs|admin --p12 FILE`.** It issues a P-256 client
+  certificate from the browser CA, with the same identity extension, scope and revoked file.
+  - The PKCS#12 password comes from a file or from stdin, never from argv.
+  - The file is written with mode 0600 and is never overwritten.
+- **Client chains of either CA.** The server verifies a client chain of either CA, with
+  ecdsa_secp256r1_sha256 for the browser one.
+- **`--tls-san NAME_OR_IP`**: repeatable, no default. `--tls-name` stays the first DNS SAN.
+- **Only `std.crypto.sign.ecdsa`.** Agents, `zcube` and the relay stay on Ed25519.
 
-  This needs P-256 signing and verification in the TLS server, which `std.crypto` has.
-- **(B).** Move the whole PKI to P-256.
-- **(C), conservative.** Cut part 1. The console stays where it is today: `--insecure-listen`
-  on loopback, or an operator's own proxy. Record the evidence and do part 2.
+What it amends:
 
-There was no answer within 20 minutes, so the slice takes **(C)**. Part 1 is a fresh slice
-once the owner picks (A) or (B). Either one changes the fixed PKI decision, which is the
-owner's call. `--tls-san NAME_OR_IP` (repeatable, no default) was proposed for the server
-certificate's SANs and was not added: it only matters once a browser can handshake.
+- The brief's "Ed25519 only" and its two non-goals, **for the browser path only**.
+  docs/briefs/b7.md says so.
+
+Requirements:
+
+- **No signing across paths.** A browser-CA certificate can never be a node certificate, and
+  an Ed25519 client certificate never chains to the browser CA. The rule has its own near-miss
+  rows and teeth.
+- **Every new kind** gets exact-bytes x509 templates, near-miss rows, teeth and fuzz rows.
+- **Malleability.** ECDSA signatures are checked for low-S and encoding malleability as std
+  does, with a test.
+
+**Status.** Part 1 is **not built in this session**. This session's context was spent on
+part 2 and on finding the evidence above. The supervisor allowed part 2 to be its own report,
+so part 1 is handed to a fresh session, from this decision.
 
 ## Part 2, the harnesses over TLS
 
@@ -88,11 +99,13 @@ The fix belongs to the agent:
 - it reads the server through `api_tls_client`;
 - both runtimes pass the flags.
 
-That is next to slice 5's agent-client work, so it is left to a slice of its own.
-`swarm-smoke` stays on `--insecure-listen` until then. Converting it is the pattern of
+That is next to slice 5's agent-client work. The supervisor agreed (2026-11-14) that it becomes
+**B7 slice 7**, done by a fresh session after slice 5 lands, before 0.5.1 ships (B7 makes TLS
+the default, so 0.5.1 must not ship with C2's peer fetch silently broken). In that slice,
+`swarm-smoke` and `demo-c2` move to TLS. `swarm-smoke` stays on `--insecure-listen` until then. Converting it is the pattern of
 `agent-smoke`: the `pki` and `credentials` fields, `tls_ready` and `agent_tls`.
 
 ## CI
 
-The harnesses run in the CI jobs they already had. No browser test was added, so CI gains no
-job.
+The harnesses run in the CI jobs they already had. Part 1's browser test, and whether CI runs
+it, are left to the session that builds part 1.
