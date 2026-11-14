@@ -10,6 +10,7 @@ const b1 = @import("demo_b1_state.zig");
 const c1 = @import("demo_c1_state.zig");
 const demo_host = @import("demo_host.zig");
 const diag_mod = @import("diag.zig");
+const harness_tls = @import("harness_tls.zig");
 const peer_files = @import("peer_files.zig");
 const peer_stream = @import("peer_stream.zig");
 const pem = @import("pem.zig");
@@ -72,19 +73,17 @@ pub fn start(demo: *Demo) !void {
         "ZCUBE_KEY=certs/app.key", .{demo.tls_address});
 }
 
-/// The one `ca-<hash>.crt` the server wrote in its state directory.
+/// The one CA certificate the server wrote in its state directory (`harness_tls.Pki.find_ca`).
 fn find_ca(host: *Host, state_dir: []const u8) ![]const u8 {
-    const dir = try std.Io.Dir.cwd().openDir(host.io, state_dir, .{ .iterate = true });
-    defer dir.close(host.io);
-    var iterator = dir.iterate();
-    var found: ?[]const u8 = null;
-    for (0..64) |_| {
-        const entry = (try iterator.next(host.io)) orelse break;
-        if (!std.mem.startsWith(u8, entry.name, "ca-")) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".crt")) continue;
-        try host.check_quiet(found == null, "two CA certificates in {s}", .{state_dir});
-        found = try std.fmt.allocPrint(host.arena(), "{s}/{s}", .{ state_dir, entry.name });
-    }
+    var pki: harness_tls.Pki = .{
+        .io = host.io,
+        .arena = host.arena(),
+        .server_exe = host.config.server_exe,
+        .store = host.config.store,
+        .state_dir = state_dir,
+        .certs = try host.path_in_work("certs"),
+    };
+    const found = pki.find_ca() catch return host.fail("{s}", .{pki.said});
     return found orelse host.fail("the server wrote no CA certificate in {s}", .{state_dir});
 }
 

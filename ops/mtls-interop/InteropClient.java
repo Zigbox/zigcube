@@ -5,6 +5,8 @@ import java.net.SocketTimeoutException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.KeyFactory;
 import java.security.KeyStore;
 import java.security.PrivateKey;
@@ -26,7 +28,10 @@ import javax.net.ssl.TrustManagerFactory;
  * sends one HTTP request and prints the reply's status line. A test tool only: nothing here ships
  * (docs/decisions/2026-11-05-interop-tools-are-test-only.md).
  *
- * Usage: InteropClient CA.pem PORT SERVER-NAME PATH [CERT.pem KEY.pem]
+ * Usage: InteropClient CA.pem PORT SERVER-NAME PATH [CERT.pem KEY.pem | FILE.p12 PASSWORD-FILE]
+ *
+ * A `.p12` (the browser path, B7 slice 6) is loaded by the JDK itself; its password file loses one
+ * trailing "\n" and then one "\r", as `zcube-server ca issue-client --password-file` reads it.
  *
  * It prints one line: `STATUS <status line>` when a reply came, or `FAILED <exception>: <message>`.
  * The server's certificate must chain to CA.pem and name SERVER-NAME (endpoint identification).
@@ -39,7 +44,8 @@ import javax.net.ssl.TrustManagerFactory;
 public final class InteropClient {
     public static void main(String[] args) throws Exception {
         if (args.length != 4 && args.length != 6) {
-            throw new IllegalArgumentException("usage: InteropClient CA PORT NAME PATH [CERT KEY]");
+            throw new IllegalArgumentException(
+                "usage: InteropClient CA PORT NAME PATH [CERT KEY | P12 PASSWORD_FILE]");
         }
         int port = Integer.parseInt(args[1]);
         String name = args[2];
@@ -106,6 +112,7 @@ public final class InteropClient {
     }
 
     static KeyManager[] keyManagers(String cert, String key) throws Exception {
+        if (cert.endsWith(".p12")) return p12KeyManagers(cert, key);
         KeyStore keys = KeyStore.getInstance("PKCS12");
         keys.load(null, null);
         PrivateKey privateKey = KeyFactory.getInstance("Ed25519")
@@ -114,6 +121,25 @@ public final class InteropClient {
         keys.setKeyEntry("client", privateKey, new char[0], chain.toArray(new Certificate[0]));
         KeyManagerFactory factory = KeyManagerFactory.getInstance("SunX509");
         factory.init(keys, new char[0]);
+        return factory.getKeyManagers();
+    }
+
+    /**
+     * The browser path: a PKCS#12 file from `ca issue-client --p12`, read by the JDK itself, and
+     * its password file (one trailing "\n" then one "\r" dropped, as zcube-server does).
+     */
+    static KeyManager[] p12KeyManagers(String file, String passwordFile) throws Exception {
+        String text = Files.readString(Path.of(passwordFile), StandardCharsets.UTF_8);
+        // As the server reads `--password-file`: one trailing "\n" is dropped, then one "\r".
+        if (text.endsWith("\n")) text = text.substring(0, text.length() - 1);
+        if (text.endsWith("\r")) text = text.substring(0, text.length() - 1);
+        char[] password = text.toCharArray();
+        KeyStore keys = KeyStore.getInstance("PKCS12");
+        try (InputStream in = Files.newInputStream(Path.of(file))) {
+            keys.load(in, password);
+        }
+        KeyManagerFactory factory = KeyManagerFactory.getInstance("SunX509");
+        factory.init(keys, password);
         return factory.getKeyManagers();
     }
 

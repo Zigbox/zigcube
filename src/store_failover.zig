@@ -42,6 +42,7 @@ const diag_mod = @import("diag.zig");
 const Diag = diag_mod.Diag;
 const pq = @import("pq.zig");
 const http = @import("agent_http.zig");
+const harness_tls = @import("harness_tls.zig");
 const demo_host = @import("demo_host.zig");
 const RealClock = @import("agent_clock.zig").RealClock;
 const PostgresStore = @import("store_postgres.zig").PostgresStore;
@@ -98,6 +99,10 @@ const Rig = struct {
     server: ?std.process.Child = null,
     server_port: u16,
     server_starts: u32 = 0,
+    /// The server's CA and the `failover` admin certificate issued from it (B7 slice 6: the
+    /// rig talks to `--listen` as an operator would).
+    pki: ?harness_tls.Pki = null,
+    credentials: ?*harness_tls.Credentials = null,
     /// The server's remembered revision just before the failover.
     remembered: u64 = 0,
     /// `async`: the server's store's revision on the standby just after its promotion.
@@ -306,9 +311,17 @@ fn start_server(rig: *Rig) !void {
     const state = try std.fmt.allocPrint(arena, "{s}/state", .{rig.work});
     const store_arg = try std.fmt.allocPrint(arena, "postgres:{s}", .{rig.through});
     const argv = [_][]const u8{
-        rig.options.server, "--insecure-listen", listen, "--store",
-        store_arg,          "--state-dir",       state,  "--create-store",
+        rig.options.server, "--listen",    listen, "--store",
+        store_arg,          "--state-dir", state,  "--create-store",
         "--quiet",
+    };
+    if (rig.pki == null) rig.pki = .{
+        .io = rig.io,
+        .arena = arena,
+        .server_exe = rig.options.server,
+        .store = store_arg,
+        .state_dir = state,
+        .certs = try std.fmt.allocPrint(arena, "{s}/certs", .{rig.work}),
     };
     rig.server = try std.process.spawn(rig.io, .{
         .argv = &argv,
@@ -322,6 +335,10 @@ fn start_server(rig: *Rig) !void {
     try std.Io.Dir.cwd().writeFile(rig.io, .{ .sub_path = pid_path, .data = pid });
     var waited: u32 = 0;
     while (waited < wait_ms_max) : (waited += poll_ms) {
+        if (!try tls_ready(rig)) {
+            faults.nap(rig.io, poll_ms);
+            continue;
+        }
         if (call(rig, "GET", "/v1/status", "")) |reply| {
             if (reply.status == 200) return;
         } else |_| {}
@@ -356,9 +373,24 @@ fn kill_stale_server(io: std.Io, arena: Allocator, work: []const u8) void {
     say("failover: killed zcube-server {d}, left running by a killed earlier run", .{pid});
 }
 
+/// Whether the rig holds its `failover` admin credentials: once the server wrote its CA, issues
+/// them (the first time) and loads them. Only a CA not yet written is waited for.
+fn tls_ready(rig: *Rig) !bool {
+    if (rig.credentials != null) return true;
+    // start_server makes the Pki before it starts the server.
+    assert(rig.pki != null);
+    const pki = &rig.pki.?;
+    const ca = pki.find_ca() catch return rig.fail("{s}", .{pki.said});
+    if (ca == null) return false;
+    _ = pki.issue("failover", "admin") catch return rig.fail("{s}", .{pki.said});
+    rig.credentials = pki.load("failover") catch return rig.fail("{s}", .{pki.said});
+    return true;
+}
+
 fn call(rig: *const Rig, method: []const u8, target: []const u8, body: []const u8) !http.Reply {
     const address = try net.IpAddress.parse("127.0.0.1", rig.server_port);
-    const client: http.Client = .{ .io = rig.io, .address = address };
+    const credentials = rig.credentials orelse return error.ApiUnreachable;
+    const client: http.Client = .{ .io = rig.io, .address = address, .tls = credentials };
     var diag: Diag = undefined;
     diag.reset();
     return client.call(rig.arena, .{ .method = method, .target = target, .body = body }, &diag);

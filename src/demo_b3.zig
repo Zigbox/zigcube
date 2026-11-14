@@ -105,6 +105,8 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
             .images = "",
             .store = "",
             .transcript_path = options.transcript,
+            // B7 slice 6: the server serves TLS only; the guest's agent has a node certificate.
+            .tls_only = true,
         },
         .work = "",
         .state = "",

@@ -71,6 +71,7 @@ check $PR x "" "build.zig.zon" TTTTTTTTTTTT
 check $PR x "" ".github/workflows/ci.yml" TTTTTTTTTTTT
 check $PR x "" ".github/ci-changes.sh" TTTTTTTTTTTT
 check $PR x "" "src/demo_host.zig" TTTTTTTTTTTT
+check $PR x "" "src/harness_tls.zig" TTTTTTTTTTTT
 check $PR x "" "src/server.zig" TTTTTTTTTTTT
 check $PR x "" "src/agent_loop.zig" TTTTTTTTTTTT
 check $PR x "" "src/store_postgres.zig" TTTTTTTTTTTT

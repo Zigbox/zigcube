@@ -18,6 +18,8 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const peer_ca = @import("peer_ca.zig");
 const peer_stream = @import("peer_stream.zig");
+const p256 = @import("x509_p256.zig");
+const server_browser_ca = @import("server_browser_ca.zig");
 const schedule = @import("tls_schedule.zig");
 const secure_random = @import("secure_random.zig");
 const tls_server = @import("tls_server.zig");
@@ -49,13 +51,32 @@ pub const Setup = struct {
     not_after_ms: u64,
     cluster_buffer: [peer_ca.cluster_bytes]u8,
     cluster_length: u8,
+    /// The browser path (B7 slice 6): the browser CA's key, and the P-256 key and certificate a
+    /// client that does not offer Ed25519 gets, renewed with the Ed25519 pair. Null in tests
+    /// that run without it.
+    browser: ?BrowserIdentity,
 
-    /// `ca` and `dns_name` outlive the setup. On failure `diag` says why.
+    /// What the browser path needs from the caller: the browser CA's key and the extra names
+    /// (`--tls-san`), both outliving the setup.
+    pub const Browser = struct {
+        ca_key: p256.KeyPair,
+        sans: []const p256.San,
+    };
+
+    const BrowserIdentity = struct {
+        ca_key: p256.KeyPair,
+        sans: []const p256.San,
+        key_pair: p256.KeyPair,
+        certificate: p256.Der,
+    };
+
+    /// `ca`, `dns_name` and `browser`'s names outlive the setup. On failure `diag` says why.
     pub fn init(
         setup: *Setup,
         io: std.Io,
         ca: *const peer_ca.Ca,
         dns_name: []const u8,
+        browser: ?Browser,
         diag: *Diag,
     ) Error!void {
         assert(dns_name.len > 0);
@@ -68,6 +89,12 @@ pub const Setup = struct {
             .not_after_ms = 0,
             .cluster_buffer = undefined,
             .cluster_length = 0,
+            .browser = if (browser) |given| .{
+                .ca_key = given.ca_key,
+                .sans = given.sans,
+                .key_pair = undefined,
+                .certificate = undefined,
+            } else null,
         };
         setup.cluster_length = @intCast(ca.cluster(&setup.cluster_buffer).len);
         try setup.renew(diag);
@@ -75,6 +102,7 @@ pub const Setup = struct {
 
     pub fn deinit(setup: *Setup) void {
         std.crypto.secureZero(u8, std.mem.asBytes(&setup.key_pair));
+        if (setup.browser) |*browser| std.crypto.secureZero(u8, std.mem.asBytes(browser));
     }
 
     /// A new key and a certificate for it, valid `x509_leaf_ttl_ms_max` from now.
@@ -97,8 +125,31 @@ pub const Setup = struct {
             });
             return error.Refused;
         };
+        if (setup.browser) |*browser| try setup.renew_browser(browser, diag);
         setup.key_pair = key_pair;
         setup.not_after_ms = now_ms + constants.x509_leaf_ttl_ms_max;
+    }
+
+    /// A new P-256 key and its certificate from the browser CA, for the same names and ttl.
+    fn renew_browser(setup: *Setup, browser: *BrowserIdentity, diag: *Diag) Error!void {
+        var seed: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        const key_pair = server_browser_ca.make_key(setup.io, &seed, diag) catch
+            return error.Refused;
+        var certificate: p256.Der = .{};
+        server_browser_ca.issue_server(&certificate, setup.ca, browser.ca_key, .{
+            .dns_name = setup.dns_name,
+            .sans = browser.sans,
+        }, key_pair, constants.x509_leaf_ttl_ms_max) catch |err| {
+            diag.raise(.E0106);
+            diag.cause("the API server's browser certificate for {s}: {s}", .{
+                setup.dns_name, @errorName(err),
+            });
+            diag.fix(.{ .sentence = "check --tls-name and each --tls-san" });
+            return error.Refused;
+        };
+        browser.key_pair = key_pair;
+        browser.certificate = certificate;
     }
 
     /// Starts `conn`'s server with the current certificate, renewing it first when half its
@@ -131,6 +182,16 @@ pub const Setup = struct {
             .certificates = &chain,
             .signer = tls_server.key_pair_signer(&conn.key_pair),
         };
+        var browser_chain: [1][]const u8 = undefined;
+        if (setup.browser) |*browser| {
+            conn.browser_key = browser.key_pair;
+            browser_chain[0] = browser.certificate.slice();
+            config.browser = .{
+                .anchor = p256.point_of(browser.ca_key),
+                .certificates = &browser_chain,
+                .key = &conn.browser_key,
+            };
+        }
         conn.server.init(&config);
     }
 
@@ -190,6 +251,8 @@ pub const Conn = struct {
     /// The server key this connection signs its handshake with: a copy, so a renewal in
     /// `Setup` never changes it mid-handshake.
     key_pair: Ed25519.KeyPair,
+    /// The browser path's key, copied the same way (unused without a browser identity).
+    browser_key: p256.KeyPair,
     /// The socket's own reader and writer: ciphertext.
     raw_reader: *Reader,
     raw_writer: *Writer,
@@ -243,6 +306,7 @@ pub const Conn = struct {
     pub fn deinit(conn: *Conn) void {
         std.crypto.secureZero(u8, std.mem.asBytes(&conn.server));
         std.crypto.secureZero(u8, std.mem.asBytes(&conn.key_pair));
+        std.crypto.secureZero(u8, std.mem.asBytes(&conn.browser_key));
         std.crypto.secureZero(u8, &conn.plain);
         std.crypto.secureZero(u8, &conn.sealed);
         std.crypto.secureZero(u8, &conn.stage);

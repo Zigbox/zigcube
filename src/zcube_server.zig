@@ -13,6 +13,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const server_mod = @import("server.zig");
 const issue_mod = @import("server_issue.zig");
+const p12_mod = @import("server_issue_p12.zig");
 const x509 = @import("x509.zig");
 
 const Diag = diag_mod.Diag;
@@ -78,7 +79,11 @@ pub fn main(init: std.process.Init) u8 {
 fn issue(init: std.process.Init, request: *const config_mod.Issue) u8 {
     var diag: Diag = undefined;
     diag.reset();
-    const issued = issue_mod.issue(init.gpa, init.io, request, &diag) catch |err| {
+    const result = if (request.p12 != null)
+        p12_mod.issue(init.gpa, init.io, request, &diag)
+    else
+        issue_mod.issue(init.gpa, init.io, request, &diag);
+    const issued = result catch |err| {
         return switch (err) {
             error.OutOfMemory => constants.exit_environment,
             error.Canceled => constants.exit_ok,
@@ -97,6 +102,13 @@ fn issue(init: std.process.Init, request: *const config_mod.Issue) u8 {
     };
     var until_buffer: [20]u8 = undefined;
     var buffer: [512]u8 = undefined;
+    if (request.p12) |path| {
+        const until = x509.format_time(&until_buffer, issued.not_after_ms);
+        const p12_line = std.fmt.bufPrint(&buffer, "zcube-server: wrote {s} ({s}, browser CA, " ++
+            "until {s})\n", .{ path, what, until }) catch
+            return say(init.io, "zcube-server: wrote the PKCS#12 file\n");
+        return say(init.io, p12_line);
+    }
     const line = std.fmt.bufPrint(&buffer, "zcube-server: wrote {s}.key and {s}.crt in {s} " ++
         "({s}, until {s})\n", .{
         request.name,

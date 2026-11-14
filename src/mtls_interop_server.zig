@@ -13,6 +13,13 @@
 //!     client reports the alert, and the server logs the refusal's code (`tls: ZC-E08..`).
 //!
 //! Both clients pin the CA and check the server's certificate names `zcube-server`.
+//!
+//! The browser path (B7 slice 6, docs/mtls.md "Browsers"): `ca issue-client --p12` writes a
+//! PKCS#12 file from the browser CA, and each client offers ECDSA P-256 alone (no Ed25519), as a
+//! browser does, pins the browser CA, and checks the server's P-256 certificate names
+//! `zcube-server`. `s_client` presents the file's certificate and key (converted to PEM by
+//! `openssl pkcs12`), the JDK loads the file itself: each is served, held to `jobs`. A cluster CA
+//! certificate on that path, or none, is refused at the handshake.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -23,6 +30,7 @@ const peer_files = @import("peer_files.zig");
 const peer_stream = @import("peer_stream.zig");
 const pem = @import("pem.zig");
 const server_ca = @import("server_ca.zig");
+const server_browser_ca = @import("server_browser_ca.zig");
 const x509 = @import("x509.zig");
 
 const Diag = diag_mod.Diag;
@@ -37,8 +45,10 @@ const client_seed: [32]u8 = @splat(0x3C);
 
 /// `java_eager` writes its request at once after its Finished (`-Dinterop.eager=true`): the
 /// refusal's alert must still reach it, not a reset (`linger_refused` in `server_http.zig`).
-const ClientKind = enum { openssl, java, java_eager };
-const Cert = enum { jobs, none, expired, other_ca };
+/// `openssl_browser` and `java_browser` offer ECDSA P-256 alone and pin the browser CA.
+const ClientKind = enum { openssl, java, java_eager, openssl_browser, java_browser };
+/// `browser` is the PKCS#12 file `ca issue-client --p12` wrote (PEM for `s_client`).
+const Cert = enum { jobs, none, expired, other_ca, browser };
 /// A certificate file and its key file, or null for no certificate.
 const Files = ?[2][]const u8;
 
@@ -66,6 +76,8 @@ fn refused(server_says: []const u8, client_says: []const u8) Expect {
 const no_certificate = "tls: ZC-E0814: the client sent no certificate";
 const expired_says = "tls: ZC-E0811: the client's certificate has expired";
 const other_ca_says = "tls: ZC-E0810: the client's certificate was refused: its issuer is not";
+const browser_none_says = "tls: ZC-E0814: the client (a browser: it offered no Ed25519) sent no";
+const cross_says = "tls: ZC-E08";
 
 const rows = [_]Row{
     .{
@@ -128,6 +140,30 @@ const rows = [_]Row{
         .cert = .other_ca,
         .expect = refused(other_ca_says, "(unknown_ca)"),
     },
+    .{
+        .name = "browser path: s_client with ECDSA alone and the .p12's key is served",
+        .client = .openssl_browser,
+        .cert = .browser,
+        .expect = .accepted,
+    },
+    .{
+        .name = "browser path: the java client with ECDSA alone and the .p12 is served",
+        .client = .java_browser,
+        .cert = .browser,
+        .expect = .accepted,
+    },
+    .{
+        .name = "browser path: s_client with a cluster CA certificate is refused",
+        .client = .openssl_browser,
+        .cert = .jobs,
+        .expect = refused(cross_says, "SSL alert number"),
+    },
+    .{
+        .name = "browser path: s_client with no certificate is told of the browser CA",
+        .client = .openssl_browser,
+        .cert = .none,
+        .expect = refused(browser_none_says, "SSL alert number 116"),
+    },
 };
 
 /// The running `zcube-server` and the files the clients read.
@@ -140,6 +176,8 @@ const Zcube = struct {
     dir: []const u8,
     /// The CA certificate the clients pin.
     ca: []const u8,
+    /// The browser CA's certificate, which the browser-path clients pin.
+    browser_ca: []const u8,
 };
 
 /// Runs every row against one server, each counted by `interop.finish`.
@@ -187,11 +225,37 @@ fn start(h: *Harness, zcube: *Zcube, server_exe: []const u8) !void {
     var cert_buffer: [server_ca.key_name_bytes_max]u8 = undefined;
     const ca_name = server_ca.cert_name_for(key_name, &cert_buffer);
     zcube.ca = try std.fmt.allocPrint(arena, "{s}/{s}", .{ zcube.dir, ca_name });
+    var browser_buffer: [server_browser_ca.name_bytes_max]u8 = undefined;
+    const browser_name = server_browser_ca.cert_name_for(key_name, &browser_buffer);
+    zcube.browser_ca = try std.fmt.allocPrint(arena, "{s}/{s}", .{ zcube.dir, browser_name });
     _ = try interop.run_tool(h, &.{
         server_exe, "ca",  "issue-client", client_name, "--scope", "jobs",
         "--store",  store, "--out",        zcube.dir,
     });
     try issue_by_hand(h, zcube, key_name);
+    try issue_p12(h, zcube, server_exe, store);
+}
+
+/// `web.p12` (the browser CA's, scope `jobs`, its password in `web.password`) and `web.pem`, its
+/// certificate and key as `openssl pkcs12` reads them.
+fn issue_p12(h: *Harness, zcube: *const Zcube, server_exe: []const u8, store: []const u8) !void {
+    const arena = h.arena.allocator();
+    const p12 = try std.fmt.allocPrint(arena, "{s}/web.p12", .{zcube.dir});
+    const password = try std.fmt.allocPrint(arena, "{s}/web.password", .{zcube.dir});
+    const pem_path = try std.fmt.allocPrint(arena, "{s}/web.pem", .{zcube.dir});
+    try std.Io.Dir.cwd().writeFile(h.io, .{
+        .sub_path = password,
+        .data = "interop-password\n",
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
+    _ = try interop.run_tool(h, &.{
+        server_exe, "ca",  "issue-client", "web", "--scope",         "jobs",
+        "--store",  store, "--p12",        p12,   "--password-file", password,
+    });
+    const passin = try std.fmt.allocPrint(arena, "file:{s}", .{password});
+    _ = try interop.run_tool(h, &.{
+        "openssl", "pkcs12", "-in", p12, "-passin", passin, "-nodes", "-clcerts", "-out", pem_path,
+    });
 }
 
 /// `expired.crt` (this CA, expired an hour ago) and `other-ca.crt` (another CA, valid), both for
@@ -251,6 +315,10 @@ fn files_of(h: *Harness, zcube: *const Zcube, cert: Cert) !Files {
         .jobs => client_name,
         .expired => "expired",
         .other_ca => "other-ca",
+        .browser => return .{
+            try std.fmt.allocPrint(arena, "{s}/web.pem", .{zcube.dir}),
+            try std.fmt.allocPrint(arena, "{s}/web.pem", .{zcube.dir}),
+        },
     };
     const key: []const u8 = if (cert == .jobs) client_name else "hand";
     return .{
@@ -287,9 +355,11 @@ fn run_row(h: *Harness, zcube: *Zcube, row: *const Row) !void {
 fn call(h: *Harness, zcube: *const Zcube, row: *const Row, path: []const u8) ![]const u8 {
     const files = try files_of(h, zcube, row.cert);
     return switch (row.client) {
-        .openssl => s_client(h, zcube, files, path),
+        .openssl => s_client(h, zcube, files, path, false),
         .java => java_client(h, zcube, files, path, false),
         .java_eager => java_client(h, zcube, files, path, true),
+        .openssl_browser => s_client(h, zcube, files, path, true),
+        .java_browser => java_browser(h, zcube, row.cert, path),
     };
 }
 
@@ -311,7 +381,37 @@ fn java_client(
     return interop.run_tool(h, argv.items);
 }
 
-fn s_client(h: *Harness, zcube: *const Zcube, files: Files, path: []const u8) ![]const u8 {
+/// The JDK on the browser path: `jdk.tls.client.SignatureSchemes` offers ECDSA P-256 alone, and
+/// it loads `web.p12` itself (`InteropClient` takes a `.p12` and its password file).
+fn java_browser(h: *Harness, zcube: *const Zcube, cert: Cert, path: []const u8) ![]const u8 {
+    const scratch = h.scratch.allocator();
+    var argv: std.ArrayList([]const u8) = .empty;
+    const port = try std.fmt.allocPrint(scratch, "{d}", .{zcube.port});
+    try argv.appendSlice(scratch, &.{
+        h.java,          "-Djdk.tls.client.SignatureSchemes=ecdsa_secp256r1_sha256",
+        "-cp",           h.classes,
+        "InteropClient", zcube.browser_ca,
+        port,            tls_name,
+        path,
+    });
+    switch (cert) {
+        .none => {},
+        .browser => try argv.appendSlice(scratch, &.{
+            try std.fmt.allocPrint(scratch, "{s}/web.p12", .{zcube.dir}),
+            try std.fmt.allocPrint(scratch, "{s}/web.password", .{zcube.dir}),
+        }),
+        else => if (try files_of(h, zcube, cert)) |pair| try argv.appendSlice(scratch, &pair),
+    }
+    return interop.run_tool(h, argv.items);
+}
+
+fn s_client(
+    h: *Harness,
+    zcube: *const Zcube,
+    files: Files,
+    path: []const u8,
+    browser: bool,
+) ![]const u8 {
     const scratch = h.scratch.allocator();
     const request = try std.fmt.allocPrint(
         scratch,
@@ -320,15 +420,18 @@ fn s_client(h: *Harness, zcube: *const Zcube, files: Files, path: []const u8) ![
     );
     try h.write_file("request.txt", request);
     const connect = try std.fmt.allocPrint(scratch, "127.0.0.1:{d}", .{zcube.port});
+    const ca = if (browser) zcube.browser_ca else zcube.ca;
     var argv: std.ArrayList([]const u8) = .empty;
     // `-quiet` keeps reading after its input ends, until the server closes; `timeout` bounds it.
     try argv.appendSlice(scratch, &.{
         "setpriv",              "--pdeathsig", "KILL",             "timeout",
         "10",                   "openssl",     "s_client",         "-connect",
-        connect,                "-tls1_3",     "-CAfile",          zcube.ca,
+        connect,                "-tls1_3",     "-CAfile",          ca,
         "-servername",          tls_name,      "-verify_hostname", tls_name,
         "-verify_return_error", "-quiet",
     });
+    // A browser offers no Ed25519: the server takes the P-256 path, with the browser CA.
+    if (browser) try argv.appendSlice(scratch, &.{ "-sigalgs", "ECDSA+SHA256" });
     if (files) |pair| try argv.appendSlice(scratch, &.{ "-cert", pair[0], "-key", pair[1] });
     const input = try std.Io.Dir.cwd().openFile(h.io, h.path("request.txt"), .{});
     defer input.close(h.io);
@@ -374,5 +477,5 @@ fn wait_text(h: *Harness, path: []const u8, from: usize, text: []const u8, ms: u
 }
 
 comptime {
-    assert(rows.len == 10);
+    assert(rows.len == 14);
 }

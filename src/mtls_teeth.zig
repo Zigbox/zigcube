@@ -13,4 +13,5 @@ test {
     _ = @import("tls_server_fuzz_teeth.zig");
     _ = @import("tls_server_test.zig");
     _ = @import("x509_fuzz.zig");
+    _ = @import("x509_p256_test.zig");
 }

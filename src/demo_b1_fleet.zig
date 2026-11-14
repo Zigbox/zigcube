@@ -56,9 +56,11 @@ pub const Fleet = struct {
             "--images",       host.config.images,
             "--verbose",
         };
+        const tls = try host.agent_tls(names[index]);
+        const all = try std.mem.concat(arena, []const u8, &.{ &args, tls });
         const log = try log_name(arena, index, fleet.starts[index]);
         const cwd: std.process.Child.Cwd = .{ .path = dir };
-        fleet.agents[index] = try host.spawn_in(host.config.agent_exe, &args, log, cwd);
+        fleet.agents[index] = try host.spawn_in(host.config.agent_exe, all, log, cwd);
     }
 
     /// `kill -9` of the agent alone: its supervisors and their commands live on.
