@@ -77,7 +77,8 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>The certificate is genuine and well formed, but it is not for this use: a workload's, node's or client's certificate presented as a server's, one of those three where another of them is needed (a workload's where the API needs a node's or a client's), a CA certificate presented as a leaf, or, under a foreign anchor, a certificate whose extended key usage lacks serverAuth or whose basic constraints say CA.</p>
-<p>The cause names the kind found and the kind needed. Give the peer a certificate issued for its role: a server certificate for a server.</p>
+<p>The server also refuses, with this code, a node or client certificate whose name is in its revoked file: at the handshake, and before each request on a connection opened before the name was revoked, which is then closed.</p>
+<p>The cause names the kind found and the kind needed, or the revoked name. Give the peer a certificate issued for its role: a server certificate for a server.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0819</pre>

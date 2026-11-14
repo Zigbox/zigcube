@@ -77,8 +77,19 @@ Both commands follow the same rules:
   2026-11-13-revoked-names-shared.md). A revoked name stops being issued at once.
 
 A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`). The server
-reads `revoked` when it starts, so a certificate already issued stops working once its name is
-in `revoked` and the server has restarted.
+rereads `revoked` without a restart (B7 slice 5): on its HTTP watchdog tick it compares the
+file's modification time, size and inode, and reads it again once a change has held for one
+tick, so an edit takes effect within about two seconds and one line on stderr says so
+(`zcube-server: the revoked file was reloaded: N revoked names`). A file that fails to parse
+keeps the set in force and says so on one line; it never empties the set. Issuance (`ca issue-*`
+in the same process, node joins and renewals) uses the reloaded set at once.
+
+A connection's certificate is checked again before each request on it, not only at its
+handshake (B7 slice 5): the server keeps the peer's validity window and identity with the
+connection and refuses the request, then closes the connection, when the certificate has
+expired since (`ZC-E0811`, with the same minute of skew as the handshake) or its name is now in
+`revoked` (`ZC-E0819`). So a keep-alive connection opened before a revocation does not outlive
+it.
 
 ### Validity
 

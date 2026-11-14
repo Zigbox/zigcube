@@ -77,6 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>The certificate is signed by the pinned anchor but the current time is outside its validity window, allowing peer_clock_skew_ms of clock difference on each side. The signature was checked first, so the certificate is genuine. The cause shows notBefore, notAfter and this machine's time.</p>
+<p>The API server checks the client's certificate again before each request, so a connection outlives its certificate by at most one request; the agent checks its own node.crt before each connection.</p>
 <p>Check the clocks on both machines. A workload certificate lives for the service's deadline, at most x509_leaf_ttl_ms_max: ask for a new one.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
