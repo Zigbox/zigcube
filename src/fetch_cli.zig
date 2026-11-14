@@ -39,6 +39,7 @@ const zigbox_fetch = @import("zigbox_fetch.zig");
 const zigbox_image = @import("zigbox_image.zig");
 const pull_report = @import("pull_report.zig");
 const x509 = @import("x509.zig");
+const api_tls_test = @import("api_tls_test.zig");
 
 const Zsha256 = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
 const IpAddress = std.Io.net.IpAddress;
@@ -975,6 +976,37 @@ fn identity_or_say(io: std.Io, parsed: *const Args, diag: *diag_mod.Diag) ?peer.
     return loaded;
 }
 
+/// `identity_or_say`, but a node that has not joined yet (no `peer.cred` or `ca.pub`, which the
+/// agent's join writes after it registers, so after it may have started this fetch) is waited
+/// for: re-read every `fetch_peer_poll_ms` for up to `wait_ms` when there are peers to ask
+/// (`--server` or `--peer`). Still none, it is ZC-E0806 in `diag`, "no peer identity", and the
+/// fetch goes on from the registry: the peers are never asked without one.
+fn identity_or_wait(
+    io: std.Io,
+    parsed: *const Args,
+    wait_ms: u32,
+    diag: *diag_mod.Diag,
+) ?peer.Identity {
+    assert(diag.code == null);
+    if (parsed.server == null and parsed.peer_count == 0) return identity_or_say(io, parsed, diag);
+    const started = peer_stream.boot_ms(io);
+    while (true) {
+        if (identity_or_say(io, parsed, diag)) |held| return held;
+        if (diag.code != null) return null; // Files that cannot be used: said by the reader.
+        if (peer_stream.boot_ms(io) -| started >= wait_ms) break;
+        io.sleep(.fromMilliseconds(constants.fetch_peer_poll_ms), .awake) catch break;
+    }
+    diag.raise(.E0806);
+    diag.cause("no peer identity: node {s} has not joined the cluster CA yet ({s} or {s} " ++
+        "is missing in {s}) after {d} ms", .{
+        parsed.node,      agent_peer.credential_file, agent_peer.ca_file,
+        parsed.state_dir, wait_ms,
+    });
+    diag.fix(.{ .sentence = "the fetch goes on from the registry; the agent joins by itself, " ++
+        "and the next fetch asks the peers" });
+    return null;
+}
+
 /// The server's TLS client when `--ca` is given, else null (plain HTTP). Credentials that cannot
 /// be used are one line in the fetch's log (their code and cause), and the server is then not
 /// read at all: plain HTTP to a TLS listener would only be refused (ZC-E0815).
@@ -1011,7 +1043,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         return finish(io, &diag, constants.exit_user);
     };
     const gpa = init.gpa;
-    const identity = identity_or_say(io, &parsed, &diag);
+    const identity = identity_or_wait(io, &parsed, constants.fetch_peer_wait_ms, &diag);
     if (diag.code != null) {
         emit(io, &diag); // The peers will not be asked; the registry may still answer.
         diag.reset();
@@ -1952,6 +1984,111 @@ test "an HTTP reply gives its body only for 200" {
     try std.testing.expect(http_body("HTTP/1.0 404 Not Found\r\n\r\nabc") == null);
     try std.testing.expect(http_body("nonsense") == null);
     try std.testing.expect(http_body("HTTP/1.0 200 OK\r\n") == null);
+}
+
+test "a fetch with peers to ask and no peer identity yet says so (ZC-E0806), and goes on" {
+    // Goal: the swarm-smoke flake: a fetch that started before the node joined asked no peer
+    // and said nothing. Method: an empty state directory and a peer to ask, waited for 0 ms:
+    // no identity, and ZC-E0806 naming the missing files; with nothing to ask, nothing is said.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const state = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    const with_peer = [_][]const u8{
+        "--node",       "node1",          "--state-dir", state,
+        "--images-dir", "/i",             "--digest",    "b3:00000000",
+        "--registry",   "127.0.0.1:9000", "--peer",      "node2=127.0.0.1:9001",
+    };
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const parsed = parse(&with_peer).?;
+    try std.testing.expect(identity_or_wait(std.testing.io, &parsed, 0, &diag) == null);
+    try std.testing.expectEqual(@as(?@TypeOf(diag.code.?), .E0806), diag.code);
+    const cause = diag.last_cause().?;
+    try std.testing.expect(std.mem.find(u8, cause, "no peer identity") != null);
+    try std.testing.expect(std.mem.find(u8, cause, agent_peer.credential_file) != null);
+    diag.reset();
+    const alone = parse(with_peer[0..10]).?;
+    try std.testing.expect(identity_or_wait(std.testing.io, &alone, 0, &diag) == null);
+    try std.testing.expect(diag.code == null);
+}
+
+/// The arguments of a fetch that reads `rig`'s server over TLS as node1 with `--ca`, `--cert`
+/// and `--key` of the rig's directory (`cert_file`, `key_file`, `ca_file` override them).
+fn tls_args(
+    arena: std.mem.Allocator,
+    rig: *api_tls_test.Rig,
+    ca_file: ?[]const u8,
+    key_file: ?[]const u8,
+) !Args {
+    const dir = rig.dir();
+    var address: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&address);
+    try writer.print("{f}", .{rig.server.tls_address()});
+    const words = [_][]const u8{
+        "--node",       "node1",
+        "--state-dir",  dir,
+        "--images-dir", "/i",
+        "--digest",     "b3:00000000",
+        "--registry",   "127.0.0.1:9000",
+        "--server",     try arena.dupe(u8, writer.buffered()),
+        "--ca",         ca_file orelse try std.fs.path.join(arena, &.{ dir, try rig.ca_file() }),
+        "--cert",       try std.fs.path.join(arena, &.{ dir, "node1.crt" }),
+        "--key",        key_file orelse try std.fs.path.join(arena, &.{ dir, "node1.key" }),
+    };
+    return parse(&words) orelse error.TestUnexpectedResult;
+}
+
+test "over TLS a refused read is said once, and the fetch goes on without it (B7 slice 7)" {
+    // Goal: review of slice 7, SHOULD d (ii): `https_get`'s refused path against a real server.
+    // Method: node1's credentials ask for `/services/` (403, ZC-E0822): `.refused`, said once;
+    // `/node-store/` then answers 200 with the list.
+    var rig: api_tls_test.Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const arena = rig.arena.allocator();
+    var parsed = try tls_args(arena, &rig, null, null);
+    var server_tls: ServerTls = undefined;
+    const tls = server_tls_or_say(rig.io, std.testing.allocator, &parsed, null, &server_tls).?;
+    defer server_tls.credentials.deinit();
+    const reply = try arena.alloc(u8, reply_bytes);
+    var net: Net = .{
+        .io = rig.io,
+        .registry = null,
+        .peers = &.{},
+        .identity = null,
+        .reply = reply,
+        .conns = &.{},
+        .server_tls = tls,
+    };
+    var out: [4096]u8 = undefined;
+    const refused = net.https_get(tls, "/v1/list?prefix=/services/", &out);
+    try std.testing.expect(refused == .refused);
+    try std.testing.expect(tls.said);
+    const listed = net.https_get(tls, "/v1/list?prefix=/node-store/&limit=65", &out);
+    try std.testing.expect(listed == .bytes);
+    try std.testing.expect(std.mem.find(u8, listed.bytes, "\"revision\"") != null);
+}
+
+test "over TLS a CA or key that cannot be loaded leaves the server unread (B7 slice 7)" {
+    // Goal: review of slice 7, SHOULD d (ii): `ServerTls.load`'s refusals. Method: a `--ca`
+    // that does not exist, then a `--key` that does not exist: no TLS client, and `--server`
+    // dropped, so the fetch never reads the server in the clear.
+    var rig: api_tls_test.Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const arena = rig.arena.allocator();
+    const missing = try std.fs.path.join(arena, &.{ rig.dir(), "absent.pem" });
+    const cases = [_][2]?[]const u8{ .{ missing, null }, .{ null, missing } };
+    for (cases) |case| {
+        var parsed = try tls_args(arena, &rig, case[0], case[1]);
+        try std.testing.expect(parsed.server != null);
+        var server_tls: ServerTls = undefined;
+        const got = server_tls_or_say(rig.io, std.testing.allocator, &parsed, null, &server_tls);
+        try std.testing.expect(got == null);
+        try std.testing.expect(parsed.server == null);
+        try std.testing.expect(server_tls.said);
+    }
 }
 
 test "the fetch arguments need a node, directories, a digest and a registry" {

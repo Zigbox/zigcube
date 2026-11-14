@@ -63,7 +63,7 @@ fn issue(
     try file.writeStreamingAll(io, pem.encode_key(&text, &seed));
 }
 
-const Rig = struct {
+pub const Rig = struct {
     io: std.Io,
     threaded: std.Io.Threaded,
     tmp: testing.TmpDir,
@@ -72,7 +72,7 @@ const Rig = struct {
     server: *server_mod.Server,
     arena: std.heap.ArenaAllocator,
 
-    fn start(rig: *Rig) !void {
+    pub fn start(rig: *Rig) !void {
         const room = constants.http_connections_max + constants.server_threads_extra + 8;
         rig.threaded = .init(testing.allocator, .{ .concurrent_limit = .limited(room) });
         rig.io = rig.threaded.io();
@@ -105,7 +105,7 @@ const Rig = struct {
         try issue(rig.io, rig.tmp.dir, &rig.server.ca, .node, "node1");
     }
 
-    fn stop(rig: *Rig) void {
+    pub fn stop(rig: *Rig) void {
         rig.server.stop();
         rig.arena.deinit();
         rig.tmp.cleanup();
@@ -113,14 +113,14 @@ const Rig = struct {
     }
 
     /// The CA certificate's name in the state directory: one per store (`server_ca`).
-    fn ca_file(rig: *Rig) ![]const u8 {
+    pub fn ca_file(rig: *Rig) ![]const u8 {
         const server = rig.server;
         var name: [server_ca.key_name_bytes_max]u8 = undefined;
         const key = server.ca_name_buffer[0..server.ca_name_length];
         return rig.arena.allocator().dupe(u8, server_ca.cert_name_for(key, &name));
     }
 
-    fn dir(rig: *const Rig) []const u8 {
+    pub fn dir(rig: *const Rig) []const u8 {
         return rig.path_buffer[0..rig.path_length];
     }
 
@@ -217,6 +217,40 @@ test "the API over TLS: an admin, a jobs client and a node, each held to its sco
     // Teeth (B7 slice 3, `ca issue-node`): a node certificate for node1 cannot join as node2.
     const join = try rig.status(&node, "POST", "/v1/agent/nodes/node2/credential");
     try testing.expectEqual(@as(u16, 403), join);
+}
+
+test "the API over TLS: a node lists /node-store/ and its own fetchers, nothing else (B7)" {
+    // Goal: review of slice 7, SHOULD d (i): the scope of a node certificate end to end, through
+    // server_http and api, not only `api_scope.refusal`. Method: as node1 over TLS, the list of
+    // `/node-store/` and node1's fetchers of a digest answer; `/services/` plainly, encoded and
+    // as a second prefix, and node2's fetchers, are 403 with ZC-E0822.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    var node: api_tls_client.Credentials = undefined;
+    try rig.load("node1", &node);
+    defer node.deinit();
+    const list = "/v1/list?prefix=/node-store/";
+    try testing.expectEqual(@as(u16, 200), try rig.status(&node, "GET", list));
+    try testing.expectEqual(@as(u16, 200), try rig.status(&node, "GET", list ++ "&limit=65"));
+    const own = try rig.status(&node, "GET", "/v1/agent/nodes/node1/fetchers/b3:51aa9c03");
+    try testing.expect(own != 403);
+    const refused = [_][]const u8{
+        "/v1/list?prefix=/services/",
+        "/v1/list?prefix=%2Fservices%2F",
+        "/v1/list?prefix=/node-store/&prefix=/services/",
+        "/v1/list?prefix=/services/&prefix=/node-store/",
+        "/v1/list?prefix=/replicas/",
+        "/v1/list?prefix=/node-store/&reverse=true",
+        "/v1/agent/nodes/node2/fetchers/b3:51aa9c03",
+    };
+    for (refused) |path| {
+        const reply = try rig.call(&node, "GET", path);
+        const ok = std.mem.startsWith(u8, reply, "HTTP/1.1 403") and
+            std.mem.indexOf(u8, reply, "ZC-E0822") != null;
+        if (!ok) std.debug.print("GET {s}: {s}\n", .{ path, reply });
+        try testing.expect(ok);
+    }
 }
 
 test "the API over TLS: a server certificate for another name is refused, naming both (B7)" {
