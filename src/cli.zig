@@ -12,6 +12,7 @@ const assert = std.debug.assert;
 const bundle_collect = @import("bundle_collect.zig");
 const cli_args = @import("cli_args.zig");
 const cli_allocations = @import("cli_allocations.zig");
+const cli_rollout = @import("cli_rollout.zig");
 const cli_stats = @import("cli_stats.zig");
 const cli_commands = @import("cli_commands.zig");
 const cli_env = @import("cli_env.zig");
@@ -137,6 +138,10 @@ pub fn execute(
         .accept_rollback => try cli_commands.accept_rollback(env, client, options, report),
         .check_allocations => try cli_allocations.check(env, client, options, report),
         .stats_pull => |node| try cli_stats.pull(env, client, options, node, report),
+        .rollout => |what| {
+            try cli_rollout.rollout(env, client, options, what.action, what.name, report);
+        },
+        .history => |name| try cli_rollout.history(env, client, options, name, report),
         .repair_allocations => |node| {
             try cli_allocations.repair(env, client, options, node, report);
         },
