@@ -65,7 +65,10 @@ classify() {
     src/demo_b4*.zig) want_one demo_b4; return ;;
     # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
-    src/zigbox_* | src/relay*.zig) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; return ;;
+    src/zigbox_*) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; return ;;
+    # The relay is also the TLS client mtls-interop runs against stock servers (B4).
+    src/relay*.zig) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; want_one mtls_interop
+      return ;;
     # The mTLS interop harness and its Java server.
     src/mtls_interop.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
     # The smoke's own files.

@@ -92,7 +92,9 @@ check $PR x "" "src/scheduler_test.zig src/demo_c2.zig" TFFFFFTFFF
 check $PR x "" "src/demo_b3_script.zig ops/demo-b3/guest.sh" TFFFFFFFTT
 check $PR x "" "src/demo_c2_vms.zig" TFFFFFTFTT
 check $PR x "" "src/demo_b1_state.zig" TFFFTFFFTT
-check $PR x "" "src/relay.zig" TFFFFTTFTT
+check $PR x "" "src/relay.zig" TFFFFTTTTT
+check $PR x "" "src/relay_secure.zig" TFFFFTTTTT
+check $PR x "" "src/zigbox_supervisor.zig" TFFFFTTFTT
 check $PR x "" "docs/demos/b3.md" FFFFFFFFFF
 # demo-b4: its own script runs it alone; demo-b3's files and the TLS upstream run both.
 check $PR x "" "src/demo_b4_script.zig" TFFFFFFFFT
