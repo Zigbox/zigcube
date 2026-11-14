@@ -242,8 +242,35 @@ fn read_binaries(
                 path,
                 constants.package_file_bytes_max,
             );
+            if (elf_problem(entry.field[index], architecture)) |problem| {
+                return refuse(log, "{s} is not a Linux executable for {s}: {s}", .{
+                    path, architecture.rpm_name(), problem,
+                });
+            }
         }
     }
+}
+
+/// Why `bytes` is not a 64-bit little-endian ELF file for `architecture`, or null when it is. It
+/// reads the identification bytes and `e_machine` (offset 18) only: enough to catch an x86_64
+/// binary under an aarch64 name, or a Mach-O one, before it is packaged.
+fn elf_problem(bytes: []const u8, architecture: model.Architecture) ?[]const u8 {
+    const elf_header_bytes = 64;
+    if (bytes.len < elf_header_bytes) return "shorter than an ELF header";
+    if (!std.mem.eql(u8, bytes[0..4], "\x7fELF")) return "no ELF magic";
+    if (bytes[4] != 2) return "not 64-bit ELF";
+    if (bytes[5] != 1) return "not little-endian";
+    const machine = std.mem.readInt(u16, bytes[18..20], .little);
+    const expected: u16 = switch (architecture) {
+        .x86_64 => 62, // EM_X86_64
+        .aarch64 => 183, // EM_AARCH64
+    };
+    if (machine == expected) return null;
+    return switch (machine) {
+        62 => "its ELF machine is x86_64",
+        183 => "its ELF machine is aarch64",
+        else => "its ELF machine is neither x86_64 nor aarch64",
+    };
 }
 
 fn read_asset(
@@ -515,6 +542,29 @@ test "arguments: a full build line parses, and each missing piece is refused" {
     const unknown = [_][]const u8{ "--out", "o", "--nope", "x" };
     var bad: TestIterator = .{ .words = &unknown };
     try std.testing.expect(parse_arguments(&bad) == null);
+}
+
+test "an executable whose ELF machine is not the package's architecture is refused" {
+    // Goal: slice 1's follow-up; an x86_64 binary under an aarch64 name never becomes a package.
+    // Method: a 64-byte header with each machine, against each architecture, and broken headers.
+    var header: [64]u8 = @splat(0);
+    @memcpy(header[0..4], "\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    std.mem.writeInt(u16, header[18..20], 62, .little);
+    const expect = std.testing.expectEqualStrings;
+    try std.testing.expectEqual(@as(?[]const u8, null), elf_problem(&header, .x86_64));
+    try expect("its ELF machine is x86_64", elf_problem(&header, .aarch64).?);
+    std.mem.writeInt(u16, header[18..20], 183, .little);
+    try std.testing.expectEqual(@as(?[]const u8, null), elf_problem(&header, .aarch64));
+    try expect("its ELF machine is aarch64", elf_problem(&header, .x86_64).?);
+    std.mem.writeInt(u16, header[18..20], 40, .little); // EM_ARM
+    try std.testing.expect(elf_problem(&header, .aarch64) != null);
+    try expect("shorter than an ELF header", elf_problem(header[0..63], .x86_64).?);
+    header[4] = 1;
+    try expect("not 64-bit ELF", elf_problem(&header, .aarch64).?);
+    header[0] = 0xcf; // A Mach-O binary starts cf fa ed fe.
+    try expect("no ELF magic", elf_problem(&header, .aarch64).?);
 }
 
 test "arguments: --arch names one architecture, --signed-at is seconds" {
