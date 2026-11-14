@@ -81,20 +81,31 @@ Read first: `AGENTS.md`, `docs/STYLE.md`, `REVIEW.md`; Zigbox's `docs/releases/a
      with two archives from two repositories, updated by two release workflows, so Zigbox's
      `tap-formula` check and its release must change. Not done unless the owner asks.
    - The Mac `zcube` needs no virtualization entitlement (it starts no VM): hardened runtime only.
-5. **Package set (ASK).** Zigbox's `zigbox` package already owns `/usr/bin/zbx`, so
-   `c3-linux-packages.md`'s table collides with it. Proposed:
+5. **Package set (set by the owner, 2026-11-14).** Linux only; deb and rpm alike.
 
    | Package | Holds | Depends |
    |---|---|---|
-   | `zigcube-cli` | `zcube` | none |
-   | `zigcube-server` | `zcube-server`, unit (not enabled), `zcube` system user, `/etc/zigcube/server.zon` (a config file, kept on upgrade), `/var/lib/zigcube` | `libpq5`, `libsqlite3-0` (rpm: `libpq`, `sqlite-libs`) |
-   | `zigcube-agent` | `zcube-agent`, unit (not enabled), default config | `zigbox (>= 0.5.0)`, `uidmap`, `passt` (rpm: `shadow-utils`) |
-   | `zigcube` | a README only | the three above |
+   | `zigbox` | `zbx`, static | none |
+   | `zigcube` | `zcube` only | none |
+   | `zigcube-server-sqlite` | `zcube-server` built with the SQLite and memory stores, unit (not enabled) | `zigcube`, `libsqlite3-0` (rpm: `sqlite-libs`) |
+   | `zigcube-server-postgres` | `zcube-server` built with the Postgres and memory stores, unit (not enabled) | `zigcube`, `libpq5` (rpm: `libpq`) |
+   | `zigcube-agent` | `zcube-agent`, unit (not enabled) | `zigcube`; Recommends `zigbox` |
+   | `zigbox-dev` | no files | `zigbox (>= <pinned Zigbox version>)`, `zigcube-server-sqlite`, `zigcube-agent` |
 
-   `zigcube-agent` depends on Zigbox's `zigbox` for `zbx` (`zbx doctor`, `zbx ps`) instead of
-   shipping its own copy, which would collide. That works because one apt source carries both
-   suites. The dev-box install is `apt install zigcube`. No unit is enabled on install; the
-   server's default config listens on `127.0.0.1`.
+   - The two server packages install the same `/usr/bin/zcube-server`: each `Conflicts` with and
+     `Replaces` the other, and both `Provide` `zigcube-server` (you never need both stores).
+   - `zigbox-dev` was `zigbox-all` in the first message; renamed. Built in Zigcube's release.
+   - Installing starts nothing: both units ship disabled because both need a config file first.
+   - **The agent never runs `zbx`** (checked: `src/` has no exec of it; it links Zigbox's module and
+     only *names* `zbx doctor` and `zbx pull` in advice to the user), so `Recommends` stays.
+   - **macOS:** Homebrew has `zbx` and `zcube` only. The `zigcube` formula `depends_on` the tap's
+     `zigbox` formula: on a Mac the server and agent run inside the zbx VM, so `zcube` alone is
+     no use there. The Linux `zigcube` package keeps no dependencies.
+   - **ASK (collision):** a package named `zigbox` holding `zbx` is also what Zigbox's own release
+     publishes in suite `stable`. If Zigcube's release builds one too, two products ship one name
+     (and `zigbox-dev`'s `>=` pin points at whichever wins). Proposed: Zigcube does **not** build
+     `zigbox`; the name is Zigbox's, from suite `stable`, which the one apt source already carries.
+     Say if the owner meant otherwise.
 6. **The package writer.** Copy `zigbox_package`'s sources into `src/package/` with a header
    naming the Zigbox commit, and extend the copy (`Depends`, `Conflicts`, maintainer scripts,
    config-file marks, a suite name). Reason: Zigcube pins a released Zigbox tag, so an upstream
@@ -110,14 +121,20 @@ reviewed by about T+4h and slice 3 by T+6h; if slice 3 is not reviewed by T+6h, 
 moves everything to 0.6.0, because the owner's setup and an `rc` dry run still have to follow it.
 The release workflow cannot run for real until the owner sets the secrets (below).
 
-1. **Linux packages, signed with a throwaway key.** The writer copy and its extensions; the four
+0. **Store split (its own slice, own report).** A build option `-Dstore=sqlite|postgres|all`
+   (`all` the default for development and CI) compiles in one store plus the memory store and links
+   only its library. A `--store` naming a backend not built in is refused with a one-line error;
+   that error needs a `ZC-` code, **ASK before registering it**. It changes gated code, so the
+   report carries `check: PASS` (store:memory, sqlite) and the Postgres suite (`zig build pg-up`,
+   `ZCUBE_TEST_POSTGRES` set). Slice 1 needs it for the two server builds.
+1. **Linux packages, signed with a throwaway key.** The writer copy and its extensions; the six
    packages for x86_64 and aarch64; `zig build packages`, `packages-check`, `release-assets`
    (tarballs, SBOM, `SHA256SUMS`) and `release-sign.sh` ported; the server's build in a
    RHEL 9 compatible container, so it is a script or a documented command, not part of
    `zig build`; the apt `zigcube` suite and the dnf tree. Tests: the writer's unit tests, the
    `-Dtest-key` pipeline, and a `packages-test` job that signs with a throwaway RSA 4096 key
    made like the release key, serves the trees over a local file or HTTP source, and in four
-   containers (Debian 12, Ubuntu 24.04, Fedora, Rocky 9) installs `zigcube`, runs `zcube
+   containers (Debian 12, Ubuntu 24.04, Fedora, Rocky 9) installs `zigbox-dev` (and each server flavour in turn), runs `zcube
    --version`, starts `zcube-server --help` and checks `ldd`, `apt remove` or `dnf remove`
    leaving `/var/lib/zigcube`, and a second install from an older package keeping an edited
    `server.zon`. `systemd-analyze verify` on both units. Not tested here: a booted systemd (the
@@ -133,7 +150,7 @@ The release workflow cannot run for real until the owner sets the secrets (below
    `mac-test`, `draft-test` jobs; `package-refresh.yml` for the `zigcube` suite; the actions
    (`setup-gh`, `find-draft`, `tap-formula`, `mac-check-zip`, `setup-zig-macos`), pinned as
    Zigbox's are. The version comes from `build.zig.zon` (now `0.0.0`; the release PR sets
-   `0.5.1`), the notes from `docs/releases/<v>.md`. `verify` installs `zigcube` from zigbox.org on
+   `0.5.1`), the notes from `docs/releases/<v>.md`. `verify` installs `zigbox-dev` from zigbox.org on
    Ubuntu and brews `zigcube` on a Mac, so it needs Zigbox's repository to carry `zigbox`:
    **Zigbox 0.5.1 is published first.** Triggers are pull requests that touch the release files
    (never a plain branch push, AGENTS.md) and `workflow_dispatch`.
@@ -180,6 +197,6 @@ renewal (yearly) now sets the secret in two repositories' environments; the runb
   tree (the site merges two assets).
 - A copied package writer with additions, not the exported module alone.
 - The server is built in a container, because it is dynamic.
-- `zigcube-agent` depends on `zigbox` and ships no `zbx`; the dev package is `zigcube`, not `zigbox`.
+- The package set is the owner's (six packages, two server flavours); see item 5.
 - A separate Homebrew formula.
 - No `release-test/**` push trigger (AGENTS.md: CI runs on pull requests and `main`).
