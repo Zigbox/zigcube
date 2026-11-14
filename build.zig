@@ -583,6 +583,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     b.step("demo-c0", help).dependOn(&run.step);
     add_demo_c1_step(b, step_options, transcript);
     add_demo_b1_step(b, step_options, transcript);
+    add_demo_b7_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
 }
@@ -663,6 +664,39 @@ fn add_demo_b1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run B1's demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-b1", help).dependOn(&run.step);
+}
+
+/// `zig build demo-b7 [-Dtranscript=FILE]`: B7's demo, run for real (src/demo_b7.zig): the server
+/// on SQLite serving the API over TLS, one `zcube-agent` with `FakeRuntime` and the `zcube`
+/// command, each with a certificate of the server's CA. No KVM; docs/demos/b7.md.
+fn add_demo_b7_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const exe = b.addExecutable(.{
+        .name = "demo_b7",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b7.zig"),
+            .target = step_options.target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addArtifactArg(built.agent);
+    run.addArg("--images");
+    run.addFileArg(b.path("fixtures/images.zon"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run B7's demo for real: the API over mTLS (-Dtranscript=FILE)";
+    b.step("demo-b7", help).dependOn(&run.step);
 }
 
 /// `zig build demo-c2 [-Dtranscript=FILE]`: SPEC's C2 demo, run for real (src/demo_c2.zig): the

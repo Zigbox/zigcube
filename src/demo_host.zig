@@ -42,6 +42,8 @@ pub const Config = struct {
     lease_ttl_ms: ?[]const u8 = null,
     /// The server's `--config FILE` (a ZON file, for `.relays`); null passes none.
     server_config: ?[]const u8 = null,
+    /// `--listen` (TLS) as well as `--insecure-listen`, which the host's own calls use (demo-b7).
+    tls_listen: ?[]const u8 = null,
 };
 
 /// What a `zcube` command did: its exit code (255 if a signal ended it) and both streams.
@@ -166,6 +168,9 @@ pub const Host = struct {
         }
         if (host.config.server_config) |path| {
             try args.appendSlice(arena_allocator, &.{ "--config", path });
+        }
+        if (host.config.tls_listen) |address| {
+            try args.appendSlice(arena_allocator, &.{ "--listen", address });
         }
         host.server = try host.spawn(host.config.server_exe, args.items, log);
         const ready = struct {

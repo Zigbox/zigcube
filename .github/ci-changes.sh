@@ -64,7 +64,7 @@ classify() {
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
     src/zigbox_* | src/relay*.zig) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; return ;;
     # The mTLS interop harness and its Java server.
-    src/mtls_interop.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
+    src/mtls_interop*.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
     # The smoke's own files.
     ops/zigbox-smoke/*) want_one zigbox_smoke; return ;;
     # The store suites' own files (the backends themselves are the server and run everything).
