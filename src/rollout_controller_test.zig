@@ -12,6 +12,7 @@ const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const control_plane = @import("control_plane.zig");
 const rollout_controller = @import("rollout_controller.zig");
+const sim_tap = @import("sim_tap.zig");
 const store = @import("store.zig");
 const writers = @import("writers.zig");
 const ManualClock = @import("clock.zig").ManualClock;
@@ -30,18 +31,32 @@ const web: apply_mod.Input = .{
 
 const min_ready_ms = (records.RolloutPolicy{}).min_ready_ms;
 
+/// What the fixture's store does to the next transaction that deletes a replica record (a
+/// retirement), before it commits: the interleavings TLA+ gap 1 and the pause write race name.
+const Interleave = enum { none, stop_kept, pause };
+
 const Fixture = struct {
     manual: ManualClock,
     memory: *MemoryStore,
+    tap: sim_tap.TapStore,
     arena_state: std.heap.ArenaAllocator,
     diag: Diag,
     plane: control_plane.ControlPlane,
     api: controller.DecisionSource,
+    interleave: Interleave = .none,
+    /// The retirement `interleave` wrote before, and whether it committed.
+    interleaved: ?[*]const store.Op = null,
+    interleaved_committed: bool = false,
 
     fn start(self: *Fixture) !void {
         self.manual = .{ .ms = 1761350000000 };
         self.memory = try testing.allocator.create(MemoryStore);
         self.memory.init(testing.allocator, self.manual.clock());
+        self.tap = .{ .inner = self.memory.interface(), .context = self, .after = committed };
+        self.tap.before = interleave_before;
+        self.interleave = .none;
+        self.interleaved = null;
+        self.interleaved_committed = false;
         self.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         self.diag.reset();
         self.plane = control_plane.ControlPlane.init(1);
@@ -63,7 +78,7 @@ const Fixture = struct {
     fn context(self: *Fixture) controller.Context {
         _ = self.arena_state.reset(.retain_capacity);
         return .{
-            .store = self.memory.interface(),
+            .store = self.tap.interface(),
             .clock = self.manual.clock(),
             .arena = self.arena_state.allocator(),
             .diag = &self.diag,
@@ -192,6 +207,79 @@ const Fixture = struct {
         const ctx = self.context();
         return rollout_controller.request(&ctx, &self.api, web.name, what);
     }
+
+    fn committed(pointer: *anyopaque, request_done: ?store.TxnRequest, _: store.Revision) void {
+        const self: *Fixture = @ptrCast(@alignCast(pointer));
+        const done = request_done orelse return;
+        const ops = self.interleaved orelse return;
+        if (done.on_success.ptr == ops) self.interleaved_committed = true;
+    }
+
+    /// Writes `interleave` straight to the memory store, on an arena of its own (the
+    /// transaction's request lives on the fixture's), once.
+    fn interleave_before(pointer: *anyopaque, txn_request: store.TxnRequest) void {
+        const self: *Fixture = @ptrCast(@alignCast(pointer));
+        if (self.interleave == .none) return;
+        const prefix = records.replicas_prefix(web.name);
+        for (txn_request.on_success) |op| {
+            if (op == .delete and std.mem.startsWith(u8, op.delete, prefix.slice())) break;
+        } else return;
+        const what = self.interleave;
+        self.interleave = .none;
+        self.interleaved = txn_request.on_success.ptr;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var diag: Diag = undefined;
+        diag.reset();
+        const ctx: controller.Context = .{
+            .store = self.memory.interface(),
+            .clock = self.manual.clock(),
+            .arena = arena.allocator(),
+            .diag = &diag,
+        };
+        switch (what) {
+            .none => unreachable,
+            .stop_kept => stop_kept(&ctx, txn_request) catch @panic("stop_kept failed"),
+            .pause => {
+                const outcome = rollout_controller.request(&ctx, &self.api, web.name, .pause) catch
+                    @panic("pause failed");
+                assert(outcome == .done);
+            },
+        }
+    }
+
+    /// Reports `stopped` for the first generation-1 replica the transaction keeps.
+    fn stop_kept(ctx: *const controller.Context, txn_request: store.TxnRequest) !void {
+        const list = try controller.list_all(
+            records.Replica,
+            ctx,
+            records.replicas_prefix(web.name).slice(),
+            null,
+            constants.replicas_max,
+        );
+        for (list.items) |replica| {
+            if (replica.rec.generation != 1) continue;
+            const deleted = for (txn_request.on_success) |op| {
+                if (op == .delete and std.mem.eql(u8, op.delete, replica.kv.key)) break true;
+            } else false;
+            if (deleted) continue;
+            const observed: records.Observed = .{
+                .replica = replica.rec.id,
+                .node = "node1",
+                .generation = 1,
+                .status = .stopped,
+                .reported_at_ms = ctx.clock.now_ms(),
+            };
+            const key = records.observed_key("node1", replica.rec.id);
+            const bytes = try records.encode(ctx.arena, observed, ctx.diag);
+            const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
+            const role: writers.Role = .{ .agent = "node1" };
+            const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, ctx.diag);
+            assert(done.succeeded);
+            return;
+        }
+        unreachable; // The fixture keeps two old replicas while it retires one.
+    }
 };
 
 test "a rolling update starts one new replica at a time and retires an old one once it is ready" {
@@ -221,6 +309,42 @@ test "a rolling update starts one new replica at a time and retires an old one o
     const done = try fixture.rollout();
     try testing.expectEqual(records.RolloutPhase.complete, done.phase);
     try testing.expectEqual(@as(u64, 2), done.to);
+}
+
+test "a kept replica that stops between the read and the commit fails the retirement" {
+    // Goal: TLA+ gap 1. A retirement compares the reports of the replicas it counts toward the
+    // floor (`replicas - max_unavailable`, 3 here), so one that stops after the controller read
+    // it fails the transaction and the next pass counts again. Method: the store reports a kept
+    // old replica stopped just before the first retirement commits.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    _ = try fixture.report(2, .running);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    fixture.interleave = .stop_kept;
+    try fixture.settle();
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+}
+
+test "a pause between the read and the commit fails the retirement" {
+    // Goal: the replica controller's write compares `/rollouts/<service>`, so a pause that lands
+    // between its read and its commit stops the retirement it judged on the active rollout (R4).
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    _ = try fixture.report(2, .running);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    fixture.interleave = .pause;
+    try fixture.settle();
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
 }
 
 test "a pause starts nothing more until a resume, and a second pause changes nothing" {

@@ -973,12 +973,12 @@ pub const Cluster = struct {
 
     /// The sim-c3 line: how often each rollout check judged, and the pauses and resumes asked.
     fn report_c3(c: *const Cluster, report: anytype) void {
-        report.print("sim-c3 R1 retirements={d} R2 surges={d} R3 versions={d} " ++
+        report.print("sim-c3 R1 retirements={d} doubted={d} R2 surges={d} R3 versions={d} " ++
             "R4 paused={d} R6 history={d}; pauses={d} resumes={d}\n", .{
-            c.c3_tally.retirements_judged, c.c3_tally.surges_judged,
-            c.c3_tally.versions_judged,    c.c3_tally.paused_judged,
-            c.c3_tally.history_judged,     c.rollout_pauses,
-            c.rollout_resumes,
+            c.c3_tally.retirements_judged, c.c3_tally.retirements_doubted,
+            c.c3_tally.surges_judged,      c.c3_tally.versions_judged,
+            c.c3_tally.paused_judged,      c.c3_tally.history_judged,
+            c.rollout_pauses,              c.rollout_resumes,
         });
     }
 

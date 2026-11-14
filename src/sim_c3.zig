@@ -26,6 +26,9 @@ pub const Tally = struct {
     /// Transactions of the replica controller that retired a running replica of an active
     /// rollout (R1).
     retirements_judged: u64 = 0,
+    /// Replicas R1 counted as running though they were not at the head: their report changed
+    /// after every key the transaction compared, so the controller may have read them running.
+    retirements_doubted: u64 = 0,
     /// Revisions that created a replica of a service whose rollout is active (R2).
     surges_judged: u64 = 0,
     /// Replicas created and compared with their service's history (R3).
@@ -225,16 +228,42 @@ fn step_problem(
     const policy = service.rec.rollout_policy();
     if (policy.strategy != .rolling or step.retired_running == 0) return null;
     tally.retirements_judged += 1;
+    // The controller promises the floor on the state it read
+    // (docs/decisions/2026-11-14-c3-rolling-floor-compares.md). A report the transaction did not
+    // compare and that changed after every key it did may have changed after that read: a
+    // replica that crashed there is not the controller's doing, so R1 counts it as running.
+    const read_at = compared_since(request);
     var up: u32 = 0;
     for (snap.replicas) |*replica| {
         if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
-        if (running(snap, &replica.rec)) up += 1;
+        if (running(snap, &replica.rec)) {
+            up += 1;
+        } else if (snap.observed_of(&replica.rec)) |observed| {
+            if (observed.kv.mod_revision > read_at and !compared(request, observed.kv.key)) {
+                up += 1;
+                tally.retirements_doubted += 1;
+            }
+        }
     }
     const floor = service.rec.replicas -| policy.max_unavailable;
     if (up - step.retired_running < floor) {
         return "R1: a retirement left fewer replicas running than replicas - max_unavailable";
     }
     return null;
+}
+
+/// The least revision the transaction's read can have been at: the highest it compared.
+fn compared_since(request: store.TxnRequest) store.Revision {
+    var at: store.Revision = 0;
+    for (request.compares) |compare| at = @max(at, compare.mod_revision);
+    return at;
+}
+
+fn compared(request: store.TxnRequest, key: []const u8) bool {
+    for (request.compares) |compare| {
+        if (std.mem.eql(u8, compare.key, key)) return true;
+    }
+    return false;
 }
 
 /// A user's scale-down (a `scale_down` decision on the service in the transaction) removes

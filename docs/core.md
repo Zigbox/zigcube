@@ -525,8 +525,11 @@ the ending and must fail R1, with or without `--c1`. The fleet's canary list gai
 
 `sim_cluster ... --c3` (C3 slice 7, `src/sim_c3.zig`; it implies `--c1`) adds C3's rollout checks
 (docs/briefs/c3.md, "Simulation: checks and teeth") to sim-c1's, judged at the head of the store
-like them: R1 (a transaction of the replica controller retires no running old replica beyond the
-rollout's `retire` budget, judged over the observed records it compared), R2 (no more replicas
+like them: R1 (a transaction of the replica controller that retires a running replica of a rolling
+rollout leaves at least `replicas - max_unavailable` running; a report the transaction did not
+compare and that changed after every key it did is counted as running, since the controller
+promises the floor on the state it read, `docs/decisions/2026-11-14-c3-rolling-floor-compares.md`),
+R2 (no more replicas
 than `replicas + max_surge` while a rollout is active), R3 (every replica created runs a
 generation in the service's history), R4 (a paused rollout starts and retires nothing; a scale
 down the user asked for is exempt) and R6 (a history record never changes under its generation).
@@ -536,8 +539,11 @@ it in `rollout_controller.Track`.
 
 With `--c3` the world also pauses and resumes rollouts (`rollout_prng`, a stream of its own, so a
 run without `--c3` draws as before), and resumes any paused rollout at the heal. The report adds
-`sim-c3 R1 retirements=.. R2 surges=.. R3 versions=.. R4 paused=.. R6 history=..; pauses=..
-resumes=..`. `--profile=bad_release` turns the faults off and raises the share of applies whose
+`sim-c3 R1 retirements=.. doubted=.. R2 surges=.. R3 versions=.. R4 paused=.. R6 history=..; pauses=..
+resumes=..` (`doubted` counts the replicas R1 gave that benefit; the simulator's controllers
+read and commit with nothing between, so it is 0 there, and the unit tests in
+`src/rollout_controller_test.zig` write between the read and the commit instead).
+`--profile=bad_release` turns the faults off and raises the share of applies whose
 image never starts (`w_broken`), so rollouts fail (ZC-E0304) and are paused and resumed failed.
 
 Teeth (`zig build sim-c3-teeth`, one step each, `src/c1_teeth.zig`): `rollout_budget` (the replica

@@ -553,7 +553,51 @@ const Run = struct {
             try run.remove_stale(&batch, item, &decision, service);
         }
         try run.create_replicas(&batch, service, &decision, creations);
+        try run.expect_floor(&batch, service, plan, roll, retired[0..retired_count]);
         _ = try run.finish(&batch);
+    }
+
+    /// Puts in the read set what a retirement of a running replica rests on (R1): the reports of
+    /// `replicas - max_unavailable` of the running replicas it keeps, and their nodes' status, so
+    /// one that stops or whose node is lost before the commit makes the transaction fail and the
+    /// next pass count again. While the compare budget holds them all, the floor is exact. A
+    /// larger service gets as many as fit (docs/decisions/2026-11-14-c3-slice7-controller.md).
+    fn expect_floor(
+        run: *Run,
+        batch: *Batch,
+        service: *const ServiceEntry,
+        plan: *const ServicePlan,
+        roll: *const Roll,
+        retired: []const *const Item,
+    ) Error!void {
+        if (c1_teeth.rollout_budget) return;
+        if (roll.policy.strategy != .rolling) return;
+        for (retired) |item| {
+            if (item.running and item.lost == null) break;
+        } else return;
+        var left = service.rec.replicas -| roll.policy.max_unavailable;
+        for (plan.slice()) |*item| {
+            if (left == 0) return;
+            if (item.class == .dead or item.class == .held) continue;
+            if (!item.running or item.lost != null) continue;
+            if (std.mem.indexOfScalar(*const Item, retired, item) != null) continue;
+            const observed = item.observed orelse continue;
+            const node = observed.rec.node;
+            const status = run.snap.status_of(node);
+            const known = status == null or in_read_set(batch, status.?.kv.key);
+            const cost: u32 = if (known) 1 else 2;
+            if (batch.compares_count + cost > constants.store_txn_compares_max) return;
+            batch.expect(observed.kv.key, observed.kv.mod_revision);
+            if (!known) batch.expect(status.?.kv.key, status.?.kv.mod_revision);
+            left -= 1;
+        }
+    }
+
+    fn in_read_set(batch: *const Batch, key: []const u8) bool {
+        for (batch.compares[0..batch.compares_count]) |compare| {
+            if (std.mem.eql(u8, compare.key, key)) return true;
+        }
+        return false;
     }
 
     /// New replicas the budget still allows: `budget.start` less the numbers the counter handed

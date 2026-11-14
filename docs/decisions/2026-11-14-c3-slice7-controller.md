@@ -54,3 +54,16 @@ Choices the brief left open, or where this slice differs from it or from slice 6
     `sim_cluster --seeds 1..40 150 --c3` run by hand.
 15. **A finished rollout is not deleted after a retention period.** It stays until the next apply
     replaces it.
+16. **A replacement made during a pause keeps the old generation** (TLA+ review, gap 2). An old
+    replica that ends while its rollout is paused or failed is replaced at its own generation
+    (`replica_controller.create_replicas_from`), so a pause starts nothing new; R4 checks that no
+    paused step creates more new-generation replicas than died. While the rollout is active the
+    replacement runs the new spec, as item 7 says.
+17. **What a retirement compares** (TLA+ gap 1, finding 7): the "recheck" reading, with the floor
+    compared exactly while it fits in a transaction and as far as it fits past that;
+    `docs/decisions/2026-11-14-c3-rolling-floor-compares.md`. Every write of `/rollouts/<service>`
+    and every retirement compares the rollout record's revision, so a pause between a read and
+    a commit fails the commit.
+18. **`State.earlier` comes from the record** (slice 6's 4d4ec68, merged): a rollout ran before
+    when it is a rollback or its `from` is not 0. Slice 7 calls no rollback (item 8); slice 8 must
+    not roll back a rollout whose `from` is 0, since there is nothing to go back to.
