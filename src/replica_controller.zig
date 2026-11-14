@@ -249,10 +249,13 @@ const Run = struct {
         if (plan.dead > 0) return run.replace(service, &plan, &roll);
         if (plan.stale > 0 and roll.starts) return run.roll_out(service, &plan, &roll);
         // A halted rollout (failed or paused) keeps its stale replicas, which then count as
-        // any other toward what the service asks for.
+        // any other toward what the service asks for, and the new ones it surged: up to
+        // `max_surge` more than that stay, or a pause would undo the step it paused at.
         const keep = plan.live + plan.held + plan.stale;
+        const halted = plan.stale > 0 and roll.rollout != null;
+        const wanted = service.rec.replicas + if (halted) roll.policy.max_surge else 0;
         if (keep < service.rec.replicas) return run.scale_up(service, keep, &roll);
-        if (keep > service.rec.replicas) return run.scale_down(service, &plan);
+        if (keep > wanted) return run.scale_down(service, &plan, wanted);
     }
 
     // ---- Reading ----
@@ -964,8 +967,15 @@ const Run = struct {
 
     // ---- Removing ----
 
-    fn scale_down(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!void {
-        const wanted = service.rec.replicas;
+    /// Removes replicas until `wanted` are left: the service's count, or up to `max_surge` more
+    /// while its rollout is halted.
+    fn scale_down(
+        run: *Run,
+        service: *const ServiceEntry,
+        plan: *const ServicePlan,
+        wanted: u32,
+    ) Error!void {
+        assert(wanted >= service.rec.replicas);
         const keep = plan.live + plan.held + plan.stale;
         assert(keep > wanted);
         var victims: [constants.replicas_per_service_max]Item = undefined;
@@ -985,9 +995,10 @@ const Run = struct {
             if (index > 0) names.appendSlice(run.ctx.arena, ", ") catch return nomem(run.ctx);
             names.appendSlice(run.ctx.arena, item.replica.rec.id) catch return nomem(run.ctx);
         }
+        const asked = service.rec.replicas;
         const reason = try controller.format(run.ctx, "service {s} wants {d} {s} and {d} " ++
             "exist; removing {s}", .{
-            service.rec.name, wanted, plural(wanted, "replica", "replicas"), keep, names.items,
+            service.rec.name, asked, plural(asked, "replica", "replicas"), keep, names.items,
         });
         const decision = try controller.put_decision(run.ctx, &run.rc.source, .{
             .actor = actor,

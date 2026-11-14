@@ -338,7 +338,8 @@ fn model_failure(
     facts: *const plan_mod.Facts,
 ) ?plan_mod.Failure {
     const from = model.evidence_from_ms;
-    if (facts.new_held_at_ms != null and facts.new_held_at_ms.? >= from) return .held;
+    // A replica still held fails the rollout whenever it was first seen (C3 slice 7).
+    if (facts.new_held_at_ms != null) return .held;
     const restarts = facts.new_restarts_exceeded_at_ms;
     if (restarts != null and restarts.? >= from) return .restarts;
     if (facts.new_unready_since_ms) |since| {

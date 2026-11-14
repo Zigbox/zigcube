@@ -36,7 +36,7 @@
 //! phase starts a rollout from the current mix of replicas. `paused` and `failed` start and retire
 //! nothing; replacing a replica that failed on its own is the replica controller's, outside the
 //! budget. A resumed rollout is judged only on failures seen after the resume
-//! (`State.evidence_from_ms`).
+//! (`State.evidence_from_ms`), except a new replica still held, which fails it again at once.
 //!
 //! Done means no old replica is live and `desired` new ones are ready. Done wins over a failure
 //! seen on the same pass: the work it guards is finished.
@@ -283,7 +283,8 @@ pub const Failure = enum {
 
 /// What one pass of the controller sees besides the mix. Counting restarts against a bound and
 /// placing replicas are the controller's; the plan takes their verdicts, with the moment each
-/// was first seen so that a resumed rollout is not failed again on what it was paused for.
+/// was first seen so that a resumed rollout is not failed again on what it was paused for (a held
+/// replica excepted: it is still there).
 pub const Facts = struct {
     desired: u32,
     mix: Mix,
@@ -383,9 +384,10 @@ fn failure_of(
 ) ?Failure {
     assert(active(state.phase));
     const from = state.evidence_from_ms;
-    if (facts.new_held_at_ms) |at| {
-        if (at >= from) return .held;
-    }
+    // A held replica is not a past event but a present one: it is never replaced within its
+    // generation and holds its slot, so a rollout resumed with one still held could only end at
+    // its deadline. It fails again at once (C3 slice 7, sim-c3 seed 63).
+    if (facts.new_held_at_ms != null) return .held;
     if (facts.new_restarts_exceeded_at_ms) |at| {
         if (at >= from) return .restarts;
     }
@@ -839,9 +841,10 @@ test "rollout plan: every edge of pause, resume and begin" {
 
 test "rollout plan: a resumed failure is judged on new evidence only" {
     // Goal: a rollout paused for a failure (on_failure pause) and resumed goes on, and is not
-    // failed again on the evidence it was paused for: a held replica, a passed restart bound, a
-    // ready timeout or the deadline. New evidence after the resume fails it again. Method: each
-    // failure pauses a rollout; resume; the same facts a moment later; then fresh ones.
+    // failed again on the evidence it was paused for: a passed restart bound, a ready timeout or
+    // the deadline. A replica still held fails it again at once (it blocks the rollout for good).
+    // New evidence after the resume fails it again. Method: each failure pauses a rollout;
+    // resume; the same facts a moment later; then fresh ones.
     const policy: Policy = .{ .on_failure = .pause };
     const Kind = enum { held, restarts, ready_timeout, deadline };
     for ([_]Reason{ .apply, .rollback }) |reason| {
@@ -865,6 +868,11 @@ test "rollout plan: a resumed failure is judged on new evidence only" {
             try testing.expectEqual(fresh_deadline, resumed_state.deadline_at_ms);
             facts.now_ms = resume_at + 1;
             const again = pass(&policy, &resumed_state, &facts);
+            if (kind == .held) {
+                try testing.expectEqual(@as(?Failure, .held), again.failure);
+                try testing.expectEqual(Phase.paused, again.state.phase);
+                continue;
+            }
             try testing.expectEqual(@as(?Failure, null), again.failure);
             try testing.expectEqual(reason.active_phase(), again.state.phase);
             // Fresh evidence counts.

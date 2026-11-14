@@ -14,7 +14,7 @@
 //! seed: operations (40 to 800), nodes (unless given), lease ttl, replica counts.
 //! `--profile=auto` draws which fault classes are on (`mixed` is today's mix and the default,
 //! so a command line without these flags runs what it always ran; `partitions`, `skew`,
-//! `crash_heavy` and `slow_store` switch the other classes off). A flag given beats the draw.
+//! `crash_heavy`, `slow_store` and `bad_release` switch the other classes off). A flag given beats the draw.
 //! The report and each failure say what ran, and the replay line is concrete: it names the
 //! drawn values, so it needs no draw to reproduce.
 //!
@@ -30,6 +30,7 @@
 //! `--jobs=false` leaves the job workload and its checks out (J1 to J3, J5 to J8; on by default).
 //!
 //! `--c1` runs sim-c1 (docs/core.md, "sim-c1"): the per-revision checks of docs/authority.md §4.
+//! `--c3` runs sim-c3 on top (C3 slice 7, docs/briefs/c3.md): R1 R2 R3 R4 R6, with pauses.
 //! `--expect-symptom=TEXT` with `--expect-fail` makes the failure count only if it starts with
 //! TEXT, or with one of several `|`-separated alternatives (src/symptom.zig); the negative tests
 //! of sim-c1 use it (`sim_c1_teeth_main.zig`).
@@ -157,6 +158,9 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.options.strong = true;
     } else if (std.mem.eql(u8, arg, "--c1")) {
         parsed.options.c1 = true;
+    } else if (std.mem.eql(u8, arg, "--c3")) {
+        parsed.options.c1 = true;
+        parsed.options.c3 = true;
     } else if (std.mem.eql(u8, arg, "--expect-symptom-any")) {
         parsed.expect_symptom_any = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
@@ -296,7 +300,7 @@ fn print_replay(
         runner, seed, operations, options.nodes orelse 0,
     });
     if (!options.liveness) try out.writeAll(" --liveness=false");
-    if (options.c1) try out.writeAll(" --c1");
+    if (options.c3) try out.writeAll(" --c3") else if (options.c1) try out.writeAll(" --c1");
     if (!options.jobs) try out.writeAll(" --jobs=false");
     if (options.strong) try out.writeAll(" --strong");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
@@ -361,7 +365,9 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
     }
     const total = parsed.last_seed - parsed.first_seed + 1;
     // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
-    const run_name: []const u8 = if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
+    const run_name: []const u8 = if (parsed.options.c3)
+        "sim-cluster --c3"
+    else if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
     if (parsed.operations) |operations| {
         out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
             run_name, parsed.first_seed, parsed.last_seed, operations, failures, total,

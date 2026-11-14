@@ -25,9 +25,12 @@ pub const ClusterProfile = enum(u8) {
     crash_heavy,
     /// Store outages and lost acknowledgements, with slow links, only.
     slow_store,
+    /// No faults, and many applies of an image that never starts: rollouts to a generation that
+    /// never becomes healthy (C3 slice 7; `flaky_health` waits for probes, slices 9 and 10).
+    bad_release,
 
     /// Draw weights, in the order of the enum.
-    pub const weights = [_]u32{ 3, 2, 2, 2, 2 };
+    pub const weights = [_]u32{ 3, 2, 2, 2, 2, 2 };
 
     comptime {
         assert(weights.len == @typeInfo(ClusterProfile).@"enum".field_names.len);

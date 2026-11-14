@@ -174,6 +174,7 @@ test {
     _ = @import("tls_client_test.zig");
     _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
+    _ = @import("rollout_controller_test.zig");
     _ = @import("scheduler_test.zig");
     _ = @import("job_controller_test.zig");
     _ = @import("api_test.zig");

@@ -317,6 +317,7 @@ pub const Swarm = struct {
                 swarm.net.request.delay_ms_max = 200 + r.uintLessThan(u32, 400);
                 swarm.net.reply.delay_ms_max = 200 + r.uintLessThan(u32, 400);
             },
+            .bad_release => swarm.w_broken = 6 + r.uintLessThan(u32, 10),
         }
     }
 
@@ -866,9 +867,10 @@ pub const Cluster = struct {
     /// J4: the client that follows the job endings through the watch, and its own random stream.
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
-    /// C3's pauses and resumes (`--c1` only), from a stream of their own so that a world without
-    /// `--c1` draws as before.
+    /// C3's pauses and resumes (`--c3` only), from a stream of their own so that a world without
+    /// `--c3` draws as before.
     rollout_prng: std.Random.DefaultPrng,
+    c3: bool,
     rollout_pauses: u32,
     rollout_resumes: u32,
     job_next: u32,
@@ -949,6 +951,7 @@ pub const Cluster = struct {
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.rollout_prng = .init(seed ^ 0x9a05_e7e5_0c3);
+        c.c3 = false;
         c.rollout_pauses = 0;
         c.rollout_resumes = 0;
         c.job_next = 1;
@@ -1837,7 +1840,7 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
         }
     }
     const found = sim_c1.at_revision(&ctx, request, c.retention_running) orelse
-        sim_c3.at_revision(&ctx, request, &c.c3_tally);
+        if (c.c3) sim_c3.at_revision(&ctx, request, &c.c3_tally) else null;
     if (found) |problem| {
         c.c1_violation = problem;
         c.c1_violation_revision = revision;
@@ -1864,7 +1867,7 @@ fn before_commit(context: *anyopaque, request: store.TxnRequest) void {
         .diag = &c.tap_diag,
     };
     c.c1_pending = sim_c1.before_commit(&ctx, request, &c.c1_tally) orelse
-        sim_c3.before_commit(&ctx, request, &c.c3_tally);
+        if (c.c3) sim_c3.before_commit(&ctx, request, &c.c3_tally) else null;
 }
 
 /// The injection of the two negative tests (compare skipped): just ahead of the scheduler's
@@ -2189,11 +2192,11 @@ fn operation(c: *Cluster) void {
         .job_cancel => c.cancel_job(),
         .job_end => c.end_job(),
     }
-    if (c.c1 and c.fault_totals == null) pause_or_resume(c, name);
+    if (c.c3 and c.fault_totals == null) pause_or_resume(c, name);
     c.advance(100);
 }
 
-/// Under `--c1`, before the heal, one operation in four also pauses or resumes the rollout of the
+/// Under `--c3`, before the heal, one operation in four also pauses or resumes the rollout of the
 /// service it drew (just applied, so most often one in progress) through the core's request, the
 /// one slice 11's API calls, for R4.
 fn pause_or_resume(c: *Cluster, name: []const u8) void {
@@ -2896,7 +2899,7 @@ fn heal(c: *Cluster) void {
         node.job_refusals_at_heal = node.job_refusals;
     }
     // Every paused rollout is resumed, so that the liveness check sees each one finish or fail.
-    if (c.c1) for (service_names) |name| c.request_rollout(name, .resume_rollout);
+    if (c.c3) for (service_names) |name| c.request_rollout(name, .resume_rollout);
 }
 
 /// Null if `node` has no container of `name` that is not stopped; else whether it is `running`
@@ -3130,6 +3133,9 @@ pub const Options = struct {
     on_step: ?*const fn (step: []const u8) void = null,
     /// sim-c1 (docs/core.md): the per-revision checks, the overlap bound, the extra faults.
     c1: bool = false,
+    /// sim-c3 (C3 slice 7; needs `c1`): the rollout checks R1 R2 R3 R4 R6 and the pauses and
+    /// resumes that R4 judges. Off, a `--c1` world is the one earlier builds drew.
+    c3: bool = false,
     /// Which fault classes are on (`sim_shape.zig`). `mixed` is the seed's own mix, as every
     /// build before profiles drew it.
     profile: sim_shape.ClusterProfile = .mixed,
@@ -3224,7 +3230,9 @@ pub fn simulate(
         c.swarm.replicas_pct,
     });
     c.liveness = options.liveness;
+    assert(!options.c3 or options.c1);
     c.c1 = options.c1;
+    c.c3 = options.c3;
     c.jobs_on = options.jobs;
     if (c.jobs_on) {
         c.swarm.add_jobs(seed);
@@ -3474,7 +3482,7 @@ fn print_summary(c: *Cluster) void {
             c.c1_tally.facts_other,
         });
         report.print("sim-c1 L1: placements judged={d}\n", .{c.c1_tally.placements_judged});
-        report.print("sim-c3 R1 retirements={d} R2 surges={d} R3 versions={d} R4 paused={d} " ++
+        if (c.c3) report.print("sim-c3 R1 retirements={d} R2 surges={d} R3 versions={d} R4 paused={d} " ++
             "R6 history={d}; pauses={d} resumes={d}\n", .{
             c.c3_tally.retirements_judged, c.c3_tally.surges_judged,
             c.c3_tally.versions_judged,    c.c3_tally.paused_judged,
