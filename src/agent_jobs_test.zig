@@ -1494,6 +1494,7 @@ test "a lost answer to an earlier run's write does not hold back a later run's s
     try testing.expectEqual(@as(u32, 0), world.sim.running_count());
     // Once the answers come back, the cancel is reported as the cause.
     world.switched.lost_answer_prefix = null;
+    world.last_failure = null;
     rig.step();
     rig.step();
     const seen = (try rig.observed()).?;

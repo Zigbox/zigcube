@@ -1389,6 +1389,16 @@ const c1_teeth_roots = [_]struct {
         .seeds = 241,
         .ops = 300,
     },
+    .{
+        .name = "job_pass_break",
+        .root = "src/sim_c1_teeth_job_pass_break_main.zig",
+        .symptom = "J6",
+        .canary_seeds = 1,
+        .canary_first = 225,
+        .first_seed = 225,
+        .seeds = 225,
+        .ops = 300,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1441,7 +1451,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 23 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 24 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1711,7 +1721,8 @@ const worlds = [_][]const u8{
     "src/sim_c1_evict_world_main.zig",
 };
 
-/// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5 may fail.
+/// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5, nor seed 225
+/// (#248), may fail.
 fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
     const step = b.step("sim-c1-worlds", "Run sim-c1 in the job_evicted world");
     const only = b.step("sim-c1-worlds-exe", "Install the world runners");
@@ -1730,6 +1741,12 @@ fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
         run.addArgs(&.{ "--seeds", "1..5", "300", "--c1" });
         run.expectExitCode(0);
         step.dependOn(&run.step);
+        // #248: seed 225 broke J6 on fb385b2 (a server failure ended the job pass before an
+        // orphan's committed stop); the replay must pass.
+        const replay = b.addRunArtifact(exe);
+        replay.addArgs(&.{ "225", "300", "1", "--c1" });
+        replay.expectExitCode(0);
+        step.dependOn(&replay.step);
     }
 }
 
@@ -1810,6 +1827,22 @@ const c1_regressions = [_][]const []const u8{
         "2764708423",         "69",                    "4",
         "--strong",           "--profile=crash_heavy", "--lease-ttl-ms=8248",
         "--replicas-pct=300", "--heal-at=58",
+    },
+    // #247: a lost answer (ZC-E0201) to a run's write ended the job pass, and a run whose
+    // cancel had committed kept running past J6's bound (137,767 ms) on f49041a. fb385b2 passes
+    // it by luck of timing; the pass now stops decided runs after a server failure
+    // (docs/decisions/2026-11-14-b3-soak-after-247.md).
+    &.{
+        "870682998",          "80",                   "3",
+        "--strong",           "--profile=slow_store", "--lease-ttl-ms=8488",
+        "--replicas-pct=100", "--heal-at=76",
+    },
+    // #96: an agent stepped in a busy loop in the fault phase (2,098 steps) on f49041a; #244's
+    // fence pause (`.watch = false`) fixed it on fb385b2 (1,492 steps).
+    &.{
+        "833885280",           "185",                "4",
+        "--c1",                "--strong",           "--profile=crash_heavy",
+        "--lease-ttl-ms=8226", "--replicas-pct=200", "--heal-at=390",
     },
 };
 
