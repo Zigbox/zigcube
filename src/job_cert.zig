@@ -15,6 +15,7 @@ const constants = @import("constants.zig");
 const records = @import("records.zig");
 const identity = @import("x509_identity.zig");
 const x509 = @import("x509.zig");
+const c1_teeth = @import("c1_teeth.zig");
 
 pub const Refusal = error{
     /// The job has no relay: it gets no certificate.
@@ -97,6 +98,10 @@ fn skipped(fault: TestFault) bool {
 pub fn not_after_ms(started_ms: u64, deadline_ms: u64, grace_ms: u64) ?u64 {
     var sum = std.math.add(u64, started_ms, deadline_ms) catch return null;
     sum = std.math.add(u64, sum, grace_ms) catch return null;
+    // `job_cert_long` (sim-c1's R5 tooth) counts the slack twice.
+    if (c1_teeth.job_cert_long) {
+        sum = std.math.add(u64, sum, constants.workload_cert_slack_ms) catch return null;
+    }
     return std.math.add(u64, sum, constants.workload_cert_slack_ms) catch null;
 }
 
@@ -111,11 +116,15 @@ pub fn decide(
     if (records.job_state_terminal(status.state) and !skipped(.ended)) return error.run_ended;
     // The owner has said the run must stop: no new identity for it, whatever the status says yet.
     if (job.cancel_requested != null and !skipped(.ended)) return error.run_ended;
-    if (!skipped(.image) and !image_is(job.image, ask.image_digest)) return error.wrong_image;
+    // `job_cert_image` is sim-c1's tooth for R4's image clause: the digest is not compared.
+    const compare_image = !skipped(.image) and !c1_teeth.job_cert_image;
+    if (compare_image and !image_is(job.image, ask.image_digest)) return error.wrong_image;
     const held = claim orelse return error.no_claim;
     if (held.status == .stopped and !skipped(.ended)) return error.run_ended;
     if (!std.mem.eql(u8, held.node, ask.node) and !skipped(.node)) return error.wrong_node;
-    if (!skipped(.epoch) and !epoch_current(held, status, assignment, ask)) {
+    // `job_cert_stale` is sim-c1's R4 tooth: the epoch is not compared.
+    const compare_epoch = !skipped(.epoch) and !c1_teeth.job_cert_stale;
+    if (compare_epoch and !epoch_current(held, status, assignment, ask)) {
         return error.stale_epoch;
     }
     const started = held.started_at_ms orelse return error.not_started;

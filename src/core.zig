@@ -62,6 +62,7 @@ pub const modules = .{
     @import("runtime.zig"),
     @import("sim_c0.zig"),
     @import("sim_c1.zig"),
+    @import("sim_certs.zig"),
     @import("evidence.zig"),
     @import("why_acceptance.zig"),
     @import("c1_teeth.zig"),

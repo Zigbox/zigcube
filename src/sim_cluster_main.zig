@@ -289,16 +289,17 @@ fn print_replay(
     options: sim_cluster.Options,
     heal_at: ?u32,
 ) !void {
-    // The burst world is a comptime flag of its own runner, so its replay names that runner
-    // (`sim-c1-burst` builds it; #202).
-    const runner = if (c1_teeth.burst_world) "sim_c1_burst" else "sim_cluster";
+    // The burst world and each tooth are comptime flags of their own runners, so the replay names
+    // that runner (`sim-c1-burst` builds the first, #202; `sim-c1-teeth-exe` the others).
+    const runner = c1_teeth.runner;
     try out.print("  replay: zig-out/bin/{s} {d} {d} {d}", .{
         runner, seed, operations, options.nodes orelse 0,
     });
     if (!options.liveness) try out.writeAll(" --liveness=false");
     if (options.c1) try out.writeAll(" --c1");
     if (!options.jobs) try out.writeAll(" --jobs=false");
-    if (options.strong) try out.writeAll(" --strong");
+    // A tooth that needs the strong world implies it; the line says so anyway.
+    if (options.strong or c1_teeth.strong_world) try out.writeAll(" --strong");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
     if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});
     if (options.lease_ttl_ms) |ttl| try out.print(" --lease-ttl-ms={d}", .{ttl});
