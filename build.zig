@@ -1701,12 +1701,14 @@ const c1_teeth_roots = [_]struct {
         .name = "job_pass_break",
         .root = "src/sim_c1_teeth_job_pass_break_main.zig",
         .symptom = "J6",
-        // Sparse: seeds 225 and 44 of the evict world are its known hits (J6 at 21,596 and
-        // 23,406 ms on the loop's `break`); seeds 1..40 have none. The unit tests in
+        // Sparse: seeds 225 and 180 of the evict world are its known hits in the B4-B7 bundle
+        // (J6 on the loop's `break`); seed 44 hit before B5 and B6 changed the world and no
+        // longer does, and seeds 1..179 and 181..240 have none
+        // (docs/decisions/2026-11-14-bundle-teeth-reseed.md). The unit tests in
         // `agent_jobs_test.zig` (#247) are the real guard of both halves of the fix.
         .canary_seeds = 1,
         .canary_first = 225,
-        .also_seeds = &.{44},
+        .also_seeds = &.{180},
         .first_seed = 225,
         .seeds = 225,
         .ops = 300,
