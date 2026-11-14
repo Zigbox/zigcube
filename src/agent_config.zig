@@ -16,7 +16,8 @@
 //! ```
 //!
 //! `zcube-agent supervise <container directory>` is the supervisor mode (`fake_supervisor.zig`),
-//! used only by the agent itself.
+//! and `zcube-agent probe <replica> <timeout_ms> <command...>` the health check worker
+//! (`probe_worker.zig`), both used only by the agent itself.
 
 const std = @import("std");
 const assert = std.debug.assert;

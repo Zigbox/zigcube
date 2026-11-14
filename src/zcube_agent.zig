@@ -5,7 +5,9 @@
 //! exit 70. Never a stack trace.
 //!
 //! `zcube-agent supervise <dir>` is the same executable run again as the supervisor of one
-//! container (`fake_supervisor.zig`); nothing else uses that mode.
+//! container (`fake_supervisor.zig`); nothing else uses that mode. `zcube-agent probe` is the
+//! same for one health check over Zigbox exec (`probe_worker.zig`); its exit code means nothing:
+//! it says its result in one line on stdout, and a worker that ends without one is a refused check.
 
 const std = @import("std");
 const assert = std.debug.assert;
