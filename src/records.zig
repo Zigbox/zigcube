@@ -745,6 +745,13 @@ pub fn history_of(service: *const Service, applied_at_ms: u64) History {
 
 pub const RolloutPhase = enum { progressing, paused, rolling_back, complete, failed };
 
+/// What a rollout is for (`rollout_plan.Reason`): a user's apply, or a rollback that landed as a
+/// new generation. It names the phase a paused rollout resumes in.
+pub const RolloutReason = enum { apply, rollback };
+
+/// Why a rollout is paused (`rollout_plan.PauseCause`): the user paused it, or a failure did.
+pub const RolloutPausedBy = enum { user, failure };
+
 /// What the replica controller may do now for a rollout: start this many new replicas, retire
 /// this many ready old ones (`retire`, the count R1 limits) and this many old ones that are not
 /// ready (`retire_unready`). A replica counted as unready that is ready when the controller acts
@@ -776,6 +783,17 @@ pub const Rollout = struct {
     budget: RolloutBudget = .{},
     /// The decision that started or last moved the rollout.
     cause_decision: []const u8 = "",
+    /// What the rollout is for (C3 slices 7 and 11; absent: read from an active `phase`, else
+    /// `apply`). The members below are what pause and resume need
+    /// (docs/decisions/2026-11-13-c3-slice6-rollout-plan.md, item 5); all optional.
+    reason: ?RolloutReason = null,
+    /// Failures seen before this moment do not count: the start, or the last resume (absent:
+    /// `started_at_ms`).
+    evidence_from_ms: ?u64 = null,
+    /// When the current pause began; present exactly while `phase` is `paused`.
+    paused_at_ms: ?u64 = null,
+    /// Who paused it; present exactly while `phase` is `paused`.
+    paused_by: ?RolloutPausedBy = null,
 };
 
 /// Whether `rollout` is the rollout of the service whose key was created at
@@ -1886,6 +1904,37 @@ test "C3: history and rollout records encode and read back" {
     try testing.expect(rollout_of(&rollout_back, 40));
     try testing.expect(!rollout_of(&rollout_back, 41));
     try testing.expect(!rollout_of(&rollout_back, null));
+}
+
+test "C3 slice 11: a rollout's pause members round-trip, and are left out when absent" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rollout: Rollout = .{
+        .service = "hello",
+        .service_created = 40,
+        .from = 6,
+        .to = 7,
+        .phase = .progressing,
+        .started_at_ms = 10,
+        .deadline_at_ms = 600_010,
+    };
+    const rollout_bytes = try encode(arena, rollout, &diag);
+    try testing.expect(std.mem.indexOf(u8, rollout_bytes, "paused") == null);
+    var paused = rollout;
+    paused.phase = .paused;
+    paused.reason = .rollback;
+    paused.evidence_from_ms = 20;
+    paused.paused_at_ms = 30;
+    paused.paused_by = .user;
+    const paused_bytes = try encode(arena, paused, &diag);
+    const paused_back = try read(Rollout, arena, kv_of("/rollouts/hello", paused_bytes), &diag);
+    try testing.expectEqual(@as(?RolloutReason, .rollback), paused_back.reason);
+    try testing.expectEqual(@as(?u64, 20), paused_back.evidence_from_ms);
+    try testing.expectEqual(@as(?u64, 30), paused_back.paused_at_ms);
+    try testing.expectEqual(@as(?RolloutPausedBy, .user), paused_back.paused_by);
 }
 
 test "C3: a history key names one generation, in decimal, with no leading zero" {
