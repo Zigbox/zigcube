@@ -1377,7 +1377,7 @@ const c1_teeth_roots = [_]struct {
         // controllers keep what a re-registered node holds. Tenant labels exist only in the
         // tenant world, which the tooth switches on. Plain runs do not judge P1.
         .symptom = "P1",
-        .canary_seeds = 20,
+        .canary_seeds = 50,
     },
     .{
         .name = "job_reuse",

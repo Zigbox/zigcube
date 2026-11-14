@@ -416,6 +416,9 @@ const Node = struct {
     label_set: u8 = 0,
     /// B6: the agent was stopped by `relabel_node`, and comes back with another label set.
     relabel_pending: bool = false,
+    /// B6: the set `relabel_node` chose for it (its shared or exclusive twin), else any other
+    /// (`relabel_other`).
+    relabel_to: ?u8 = null,
     /// The agent does nothing before this true time (a call in progress, a back-off).
     resume_ms: u64,
     /// How long the calls of the step in progress took.
@@ -538,13 +541,19 @@ const Node = struct {
             node.cluster.stats.wipes += 1;
         }
         // B6: half the restarts of the tenant world draw the node's labels again (its own
-        // generator: no other draw moves), and some of those draws differ. The registration, and
-        // with it the labels, changes only when the lease ends (a host crash fences, a long cut
-        // expires it); then the replica and job controllers move off what the new labels refuse
-        // (P1, `sim_tenancy`).
+        // generator: no other draw moves), and some of those draws differ. The agent registers
+        // them only with a new tenure (after a fence or a lost disk); then the replica and job
+        // controllers move off what the new labels refuse (P1, `sim_tenancy`).
         if (node.relabel_pending) {
             node.relabel_pending = false;
-            node.relabel_other();
+            if (node.relabel_to) |set| {
+                node.relabel_to = null;
+                assert(set != node.label_set);
+                node.label_set = set;
+                node.cluster.relabels += 1;
+            } else {
+                node.relabel_other();
+            }
         } else if (node.cluster.tenants and node.cluster.label_prng.random().boolean()) {
             const before = node.label_set;
             node.label_set = node.draw_label_set();
@@ -1582,20 +1591,37 @@ pub const Cluster = struct {
         }
     }
 
-    /// B6, the tenant world under faults only: before one operation in eight (the label
-    /// generator draws it), an operator configures one node's agent with other labels and
-    /// restarts it. Its containers keep running and it registers again within its lease, so
-    /// what it holds may now be refused by its own labels: the replica and job controllers must
-    /// move that off (P1, `sim_tenancy`). Runs without tenants draw nothing here.
+    /// B6, the tenant world before the heal: before one operation in eight (the label generator
+    /// draws it), an operator reinstalls one node with other labels (a host crash that loses its
+    /// disk, state directory and containers). An agent registers labels only with a new tenure
+    /// (`agent.zig`: a restart that finds its lease keeps it, and the old labels), so a plain
+    /// restart would change nothing the server sees. The node comes back empty under its new
+    /// labels while the server still assigns it what it held, which its agent would start again,
+    /// so the replica and job controllers must move what the labels refuse elsewhere (P1,
+    /// `sim_tenancy`). Runs without tenants draw nothing here.
     fn relabel_node(c: *Cluster) void {
         assert(c.tenants);
         const random = c.label_prng.random();
         if (random.uintLessThan(u32, 8) != 0) return;
-        const node = c.nodes[random.uintLessThan(usize, c.nodes.len)];
+        // Half the time an odd-index node (the only ones that may be exclusive), toggled between
+        // shared and exclusive for its own tenant (`tenant_sets` keeps the exclusive twin of set
+        // `s` at `s + 2`): a shared spell lets services and other tenants land on it, and the
+        // exclusive one refuses them, the case P1's eviction exists for.
+        const odd = c.nodes.len > 1 and random.boolean();
+        const index = if (odd)
+            1 + 2 * random.uintLessThan(usize, c.nodes.len / 2)
+        else
+            random.uintLessThan(usize, c.nodes.len);
+        const node = c.nodes[index];
         if (node.down or node.sim.crashed) return;
         c.stats.relabel_restarts += 1;
         node.relabel_pending = true;
-        node.sim.crash_now(.process);
+        node.wipe_pending = true;
+        if (odd) {
+            const set = node.label_set;
+            node.relabel_to = if (set < 2) set + 2 else set - 2;
+        }
+        node.sim.crash_now(.host);
         node.check_crashed();
     }
 

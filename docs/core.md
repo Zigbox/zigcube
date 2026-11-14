@@ -534,16 +534,18 @@ which drawn `auto` operations switch on) has tenants, and draws none from the cl
 included. Nodes carry `tenant=a` or `tenant=b`, and the nodes of odd index (the second, the fourth, ...)
 may also be `exclusive=tenant`; the nodes of even index never are, and `replicas_for` counts only those, so
 the services always fit. A restart of an agent, half the time, comes back configured with other labels, and
-before one operation in eight (until the heal) an operator restarts one agent with a different set (`relabels=`
-and `operator restarts` in the report); an agent restarting within its lease registers again in place, so
-what its node holds may become refused. Jobs name `tenant=a` or `b` (`job_tenant`, no draw), every fourth
+before one operation in eight (until the heal) an operator reinstalls one node with a different set (a host
+crash that loses its disk; an odd node half the time, toggled between its shared and exclusive set;
+`relabels=` and `operator restarts` in the report). An agent sends new labels only with a new tenure (after a
+fence or a lost disk), which starts empty, so what a relabel leaves refused is the stale assignments of the
+old tenure, until the controllers act. Jobs name `tenant=a` or `b` (`job_tenant`, no draw), every fourth
 none (and only a non-exclusive node may run it), every eleventh `tenant=c`, which no node carries (it stays
 pending and ends `not_started`). The judge is independent: it records the labels each agent registered
 with (each new `/nodes/<n>` revision), each job's tenant from the simulation's own `job_tenant`, and decides
 with its own rule. **P1a** (`--c1`, in `before_commit`): no new assignment lands on a node whose registered
 labels refuse it, and a stored run's `require` is the job's. **P1b** (every simulated second the store is
 healthy): a hold its node's registration refuses is acted on (the replica removed, the run stopped, ended or
-replaced) within 35 s of when it is first seen or the store last failed; at rest none remains. A node with
+replaced) within 5 s (`acted_ms_max`) of when it is first seen or the store last failed; at rest none remains. A node with
 no registration is I7's. `sim-c1-teeth-placement_exclusive` (`c1_teeth.placement_exclusive`, which implies
 `--tenants`) skips the scheduler's `exclusive` rule and must fail P1; `sim-c1-teeth-relabel_kept`
 (`c1_teeth.relabel_kept`, which implies `--tenants`) turns off the controllers' relabel eviction and must

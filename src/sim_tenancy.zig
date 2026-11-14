@@ -66,12 +66,14 @@ pub fn job_number(name: []const u8) ?u32 {
 }
 
 /// How long a hold a re-registration made refused may stay unacted on, counted from when it was
-/// first seen or the store last failed, whichever is later. The replica and job controllers act
-/// on their next pass: the job controller watches `/nodes/`, and either controller's 30 s resync
-/// finds it if a wake was missed; this leaves 5 s for a slow pass and a retried write. Measured
-/// 2026-11-14 over seeds 1..60 (150 operations, `--strong --tenants`): 36 refused holds, each
-/// acted on before the next one-second scan.
-pub const acted_ms_max: u64 = 35_000;
+/// first seen or the store last failed, whichever is later. A registration wakes both
+/// controllers at once (the job controller watches `/nodes/`, the replica controller
+/// `/node-status/`), and each acts in that pass, so on a healthy store this is a pass and a
+/// retried write, not the 30 s resync. It is tight on purpose: a node that comes back under new
+/// labels comes back empty (a new tenure), and the paths that replace what a node lost also
+/// clear such holds, within seconds to tens of seconds; only a bound under those tells a missing
+/// eviction (`relabel_kept`) from them. A sim-check constant, not a product bound.
+pub const acted_ms_max: u64 = 5_000;
 
 /// Refused holds tracked at once; more fails the run (the world holds far fewer).
 const holds_max: u32 = 256;
