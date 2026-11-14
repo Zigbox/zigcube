@@ -1363,7 +1363,7 @@ const c1_teeth_roots = [_]struct {
         // earlier epoch gets a certificate. Relayed jobs exist only in the strong world, which
         // the tooth switches on. Plain runs (no `--c1`) judge R4 too.
         .symptom = "R4: a certificate was issued for a stale epoch",
-        .canary_seeds = 20,
+        .canary_seeds = 60,
         .plain_symptom = "R4: a certificate was issued for a stale epoch",
     },
     .{
@@ -1388,7 +1388,7 @@ const c1_teeth_roots = [_]struct {
         // R4's image clause (B4 slice 3 fixes): the issuer does not compare the ask's image
         // digest, and a forged ask for another image gets a certificate.
         .symptom = "R4: a certificate names another image than the job pins",
-        .canary_seeds = 20,
+        .canary_seeds = 80,
         .plain_symptom = "R4: a certificate names another image than the job pins",
     },
     .{
@@ -1396,7 +1396,7 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_relay_stop_leak_main.zig",
         // R7 (B4 slice 3 fixes): a run's relayed connections stay open through its stop's grace.
         .symptom = "R7",
-        .canary_seeds = 20,
+        .canary_seeds = 80,
         .plain_symptom = "R7",
     },
     .{
@@ -1464,7 +1464,9 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const ops_text = ops_argument(b, sim);
     const nodes_text = b.fmt("{d}", .{if (sim.auto_shape) 0 else nodes});
     const run = b.addRunArtifact(exe);
-    run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1" });
+    // The strong world (wipes, relayed jobs, certificates) costs no measurable time here (B4 slice 3
+    // fixes); `tools/wasm_check.mjs --sim-c1` sets it on the WASM side too.
+    run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1", "--strong" });
     run.addArg(b.fmt("--profile={s}", .{sim.profile}));
     const native_report = run.captureStdOut(.{});
     const step = b.step("sim-c1", "Run sim-c1 natively and as WASM, and compare (-Dseed=N)");

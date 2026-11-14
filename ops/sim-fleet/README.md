@@ -36,6 +36,11 @@ One host that runs the simulators (`sim_cluster`, `sim_cluster --c1` and `sim_sw
    | `sim_c1_teeth_job_wipe` (with its symptom, J2 or J7: `--expect-symptom` takes `|`-separated alternatives and a bare "J" matches nothing) | 26 and 26 of 200 (100 operations, `--strong`, plain and `--c1`); 25 of 200 plain (drawn operations, `--profile=auto`); 4 of 60 `--c1` (same; a rate of about 0.07, wide error) | 0.065 | 300 | 1.9e-9 |
    | `sim_c1_teeth_relay_leak` (with its symptom, R1) | 37 and 32 of 40 (100 operations, `--strong` implied, plain and `--c1`); 35 of 40 `--c1` (drawn operations, `--profile=auto`; 2026-11-10) | 0.8 | 20 | 1.2e-14 |
    | `sim_c1_teeth_relay_dropped` (with its symptom, R3) | not yet measured | not yet set | 20 | not yet computed |
+   | `sim_c1_teeth_job_cert_stale` (with its symptom, R4: a stale epoch) | 104 of 240 (drawn operations, `--profile=auto`, `--c1`, `--strong` implied; 2026-11-14) | 0.3 | 60 | 5.1e-10 |
+   | `sim_c1_teeth_job_cert_image` (with its symptom, R4: another image) | 92 of 240 (same) | 0.25 | 80 | 1.0e-10 |
+   | `sim_c1_teeth_job_cert_long` (with its symptom, R5) | 235 of 240 (same) | 0.8 | 20 | 1.0e-14 |
+   | `sim_c1_teeth_relay_conn_leak` (with its symptom, R6) | 223 of 240 (same; one seed fails R7 first) | 0.7 | 20 | 3.5e-11 |
+   | `sim_c1_teeth_relay_stop_leak` (with its symptom, R7) | 95 of 240 (same) | 0.25 | 80 | 1.0e-10 |
    | `sim_c1_teeth_job_ledger_small` (with its symptom, J8: the start ledger is full (16 runs), 400 operations) | not measured (caught at seed 1) | not set | 10 | not measured |
    | `sim_c1_teeth_job_evicted` (with its symptom, J8: a run that no node started) | sparse: about 1 seed in 100, and the only known hit is seed 186 at 300 operations, `--c1`, default profile (2026-11-11). Its canary is the fixed range `186+1@300` (manifest `FIRST+COUNT@OPS`; `run.sh` passes `--c1` only), about 55 s, so it re-proves that one seed, not a hit rate | n/a | 1 | n/a (a seed-specific check: it says whether the clause still fires at 186, not that the clause is caught in general) |
    | `sim_swarm_teeth` | 192 of 400 (reviewer: 51 of 101) | 0.4 | 200 | 4e-45 |

@@ -99,11 +99,35 @@ follow-ups that B4 keeps open. The slice's own decisions are in
    seed 90 is found, and the agent or the bound (an owner's call: `lost_grace_ms` is user-visible)
    is changed so that sim-c1 holds with it.
 
-## Not changed
+## Also changed
 
-- **check's sim-c1 run and `--strong`** (review B, SHOULD 5): see "Measurements".
-- **Replay lines of a failing tooth** (NIT): see "Measurements".
+- **check's sim-c1 run is strong (review B, SHOULD 5).** `zig build sim-c1`, which `zig build
+  check` runs (seed 1, 100 operations, Debug), now passes `--strong`, and the WASM side follows:
+  `zcube_sim_cluster_shaped` takes a last argument, `strong`, which `tools/wasm_check.mjs --sim-c1`
+  sets. The native run took 8.3 s plain and 8.0 s strong on this container (one run each), so the
+  10 % bound on check's time is not touched; the two WASM runs took 16.2 s and 9.1 s with it.
+  Native and WASM reports agree byte for byte.
+- **Replay lines of a failing tooth (NIT).** `print_replay` names the tooth's own runner
+  (`c1_teeth.runner`, an explicit table: Zig 0.17 cannot list a root's decls) and `--strong` when
+  the tooth implies it, e.g. `zig-out/bin/sim_c1_teeth_job_cert_image 240 798 2 --c1 --strong ...`.
+- **docs/api.md, ZC-E0130 (supervisor, leftover of PR #233).** The list of what admission refuses
+  for a relayed job now also names the image rule (`b3:` and 64 lowercase hex digits) and the
+  label-character rule, as `validate_shape` and `job_cert.zig` enforce them. The general label
+  limits (32-byte keys, 128-byte values) are tighter than the certificate's, so no other rule is
+  missing.
 
 ## Measurements
 
-(Filled in below by the fix session's runs.)
+Seeds 1..240, drawn operations, `--profile=auto`, `--c1` (`--strong` implied by every tooth
+below), ReleaseSafe, 2026-11-14, on the world with `stop_takes_grace`:
+
+| Runner | Caught | With its symptom | Floor | Seeds | P(miss) |
+|---|---|---|---|---|---|
+| `sim_c1_teeth_job_cert_stale` | 104 of 240 | 104 | 0.3 | 60 | 5.1e-10 |
+| `sim_c1_teeth_job_cert_image` | 92 of 240 | 92 | 0.25 | 80 | 1.0e-10 |
+| `sim_c1_teeth_job_cert_long` | 235 of 240 | 235 | 0.8 | 20 | 1.0e-14 |
+| `sim_c1_teeth_relay_conn_leak` | 223 of 240 | 222 (seed 189 fails R7 first) | 0.7 | 20 | 3.5e-11 |
+| `sim_c1_teeth_relay_stop_leak` | 95 of 240 | 95 | 0.25 | 80 | 1.0e-10 |
+
+The positive run, `sim_cluster --seeds 1..240 auto --profile=auto --c1 --strong` with every tooth
+off: POSITIVE_RESULT.

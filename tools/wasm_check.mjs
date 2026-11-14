@@ -95,6 +95,8 @@ if (simCluster) {
     profileIndex(CLUSTER_PROFILES, profileText),
     0,
     0,
+    // sim-c1 runs the strong world (B4 slice 3 fixes), as build.zig's native run does.
+    simC1 ? 1 : 0,
   );
   const label = simC1 ? "sim-c1" : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);

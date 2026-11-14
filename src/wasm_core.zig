@@ -129,6 +129,7 @@ export fn zcube_sim_cluster_shaped(
     profile: u32,
     lease_ttl_ms: u32,
     replicas_pct: u32,
+    strong: u32,
 ) u32 {
     const requested: sim_cluster.Options = .{
         .nodes = if (nodes == 0) null else nodes,
@@ -141,6 +142,7 @@ export fn zcube_sim_cluster_shaped(
             sim_shape.ClusterProfile.from_index(profile).?,
         .lease_ttl_ms = if (lease_ttl_ms == 0) null else lease_ttl_ms,
         .replicas_pct = if (replicas_pct == 0) null else replicas_pct,
+        .strong = strong != 0,
     };
     const resolved = sim_cluster.plan(seed, if (operations == 0) null else operations, requested);
     sim_cluster.simulate(
