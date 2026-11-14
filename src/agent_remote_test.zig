@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const assert = std.debug.assert;
 const net = std.Io.net;
 const agent_mod = @import("agent.zig");
 const agent_peer = @import("agent_peer.zig");
@@ -49,7 +50,9 @@ const Rig = struct {
     io: std.Io,
     tmp: testing.TmpDir,
     path: []u8,
-    server: *server_mod.Server,
+    /// Null while no server runs: between a stop and a start that failed, so that teardown
+    /// never stops one server twice.
+    server: ?*server_mod.Server,
     http_transport: remote_mod.HttpTransport,
     remote: remote_mod.RemoteStore,
     clock_source: clock_mod.RealClock,
@@ -66,9 +69,9 @@ const Rig = struct {
         rig.path = try std.fmt.allocPrint(testing.allocator, "{s}/store.db", .{buffer[0..length]});
         errdefer testing.allocator.free(rig.path);
         rig.server = try start_server(rig.io, rig.path, true);
-        errdefer rig.server.stop();
+        errdefer rig.stop_server();
         rig.http_transport = .{
-            .client = .{ .io = rig.io, .address = rig.server.address() },
+            .client = .{ .io = rig.io, .address = rig.live().address() },
         };
         rig.remote = remote_mod.RemoteStore.init(
             testing.allocator,
@@ -80,7 +83,7 @@ const Rig = struct {
     }
 
     fn stop(rig: *Rig) void {
-        rig.server.stop();
+        rig.stop_server();
         testing.allocator.free(rig.path);
         rig.tmp.cleanup();
         rig.test_io.stop();
@@ -90,14 +93,52 @@ const Rig = struct {
     /// The server stops and starts again over the same file: the store is the only state. The
     /// agent's client is pointed at the new port.
     fn restart_server(rig: *Rig) !void {
-        rig.server.stop();
-        rig.server = try start_server(rig.io, rig.path, false);
-        rig.http_transport.client.address = rig.server.address();
+        try rig.restart_server_on(.{ .sqlite = rig.path }, false, null);
+    }
+
+    /// Stops the server and starts one over `store_config`. If the start fails, no server runs
+    /// and `stop` still tears the rig down.
+    fn restart_server_on(
+        rig: *Rig,
+        store_config: config_mod.Store,
+        create: bool,
+        diag: ?*Diag,
+    ) !void {
+        rig.stop_server();
+        try rig.start_server_again(store_config, create, diag);
+    }
+
+    /// Starts a server after `stop_server`, and points the agent's client at its port. With
+    /// `diag`, a failure is the caller's to check and nothing is printed.
+    fn start_server_again(
+        rig: *Rig,
+        store_config: config_mod.Store,
+        create: bool,
+        diag: ?*Diag,
+    ) !void {
+        assert(rig.server == null);
+        rig.server = if (diag) |into|
+            try start_server_diag(rig.io, store_config, create, into)
+        else
+            try start_server_on(rig.io, store_config, create);
+        assert(rig.server != null);
+        rig.http_transport.client.address = rig.live().address();
+    }
+
+    /// Stops the server if one runs; stopping none is allowed, so teardown may always call it.
+    fn stop_server(rig: *Rig) void {
+        if (rig.server) |server| server.stop();
+        rig.server = null;
+    }
+
+    /// The running server; a test that reaches for it while none runs is a bug in the test.
+    fn live(rig: *Rig) *server_mod.Server {
+        return rig.server.?;
     }
 
     /// A request to the public API, for the things a person does (apply).
     fn post(rig: *Rig, path: []const u8, body: []const u8) !u16 {
-        const client: http.Client = .{ .io = rig.io, .address = rig.server.address() };
+        const client: http.Client = .{ .io = rig.io, .address = rig.live().address() };
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         var diag: Diag = undefined;
@@ -138,8 +179,23 @@ fn start_server(io: std.Io, path: []const u8, create: bool) !*server_mod.Server 
 fn start_server_on(io: std.Io, store_config: config_mod.Store, create: bool) !*server_mod.Server {
     var diag: Diag = undefined;
     diag.reset();
+    return start_server_diag(io, store_config, create, &diag) catch |err| {
+        if (diag.code) |code| std.debug.print("server did not start: {s}\n", .{@tagName(code)});
+        return err;
+    };
+}
+
+/// Starts a server; a failure leaves its diagnostic in `diag` and prints nothing.
+fn start_server_diag(
+    io: std.Io,
+    store_config: config_mod.Store,
+    create: bool,
+    diag: *Diag,
+) !*server_mod.Server {
+    var parse_diag: Diag = undefined;
+    parse_diag.reset();
     const config: config_mod.Config = .{
-        .listen = config_mod.parse_listen("127.0.0.1:0", &diag) catch unreachable, // A literal.
+        .listen = config_mod.parse_listen("127.0.0.1:0", &parse_diag) catch unreachable, // A literal.
         .store = store_config,
         .create_store = create,
         .verbose = false,
@@ -150,10 +206,7 @@ fn start_server_on(io: std.Io, store_config: config_mod.Store, create: bool) !*s
         .version = "0.0.0-test",
         .report_failures = false,
         .log_requests = false,
-    }, &diag) catch |err| {
-        if (diag.code) |code| std.debug.print("server did not start: {s}\n", .{@tagName(code)});
-        return err;
-    };
+    }, diag);
 }
 
 fn register_op(lease: store.LeaseId) store.Op {
@@ -185,7 +238,7 @@ test "a node joins: lease, registration, keepalive, and a lease that has ended" 
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const direct = rig.server.shared.store;
+    const direct = rig.live().shared.store;
     const got = try direct.get(arena_state.allocator(), "/nodes/node1", null, &diag);
     try testing.expectEqual(lease.id, got.kv.?.lease);
 
@@ -204,6 +257,27 @@ test "a node joins: lease, registration, keepalive, and a lease that has ended" 
     try testing.expectEqual(@as(?codes.Code, .E0206), diag.code);
 }
 
+test "a server that cannot start again leaves the rig safe to stop" {
+    // Goal: teardown after a partial start. A restart stops the server and then fails to start
+    // one; the rig must not stop the old server a second time. Method: restart over a SQLite
+    // path whose directory lies under the store file, so the state directory cannot be made;
+    // the restart fails, and the deferred `stop` must run cleanly (it used to segfault).
+    var rig = try Rig.start();
+    defer rig.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const path = try std.fmt.allocPrint(arena_state.allocator(), "{s}/state/store.db", .{
+        rig.path,
+    });
+    var diag: Diag = undefined;
+    diag.reset();
+    if (rig.restart_server_on(.{ .sqlite = path }, true, &diag)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(@as(?codes.Code, .E0201), diag.code);
+    try testing.expect(rig.server == null);
+}
+
 test "a server that is not there is ZC-E0503, and the same store works when it returns" {
     // Goal: the failure the agent lives with while the server restarts. Method: stop the server
     // (its port is closed), make a call, start it again over the same file and make the call
@@ -215,13 +289,12 @@ test "a server that is not there is ZC-E0503, and the same store works when it r
     diag.reset();
     const lease = try remote.lease_grant(10_000, &diag);
 
-    rig.server.stop();
+    rig.stop_server();
     try testing.expectError(error.BackendFailed, remote.lease_grant(10_000, &diag));
     try testing.expectEqual(@as(?codes.Code, .E0503), diag.code);
     try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "127.0.0.1") != null);
 
-    rig.server = try start_server(rig.io, rig.path, false);
-    rig.http_transport.client.address = rig.server.address();
+    try rig.start_server_again(.{ .sqlite = rig.path }, false, null);
     diag.reset();
     const renewed = try remote.lease_keepalive(lease.id, &diag);
     try testing.expectEqual(lease.id, renewed.id);
@@ -235,9 +308,7 @@ test "a memory-store server restarts under the agent: nothing is refused, nothin
     // revision went back to the start, and the call is answered.
     var rig = try Rig.start();
     defer rig.stop();
-    rig.server.stop();
-    rig.server = try start_server_on(rig.io, .memory, false);
-    rig.http_transport.client.address = rig.server.address();
+    try rig.restart_server_on(.memory, false, null);
     const remote = rig.remote.interface();
     var diag: Diag = undefined;
     diag.reset();
@@ -249,9 +320,7 @@ test "a memory-store server restarts under the agent: nothing is refused, nothin
     try testing.expect(rig.remote.known == null);
     try testing.expectEqual(@as(?remote_mod.client.Notice, .unverified), rig.remote.take_notice());
 
-    rig.server.stop();
-    rig.server = try start_server_on(rig.io, .memory, false);
-    rig.http_transport.client.address = rig.server.address();
+    try rig.restart_server_on(.memory, false, null);
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     diag.reset();
@@ -364,7 +433,7 @@ test "a pull record goes in under the tenure; a stale tenure is refused" {
     const held = [_]store.Compare{.{ .key = "/nodes/node1", .mod_revision = joined.revision }};
     const done = try remote.txn(.{ .compares = &held, .on_success = &.{put} }, &diag);
     try testing.expect(done.succeeded);
-    const direct = rig.server.shared.store;
+    const direct = rig.live().shared.store;
     const page = try direct.list(arena, .{ .prefix = "/pulls/node1/", .limit = 10 }, &diag);
     try testing.expectEqual(@as(usize, 1), page.kvs.len);
     const record = try records.read(records.Pull, arena, page.kvs[0], &diag);
@@ -521,7 +590,7 @@ fn observed_running(rig: *Rig) !u32 {
     defer arena_state.deinit();
     var diag: Diag = undefined;
     diag.reset();
-    const page = try rig.server.shared.store.list(arena_state.allocator(), .{
+    const page = try rig.live().shared.store.list(arena_state.allocator(), .{
         .prefix = "/observed/node1/",
         .limit = constants.store_list_limit_max,
     }, &diag);
@@ -537,7 +606,7 @@ fn running_names(rig: *Rig, out: *[2]runtime_name) !void {
     defer arena_state.deinit();
     var diag: Diag = undefined;
     diag.reset();
-    const page = try rig.server.shared.store.list(arena_state.allocator(), .{
+    const page = try rig.live().shared.store.list(arena_state.allocator(), .{
         .prefix = "/observed/node1/",
         .limit = constants.store_list_limit_max,
     }, &diag);
@@ -684,12 +753,13 @@ test "a memory-store server that restarts has a new CA, and the agent joins it w
     var test_io: TestIo = undefined;
     const io = test_io.start();
     defer test_io.stop();
-    var server = try start_server_on(io, .memory, true);
-    defer server.stop();
+    // Optional, as in `Rig`: a restart that fails must not leave the old server to stop twice.
+    var server: ?*server_mod.Server = try start_server_on(io, .memory, true);
+    defer if (server) |running| running.stop();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var http_transport: remote_mod.HttpTransport = .{
-        .client = .{ .io = io, .address = server.address() },
+        .client = .{ .io = io, .address = server.?.address() },
     };
     var remote_store = remote_mod.RemoteStore.init(
         testing.allocator,
@@ -717,9 +787,10 @@ test "a memory-store server that restarts has a new CA, and the agent joins it w
     try testing.expect(remote_store.ca_key_id != null);
     try testing.expect(!identity.observe_ca(remote_store.ca_key_id.?));
 
-    server.stop();
+    server.?.stop();
+    server = null;
     server = try start_server_on(io, .memory, true);
-    http_transport.client.address = server.address();
+    http_transport.client.address = server.?.address();
     lease = try remote.lease_grant(10_000, &diag);
     _ = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
     try testing.expect(identity.observe_ca(remote_store.ca_key_id.?));
@@ -743,7 +814,7 @@ test "the agent reads more than store_list_limit_max retained observations of it
     const arena = arena_state.allocator();
     var diag: Diag = undefined;
     diag.reset();
-    const direct = rig.server.shared.store;
+    const direct = rig.live().shared.store;
     const lease = try direct.lease_grant(10_000, &diag);
     const registered = register_op(lease.id);
     _ = try direct.txn(.{ .on_success = &.{registered} }, &diag);
