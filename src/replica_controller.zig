@@ -88,23 +88,35 @@ comptime {
     assert(decision + batch_replicas_max * (decision + 1) + 1 <= constants.store_txn_ops_max);
     // The operations no longer bind (the decision's own compare does, below): one more replica
     // would fit them but not the compares.
-    // The service, the counter and the service decision's summary; per replica its key, its
-    // assignment and its decision's summary; and per lost node, once however many of its
-    // replicas the batch removes, the node's status and its `/nodes` record.
+    // The service, the service's rollout (seam b, `expect_rollout`) and the service decision's
+    // summary; per replica removed its key, its assignment and its decision's summary; per
+    // replica created its decision's summary, and the counter once; and per lost node, once
+    // however many of its replicas the batch removes, the node's status and its `/nodes` record.
     const fixed = 2 + controller.decision_compares;
+    const counter = 1;
     const per_replica = 2 + controller.decision_compares;
+    const per_created = controller.decision_compares;
     const per_judged_node = 2;
-    assert(fixed + batch_replicas_max * per_replica + judged_nodes_batch_max * per_judged_node <=
-        constants.store_txn_compares_max);
-    // One more lost node would not fit, so the limit is what the store allows, not slack.
-    assert(fixed + batch_replicas_max * per_replica +
-        (judged_nodes_batch_max + 1) * per_judged_node > constants.store_txn_compares_max);
-    assert(fixed + (batch_replicas_max + 1) * per_replica +
-        judged_nodes_batch_max * per_judged_node > constants.store_txn_compares_max);
+    // A replacement removes `removed` dead replicas (each on a lost node, at worst) and creates
+    // at most the rest of the batch. Its worst case, two removals on two lost nodes, is exactly
+    // the limit: one more lost node or one more replica would not fit.
+    var worst: u32 = 0;
+    for (0..batch_replicas_max + 1) |index| {
+        const removed: u32 = index;
+        const created: u32 = batch_replicas_max - removed;
+        const nodes: u32 = @min(removed, judged_nodes_batch_max);
+        var compares: u32 = fixed + removed * per_replica + nodes * per_judged_node;
+        if (created > 0) compares += counter + created * per_created;
+        worst = @max(worst, compares);
+    }
+    assert(worst == constants.store_txn_compares_max);
+    assert(worst == fixed + batch_replicas_max * per_replica +
+        judged_nodes_batch_max * per_judged_node);
     assert(judged_nodes_batch_max <= batch_replicas_max);
-    // A rollout step: the fixed compares and the rollout's; per replica created or retired its
-    // key, its assignment or its report, and its decision's summary.
-    assert(fixed + 1 + batch_replicas_max * per_replica <= constants.store_txn_compares_max);
+    // A rollout step: the fixed compares and the counter; per replica created or retired its
+    // key, its assignment or its report, and its decision's summary. `expect_floor` adds what
+    // still fits (checked as it goes).
+    assert(fixed + counter + batch_replicas_max * per_replica <= constants.store_txn_compares_max);
     const per_hold = controller.decision_compares + 2 + per_judged_node;
     assert(hold_batch_max * per_hold <= constants.store_txn_compares_max);
 }
@@ -428,10 +440,11 @@ const Run = struct {
         var removed_count: u32 = 0;
         var lost_nodes: [judged_nodes_batch_max][]const u8 = undefined;
         var lost_nodes_count: u32 = 0;
-        const removals_max: u32 = if (plan.stale > 0) 1 else batch_replicas_max;
         for (plan.slice()) |*item| {
             if (item.class != .dead) continue;
-            if (removed_count == removals_max) break;
+            // A dead replica costs nothing to remove (it serves nothing), during a rollout too:
+            // what bounds the batch is the creations below (`room`, R2) and the compares.
+            if (removed_count == batch_replicas_max) break;
             if (judged_node(item)) |node| {
                 if (!note_node(lost_nodes[0..], &lost_nodes_count, node)) continue;
             }

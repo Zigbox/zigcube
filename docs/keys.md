@@ -214,7 +214,8 @@ generation; `from` is the generation the service last ran to completion (the tar
 rollout that ended `complete`; when the previous rollout did not end `complete`, its own `from`),
 0 if none: a generation that never became ready is never a `from`, so a rollback never restores
 one. A service's first generation has no rollout of its own, so with no rollout of the service
-`from` is the newest generation below the service's that its old replicas run (old replicas of a
+`from` is the newest generation below the service's that an old replica is ready at (observed
+running for `min_ready_ms`; 0 if none is: C3 slice 7 review, B SHOULD 4) (old replicas of a
 deleted incarnation at that generation or above count for none). With `from` 0 (a service's
 first generation, or an apply over one that failed), a rollout that fails under `on_failure:
 rollback` has nothing to roll back to and stays `failed`, owing no rollback, as a failed rollback
@@ -224,6 +225,8 @@ contradicts itself is refused by every reader (ZC-E0301): `to` 0, `from` not bel
 deadline or `evidence_from_ms` before `started_at_ms`, `reason` `rollback` or phase
 `rolling_back` with `from` 0, `progressing` with reason `rollback` or `rolling_back` with `apply`,
 `paused_at_ms` or `paused_by` set exactly when not `paused`, a pause before `evidence_from_ms`.
+Nothing wrote `/rollouts/` before slice 7, so a record of slice 6's shape (`rolling_back` with no
+`reason`, `paused` with no `paused_at_ms`) is not read either: it is refused the same way.
 `budget` is how many new
 replicas the replica controller may start now, how many ready old ones it may retire (`retire`,
 the count that keeps `max_unavailable`) and how many old ones that are not ready it may retire

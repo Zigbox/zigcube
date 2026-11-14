@@ -325,10 +325,6 @@ const Run = struct {
             if (!fresh) {
                 result.old_records += 1;
                 result.old_generation = @max(result.old_generation, replica.rec.generation);
-                if (replica.rec.generation < service.rec.generation) {
-                    const generation = replica.rec.generation;
-                    result.earlier_generation = @max(result.earlier_generation, generation);
-                }
             }
             if (!live_report(run.snap, &replica.rec)) {
                 if (fresh) result.held_at_ms = later(result.held_at_ms, held_at(track));
@@ -348,6 +344,10 @@ const Run = struct {
             } else {
                 result.mix.old_live += 1;
                 if (ready) result.mix.old_ready += 1;
+                if (ready and replica.rec.generation < service.rec.generation) {
+                    const generation = replica.rec.generation;
+                    result.earlier_generation = @max(result.earlier_generation, generation);
+                }
             }
         }
         const orphans = stopping_orphans(run.snap, service.rec.name);
@@ -679,7 +679,7 @@ const Run = struct {
             if (records.rollout_of(&rollout.rec, service.kv.create_revision)) return;
             // `reconcile_service` began a new one over it or found nothing to roll: a record of
             // a previous incarnation with no new rollout to replace it goes here.
-            if (service.kv.mod_revision > run.snap.revision) return;
+            assert(service.kv.mod_revision <= run.snap.revision);
         }
         var batch: Batch = .{};
         batch.expect(rollout.kv.key, rollout.kv.mod_revision);

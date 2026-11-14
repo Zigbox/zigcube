@@ -33,8 +33,9 @@ const min_ready_ms = (records.RolloutPolicy{}).min_ready_ms;
 
 /// What the fixture's store does to the next transaction that deletes a replica record (a
 /// retirement), before it commits: the interleavings TLA+ gap 1 and the pause write race name.
-/// `pause_create` pauses before the next transaction that creates replicas and deletes none.
-const Interleave = enum { none, stop_kept, pause, pause_create };
+/// `pause_create` pauses before the next transaction that creates replicas and deletes none;
+/// `stop_last` stops the kept replica the floor counts last (the newest).
+const Interleave = enum { none, stop_kept, stop_last, pause, pause_create };
 
 const Fixture = struct {
     manual: ManualClock,
@@ -287,7 +288,8 @@ const Fixture = struct {
         };
         switch (what) {
             .none => unreachable,
-            .stop_kept => stop_kept(&ctx, txn_request) catch @panic("stop_kept failed"),
+            .stop_kept, .stop_last => stop_kept(&ctx, txn_request, what == .stop_last) catch
+                @panic("stop_kept failed"),
             .pause, .pause_create => {
                 const outcome = rollout_controller.request(&ctx, &self.api, web.name, .pause) catch
                     @panic("pause failed");
@@ -310,8 +312,13 @@ const Fixture = struct {
         return deletes;
     }
 
-    /// Reports `stopped` for the first generation-1 replica the transaction keeps.
-    fn stop_kept(ctx: *const controller.Context, txn_request: store.TxnRequest) !void {
+    /// Reports `stopped` for the first generation-1 replica the transaction keeps, or with
+    /// `last` for the last replica it keeps, of any generation.
+    fn stop_kept(
+        ctx: *const controller.Context,
+        txn_request: store.TxnRequest,
+        last: bool,
+    ) !void {
         const list = try controller.list_all(
             records.Replica,
             ctx,
@@ -319,8 +326,9 @@ const Fixture = struct {
             null,
             constants.replicas_max,
         );
-        for (list.items) |replica| {
-            if (replica.rec.generation != 1) continue;
+        for (0..list.items.len) |index| {
+            const replica = list.items[if (last) list.items.len - 1 - index else index];
+            if (!last and replica.rec.generation != 1) continue;
             const deleted = for (txn_request.on_success) |op| {
                 if (op == .delete and std.mem.eql(u8, op.delete, replica.kv.key)) break true;
             } else false;
@@ -328,7 +336,7 @@ const Fixture = struct {
             const observed: records.Observed = .{
                 .replica = replica.rec.id,
                 .node = "node1",
-                .generation = 1,
+                .generation = replica.rec.generation,
                 .status = .stopped,
                 .reported_at_ms = ctx.clock.now_ms(),
             };
@@ -386,6 +394,22 @@ test "a kept replica that stops between the read and the commit fails the retire
     try fixture.settle();
     fixture.manual.advance(min_ready_ms);
     fixture.interleave = .stop_kept;
+    try fixture.settle();
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+}
+
+test "the kept replica the floor counts last also fails the retirement when it stops" {
+    // Goal: Review B SHOULD 5 (M6). The floor compares all `replicas - max_unavailable` kept
+    // running replicas, the last one too: the new replica, stopped before the commit, fails it.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    _ = try fixture.report(2, .running);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    fixture.interleave = .stop_last;
     try fixture.settle();
     try testing.expect(fixture.interleaved != null);
     try testing.expect(!fixture.interleaved_committed);
@@ -671,6 +695,310 @@ test "a rollout record that does not decode halts its service only (RB-S2)" {
     try testing.expectEqual(@as(usize, 2), hello.items.len);
     try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
     try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+}
+
+/// Rewrites `/rollouts/web` as `edit` changes it, in one arena, as the rollout controller.
+fn rewrite_rollout(fixture: *Fixture, edit: *const fn (*records.Rollout) void) !void {
+    const ctx = fixture.context();
+    const key = records.rollout_key(web.name);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    var rec = try records.read(records.Rollout, ctx.arena, got.kv.?, &fixture.diag);
+    edit(&rec);
+    const bytes = try records.encode(ctx.arena, rec, &fixture.diag);
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
+    const role: writers.Role = .rollout_controller;
+    const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &fixture.diag);
+    try testing.expect(done.succeeded);
+}
+
+/// Sets the service's replica counter to `next`, as the replica controller.
+fn set_counter(fixture: *Fixture, next: u64) !void {
+    const key = records.replica_numbers_key(web.name);
+    try fixture.put(.replica_controller, key.slice(), records.ReplicaNumber{ .next = next });
+}
+
+fn counter(fixture: *Fixture) !u64 {
+    const ctx = fixture.context();
+    const key = records.replica_numbers_key(web.name);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    return (try records.read(records.ReplicaNumber, ctx.arena, got.kv.?, &fixture.diag)).next;
+}
+
+/// One pass of the rollout controller alone, then of the replicas' controller alone: the budget
+/// the second spends is the one the first stored (or a test's rewrite of it).
+fn rollouts_only(fixture: *Fixture) !void {
+    const ctx = fixture.context();
+    _ = try fixture.plane.rollouts.reconcile(&ctx);
+}
+
+fn replicas_only(fixture: *Fixture) !void {
+    const ctx = fixture.context();
+    _ = try fixture.plane.replicas.reconcile(&ctx);
+}
+
+/// Rolls to generation 2 and makes its first new replica ready, then stores the budget that
+/// retires one old replica, and spends nothing of it.
+fn ready_to_retire(fixture: *Fixture) !void {
+    try fixture.roll();
+    _ = try fixture.report(2, .running);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try rollouts_only(fixture);
+    const rollout = try fixture.rollout();
+    try testing.expectEqual(@as(u32, 1), rollout.budget.retire);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+}
+
+fn budget_revision_old(rollout: *records.Rollout) void {
+    rollout.budget_revision = 1;
+}
+
+fn retire_two(rollout: *records.Rollout) void {
+    rollout.budget.retire = 2;
+}
+
+test "a budget computed on an older service spends nothing (stale budget, revision)" {
+    // Goal: Review A MUST 2. The replicas' controller run alone over a budget whose revision is
+    // older than the service's retires nothing (`budget_revision`), and retires one once it is
+    // current again (the setup can retire).
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try ready_to_retire(&fixture);
+    const current = (try fixture.rollout()).budget_revision;
+    try rewrite_rollout(&fixture, budget_revision_old);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try rollouts_only(&fixture);
+    try testing.expect((try fixture.rollout()).budget_revision >= current);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
+}
+
+test "a budget larger than the floor allows retires no more than the floor (stale budget)" {
+    // Goal: Review A MUST 2. A budget that would retire two running old replicas (stale, or
+    // wrong) retires one: the replicas running stay at `replicas - max_unavailable` (R1).
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try ready_to_retire(&fixture);
+    try rewrite_rollout(&fixture, retire_two);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+}
+
+test "a replica created since the budget retires no running replica on it (stale budget)" {
+    // Goal: the R1 guard of the review's SHOULD. The budget counted the replicas ready when it
+    // was computed; once the counter moved (a replacement started), no running replica is
+    // retired until the rollout controller counts again.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try ready_to_retire(&fixture);
+    const next = try counter(&fixture);
+    try set_counter(&fixture, next + 1);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try set_counter(&fixture, next);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
+}
+
+test "a start counted since the budget is not started again (stale budget, starts_left)" {
+    // Goal: Review A MUST 2. The budget allows one start; once the counter moved past the
+    // number the budget saw, the replicas' controller run alone starts nothing, and starts one
+    // when the counter is back where the budget saw it.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.apply(web);
+    try fixture.settle();
+    _ = try fixture.report(1, .running);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    var next = web;
+    next.image = "b3:9d20c4f1";
+    next.request_id = "r-0002b11";
+    try fixture.apply(next);
+    try rollouts_only(&fixture);
+    const rollout = try fixture.rollout();
+    try testing.expectEqual(@as(u32, 1), rollout.budget.start);
+    const seen = try counter(&fixture);
+    try testing.expectEqual(seen, rollout.budget_next.?);
+    try set_counter(&fixture, seen + 1);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(2));
+    try set_counter(&fixture, seen);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+}
+
+/// One contradiction `rollout_valid` must refuse, made on a valid record.
+const Contradiction = enum {
+    rollback_from_zero,
+    paused_without_by,
+    by_without_paused,
+    evidence_before_start,
+    paused_before_evidence,
+};
+
+fn contradict(rollout: *records.Rollout, what: Contradiction) void {
+    switch (what) {
+        .rollback_from_zero => {
+            rollout.reason = .rollback;
+            rollout.phase = .complete;
+            rollout.from = 0;
+        },
+        .paused_without_by => {
+            rollout.phase = .paused;
+            rollout.paused_at_ms = rollout.started_at_ms;
+            rollout.paused_by = null;
+        },
+        .by_without_paused => rollout.paused_by = .user,
+        .evidence_before_start => rollout.evidence_from_ms = rollout.started_at_ms - 1,
+        .paused_before_evidence => {
+            rollout.phase = .paused;
+            rollout.paused_by = .user;
+            rollout.evidence_from_ms = rollout.started_at_ms + 10;
+            rollout.paused_at_ms = rollout.started_at_ms + 9;
+        },
+    }
+}
+
+test "each rule of a stored rollout's own consistency is refused alone with ZC-E0301" {
+    // Goal: decision item 20 (Review A, Review B SHOULD 6). Rollback from generation 0, paused
+    // without `paused_by` and `paused_by` without paused, evidence before the start, a pause
+    // before the evidence: each, made alone on a valid record, is malformed.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    const ctx = fixture.context();
+    const key = records.rollout_key(web.name);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    const valid = try records.read(records.Rollout, ctx.arena, got.kv.?, &fixture.diag);
+    try testing.expectEqual(records.RolloutPhase.progressing, valid.phase);
+    for (std.enums.values(Contradiction)) |what| {
+        var bad = valid;
+        contradict(&bad, what);
+        var kv = got.kv.?;
+        kv.value = try records.encode(ctx.arena, bad, &fixture.diag);
+        fixture.diag.reset();
+        const read = records.read(records.Rollout, ctx.arena, kv, &fixture.diag);
+        try testing.expectError(error.Malformed, read);
+        try testing.expectEqual(.E0301, fixture.diag.code.?);
+    }
+}
+
+/// Sets node1's status to `state`, keeping the rest of the record.
+fn node_state(fixture: *Fixture, state: records.NodeState) !void {
+    const ctx = fixture.context();
+    const key = records.node_status_key("node1");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    var status = try records.read(records.NodeStatus, ctx.arena, got.kv.?, &fixture.diag);
+    status.state = state;
+    const bytes = try records.encode(ctx.arena, status, &fixture.diag);
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
+    const role: writers.Role = .node_controller;
+    const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &fixture.diag);
+    try testing.expect(done.succeeded);
+}
+
+const Interruption = enum { starting, lost };
+
+/// Runs the first new replica half of `min_ready_ms`, interrupts its running as `how` says for
+/// one rollout pass, runs it again, and checks it is not ready before a whole `min_ready_ms`
+/// more (no old replica is retired), then is.
+fn interrupted(how: Interruption) !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    _ = try fixture.report(2, .running);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms / 2);
+    switch (how) {
+        .starting => _ = try fixture.report(2, .starting),
+        .lost => try node_state(&fixture, .lost),
+    }
+    try rollouts_only(&fixture);
+    switch (how) {
+        .starting => _ = try fixture.report(2, .running),
+        .lost => try node_state(&fixture, .ready),
+    }
+    try rollouts_only(&fixture);
+    fixture.manual.advance(min_ready_ms / 2 + 100);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
+}
+
+test "a new replica that stops running restarts its readiness clock" {
+    // Goal: Review A SHOULD, Review B SHOULD 7 (M11). Running, then starting, then running
+    // again: `min_ready_ms` counts from the second running, never the first.
+    try interrupted(.starting);
+}
+
+test "a new replica whose node is lost restarts its readiness clock" {
+    // Goal: Review A SHOULD (M10). A replica on a lost node is not running for readiness, so
+    // its clock starts again once the node is back.
+    try interrupted(.lost);
+}
+
+test "new replicas that die more than rollout_restarts_max times fail the rollout (ZC-E0304)" {
+    // Goal: Review B SHOULD 7. Each death of a new replica (not the user's fault) is counted; the
+    // fourth fails the rollout, and the rollout's ready count is zero. `count_deaths` counts the
+    // deaths it saw reported: a lower bound (docs/decisions/2026-11-14-c3-paused-scale-down.md).
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    for (0..constants.rollout_restarts_max + 1) |round| {
+        try testing.expectEqual(records.RolloutPhase.progressing, (try fixture.rollout()).phase);
+        try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+        _ = round;
+        _ = try fixture.report(2, .running);
+        try fixture.settle();
+        const exit: records.Exit = .{ .kind = .exited, .code = 1 };
+        const new = (try fixture.replicas())[3];
+        const id = try testing.allocator.dupe(u8, new.rec.id);
+        defer testing.allocator.free(id);
+        const observed: records.Observed = .{
+            .replica = id,
+            .node = "node1",
+            .generation = 2,
+            .status = .stopped,
+            .exit = exit,
+            .reported_at_ms = fixture.manual.ms,
+        };
+        try fixture.put(.{ .agent = "node1" }, records.observed_key("node1", id).slice(), observed);
+        try fixture.settle();
+        fixture.manual.advance(100);
+        try fixture.settle();
+    }
+    const rollout = try fixture.rollout();
+    try testing.expectEqual(records.RolloutPhase.failed, rollout.phase);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+}
+
+test "a first rollout over a generation that never became ready rolls back to nothing" {
+    // Goal: Review B SHOULD 4. With no rollout before it, `from` is the newest earlier generation
+    // an old replica is ready at; generation 1 was never reported running, so `from` is 0.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.apply(web);
+    try fixture.settle();
+    var next = web;
+    next.image = "b3:9d20c4f1";
+    next.request_id = "r-0002b11";
+    try fixture.apply(next);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 0), (try fixture.rollout()).from);
 }
 
 test "a pause of a service with no rollout is refused with ZC-E0129" {

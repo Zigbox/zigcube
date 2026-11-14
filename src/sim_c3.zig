@@ -315,17 +315,17 @@ fn scaled_down(
     step.retired_running -|= excess;
 }
 
-/// R2: once a replica of an active rollout's service is created, the replicas that count toward
-/// surge (reported not stopped, on a node not lost, and the stopping containers of replicas
-/// already removed) number at most `replicas + max_surge`.
+/// R2: once a replica of a service with a rollout is created, in any phase (a paused or failed
+/// rollout too, Review B SHOULD 9), the replicas that count toward surge (reported not stopped,
+/// on a node not lost, and the stopping containers of replicas already removed) number at most
+/// `replicas + max_surge`.
 fn surge_problem(
     ctx: *const Context,
     snap: *const Snapshot,
     service: *const ServiceEntry,
     tally: *Tally,
 ) Found {
-    const rollout = rollout_of(ctx, service) orelse return null;
-    if (!rollout_plan.active(rollout.phase)) return null;
+    _ = rollout_of(ctx, service) orelse return null;
     tally.surges_judged += 1;
     var live = rollout_controller.stopping_orphans(snap, service.rec.name);
     for (snap.replicas) |*replica| {
