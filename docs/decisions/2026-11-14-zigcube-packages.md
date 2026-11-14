@@ -69,3 +69,21 @@ Where: `docs/briefs/packaging.md`; later `docs/releases/automation.md` and `pack
 - `zigbox-dev` lands in the pool at `pool/main/z/zigbox-dev/`, not under `zigcube*`. The signing
   script's asset allowlist accepts it, and the Zigbox website's deploy allowlist
   (`pool/main/z/zigcube*/**` as first written) must accept it too: a slice 4 item.
+
+## Review fixes of slice 1 (implementer, 2026-11-14)
+
+- **rpm flavours** `Conflicts` each other and nothing else; no `Obsoletes` (it is for renames, and
+  there is none). deb keeps `Conflicts` + `Replaces`.
+- **`zcube version`** is the command the packages and the brief name (it exists; there is no
+  `--version` flag on `zcube`); `zcube-server --version` is the server's.
+- **Expiry** is Zigbox's (main 74df642): `-Dsigned-at`, `Valid-Until` 21 days, `packages-redate`,
+  repomd revision and timestamps from the signing time, and `release-sign.sh` refuses a key that
+  lapses within 28 days of `ZIGBOX_SIGNED_AT`.
+- **The install test** uses the tool's fixed Ed25519 test key for the Zigcube suite and the real
+  `zigbox` from zigbox.org with its real keyring (no stub); `release-sign-test.sh` uses a throwaway
+  RSA key it generates. No secret is involved in either.
+- **Release assets** are in slice 1 (`zig build release-assets`); the full runbook is slice 4 and
+  `docs/releases/packaging.md` is its stub.
+- **A flavour swap removes `zigbox-dev`** (it depends on the SQLite flavour) and keeps an edited
+  `server.zon` naming the other store; the install test asserts both on all four distributions.
+  Whether `server.zon` should be flavour-neutral is the owner's choice (asked 2026-11-14).

@@ -17,7 +17,7 @@ for file in "$root"/zig-out/release-bin/*-x86_64; do
   cp "$file" "$bin/$name"
   cp "$file" "$bin/${name%-x86_64}-aarch64"
 done
-[ "$(ls "$bin" | wc -l)" -eq 10 ] ||
+[ "$(ls "$bin" | wc -l)" -eq 8 ] ||
   { echo "release-sign-test-container: zig-out/release-bin lacks an executable" >&2; exit 1; }
 zigbox_version=$(grep -o 'refs/tags/v[0-9.]*\.tar\.gz' "$root/build.zig.zon" | sed 's|refs/tags/v||; s|\.tar\.gz||')
 

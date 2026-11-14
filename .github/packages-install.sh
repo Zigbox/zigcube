@@ -77,10 +77,15 @@ EOF
   install() { dnf -y -q install "$@" > /dev/null; }
   upgrade() {
     sed -i "s|$REPO/0.0.0/|$REPO/0.0.1/|" /etc/yum.repos.d/zigcube.repo
-    dnf -y -q upgrade --refresh > /dev/null
+    dnf -y -q upgrade --refresh zigcube zigcube-agent zigcube-server-sqlite zigbox-dev > /dev/null
   }
-  swap() { dnf -y -q swap zigcube-server-sqlite zigcube-server-postgres > /dev/null; }
-  version_of() { rpm -q --qf '%{VERSION}' "$1" 2> /dev/null || true; }
+  # zigbox-dev needs the SQLite flavour, so a swap removes it, as apt does; unlike apt, dnf would
+  # also remove what zigbox-dev pulled in (the agent) unless told to keep it.
+  swap() {
+    dnf -y -q swap --allowerasing --setopt=clean_requirements_on_remove=False \
+      zigcube-server-sqlite zigcube-server-postgres > /dev/null
+  }
+  version_of() { if rpm -q --quiet "$1"; then rpm -q --qf '%{VERSION}' "$1"; fi; }
   files_of() { rpm -ql "$@"; }
   remove_all() { dnf -y -q remove "$@" > /dev/null; }
   new_conffile=/etc/zigcube/server.zon.rpmnew
@@ -159,8 +164,10 @@ inside_upgrade() {
 
 inside_swap() {
   swap
-  expect_versions 0.0.1 zigcube zigcube-server-postgres
+  expect_versions 0.0.1 zigcube zigcube-server-postgres zigcube-agent
   [ -z "$(version_of zigcube-server-sqlite)" ] || fail "the sqlite flavour stayed after the swap"
+  # zigbox-dev depends on the SQLite flavour: the swap removes it on both families.
+  [ -z "$(version_of zigbox-dev)" ] || fail "zigbox-dev stayed after the swap"
   say "after the swap /etc/zigcube/server.zon says: $(grep -E '^ *\.store' /etc/zigcube/server.zon)"
   local refusal
   refusal=$(zcube-server --store sqlite:/tmp/zc/swap.db 2>&1 || true)
@@ -185,7 +192,7 @@ inside() {
   inside_upgrade
   inside_swap
   inside_verify_units
-  remove_all zigbox-dev zigcube-server-postgres zigcube-agent zigcube
+  remove_all zigcube-server-postgres zigcube-agent zigcube
   for file in /usr/bin/zcube /usr/bin/zcube-server /usr/bin/zcube-agent; do
     [ ! -e "$file" ] || fail "$file is still there after the remove"
   done
@@ -240,7 +247,7 @@ host() {
   curl -fsSL -o "$work/keys/zigbox-archive-keyring.asc" https://zigbox.org/zigbox-archive-keyring.asc
   python3 -m http.server --bind 127.0.0.1 --directory "$work/serve" "$port" > "$work/http.log" 2>&1 &
   server=$!
-  trap 'kill "$server" 2> /dev/null || true' EXIT
+  trap 'kill "${server:-}" 2> /dev/null || true' EXIT
   local mounts=(-v "$work/keys:/keys:ro" -v "$root/.github/packages-install.sh:/t.sh:ro")
   if [ -n "${PACKAGES_INSTALL_CA:-}" ]; then mounts+=(-v "$PACKAGES_INSTALL_CA:/ca.crt:ro"); fi
   local image
@@ -249,7 +256,7 @@ host() {
     docker run --rm --network host "${mounts[@]}" -e "REPO=http://127.0.0.1:$port" \
       -e HTTP_PROXY -e HTTPS_PROXY -e http_proxy -e https_proxy \
       -e no_proxy=127.0.0.1,localhost -e NO_PROXY=127.0.0.1,localhost \
-      "$image" bash /t.sh --inside || { say "FAILED in $image"; status=1; }
+      "$image" bash ${PACKAGES_INSTALL_TRACE:+-x} /t.sh --inside || { say "FAILED in $image"; status=1; }
   done
   return "$status"
 }
