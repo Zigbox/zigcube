@@ -57,6 +57,7 @@ const sim_world = @import("sim_world.zig");
 const job_api = @import("job_api.zig");
 const job_retention = @import("job_retention.zig");
 const runtime = @import("runtime.zig");
+const sim_certs = @import("sim_certs.zig");
 const sim_jobs = @import("sim_jobs.zig");
 const sim_jobs_watch = @import("sim_jobs_watch.zig");
 const sim_runtime = @import("sim_runtime.zig");
@@ -454,7 +455,7 @@ const Node = struct {
     all_steps: u32,
     all_up_ms: u64,
 
-    fn name(node: *const Node) []const u8 {
+    pub fn name(node: *const Node) []const u8 {
         return node.name_buf[0..node.name_len];
     }
 
@@ -862,6 +863,8 @@ pub const Cluster = struct {
     /// The job workload is on (`Options.jobs`); the ledger and trackers' state; the next number.
     jobs_on: bool,
     jobs: sim_jobs.State,
+    /// B4 slice 3: relayed runs' certificates and connections (`sim_certs.zig`), strong runs.
+    certs: sim_certs.State,
     /// J4: the client that follows the job endings through the watch, and its own random stream.
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
@@ -940,6 +943,7 @@ pub const Cluster = struct {
         c.report = report;
         c.jobs_on = false;
         c.jobs = .{};
+        c.certs = .init(seed);
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
@@ -1195,6 +1199,7 @@ pub const Cluster = struct {
             c.net.tick(c.manual.ms);
             c.mend_links();
             c.settle();
+            if (c.jobs_on and c.strong) c.supervise_certs();
             if (c.jobs_on) c.watch_client();
             // The wedge totals J1, J6 and J8 judge by are kept whenever jobs are on,
             // not only under c1: a plain run judges the same bounds.
@@ -1225,6 +1230,27 @@ pub const Cluster = struct {
     /// minutes, and resumes from its revision. The simulation compacts to the head every 60 s,
     /// so even a short absence can end in a 410 (relist and dedupe); the real keep window is
     /// not simulated, and a plain in-window resume is the rarer path here.
+    /// B4 slice 3: one tick of the relayed runs' supervisors (`sim_certs.supervise`). The issuer
+    /// reads the store as committed, beneath the faults; a store that is down issues nothing.
+    fn supervise_certs(c: *Cluster) void {
+        if (store_faulty(c)) return;
+        const ctx = c.certs_context();
+        sim_certs.supervise(&c.certs, &ctx, c.nodes, &c.net);
+    }
+
+    /// The context the certificate model reads the store through: the tap's memory store, the
+    /// tap's arena (reset here; nothing commits while it is in use).
+    fn certs_context(c: *Cluster) controller.Context {
+        _ = c.tap_arena.reset(.retain_capacity);
+        c.tap_diag.reset();
+        return .{
+            .store = c.tap.inner,
+            .clock = c.manual.clock(),
+            .arena = c.tap_arena.allocator(),
+            .diag = &c.tap_diag,
+        };
+    }
+
     fn watch_client(c: *Cluster) void {
         const w = &c.jobs_watch;
         const now = c.manual.ms;
@@ -1817,6 +1843,13 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
     if (sim_c1.at_revision(&ctx, request, c.retention_running)) |found| {
         c.c1_violation = found;
         c.c1_violation_revision = revision;
+        return;
+    }
+    if (request != null and c.jobs_on and c.strong) {
+        if (conns_open_after_end(c, &ctx)) |found| {
+            c.c1_violation = found;
+            c.c1_violation_revision = revision;
+        }
     }
 }
 
@@ -2773,6 +2806,8 @@ fn judge_job_container(
 /// are the runtime's, not the store's.
 fn track_relays(c: *Cluster) Failure!void {
     try check(c, !c.relay_spec_wrong, "R3: a job's spec lacks the relay the job asked for");
+    try check(c, c.certs.violation == null, c.certs.violation orelse "");
+    try track_conns(c);
     for (c.nodes) |node| {
         const found = node.sim.containers.relay_problem();
         try check(c, found == null, found orelse "");
@@ -2793,6 +2828,34 @@ fn track_relays(c: *Cluster) Failure!void {
             }
         }
     }
+}
+
+/// R6 at every check: no relayed connection is open after its node reported the run's ending,
+/// nor on a container its node forgot (`sim_certs.zig`). R7 there too: the connections of a run
+/// told to stop end within `relay_cancel_ms_max` (`SimRuntime.stop_conns_problem`).
+fn track_conns(c: *Cluster) Failure!void {
+    for (c.nodes) |node| {
+        const forgot = node.sim.containers.conns_forgotten;
+        try check(c, !forgot, "R6: a relayed connection outlived its container");
+        const late = node.sim.containers.stop_conns_problem();
+        try check(c, late == null, late orelse "");
+    }
+    if (store_faulty(c)) return;
+    const ctx = c.certs_context();
+    if (conns_open_after_end(c, &ctx)) |found| try check(c, false, found);
+}
+
+/// R6 over every container with connections open, read from `ctx`.
+fn conns_open_after_end(c: *Cluster, ctx: *const controller.Context) ?[]const u8 {
+    for (c.nodes) |node| {
+        for (node.sim.containers.containers.items) |container| {
+            if (container.conns == 0) continue;
+            const labels = container.labels;
+            const found = sim_certs.conns_problem(ctx, node.name(), container.name, labels);
+            if (found != null) return found;
+        }
+    }
+    return null;
 }
 
 /// J10, at rest: no agent keeps a start record for a run whose assignment on its node is gone.
@@ -3028,6 +3091,7 @@ fn hash_node(hasher: *std.hash.Wyhash, node: *Node) void {
         hasher.update(container.image);
         hash_value(hasher, .{ container.phase, container.pid, container.started_at_ms });
         hash_value(hasher, container.ignores_stop);
+        hash_value(hasher, container.stop_takes_grace);
     }
     // The agent's files: names and bytes, and how much of each a host crash would keep.
     for (node.sim.files.files.items) |file| {
@@ -3473,7 +3537,31 @@ fn print_jobs(c: *Cluster) void {
             "(closed by exit={d} signal={d} other={d} wipe={d})\n", .{
             opened, closed, open_now, by[0], by[1], by[2], by[3],
         });
+        print_certs(c);
     }
+}
+
+/// B4 slice 3's line: asks, issues and refusals by reason; connections.
+fn print_certs(c: *Cluster) void {
+    const certs = &c.certs;
+    var opened: u32 = 0;
+    var closed: u32 = 0;
+    var open_now: u32 = 0;
+    for (c.nodes) |node| {
+        opened += node.sim.containers.conns_opened;
+        closed += node.sim.containers.conns_closed;
+        for (node.sim.containers.containers.items) |container| open_now += container.conns;
+    }
+    c.report.print("certs: asks={d} issued={d} refused={d} unread={d} forged={d} " ++
+        "forged issued={d} conns opened={d} closed={d} open at the end={d}\n", .{
+        certs.asks,          certs.issued, certs.refused, certs.unread, certs.forged,
+        certs.forged_issued, opened,       closed,        open_now,
+    });
+    c.report.print("certs: refused by", .{});
+    for (certs.by_reason, 0..) |count, index| {
+        c.report.print(" {s}={d}", .{ sim_certs.reason_name(index), count });
+    }
+    c.report.print("\n", .{});
 }
 
 fn print_phases(c: *Cluster) void {
