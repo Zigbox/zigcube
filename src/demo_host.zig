@@ -127,6 +127,19 @@ pub const Host = struct {
         args: []const []const u8,
         log: []const u8,
     ) !std.process.Child {
+        return host.spawn_in(exe, args, log, .inherit);
+    }
+
+    /// `spawn` in the directory `cwd`. A demo starts an agent in its state directory so that
+    /// everything its containers start can be found by its working directory
+    /// (`host_procs.Procs.in_state`), even after the agent removed the container's directory.
+    pub fn spawn_in(
+        host: *Host,
+        exe: []const u8,
+        args: []const []const u8,
+        log: []const u8,
+        cwd: std.process.Child.Cwd,
+    ) !std.process.Child {
         const name = try host.path_in_work(log);
         const file = try std.Io.Dir.cwd().createFile(host.io, name, .{});
         defer file.close(host.io);
@@ -135,6 +148,7 @@ pub const Host = struct {
         @memcpy(argv[1..], args);
         return std.process.spawn(host.io, .{
             .argv = argv,
+            .cwd = cwd,
             .stdin = .ignore,
             .stdout = .{ .file = file },
             .stderr = .{ .file = file },

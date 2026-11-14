@@ -72,7 +72,8 @@ pub const Fleet = struct {
             else => unreachable, // `names` has three nodes.
         }
         const log = try log_name(arena, index, fleet.starts[index]);
-        fleet.agents[index] = try host.spawn(host.config.agent_exe, args.items, log);
+        const cwd: std.process.Child.Cwd = .{ .path = dir };
+        fleet.agents[index] = try host.spawn_in(host.config.agent_exe, args.items, log, cwd);
     }
 
     /// `<work>/node3.zon`, the configuration file of `node3`: its labels and nothing else, so

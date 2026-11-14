@@ -69,7 +69,8 @@ pub const Fleet = struct {
             "--verbose",
         };
         const log = try log_name(arena, index, fleet.starts[index]);
-        fleet.agents[index] = try host.spawn(host.config.agent_exe, &args, log);
+        const cwd: std.process.Child.Cwd = .{ .path = dir };
+        fleet.agents[index] = try host.spawn_in(host.config.agent_exe, &args, log, cwd);
     }
 
     /// Power off: SIGKILL of the agent, so it cannot revoke its lease, then of every supervisor's
