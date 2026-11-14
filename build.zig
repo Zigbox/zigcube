@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
     add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
     add_release_assets_step(b, add_packages_steps(b));
+    add_mac_steps(b, options, target);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
     add_sim_steps(b, .{
@@ -282,7 +283,12 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
         }
         const exe = b.addExecutable(.{ .name = executable.name, .root_module = module });
         const install = b.addInstallArtifact(exe, .{});
-        b.getInstallStep().dependOn(&install.step);
+        // On macOS only the CLI builds (the agent and the server need Linux): `zig build` there
+        // installs `zcube` alone.
+        const for_macos = executables_options.target.result.os.tag == .macos;
+        if (!for_macos or std.mem.eql(u8, executable.name, "zcube")) {
+            b.getInstallStep().dependOn(&install.step);
+        }
         if (std.mem.eql(u8, executable.name, "zcube-server")) {
             built.server = exe;
             built.server_install = install;
@@ -1083,6 +1089,125 @@ fn package_tool(b: *std.Build) *std.Build.Step.Compile {
             .optimize = .ReleaseSafe,
         }),
     });
+}
+
+// ---- macOS: the CLI alone (docs/briefs/packaging.md, slice 2) --------------------------------
+
+/// The two architectures of the universal macOS `zcube`, as Zig names them.
+const mac_architectures = [_][]const u8{ "aarch64", "x86_64" };
+
+/// The ReleaseSafe macOS `zcube` for one architecture. It cross-builds from any host: the CLI
+/// links no framework and no library but libSystem, whose stubs come with Zig.
+fn mac_cli(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    architecture: []const u8,
+) *std.Build.Step.Compile {
+    const target = mac_target(b, architecture);
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = .ReleaseSafe });
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/zcube.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{
+            .{ .name = "build_options", .module = options.createModule() },
+            .{ .name = "zigbox", .module = zigbox.module("zigbox") },
+        },
+    });
+    return b.addExecutable(.{ .name = "zcube", .root_module = module });
+}
+
+fn mac_target(b: *std.Build, architecture: []const u8) std.Build.ResolvedTarget {
+    const query = b.fmt("{s}-macos", .{architecture});
+    return b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = query }) catch
+        @panic("mac: the target query is made of constants and parses"));
+}
+
+/// The unit tests that build on macOS (src/tests_macos.zig), for `target`.
+fn mac_tests(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+) *std.Build.Step.Compile {
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = .Debug });
+    return b.addTest(.{
+        .name = "tests_macos",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests_macos.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.createModule() },
+                .{ .name = "zigbox", .module = zigbox.module("zigbox") },
+            },
+        }),
+    });
+}
+
+/// `zig build mac-bin`: both macOS `zcube`s in `zig-out/mac-bin` (`zcube-aarch64`,
+/// `zcube-x86_64`), and the macOS unit tests compiled for both, not run. Any host.
+/// `zig build test-macos`: those tests, run for the machine's own target (a Mac in CI).
+/// `zig build mac-release`: the universal, signed zip and the formula (src/mac_release.zig);
+/// macOS only, and the tool says so in one line elsewhere.
+fn add_mac_steps(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+) void {
+    const bin_step = b.step("mac-bin", "Cross-build the macOS zcube and its unit tests");
+    var binaries: [mac_architectures.len]*std.Build.Step.Compile = undefined;
+    for (mac_architectures, 0..) |architecture, index| {
+        binaries[index] = mac_cli(b, options, architecture);
+        const install = b.addInstallArtifact(binaries[index], .{
+            .dest_dir = .{ .override = .{ .custom = "mac-bin" } },
+            .dest_sub_path = b.fmt("zcube-{s}", .{architecture}),
+        });
+        bin_step.dependOn(&install.step);
+        bin_step.dependOn(&mac_tests(b, options, mac_target(b, architecture)).step);
+    }
+    const test_run = b.addRunArtifact(mac_tests(b, options, target));
+    b.step("test-macos", "Run the unit tests that build on macOS").dependOn(&test_run.step);
+    add_mac_release(b, binaries);
+}
+
+/// `zig build mac-release` runs the tool over the two binaries `mac-bin` makes.
+fn add_mac_release(b: *std.Build, binaries: [mac_architectures.len]*std.Build.Step.Compile) void {
+    const release = @import("src/mac_release.zig");
+    const identity_help = "mac-release: the codesign identity (- is ad hoc); default " ++
+        release.default_identity;
+    const identity = b.option([]const u8, "sign-identity", identity_help) orelse
+        release.default_identity;
+    const profile_help = "mac-release: the notarytool keychain profile; default " ++
+        release.default_profile;
+    const profile = b.option([]const u8, "notary-profile", profile_help) orelse
+        release.default_profile;
+    const keychain_help = "mac-release: the keychain file codesign and notarytool use; " ++
+        "default the login keychain";
+    const keychain = b.option([]const u8, "keychain", keychain_help) orelse "";
+    const notarize_help = "mac-release: submit the archive to Apple's notary service";
+    const notarize = b.option(bool, "notarize", notarize_help) orelse false;
+    const tool = b.addExecutable(.{
+        .name = "mac_release",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mac_release.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    run.addArg("--binary-arm64");
+    run.addArtifactArg(binaries[0]);
+    run.addArg("--binary-x86_64");
+    run.addArtifactArg(binaries[1]);
+    run.addArgs(&.{ "--formula", "packaging/homebrew/zigcube.rb" });
+    run.addArgs(&.{ "--out", "zig-out/mac-release" });
+    run.addArgs(&.{ "--version", @import("build.zig.zon").version });
+    run.addArgs(&.{ "--identity", identity, "--profile", profile });
+    if (keychain.len > 0) run.addArgs(&.{ "--keychain", keychain });
+    if (notarize) run.addArg("--notarize");
+    run.has_side_effects = true;
+    const step = b.step("mac-release", "Sign, zip and optionally notarize the macOS zcube");
+    step.dependOn(&run.step);
 }
 
 fn add_tidy_step(b: *std.Build) void {

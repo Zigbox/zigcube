@@ -78,6 +78,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <h2>What it means</h2>
 <p>zcube local up starts zcube-server and zcube-agent, and looks for them in the directory that holds the zcube command itself. One of them is not there, is not an executable file, or the system refused to start it, so nothing was left running.</p>
 <p>Build all three with zig build and run zcube from zig-out/bin, or keep the three files together when you install them.</p>
+<p>zcube-server and zcube-agent run only on Linux, so the zcube command for macOS refuses zcube local with this code before it starts anything. Run zcube local on a Linux machine or VM, or point zcube at a server with --server HOST:PORT.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0122</pre>

@@ -79,6 +79,7 @@ test {
     _ = @import("package_main.zig");
     _ = @import("package_check.zig");
     _ = @import("release_assets_main.zig");
+    _ = @import("mac_release.zig");
 }
 
 // The files below are imported by a file-level `comptime` block, not by a test: a test that a

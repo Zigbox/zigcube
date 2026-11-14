@@ -19,6 +19,7 @@
 //! `up` and `down` run one at a time: each holds a lock on `<dir>/lock` throughout.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const net = std.Io.net;
 const agent_config = @import("agent_config.zig");
@@ -29,6 +30,7 @@ const cli_report = @import("cli_report.zig");
 const cli_commands = @import("cli_commands.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const codes = @import("diag/codes.zig");
 
 const Allocator = std.mem.Allocator;
 const Env = cli_env.Env;
@@ -228,6 +230,23 @@ fn raise_cannot_use_dir(report: *Report, what: []const u8) void {
     report.diag.fix(.{ .sentence = "name a directory you can write with ZCUBE_LOCAL_DIR" });
 }
 
+/// `zcube local` needs Linux: the agent runs containers, and the code below reads `/proc` and
+/// calls Linux's `fcntl`. Elsewhere (the macOS `zcube`) it is refused before anything is touched.
+/// The test passes `os` to see the refusal on Linux.
+pub fn refuse_off_linux(os: std.Target.Os.Tag, report: *Report) bool {
+    if (os == .linux) return false;
+    report.diag.raise(.E0122);
+    report.diag.while_("starting zcube local", .{});
+    report.diag.cause("zcube local needs Linux: zcube-agent and zcube-server do not run on {s}", .{
+        @tagName(os),
+    });
+    report.diag.fix(.{
+        .sentence = "run zcube local up on a Linux machine or VM, or point this zcube at a " ++
+            "server with --server HOST:PORT",
+    });
+    return true;
+}
+
 fn raise_no_executable(report: *Report, name: []const u8, dir: []const u8, what: []const u8) void {
     report.diag.raise(.E0122);
     report.diag.while_("starting the local {s}", .{name});
@@ -286,6 +305,7 @@ pub fn lock_file(io: std.Io, path: []const u8, wait_ms: u32) error{ Busy, Unusab
 /// what our caller left open (`exec 7>file; zcube local up`). Descriptors made later by std are
 /// close-on-exec already. A bounded scan: nobody keeps more than this many open across an exec.
 fn close_inherited_on_exec() void {
+    comptime assert(builtin.os.tag == .linux); // `run` refuses every other system first.
     var fd: i32 = 3;
     while (fd < constants.local_fd_scan_max) : (fd += 1) {
         // EBADF for a descriptor that is not open is the common answer, and fine.
@@ -759,6 +779,10 @@ fn down(local: *const Local) Failed!void {
 }
 
 pub fn run(env: *const Env, action: cli_args.LocalAction, report: *Report) u8 {
+    if (builtin.os.tag != .linux) {
+        assert(refuse_off_linux(builtin.os.tag, report));
+        return constants.exit_environment;
+    }
     var buffer: [constants.state_path_bytes_max]u8 = undefined;
     const dir = local_dir(env, &buffer) orelse {
         raise_no_dir(report);
@@ -793,6 +817,21 @@ pub fn run(env: *const Env, action: cli_args.LocalAction, report: *Report) u8 {
 // ---- Tests -----------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "zcube local is refused off Linux with ZC-E0122, before anything is touched" {
+    // Goal: the macOS `zcube` refuses `local` with one coded diagnostic saying why. Method: the
+    // pure check with each system tag; Linux raises nothing.
+    var report: Report = undefined;
+    report.reset();
+    try testing.expect(!refuse_off_linux(.linux, &report));
+    try testing.expect(!report.failed());
+    try testing.expect(refuse_off_linux(.macos, &report));
+    try testing.expectEqual(@as(?codes.Code, .E0122), report.diag.code);
+    const cause = report.diag.last_cause().?;
+    try testing.expect(std.mem.indexOf(u8, cause, "needs Linux") != null);
+    try testing.expect(std.mem.indexOf(u8, cause, "macos") != null);
+    try testing.expectEqual(constants.exit_environment, report.diag.exit_code());
+}
 
 test "the local directory follows ZCUBE_LOCAL_DIR, then XDG_STATE_HOME, then HOME" {
     // Goal: where `zcube local` keeps its files. Method: each variable alone and together, a

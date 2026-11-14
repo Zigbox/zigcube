@@ -481,6 +481,11 @@ pub const registry = [_]Entry{
         \\
         \\Build all three with zig build and run zcube from zig-out/bin, or keep the
         \\three files together when you install them.
+        \\
+        \\zcube-server and zcube-agent run only on Linux, so the zcube command for
+        \\macOS refuses zcube local with this code before it starts anything. Run
+        \\zcube local on a Linux machine or VM, or point zcube at a server with
+        \\--server HOST:PORT.
         ,
     },
     .{
