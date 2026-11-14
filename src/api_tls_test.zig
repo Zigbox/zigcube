@@ -13,6 +13,7 @@ const pem = @import("pem.zig");
 const server_ca = @import("server_ca.zig");
 const secure_random = @import("secure_random.zig");
 const server_mod = @import("server.zig");
+const server_static = @import("server_static.zig");
 const x509 = @import("x509.zig");
 
 const testing = std.testing;
@@ -142,6 +143,19 @@ const Rig = struct {
         method: []const u8,
         path: []const u8,
     ) !u16 {
+        const reply = try rig.call(credentials, method, path);
+        const code = try std.fmt.parseInt(u16, reply[9..12], 10);
+        if (code == 400) std.debug.print("{s} {s}: {s}\n", .{ method, path, reply });
+        return code;
+    }
+
+    /// The whole reply, head and body, to one request over TLS as the holder of `credentials`.
+    fn call(
+        rig: *Rig,
+        credentials: *api_tls_client.Credentials,
+        method: []const u8,
+        path: []const u8,
+    ) ![]const u8 {
         const stream = try rig.server.tls_address().connect(rig.io, .{ .mode = .stream });
         defer stream.close(rig.io);
         const body = if (std.mem.eql(u8, method, "GET")) "" else "{}";
@@ -168,9 +182,7 @@ const Rig = struct {
             std.debug.print("{s} {s}: {t} {?t}\n", .{ method, path, got.ending, diag.code });
             return error.TestUnexpectedResult;
         }
-        const code = try std.fmt.parseInt(u16, got.reply[9..12], 10);
-        if (code == 400) std.debug.print("{s} {s}: {s}\n", .{ method, path, got.reply });
-        return code;
+        return got.reply;
     }
 };
 
@@ -292,8 +304,104 @@ test "an agent bootstraps with a node certificate for its own node only (B7 slic
     defer node.deinit();
     var diag: Diag = undefined;
     diag.reset();
-    try node.require_node("node1.crt", "node1", &diag);
-    try testing.expectError(error.Failed, node.require_node("node1.crt", "node2", &diag));
+    const now_ms = wall_ms(rig.io);
+    try node.require_node("node1.crt", "node1", now_ms, &diag);
+    const other = node.require_node("node1.crt", "node2", now_ms, &diag);
+    try testing.expectError(error.Failed, other);
     diag.reset();
-    try testing.expectError(error.Failed, admin.require_node("ops.crt", "node1", &diag));
+    try testing.expectError(error.Failed, admin.require_node("ops.crt", "node1", now_ms, &diag));
+    // An expired --cert is refused at start-up too, naming the recovery (MUST 2).
+    diag.reset();
+    const later_ms = now_ms + constants.x509_leaf_ttl_ms_max + 3_600_000;
+    const expired = node.require_node("node1.crt", "node1", later_ms, &diag);
+    try testing.expectError(error.Failed, expired);
+    try testing.expect(diag.fixes.count > 0);
+    const fix = diag.fixes.items[0];
+    const named = std.mem.indexOf(u8, fix.sentence.slice(), "issue-node") != null or
+        std.mem.indexOf(u8, fix.command.slice(), "issue-node") != null;
+    try testing.expect(named);
+}
+
+fn wall_ms(io: std.Io) u64 {
+    return @intCast(std.Io.Clock.real.now(io).toMilliseconds());
+}
+
+/// A node certificate for `node` with `lifetime`, and its key pair, as the agent stores them.
+fn node_certificate(
+    io: std.Io,
+    ca: *const peer_ca.Ca,
+    node: []const u8,
+    lifetime: x509.Lifetime,
+    out: *x509.Der,
+) !Ed25519.KeyPair {
+    var seed = try secure_random.random_seed(io);
+    defer std.crypto.secureZero(u8, &seed);
+    const key = try Ed25519.KeyPair.generateDeterministic(seed);
+    try ca.issue_node_certificate(out, &.{
+        .node = node,
+        .subject_key = key.public_key.toBytes(),
+        .lifetime = lifetime,
+    });
+    return key;
+}
+
+test "an agent presents its stored node.crt only while it is valid and its own (B7 slice 3)" {
+    // Goal: review MUST 2. A stored node.crt that expired, is not yet valid, names another node
+    // or is not of the key beside it is not presented, so `open_tls` falls back to --cert.
+    // Method: issue each with the server's CA and offer it to `present` for node1; the
+    // credentials must keep presenting --cert. Then a valid one is taken.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    var node: api_tls_client.Credentials = undefined;
+    try rig.load("node1", &node);
+    defer node.deinit();
+    const before = node.certificate;
+    const now_ms = wall_ms(rig.io);
+    const day_ms: u64 = 24 * 3_600_000;
+    const ca = &rig.server.ca;
+    var der: x509.Der = .{};
+    const past: x509.Lifetime = .{
+        .not_before_ms = now_ms - 3 * day_ms,
+        .not_after_ms = now_ms - day_ms,
+    };
+    const expired_key = try node_certificate(rig.io, ca, "node1", past, &der);
+    try testing.expect(node.present(&der, expired_key, "node1", now_ms) != null);
+    const future: x509.Lifetime = .{
+        .not_before_ms = now_ms + day_ms,
+        .not_after_ms = now_ms + 2 * day_ms,
+    };
+    const early_key = try node_certificate(rig.io, ca, "node1", future, &der);
+    try testing.expect(node.present(&der, early_key, "node1", now_ms) != null);
+    const window = try ca.window(constants.x509_leaf_ttl_ms_max);
+    const other_key = try node_certificate(rig.io, ca, "node2", window, &der);
+    const why = node.present(&der, other_key, "node1", now_ms).?;
+    try testing.expect(std.mem.indexOf(u8, why, "another node") != null);
+    try testing.expect(node.present(&der, early_key, "node2", now_ms) != null); // Not its key.
+    try testing.expectEqualSlices(u8, before.slice(), node.certificate.slice());
+    // The node's own certificate, in its window, of its key, is taken.
+    try testing.expect(node.present(&der, other_key, "node2", now_ms) == null);
+    try testing.expectEqualSlices(u8, der.slice(), node.certificate.slice());
+}
+
+test "the API over TLS: replies larger than the server's write buffer arrive whole (B7)" {
+    // Goal: review MUST 1, the TLS writer's drain consumed only its buffer, so a reply longer
+    // than it spun. Method: GET a console file of 64 KiB or more and the 25 KB stylesheet over
+    // TLS and compare each body with the file the server embeds.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    var admin: api_tls_client.Credentials = undefined;
+    try rig.load("ops", &admin);
+    defer admin.deinit();
+    const paths = [_][]const u8{ "/mock/codes.js", "/css/console.css", "/console/js/main.js" };
+    for (paths) |path| {
+        const asset = server_static.find(path).?;
+        const reply = try rig.call(&admin, "GET", path);
+        try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200"));
+        const split = std.mem.indexOf(u8, reply, "\r\n\r\n").?;
+        try testing.expectEqualSlices(u8, asset.bytes, reply[split + 4 ..]);
+    }
+    try testing.expect(server_static.find("/mock/codes.js").?.bytes.len >= 64 * 1024);
+    try testing.expect(server_static.find("/css/console.css").?.bytes.len >= 25_000);
 }

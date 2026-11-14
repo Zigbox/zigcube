@@ -9,7 +9,9 @@
 //! - A client of scope `jobs` may create, read, cancel and watch jobs: `/v1/jobs` and below, and
 //!   `GET /v1/why/job/<name>`. Nothing else.
 //! - A client of scope `admin`, and the loopback `--insecure-listen` listener, may call
-//!   everything.
+//!   everything but one path: `POST /v1/agent/nodes/<name>/credential`, which issues a node
+//!   certificate, is the node's own (and `local`'s). No client certificate may call it, admin
+//!   included: there is no admin bootstrap (decisions/2026-11-13-node-cert-bootstrap.md).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -48,6 +50,8 @@ pub const Caller = union(enum) {
 pub const Need = union(enum) {
     /// The certificate of this node (or an admin client's).
     node: []const u8,
+    /// The certificate of this node, and nothing else: the credential endpoint.
+    node_only: []const u8,
     /// A client of scope `jobs` (or `admin`).
     jobs,
     /// A client of scope `admin`.
@@ -59,6 +63,7 @@ pub const Need = union(enum) {
                 "node {s}'s certificate or a client of scope admin",
                 .{name},
             ),
+            .node_only => |name| try writer.print("node {s}'s own certificate", .{name}),
             .jobs => try writer.writeAll("a client of scope jobs or admin"),
             .admin => try writer.writeAll("a client of scope admin"),
         }
@@ -71,12 +76,13 @@ pub fn refusal(caller: Caller, method: []const u8, path: []const u8) ?Need {
     const need = need_of(method, path);
     switch (caller) {
         .local => return null,
-        .client => |client| switch (client.scope) {
-            .admin => return null,
-            .jobs => if (need == .jobs) return null,
+        .client => |client| switch (need) {
+            .node_only => {},
+            .node, .admin => if (client.scope == .admin) return null,
+            .jobs => return null,
         },
         .node => |own| switch (need) {
-            .node => |name| if (std.mem.eql(u8, name, own)) return null,
+            .node, .node_only => |name| if (std.mem.eql(u8, name, own)) return null,
             .jobs, .admin => {},
         },
     }
@@ -91,7 +97,9 @@ fn need_of(method: []const u8, path: []const u8) Need {
         const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
         // An empty node name is no node's: only an admin may be told there is nothing there.
         if (end == 0) return .admin;
-        return .{ .node = rest[0..end] };
+        const node = rest[0..end];
+        if (std.mem.eql(u8, rest[end..], "/credential")) return .{ .node_only = node };
+        return .{ .node = node };
     }
     if (std.mem.eql(u8, path, "/v1/jobs")) return .jobs;
     if (std.mem.startsWith(u8, path, "/v1/jobs/")) return .jobs;
@@ -109,6 +117,14 @@ test "need_of: the agent API by node, the jobs API, and everything else is admin
     const rows = [_]Row{
         .{ .method = "PUT", .path = "/v1/agent/nodes/node1", .need = .{ .node = "node1" } },
         .{ .method = "GET", .path = "/v1/agent/nodes/node1/watch", .need = .{ .node = "node1" } },
+        .{
+            .method = "POST",
+            .path = "/v1/agent/nodes/node1/credential",
+            .need = .{ .node_only = "node1" },
+        },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node1/credentials", .need = .{
+            .node = "node1",
+        } },
         .{ .method = "GET", .path = "/v1/agent/nodes/", .need = .admin },
         .{ .method = "GET", .path = "/v1/agent/nodes", .need = .admin },
         .{ .method = "GET", .path = "/v1/agent/", .need = .admin },
@@ -127,7 +143,11 @@ test "need_of: the agent API by node, the jobs API, and everything else is admin
     for (rows) |row| {
         const need = need_of(row.method, row.path);
         try testing.expectEqual(std.meta.activeTag(row.need), std.meta.activeTag(need));
-        if (row.need == .node) try testing.expectEqualStrings(row.need.node, need.node);
+        switch (row.need) {
+            .node => |name| try testing.expectEqualStrings(name, need.node),
+            .node_only => |name| try testing.expectEqualStrings(name, need.node_only),
+            .jobs, .admin => {},
+        }
     }
 }
 
@@ -144,6 +164,13 @@ test "refusal: a node only under its own name, jobs only jobs, admin and local e
     try testing.expect(refusal(jobs, "POST", "/v1/jobs") == null);
     try testing.expect(refusal(jobs, "POST", "/v1/services") != null);
     try testing.expect(refusal(jobs, "PUT", "/v1/agent/nodes/node1") != null);
+    // The credential endpoint is the node's own: no client, admin included (no admin bootstrap).
+    const credential = "/v1/agent/nodes/node1/credential";
+    try testing.expect(refusal(node1, "POST", credential) == null);
+    try testing.expect(refusal(.local, "POST", credential) == null);
+    try testing.expect(refusal(.{ .node = "node2" }, "POST", credential) != null);
+    try testing.expect(refusal(jobs, "POST", credential) != null);
+    try testing.expect(refusal(admin, "POST", credential) != null);
     for ([_]Caller{ admin, .local }) |caller| {
         try testing.expect(refusal(caller, "PUT", "/v1/agent/nodes/node2") == null);
         try testing.expect(refusal(caller, "POST", "/v1/services") == null);

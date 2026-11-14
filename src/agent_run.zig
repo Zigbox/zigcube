@@ -126,8 +126,10 @@ const Shell = struct {
             return;
         };
         if (shell.tls) |credentials| {
-            // The CA of `--ca` issued it (the server is pinned to it), so it is presented.
-            _ = credentials.present(&shell.peer.node_certificate.?, shell.peer.key);
+            // The CA of `--ca` issued it (the server is pinned to it), so it is presented; one
+            // that is not usable keeps the certificate presented so far.
+            const node = shell.agent.config.node;
+            _ = credentials.present(&shell.peer.node_certificate.?, shell.peer.key, node, now_ms);
         }
         const verb = if (had) "renewed" else "joined";
         var buffer: [128]u8 = undefined;
@@ -398,19 +400,15 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     };
     defer peer_identity.close();
     var credentials: api_tls_client.Credentials = undefined;
-    http_transport.client.tls = open_tls(io, config, &peer_identity, &credentials, &diag) catch
+    const now_ms = real.clock().now_ms();
+    const tls = open_tls(io, config, &peer_identity, &credentials, now_ms, &diag) catch
         return fail(io, &diag, config.verbose);
+    http_transport.client.tls = tls;
     defer if (config.tls != null) credentials.deinit();
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     var peer_buffer: [64]u8 = undefined;
-    agent.init(.{
-        .node = config.node,
-        .capacity = config.capacity,
-        .address = config.address,
-        .peer = peer_address(&peer_buffer, config.peer_advertise),
-        .agent_version = build_options.version,
-    });
+    init_agent(agent, config, &peer_buffer);
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
     var swarm: Swarm = .{};
     defer swarm.stop(gpa); // Also after a start that failed with the store open.
@@ -438,6 +436,16 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     defer shell.arena.deinit();
     announce(io, config);
     return serve(&shell, &diag, peer_identity.stored_problem);
+}
+
+fn init_agent(agent: *agent_mod.Agent, config: config_mod.Config, peer_buffer: *[64]u8) void {
+    agent.init(.{
+        .node = config.node,
+        .capacity = config.capacity,
+        .address = config.address,
+        .peer = peer_address(peer_buffer, config.peer_advertise),
+        .agent_version = build_options.version,
+    });
 }
 
 /// Runs the agent's loop until it is told to stop, then saves the pair.
@@ -682,23 +690,29 @@ fn open_peer(io: std.Io, config: config_mod.Config, diag: *Diag) union(enum) {
 }
 
 /// The API's TLS client (B7, docs/mtls.md): pins the CA of `--ca` and presents the node's own
-/// `node.crt` when that CA issued it, else `--cert` and `--key`.
-/// Null when `--ca` is not given (plain HTTP).
+/// `node.crt` when it is usable now (that CA's, for `--node`, of `peer.key`, not expired), else
+/// `--cert` and `--key`, which must be a node certificate for `--node` valid now. With neither,
+/// one start-up error (ZC-E0806) says why `node.crt` was refused and how to get back in
+/// (docs/agent.md, "Node certificates"). Null when `--ca` is not given (plain HTTP).
 fn open_tls(
     io: std.Io,
     config: config_mod.Config,
     peer: *const agent_peer.Peer,
     credentials: *api_tls_client.Credentials,
+    now_ms: u64,
     diag: *Diag,
 ) api_tls_client.LoadError!?*api_tls_client.Credentials {
     const tls = config.tls orelse return null;
     try credentials.load_ca(io, tls.ca, tls.server_name, diag);
+    var stored_problem: []const u8 = "it does not exist";
     if (peer.node_certificate) |*certificate| {
-        if (credentials.present(certificate, peer.key)) return credentials;
+        const problem = credentials.present(certificate, peer.key, config.node, now_ms);
+        stored_problem = problem orelse return credentials;
     }
-    const cert = tls.cert orelse return api_tls_client.refuse_no_identity(diag, peer.where);
+    const cert = tls.cert orelse
+        return api_tls_client.refuse_no_identity(diag, peer.where, stored_problem);
     try credentials.load_identity(io, cert, tls.key.?, diag);
-    try credentials.require_node(cert, config.node, diag);
+    try credentials.require_node(cert, config.node, now_ms, diag);
     return credentials;
 }
 

@@ -277,7 +277,7 @@ test "the CA key is made once, kept across a restart, and a bad revoked file is 
 
     try dir.tmp.dir.writeFile(io, .{ .sub_path = revoked_file, .data = "# out\nnode3\n" });
     try open_test(&dir, &second, .{ .quiet = true }, &diag);
-    try std.testing.expect(second.revoked.contains("node3"));
+    try std.testing.expect(second.revoked.contains(.node, "node3"));
 
     try dir.tmp.dir.writeFile(io, .{ .sub_path = revoked_file, .data = "node3\nNOT A NAME\n" });
     try std.testing.expectError(error.Failed, open_test(&dir, &second, .{ .quiet = true }, &diag));

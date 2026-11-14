@@ -642,10 +642,27 @@ pub fn raise_not_allowed(
 ) void {
     diag.raise(.E0822);
     diag.cause("{f} may not {s} {s}: it needs {f}", .{ caller, method, path, need });
-    diag.fix(.{
-        .sentence = "ask an operator for a certificate that allows it:",
-        .command = "zcube-server ca issue-client NAME --scope admin",
-    });
+    switch (need) {
+        .node, .node_only => |name| {
+            var buffer: [constants.diag_command_bytes_max]u8 = undefined;
+            const command =
+                std.fmt.bufPrint(&buffer, "zcube-server ca issue-node {s}", .{name}) catch
+                    "zcube-server ca issue-node NAME";
+            diag.fix(.{
+                .sentence = "check that the agent's --node names the node of its certificate," ++
+                    " or ask an operator for this node's certificate:",
+                .command = command,
+            });
+        },
+        .jobs => diag.fix(.{
+            .sentence = "ask an operator for a client certificate of scope jobs:",
+            .command = "zcube-server ca issue-client NAME --scope jobs",
+        }),
+        .admin => diag.fix(.{
+            .sentence = "ask an operator for a client certificate of scope admin:",
+            .command = "zcube-server ca issue-client NAME --scope admin",
+        }),
+    }
 }
 
 fn no_such(ctx: *const Context, path: []const u8) Failure {
