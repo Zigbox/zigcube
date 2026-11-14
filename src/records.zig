@@ -729,12 +729,19 @@ pub const MeshAddressNext = struct {
 
 /// `/mesh-addresses/<n>`: who holds address `n`. Written by the API with the service that takes
 /// it; marked released when that service is deleted, and replaced only by the allocation that
-/// reuses it, once the quarantine has passed and no replica of `service` remains.
+/// reuses it, once the quarantine has passed and no replica of that incarnation of `service`
+/// remains.
 pub const MeshAddressHold = struct {
     v: u32 = 1,
     service: []const u8,
     /// When the service was deleted; absent while it exists.
     released_at_ms: ?u64 = null,
+    /// Written with `released_at_ms`: the service's replica counter (`/replica-numbers/`) when
+    /// it was deleted. A replica counter is never reset, so the deleted incarnation's replicas
+    /// are exactly `<service>-<n>` with `n` below it, and a service applied again under the
+    /// same name numbers its replicas from it on (TLA+ finding 9). Absent on a release that did
+    /// not record it: every replica of the name then counts.
+    replicas_below: ?u64 = null,
 };
 
 pub const key_mesh_address_next = "/mesh-address-next";

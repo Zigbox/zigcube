@@ -33,6 +33,21 @@
   refused every create while about 65,000 were free, since a refused create does not move the
   counter (review SHOULD 3); the spread probes find a free number anywhere in the block, and the
   counter moves past the one taken.
+- **A hold names the incarnation it was released from** (TLA+ finding 9, zigcube-tla PR #3,
+  `M6_ExhaustedMeansFull`). Keyed by name alone, a service deleted and applied again kept its old
+  address held for as long as the new one ran replicas, and enough such holds refused creates
+  with ZC-E0207 while the block was not full. The delete now records `replicas_below`, the
+  service's replica counter (`/replica-numbers/<service>`, never deleted or reset, so numbers are
+  never reused across incarnations; a C0 service's `next_replica` where the counter is absent),
+  compared at the revision read; only replicas numbered below it hold the address back. The
+  counter was chosen over the service's create revision because it also identifies the
+  incarnation of an `/observed/` key, which names a replica, not a revision. The field is
+  optional and the hold stays version 1: the hold is new in this unreleased slice, and a hold
+  without it counts every replica of the name, as before. Known edge: a replica of the old
+  incarnation that an agent still reports after the name is applied again keeps the old address
+  held until it is gone, which is correct. Separately, ZC-E0207 now moves the counter past the
+  250 numbers it tried in order (its own compared write), so creates are not refused at one place
+  forever.
 - **The reuse check takes no compare on `/replicas/` or `/observed/`** (review SHOULD 9). The
   store compares single keys, not the absence of every key under a prefix, so the apply cannot
   guard "no replica record appeared since I looked". Nor does it need to: the hold is released by
@@ -74,4 +89,5 @@ Where: `docs/keys.md` ("Mesh addresses", "Version 5"), `docs/authority.md` §2, 
 (`POST /v1/apply`), `src/mesh_address.zig`.
 
 *Amended 2026-11-14 by the slice 1 review fixes: serialization, reuse reads, probes, the reuse
-check's compares, `allow` as a set, ZC-W0704's slice, the pre-C4 capture, rollback.*
+check's compares, `allow` as a set, ZC-W0704's slice, the pre-C4 capture, rollback, holds by
+incarnation and a refusal that moves the counter (TLA+ finding 9).*

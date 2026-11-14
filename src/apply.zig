@@ -292,7 +292,7 @@ pub fn delete_service(
     // The address stays held, released, until no replica is left and a day has passed. A record
     // that does not read is still deleted; its address, if any, stays held.
     if (try mesh_address.held_by(ctx, kv.value)) |address| {
-        try mesh_address.release(ctx, &batch, name, address);
+        try mesh_address.release(ctx, &batch, name, address, kv.value);
     }
     const reason = try controller.format(ctx, "{s} deleted {s} (request {s})", .{
         applied_by, name, request_id,

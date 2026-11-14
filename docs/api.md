@@ -303,7 +303,8 @@ The answer is the decision id and the one-line summary (api.md item 5), whether 
   body with `mesh_address` is `ZC-E0104`, an unknown field). It appears with `allow` on
   `/services/<name>` in the read endpoints. When every address is held (by services, or by deleted
   ones whose replicas remain or that were deleted within a day), a create is `503` and
-  `ZC-E0207`.
+  `ZC-E0207`; the service is not written, but the address counter moves on, so a retry probes
+  other numbers.
 
 ### `DELETE /v1/services/{name}[?applied_by=<name>]`
 

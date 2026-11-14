@@ -6,7 +6,10 @@
 //! revision read, so two applies that race for one number cannot both commit. Before the counter
 //! wraps (65,534 creates) every number is new. After, a number is taken only if no hold names it,
 //! or its hold was released at least `mesh_address_quarantine_ms` ago and no replica of the old
-//! service is left: no record under `/replicas/<old>/`, no `/observed/` key that names one.
+//! service is left: no record under `/replicas/<old>/`, no `/observed/` key that names one. "The
+//! old service" is the deleted incarnation: replicas numbered below the replica counter it had
+//! when it was deleted (`MeshAddressHold.replicas_below`), so a service applied again under the
+//! same name does not hold its old address forever (TLA+ finding 9).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -42,7 +45,7 @@ pub fn assign(ctx: *const Context, batch: *controller.Batch, service: []const u8
             return records.mesh_address_text(text, candidate);
         }
     }
-    return exhausted(ctx, start);
+    return exhausted(ctx, counter.mod_revision, start);
 }
 
 const block_size: u32 = @as(u32, constants.mesh_address_max) - constants.mesh_address_min + 1;
@@ -74,15 +77,18 @@ pub fn probe_number(start: u16, probe: u32) u16 {
     return @intCast(constants.mesh_address_min + from_first);
 }
 
-/// Marks the hold of `address` released at the context's time, in `batch`. A hold that names
-/// another service, or none, is left alone: the address was never this service's to release.
+/// Marks the hold of `address` released at the context's time, in `batch`, with the replica
+/// number the deleted incarnation stops at. A hold that names another service, or none, is left
+/// alone: the address was never this service's to release. `service_value` is the stored
+/// service record being deleted (its C0 `next_replica` stands in for a missing counter).
 pub fn release(
     ctx: *const Context,
     batch: *controller.Batch,
     service: []const u8,
     address: []const u8,
+    service_value: []const u8,
 ) Error!void {
-    assert(batch.has_room(1));
+    assert(batch.has_room(2));
     const number = records.mesh_address_parse(address) orelse return;
     const key = records.mesh_address_key(number);
     const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
@@ -92,12 +98,48 @@ pub fn release(
     const hold = try read_hold(ctx, kv) orelse return;
     if (!std.mem.eql(u8, hold.service, service)) return;
     if (hold.released_at_ms != null) return;
+    const below = try replicas_below(ctx, batch, service, service_value);
     const released: records.MeshAddressHold = .{
         .service = service,
         .released_at_ms = ctx.clock.now_ms(),
+        .replicas_below = below,
     };
     batch.expect(kv.key, kv.mod_revision);
     batch.put(kv.key, try records.encode(ctx.arena, released, ctx.diag));
+}
+
+/// The first replica number the deleted incarnation of `service` never used: its replica
+/// counter, compared in `batch` at the revision read (absent: compared as absent), so a replica
+/// numbered while the delete was planned conflicts the delete instead of escaping the bound.
+/// With no counter, a C0 record's `next_replica`, else 1: the replica controller creates the
+/// counter before it numbers any replica.
+fn replicas_below(
+    ctx: *const Context,
+    batch: *controller.Batch,
+    service: []const u8,
+    service_value: []const u8,
+) Error!u64 {
+    const key = records.replica_numbers_key(service);
+    const key_copy = try controller.key_copy(ctx, &key);
+    const found = try ctx.store.get(ctx.arena, key_copy, null, ctx.diag);
+    const kv = found.kv orelse {
+        batch.expect(key_copy, 0);
+        return @max(1, try legacy_next_replica(ctx, service_value) orelse 1);
+    };
+    batch.expect(key_copy, kv.mod_revision);
+    const counter = try records.read(records.ReplicaNumber, ctx.arena, kv, ctx.diag);
+    return @max(1, counter.next);
+}
+
+/// A C0 service record's `next_replica`, or null: absent, or a value that does not parse.
+fn legacy_next_replica(ctx: *const Context, value: []const u8) Error!?u64 {
+    const Legacy = struct { next_replica: ?u64 = null };
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    const legacy = std.json.parseFromSliceLeaky(Legacy, ctx.arena, value, options) catch |err| {
+        if (err == error.OutOfMemory) return failures.no_memory(ctx.diag);
+        return null;
+    };
+    return legacy.next_replica;
 }
 
 /// The `mesh_address` a stored service value names, or null: none, or a value that does not
@@ -172,27 +214,54 @@ fn reusable(
     if (now < released) return false;
     if (now - released < constants.mesh_address_quarantine_ms) return false;
     if (observed.* == null) observed.* = try observed_replicas(ctx);
-    return !try replicas_remain(ctx, hold.service, observed.*.?);
+    return !try replicas_remain(ctx, hold.service, hold.replicas_below, observed.*.?);
 }
 
-/// Whether any record of a replica of `service` is left: its `/replicas/<service>/`, or one of
-/// `observed`, the replicas `/observed/` names (`observed_replicas`).
+/// Whether any record of a replica of the deleted incarnation of `service` is left: one under
+/// `/replicas/<service>/`, or one of `observed`, the replicas `/observed/` names
+/// (`observed_replicas`), numbered below `below` (null: any number). A record under
+/// `/replicas/<service>/` whose key is not `<service>-<n>` counts: nothing can say it is newer.
 pub fn replicas_remain(
     ctx: *const Context,
     service: []const u8,
+    below: ?u64,
     observed: []const []const u8,
 ) Error!bool {
     assert(records.name_problem(service, constants.service_name_bytes_max) == null);
     const prefix = records.replicas_prefix(service);
-    const listed = try ctx.store.list(ctx.arena, .{
-        .prefix = prefix.slice(),
-        .limit = 1,
-    }, ctx.diag);
-    if (listed.kvs.len > 0) return true;
+    var revision: ?store.Revision = null;
+    var after: ?[]const u8 = null;
+    const pages_max = constants.replicas_max / constants.store_list_limit_max + 1;
+    for (0..pages_max + 1) |_| {
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = prefix.slice(),
+            .at_revision = revision,
+            .limit = constants.store_list_limit_max,
+            .continue_after = after,
+        }, ctx.diag);
+        revision = page.revision;
+        for (page.kvs) |kv| {
+            const slash = std.mem.lastIndexOfScalar(u8, kv.key, '/').?;
+            const replica = kv.key[slash + 1 ..];
+            if (!replica_of(replica, service)) return true;
+            if (of_incarnation(replica, service, below)) return true;
+        }
+        after = page.continue_after;
+        if (after == null) break;
+    } else return controller.too_many(ctx, prefix.slice(), constants.replicas_max);
     for (observed) |replica| {
-        if (replica_of(replica, service)) return true;
+        if (replica_of(replica, service) and of_incarnation(replica, service, below)) return true;
     }
     return false;
+}
+
+/// Whether `replica`, `<service>-<n>`, is numbered below `below` (null: always).
+fn of_incarnation(replica: []const u8, service: []const u8, below: ?u64) bool {
+    assert(replica_of(replica, service));
+    const bound = below orelse return true;
+    // Past nine digits `replica_number` gives up; such a number is above any counter.
+    const number = records.replica_number(service, replica) orelse return false;
+    return number < bound;
 }
 
 /// The replica every `/observed/<node>/<replica>` key names, from the key: a record whose value
@@ -236,8 +305,17 @@ pub fn replica_of(replica: []const u8, service: []const u8) bool {
     return true;
 }
 
-fn exhausted(ctx: *const Context, start: u16) Error {
+/// Refuses the create with ZC-E0207, after moving the counter past the numbers tried in order,
+/// so the next create probes other numbers rather than the same held ones (TLA+ finding 9): in a
+/// transaction of its own, compared at the revision read. A conflict means another create moved
+/// it; nothing else is written.
+fn exhausted(ctx: *const Context, counter_revision: store.Revision, start: u16) Error {
     assert(ctx.diag.code == null);
+    var batch: controller.Batch = .{};
+    const moved: records.MeshAddressNext = .{ .next = probe_number(start, probes_in_order) };
+    batch.expect(records.key_mesh_address_next, counter_revision);
+    batch.put(records.key_mesh_address_next, try records.encode(ctx.arena, moved, ctx.diag));
+    _ = try controller.commit(ctx, .api, &batch);
     ctx.diag.raise(.E0207);
     ctx.diag.cause("127.77.0.0/16 has no free address: the {d} numbers tried from number {d} " ++
         "on are all held by services, or by deleted ones whose replicas remain or that were " ++

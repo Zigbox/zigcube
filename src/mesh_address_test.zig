@@ -88,6 +88,13 @@ const Fixture = struct {
         try testing.expect(done.succeeded);
     }
 
+    /// The replica counter the replica controller would have written for `name`: its replicas
+    /// are numbered from 1 below `next`.
+    fn numbered(fixture: *Fixture, name: []const u8, next: u64) !void {
+        const key = records.replica_numbers_key(name);
+        try fixture.put(key.slice(), records.ReplicaNumber{ .next = next });
+    }
+
     /// Sets the counter past the end of the block, so the next create starts again at the first.
     fn wrap(fixture: *Fixture) !void {
         const past: records.MeshAddressNext = .{ .next = @as(u32, constants.mesh_address_max) + 1 };
@@ -169,6 +176,7 @@ test "an address is not reused within a day, nor while a replica record of its s
     defer fixture.deinit();
     _ = try fixture.apply(input("a"));
     try testing.expectEqualStrings("127.77.0.1", try fixture.address("a"));
+    try fixture.numbered("a", 3);
     try fixture.delete("a");
 
     fixture.manual.ms += day_ms - 1;
@@ -367,8 +375,9 @@ test "a release that races a write of its hold conflicts and leaves the new hold
     _ = try fixture.apply(input("a"));
     const ctx = fixture.context();
     var batch: controller.Batch = .{};
-    try mesh_address.release(&ctx, &batch, "a", "127.77.0.1");
-    try testing.expectEqual(@as(u32, 1), batch.compares_count);
+    try mesh_address.release(&ctx, &batch, "a", "127.77.0.1", "{}");
+    // The hold, and the replica counter (absent here) that bounds the incarnation.
+    try testing.expectEqual(@as(u32, 2), batch.compares_count);
     const key = records.mesh_address_key(1);
     try fixture.put(key.slice(), records.MeshAddressHold{ .service = "b" });
     try testing.expect((try controller.commit(&ctx, .api, &batch)) == .conflict);
@@ -415,6 +424,7 @@ test "an observation that does not read holds back its own service's address onl
     defer fixture.deinit();
     _ = try fixture.apply(input("a"));
     _ = try fixture.apply(input("b"));
+    try fixture.numbered("a", 3);
     try fixture.delete("a");
     try fixture.delete("b");
     try fixture.put_bytes("/observed/n1/a-1", "not a record");
@@ -501,4 +511,91 @@ test "an observed endpoint's host: a name, IPv4, or bracketed IPv6" {
         "::1:30001", "[::1:30001", "a:b:1", "[::1]x:1", "[]:1", ":1", "10.0.0.7:0", "10.0.0.7",
     };
     for (refused) |text| try testing.expect(!records.endpoint_valid(text));
+}
+
+test "a service deleted and applied again releases its old address once the old replicas go" {
+    // Goal: TLA+ finding 9 (M6_ExhaustedMeansFull): a hold names its deleted incarnation, not
+    // only its name, so a service applied again under the name, with replicas of its own, does
+    // not hold the old address forever. Method: `a` with replicas a-1 and a-2 takes 127.77.0.1
+    // and is deleted; `a` applied again takes 127.77.0.2 and runs a-3 and a-4. While a-1 is
+    // left the old address stays held; once it goes, it is reused, with a-3 and a-4 running.
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    _ = try fixture.apply(input("a"));
+    try fixture.numbered("a", 3);
+    try fixture.put_bytes("/replicas/a/a-1", "{}");
+    try fixture.delete("a");
+    _ = try fixture.apply(input("a"));
+    try testing.expectEqualStrings("127.77.0.2", try fixture.address("a"));
+    try fixture.numbered("a", 5);
+    try fixture.put_bytes("/replicas/a/a-3", "{}");
+    try fixture.put_bytes("/replicas/a/a-4", "{}");
+    const seen: records.Observed = .{
+        .replica = "a-3",
+        .node = "n1",
+        .generation = 1,
+        .status = .running,
+        .reported_at_ms = fixture.manual.ms,
+    };
+    try fixture.put("/observed/n1/a-3", seen);
+    fixture.manual.ms += day_ms;
+
+    try fixture.wrap();
+    _ = try fixture.apply(input("b"));
+    try testing.expectEqualStrings("127.77.0.3", try fixture.address("b"));
+
+    try fixture.remove("/replicas/a/a-1");
+    try fixture.wrap();
+    _ = try fixture.apply(input("c"));
+    try testing.expectEqualStrings("127.77.0.1", try fixture.address("c"));
+}
+
+test "a wrapped counter over a run of addresses its name's new incarnation blocked finds one" {
+    // Goal: TLA+ finding 9 at the scale of the probes: every number one create probes is held
+    // by a released incarnation of `a` (replicas below 3) while `a` runs again with a-5; the
+    // create is not refused (ZC-E0207) and takes the first of them.
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const start: u16 = 3000;
+    for (0..constants.mesh_address_probes_max) |probe| {
+        const key = records.mesh_address_key(mesh_address.probe_number(start, @intCast(probe)));
+        try fixture.put(key.slice(), records.MeshAddressHold{
+            .service = "a",
+            .released_at_ms = fixture.manual.ms,
+            .replicas_below = 3,
+        });
+    }
+    try fixture.put_bytes("/replicas/a/a-5", "{}");
+    fixture.manual.ms += day_ms;
+    try fixture.put(records.key_mesh_address_next, records.MeshAddressNext{ .next = start });
+    _ = try fixture.apply(input("db"));
+    try testing.expectEqualStrings("127.77.11.184", try fixture.address("db"));
+}
+
+test "a refused create moves the counter, so the next create probes other numbers" {
+    // Goal: TLA+ finding 9, the second part: ZC-E0207 moves the counter past the numbers it
+    // tried in order, so creates are not refused at the same place forever while numbers after
+    // it are free. Method: hold every probe from 4000; the first create is refused and moves
+    // the counter to 4250; the next takes 4251, the first number from there that is not held.
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const start: u16 = 4000;
+    for (0..constants.mesh_address_probes_max) |probe| {
+        const key = records.mesh_address_key(mesh_address.probe_number(start, @intCast(probe)));
+        try fixture.put(key.slice(), records.MeshAddressHold{ .service = "held" });
+    }
+    try fixture.put(records.key_mesh_address_next, records.MeshAddressNext{ .next = start });
+    try testing.expectError(error.NoCapacity, fixture.apply(input("db")));
+    try testing.expectEqual(.E0207, fixture.diag.code.?);
+    fixture.diag.reset();
+    const ctx = fixture.context();
+    const got = try ctx.store.get(ctx.arena, records.key_mesh_address_next, null, ctx.diag);
+    const next = try records.read(records.MeshAddressNext, ctx.arena, got.kv.?, ctx.diag);
+    try testing.expectEqual(@as(u32, start + 250), next.next);
+    _ = try fixture.apply(input("db"));
+    const taken = records.mesh_address_parse(try fixture.address("db"));
+    try testing.expectEqual(@as(?u16, start + 251), taken);
 }
