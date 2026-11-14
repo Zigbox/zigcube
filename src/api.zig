@@ -226,7 +226,7 @@ const apply_attempts_max: u32 = 3;
 const pulls_limit_default: u64 = 50;
 /// Who a write is attributed to while the API has no auth.
 const anonymous = "anonymous";
-const applied_by_bytes_max: u32 = 64;
+pub const applied_by_bytes_max: u32 = 64;
 
 /// The body of `POST /v1/apply`: the fields of a service the user writes (docs/keys.md), as JSON.
 const ApplyBody = struct {

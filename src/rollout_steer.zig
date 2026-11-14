@@ -545,3 +545,145 @@ test "C3 slice 11: a pause that races a controller write commits only over what 
     try testing.expectEqual(@as(u32, 2), record.ready_new);
     try testing.expectEqual(@as(u32, 0), record.budget.start);
 }
+
+/// A store whose next `races` transactions each lose a race: just before one commits, another
+/// writer moves `/services/<name>` or `/rollouts/<name>` (it puts the same bytes back, so only the
+/// key's `mod_revision` changes, or deletes and re-creates the service). Shared with api_test.zig
+/// for the 409 through the API. One at a time: its state is global, as the vtable's functions see
+/// only the wrapped store's context.
+pub const Race = struct {
+    pub const Kind = enum {
+        /// The rollout controller rewrites the rollout record.
+        rollout,
+        /// A user re-applies the service with the same spec.
+        reapply,
+        /// A user deletes the service and creates it again under the same name.
+        recreate,
+    };
+
+    var original: *const store.Store.VTable = undefined;
+    var vtable: store.Store.VTable = undefined;
+    var kind: Kind = .rollout;
+    var name: []const u8 = "";
+    var races_left: u32 = 0;
+    var txns: u32 = 0;
+    var buffer: [64 * 1024]u8 = undefined;
+
+    pub fn wrap(inner: store.Store, race_kind: Kind, service: []const u8, races: u32) store.Store {
+        original = inner.vtable;
+        vtable = inner.vtable.*;
+        vtable.txn = txn;
+        kind = race_kind;
+        name = service;
+        races_left = races;
+        txns = 0;
+        return .{ .context = inner.context, .vtable = &vtable };
+    }
+
+    /// Transactions the wrapped store was asked for since `wrap`, the racing writes not counted.
+    pub fn transactions() u32 {
+        return txns;
+    }
+
+    fn txn(
+        context: *anyopaque,
+        request: store.TxnRequest,
+        diag: *Diag,
+    ) store.Error!store.TxnResult {
+        txns += 1;
+        if (races_left > 0) {
+            races_left -= 1;
+            race(context, diag) catch @panic("race: the racing write failed");
+        }
+        return original.txn(context, request, diag);
+    }
+
+    fn race(context: *anyopaque, diag: *Diag) !void {
+        var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+        const arena = fixed.allocator();
+        const key = switch (kind) {
+            .rollout => records.rollout_key(name),
+            .reapply, .recreate => records.service_key(name),
+        };
+        const found = try original.get(context, arena, key.slice(), null, diag);
+        const kv = found.kv.?;
+        const put: store.Op = .{ .put = .{ .key = kv.key, .value = kv.value } };
+        if (kind == .recreate) {
+            const delete: store.Op = .{ .delete = kv.key };
+            const deleted = try original.txn(context, .{ .on_success = &.{delete} }, diag);
+            assert(deleted.succeeded);
+        }
+        const written = try original.txn(context, .{ .on_success = &.{put} }, diag);
+        assert(written.succeeded);
+    }
+};
+
+test "C3 slice 11: a pause tries again after a conflict, and gives up after attempts_max" {
+    // Goal: the retry loop of `steer`. One lost race is retried and the pause lands; a race lost
+    // on every attempt makes exactly `attempts_max` attempts and writes nothing.
+    comptime assert(attempts_max > 1);
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.put_service();
+    try fixture.put_rollout(fixture.rollout(.progressing));
+    var context = fixture.ctx();
+    context.store = Race.wrap(context.store, .rollout, "hello", 1);
+    const input: Input = .{
+        .name = "hello",
+        .action = .pause,
+        .applied_by = "alex@laptop",
+        .request_id = "r-0003",
+    };
+    const paused = try steer(&context, &fixture.source, input);
+    try testing.expectEqual(records.RolloutPhase.paused, paused.written.phase);
+    try testing.expectEqual(@as(u32, 2), Race.transactions());
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.read_rollout()).phase);
+
+    try fixture.put_rollout(fixture.rollout(.progressing));
+    const before = try fixture.memory.interface().status(&fixture.diag);
+    context.store = Race.wrap(fixture.memory.interface(), .rollout, "hello", attempts_max + 1);
+    const lost = try steer(&context, &fixture.source, input);
+    try testing.expect(lost == .conflict);
+    try testing.expectEqual(attempts_max, Race.transactions());
+    // Only the racing writes moved the store: one per attempt, nothing of the pause.
+    const after = try fixture.memory.interface().status(&fixture.diag);
+    try testing.expectEqual(before.revision + attempts_max, after.revision);
+    const kept = try fixture.read_rollout();
+    try testing.expectEqual(records.RolloutPhase.progressing, kept.phase);
+    try testing.expectEqual(@as(u32, 1), kept.budget.start);
+}
+
+test "C3 slice 11: a pause does not commit over a service re-applied or re-created after its read" {
+    // Goal: the compare on the service key. The rollout record is untouched by both races, so
+    // only that compare fails the attempt. A re-apply retries and pauses; a re-created service is
+    // another incarnation, whose rollout this record is not: ZC-E0129 on the retry.
+    const Code = @import("diag/codes.zig").Code;
+    const input: Input = .{
+        .name = "hello",
+        .action = .pause,
+        .applied_by = "alex@laptop",
+        .request_id = "r-0004",
+    };
+    for ([_]Race.Kind{ .reapply, .recreate }) |kind| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        try fixture.put_service();
+        try fixture.put_rollout(fixture.rollout(.progressing));
+        var context = fixture.ctx();
+        context.store = Race.wrap(context.store, kind, "hello", 1);
+        try testing.expect(try steer_once(&context, &fixture.source, input) == .conflict);
+        const kept = try fixture.read_rollout();
+        try testing.expectEqual(records.RolloutPhase.progressing, kept.phase);
+        const retried = steer(&context, &fixture.source, input);
+        switch (kind) {
+            .reapply => try testing.expect((try retried) == .written),
+            .recreate => {
+                try testing.expectError(error.NoRollout, retried);
+                try testing.expectEqual(@as(?Code, .E0129), fixture.diag.code);
+            },
+            .rollout => unreachable,
+        }
+    }
+}

@@ -1365,6 +1365,62 @@ test "GET .../rollout answers null, then the record; pause and resume write it, 
     try rig.refused(missing, 404, "ZC-E0101");
 }
 
+/// `{"applied_by": "aaa..."}` with a name of `length` bytes.
+fn applied_by_body(arena: std.mem.Allocator, length: u32) ![]const u8 {
+    const name = try arena.alloc(u8, length);
+    @memset(name, 'a');
+    return std.fmt.allocPrint(arena, "{{\"applied_by\":\"{s}\"}}", .{name});
+}
+
+test "pause and resume refuse an empty, overlong or unprintable applied_by with ZC-E0104" {
+    var rig = try Rig.start(34);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    try put_rollout(&rig, .progressing, null);
+    const arena = rig.parsed.allocator();
+    const overlong = try applied_by_body(arena, api_mod.applied_by_bytes_max + 1);
+    const bodies = [_][]const u8{
+        "{\"applied_by\":\"\"}",
+        overlong,
+        "{\"applied_by\":\"alex\\nmallory\"}",
+        "{\"applied_by\":\"alex\\u0007\"}",
+    };
+    for ([_][]const u8{ "pause", "resume" }) |verb| {
+        for (bodies) |body| {
+            const response = try rollout_post(&rig, verb, body);
+            try rig.refused(response, 400, "ZC-E0104");
+            try testing.expect(std.mem.indexOf(u8, response.body, "applied_by") != null);
+        }
+    }
+    // Nothing was written: the rollout is still running.
+    const status = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expectEqualStrings("progressing", field(field(status, "rollout"), "phase").string);
+    // The longest name passes.
+    const longest = try applied_by_body(arena, api_mod.applied_by_bytes_max);
+    try testing.expectEqual(@as(u16, 200), (try rollout_post(&rig, "pause", longest)).status);
+}
+
+test "a pause that loses every race to the rollout controller is 409 ZC-E0105" {
+    // Goal: the API's answer when `rollout_steer.steer` returns `.conflict`: every attempt lost,
+    // nothing written, 409 with ZC-E0105.
+    const rollout_steer = @import("rollout_steer.zig");
+    var rig = try Rig.start(35);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    try put_rollout(&rig, .progressing, null);
+    var ctx = rig.world.controller_context();
+    const races = rollout_steer.attempts_max;
+    ctx.store = rollout_steer.Race.wrap(ctx.store, .rollout, "hello", races);
+    const response = rig.api.handle(&ctx, .{
+        .method = "POST",
+        .path = "/v1/services/hello/rollout/pause",
+    });
+    try rig.refused(response, 409, "ZC-E0105");
+    try testing.expectEqual(rollout_steer.attempts_max, rollout_steer.Race.transactions());
+    const status = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expectEqualStrings("progressing", field(field(status, "rollout"), "phase").string);
+}
+
 test "POST /v1/apply takes health and rollout, and refuses invalid ones" {
     var rig = try Rig.start(33);
     defer rig.stop();
@@ -1378,6 +1434,16 @@ test "POST /v1/apply takes health and rollout, and refuses invalid ones" {
     try testing.expectEqual(@as(u16, 200), applied.status);
     const status = try rig.ok("/v1/services/hello/rollout", "");
     try testing.expectEqual(@as(i64, 2), field(field(status, "policy"), "max_surge").integer);
+    // The health check reaches the stored service, which the replica controller copies onto
+    // each replica for the agent to run.
+    const ctx = rig.world.controller_context();
+    const found = try ctx.store.get(ctx.arena, "/services/hello", null, ctx.diag);
+    const service = try records.read(records.Service, ctx.arena, found.kv.?, ctx.diag);
+    const health = service.health.?;
+    try testing.expectEqual(@as(usize, 1), health.command.len);
+    try testing.expectEqualStrings("true", health.command[0]);
+    try testing.expectEqual(@as(u32, 1000), health.interval_ms);
+    try testing.expectEqual(@as(u32, 3), health.failure_threshold);
     const bad =
         \\{"name":"hello","image":"b3:51aa9c03","replicas":2,"command":["sh"],
         \\ "rollout":{"max_surge":0,"max_unavailable":0}}
