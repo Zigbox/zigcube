@@ -337,8 +337,8 @@ fn runs_differently(old: records.Service, input: Input) bool {
     return !records.limits_equal(old.limits, input.limits);
 }
 
-/// The rollout policy as stored: null when it is the default, so a service that sets none, or
-/// sets the default, stays a version 3 record an older release reads.
+/// The rollout policy as stored: null when it is the default, so the record carries no `rollout`
+/// (`records.service_version` then picks the oldest version that holds the rest).
 fn stored_rollout(policy: ?records.RolloutPolicy) ?records.RolloutPolicy {
     const given = policy orelse return null;
     const default: records.RolloutPolicy = .{};

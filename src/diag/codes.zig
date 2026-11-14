@@ -816,12 +816,17 @@ pub const registry = [_]Entry{
         .explanation =
         \\The store is full in a dimension it bounds on purpose: all watch slots
         \\are in use, all lease slots are in use, the memory set aside for the
-        \\request was not enough for the result, or a record would take more
-        \\bytes than the store keeps in one value (the cause gives both sizes).
+        \\request was not enough for the result, a record would take more bytes
+        \\than the store keeps in one value (the cause gives both sizes), or no
+        \\mesh address is free for a new service (127.77.0.0/16: every address a
+        \\create tried is held, by a service or by one deleted within a day or
+        \\whose replicas remain).
         \\
         \\Close watches that are no longer needed, or ask for smaller pages. For
-        \\an oversized record, shorten its largest field. If the limit is too low
-        \\for the fleet, raise it in the server's configuration.
+        \\an oversized record, shorten its largest field. For mesh addresses,
+        \\delete services that are no longer used, or wait a day for deleted ones
+        \\to be released. These bounds are fixed in this release; none is a
+        \\setting.
         ,
     },
     .{
@@ -1880,11 +1885,11 @@ pub const registry = [_]Entry{
         .explanation =
         \\The agent gives each replica a port from the node's mesh port range for the
         \\connections other replicas make to it. No port of the range could be bound:
-        \\other programs on the node hold them. The replica runs but takes no mesh
-        \\connections until a port is free.
+        \\other programs on the node hold them. The replica does not start: an
+        \\unbindable port is a start failure, never a replica without a mesh.
         \\
         \\Find what holds the ports (ss -ltn) and stop it, or give the agent another
-        \\range. The agent retries on its own.
+        \\range. The agent retries the start on its own.
         ,
     },
     .{

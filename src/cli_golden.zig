@@ -406,37 +406,37 @@ fn allow_bad(diag: *diag_mod.Diag) void { // apply.zig
     sample(diag, .E0135, &.{cause}, "fix the entry and apply again");
 }
 
-fn mesh_no_grant(diag: *diag_mod.Diag) void { // mesh (C4 slice 3)
+fn mesh_no_grant(diag: *diag_mod.Diag) void { // the supervisor's data path (C4 slice 6)
     const cause = "no grant lets batch reach db on port 5432; db allows web on 5432";
     sample(diag, .E0707, &.{cause}, "add { .from = \"batch\", .port = 5432 } to db's allow");
 }
 
-fn mesh_peer_refused(diag: *diag_mod.Diag) void { // mesh (C4 slice 3)
+fn mesh_peer_refused(diag: *diag_mod.Diag) void { // the data path (C4 slice 6)
     const cause = "the peer's certificate expired at 2026-11-13T10:00:00Z";
     sample(diag, .E0708, &.{cause}, "check time sync on both nodes");
 }
 
-fn mesh_no_endpoint(diag: *diag_mod.Diag) void { // mesh (C4 slice 3)
+fn mesh_no_endpoint(diag: *diag_mod.Diag) void { // the data path (C4 slice 6)
     const cause = "db has no ready replica with a mesh endpoint";
     sample(diag, .E0709, &.{cause}, "zcube why service db");
 }
 
-fn mesh_port_busy(diag: *diag_mod.Diag) void { // mesh (C4 slice 3)
+fn mesh_port_busy(diag: *diag_mod.Diag) void { // the data path (C4 slice 6)
     const cause = "every port from 30000 to 30999 on node1 is in use";
     sample(diag, .E0710, &.{cause}, "free ports in the range, or give the agent another range");
 }
 
-fn mesh_no_socket(diag: *diag_mod.Diag) void { // mesh (C4 slice 4)
+fn mesh_no_socket(diag: *diag_mod.Diag) void { // Zigbox sockets (C4 slice 7)
     const cause = "the runtime refused a socket in the container of web-1: PermissionDenied";
     sample(diag, .E0711, &.{cause}, "upgrade the runtime and the agent together");
 }
 
-fn mesh_not_renewed(diag: *diag_mod.Diag) void { // mesh (C4 slice 2)
+fn mesh_not_renewed(diag: *diag_mod.Diag) void { // service certificates (C4 slice 3)
     const cause = "the certificate of web-1 was not renewed: the server did not answer";
     sample(diag, .W0703, &.{cause}, "check that the node reaches the server");
 }
 
-fn grant_unknown(diag: *diag_mod.Diag) void { // apply.zig
+fn grant_unknown(diag: *diag_mod.Diag) void { // the API's apply warning (C4 slice 9)
     const cause = "db allows btach, and no service is named btach";
     sample(diag, .W0704, &.{cause}, "correct the name if it is a typo");
 }

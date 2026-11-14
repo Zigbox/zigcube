@@ -76,8 +76,8 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">the store has no free capacity for this</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
-<p>The store is full in a dimension it bounds on purpose: all watch slots are in use, all lease slots are in use, the memory set aside for the request was not enough for the result, or a record would take more bytes than the store keeps in one value (the cause gives both sizes).</p>
-<p>Close watches that are no longer needed, or ask for smaller pages. For an oversized record, shorten its largest field. If the limit is too low for the fleet, raise it in the server's configuration.</p>
+<p>The store is full in a dimension it bounds on purpose: all watch slots are in use, all lease slots are in use, the memory set aside for the request was not enough for the result, a record would take more bytes than the store keeps in one value (the cause gives both sizes), or no mesh address is free for a new service (127.77.0.0/16: every address a create tried is held, by a service or by one deleted within a day or whose replicas remain).</p>
+<p>Close watches that are no longer needed, or ask for smaller pages. For an oversized record, shorten its largest field. For mesh addresses, delete services that are no longer used, or wait a day for deleted ones to be released. These bounds are fixed in this release; none is a setting.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0207</pre>

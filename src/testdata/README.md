@@ -23,7 +23,11 @@ before C3 slice 5 added service and replica version 4 and observed version 3; `S
 and replaced, then `hello` applied again with a new image, `env`, `limits`, `source` and 2
 replicas, and `ghost` applied with an unknown digest. `store_live` was dumped with Python's
 `sqlite3`, one `key<TAB>value` per line, unedited. Never regenerate it: it is the proof that the
-records before C3 still read.
+records before C3 still read. C4 reads it too, with no mesh address, grants or endpoint: services
+at version 3 and observations at version 2 are the newest a build's API or agent wrote before C4.
+C3 slice 5 (`3c5df94`) defines service version 4 and observed version 3, but neither its API (no
+`health` in an apply) nor its agent writes them, so no real capture of them exists yet; the test
+of them in `records.zig` is written by hand until a C3 build that writes them can be captured.
 
 `c2_pulls.txt` holds the three `/pulls/` rows a C2 slice-7 `zig build swarm-smoke` run left in the
 server's SQLite store (commit `7bceea3` plus the slice's fixes): node2 from the registry, node1
