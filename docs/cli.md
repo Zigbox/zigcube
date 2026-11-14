@@ -241,13 +241,34 @@ restarts the listing (up to 8 times, then `ZC-E0103`); a list of more than 1,024
 
 `job logs` is not here: slice 8 is cut.
 
-## rollout, history and rollback (C3; planned for slice 11)
+## rollout, history and rollback (C3 slice 11; rollback planned for slice 8)
 
-Not built yet; the records exist from C3 slice 5 (`docs/keys.md`). `zcube history <service>`
-lists the stored generations (at most 16, newest first, with who applied each and why);
-`zcube rollback <service> [--to GENERATION]` applies one of them again as a new generation (users
-address versions by generation, owner 2026-11-05); `zcube rollout status|pause|resume <service>`
-shows or steers a rollout, and `zcube get service` shows it. The codes they relay, `ZC-E0125` to
+`zcube history <service>` lists the stored generations (at most 16, newest first), the current one
+marked `*`, with its image (shortened past 15 bytes), why it was made (`apply`, or `rollback of N`),
+who applied it and the request id:
+
+```
+GEN  IMAGE                REASON         APPLIED BY   REQUEST
+3*   b3:51aa9c03          rollback of 1  alex@laptop  r-0000003
+2    b3:0123456789ab...   apply          alex@laptop  r-0000002
+```
+
+`zcube rollout status <service>` shows the generation, the rollout (or `no rollout`) and the
+policy:
+
+```
+hello: generation 2, 3 replicas
+rollout 1 -> 2 (apply): paused, started 3m ago
+  1 new ready, 0 old retired
+  paused by user 1m ago; zcube rollout resume continues it
+policy: rolling, surge 1, unavailable 0, min ready 5s, deadline 600s, on failure rollback
+```
+
+`zcube rollout pause|resume <service>` steers it and prints `hello: progressing → paused (decision
+d-7)`, or `hello: already paused, no change`. Without a rollout, or once it is complete, both are
+`ZC-E0129`, as is a resume of a failed rollout (pause it first). `-o json` prints the server's answer; `-o wide` is not taken. `zcube rollback <service>
+[--to GENERATION]` (slice 8) will apply one of the stored generations again as a new generation
+(users address versions by generation, owner 2026-11-05). The codes these relay, `ZC-E0125` to
 `E0129`, are in [api.md](api.md), "Rollouts and history".
 
 ## explain

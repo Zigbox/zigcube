@@ -291,7 +291,7 @@ fn rollback_compacted(diag: *diag_mod.Diag) void { // C3 slice 8: the rollback h
     sample(diag, .E0128, &.{cause}, "list the generations that can be restored");
 }
 
-fn rollout_none(diag: *diag_mod.Diag) void { // C3 slice 8: pause and resume
+fn rollout_none(diag: *diag_mod.Diag) void { // C3 slice 11: pause and resume
     const cause = "service hello has no rollout in progress (the last one is complete)";
     sample(diag, .E0129, &.{cause}, "see what the service runs");
 }

@@ -157,7 +157,8 @@ and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
   replicas are replaced, not what they run.
 - A version 3 record reads as "no health, the default rollout".
 
-Until C3 slice 11 the API's apply body takes neither member: slice 5 defines and stores them.
+Since C3 slice 11 the API's apply body takes both members, in this shape (docs/api.md, "Rollouts
+and history").
 
 ## `/history/<service>/<generation>`: what a generation ran (C3 slice 5)
 
@@ -205,7 +206,8 @@ known). So after an upgrade the first new generation can always be rolled back t
 { "v": 1, "service": "hello", "service_created": 40, "from": 6, "to": 7, "phase": "progressing",
   "started_at_ms": 1761350000123, "deadline_at_ms": 1761350600123, "next_at_ms": 1761350005123,
   "ready_new": 1, "retired_old": 1, "budget": {"start": 1, "retire": 0, "retire_unready": 0},
-  "cause_decision": "1761350000123-api0-0001" }
+  "cause_decision": "1761350000123-api0-0001", "reason": "apply",
+  "evidence_from_ms": 1761350000123 }
 ```
 
 Written only by the rollout controller (role `rollout_controller`), one per service. `phase` is
@@ -216,6 +218,15 @@ the count that keeps `max_unavailable`) and how many old ones that are not ready
 never retired on it); the replica controller stays the only writer of `/replicas/`. `next_at_ms`
 is when the controller looks again without a store change (`min_ready_ms`). Deleted a retention
 period after `complete`.
+
+C3 slice 11 adds four optional members, which pause and resume need: `reason` (`apply` or
+`rollback`; absent: `rolling_back` reads as `rollback`, anything else as `apply`),
+`evidence_from_ms` (failures before it do not count: the start or the last resume; absent:
+`started_at_ms`), and `paused_at_ms` and `paused_by` (`user` or `failure`), present exactly while
+`phase` is `paused`. A user's pause or resume (`POST /v1/services/<name>/rollout/pause|resume`) is
+written by the API process in the `rollout_controller` role, as one transaction that compares on
+the service's and the rollout's `mod_revision`; a pause sets `budget` to zero in the same write
+(docs/decisions/2026-11-14-c3-slice11-surfaces.md).
 
 **Whose rollout it is.** `service_created` is the `create_revision` of the `/services/<service>`
 key the rollout was started for. Deleting a service does not delete its rollout: the API is not
@@ -470,7 +481,9 @@ the observed record or decision that provoked it. A decision about one replica (
 at the service-level decision above it, so the two chains join.
 
 **Rollout decisions (C3).** The rollout controller writes `rollout_start`, `rollout_step`,
-`rollout_pause` and `rollout_fail` with the service as subject, and the API writes `rollback` (by
+`rollout_pause` and `rollout_fail` with the service as subject (a user's pause and resume, C3 slice
+11, are `rollout_pause` and `rollout_resume` by actor `rollout-controller`, citing the request's
+`applied_by` and request id), and the API writes `rollback` (by
 hand or, with `reason auto_rollback`, for the controller), each with a cause, so `zcube why
 service <name>` can say "rolled back to generation 6 because replica hello-31 stayed unhealthy for
 40 s". Their codes are ZC-E0127 to E0129, E0304 to E0306, W0304 and W0305.

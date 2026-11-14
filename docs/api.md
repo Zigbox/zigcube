@@ -494,16 +494,45 @@ are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstrea
 
 ## Rollouts and history (C3; defined in slice 5, served from slice 11)
 
-Planned, not served yet: slice 5 adds the records (`docs/keys.md`: service v4, `/history/`,
-`/rollouts/`), slice 11 the endpoints. The apply body gains `health` and `rollout` in the
-shape of service v4; until then it takes neither.
+Slice 5 adds the records (`docs/keys.md`: service v4, `/history/`, `/rollouts/`); slice 11 serves
+them. The apply body takes `health` and `rollout` in the shape of service v4 (`docs/keys.md`,
+"Version 4"); either may be left out. Rollback is slice 8 and not served yet.
 
 | Endpoint | Does | Codes |
 | --- | --- | --- |
-| `GET /v1/services/{name}/history` | the service's stored generations, newest first | `ZC-E0101` |
-| `POST /v1/services/{name}/rollback[?to=<generation>]` | applies a stored generation's spec as a new generation (`reason rollback`, `restores`); without `to`, the one before the current | `ZC-E0127` no earlier generation, `ZC-E0128` compacted, `ZC-E0105` |
-| `GET /v1/services/{name}/rollout` | the `/rollouts/` record, or `404` | `ZC-E0101` |
-| `POST /v1/services/{name}/rollout/pause`, `.../resume` | freezes or restores the rollout's budget | `ZC-E0129` no rollout to pause or resume |
+| `GET /v1/services/{name}/history` | the service's usable generations (`history.usable`), newest first, each as stored with environment values `null` | `ZC-E0101` |
+| `POST /v1/services/{name}/rollback[?to=<generation>]` | (slice 8, not served) applies a stored generation's spec as a new generation (`reason rollback`, `restores`); without `to`, the one before the current | `ZC-E0127` no earlier generation, `ZC-E0128` compacted, `ZC-E0105` |
+| `GET /v1/services/{name}/rollout` | the service's policy and its `/rollouts/` record, `rollout: null` when it has none | `ZC-E0101` |
+| `POST /v1/services/{name}/rollout/pause`, `.../resume` | freezes or restores the rollout's budget, as a rollout-controller transaction | `409` `ZC-E0129` no rollout, it is complete, or (resume) it failed; `ZC-E0105` it kept changing |
+
+```json
+GET /v1/services/hello/history
+{ "revision": 52, "service": "hello", "generation": 2,
+  "generations": [ { "generation": 2, "mod_revision": 50, "value": { "v": 1, "image": "...",
+    "env": [["API_TOKEN", null]], "applied_by": "alex@laptop", "request_id": "r-2",
+    "reason": "apply", ... } }, ... ] }
+
+GET /v1/services/hello/rollout
+{ "revision": 52, "service": "hello", "generation": 2, "replicas": 3,
+  "policy": { "strategy": "rolling", "max_surge": 1, "max_unavailable": 0, "min_ready_ms": 5000,
+    "ready_timeout_ms": 120000, "progress_deadline_ms": 600000, "grace_ms": 10000,
+    "on_failure": "rollback" },
+  "rollout": { ...the /rollouts/ record... } | null, "mod_revision": 51 }
+
+POST /v1/services/hello/rollout/pause      {"applied_by": "alex@laptop"}  (the body may be empty)
+{ "request_id": "...", "action": "pause", "name": "hello", "generation": 2, "phase": "paused",
+  "change": "paused" | "none", "revision": 53, "decision": "1761350000123-api0-0007" }
+```
+
+`GET .../rollout` answers `200` with `rollout: null`, not `404`, when there is no rollout: the
+service exists, and "no rollout" is a state of it (a record whose `service_created` is not the
+service's, `records.rollout_of`, reads as none). `policy` is the stored one with the defaults
+filled in. A pause of a paused rollout, or a resume of a running one, changes nothing: `change`
+is `none`, and there is no `revision` or `decision`. A pause sets the budget to zero in the same
+write as the phase (R4, `docs/decisions/2026-11-14-c3-slice11-surfaces.md`); a resume restarts the
+evidence window (`evidence_from_ms`) and moves the progress deadline later by the length of the
+pause. The decision is `rollout_pause` or `rollout_resume`, actor `rollout-controller`, citing
+`applied_by` and the request id.
 
 An apply with an invalid `health` is `400` `ZC-E0125`, an invalid `rollout` `400` `ZC-E0126`. A
 rollout's own outcomes are decisions, not answers: `ZC-E0304` (a new replica did not become
