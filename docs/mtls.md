@@ -77,19 +77,32 @@ Both commands follow the same rules:
   2026-11-13-revoked-names-shared.md). A revoked name stops being issued at once.
 
 A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`). The server
-rereads `revoked` without a restart (B7 slice 5): on its HTTP watchdog tick it compares the
-file's modification time, size and inode, and reads it again once a change has held for one
-tick, so an edit takes effect within about two seconds and one line on stderr says so
-(`zcube-server: the revoked file was reloaded: N revoked names`). A file that fails to parse
-keeps the set in force and says so on one line; it never empties the set. Issuance (`ca issue-*`
-in the same process, node joins and renewals) uses the reloaded set at once.
+rereads `revoked` without a restart (B7 slice 5): on each HTTP watchdog tick (500 ms) it looks
+at the file's inode, size, modification time and status-change time, and reads it once a change
+has held for one tick and the file was last modified at least 2 s ago; a read the file changed
+under is dropped and made again. A change applies **within 5 seconds** of its last write: 2 s
+to settle, a tick to read it, and at most four ticks while store writes hold the API lock (after
+them the reload waits for the write under way). One line on stderr says so
+(`zcube-server: the revoked file was reloaded: N revoked names`). Write the file to a temporary
+name in the state directory and rename it over `revoked`, so no reader sees it half written.
+
+- A file that fails to parse, or cannot be read, keeps the set in force and says so on one line;
+  it never empties the set.
+- A file that is gone (or a state directory that is gone) is an empty set, as at start, with a
+  line of its own: `zcube-server: the revoked file is gone: every name is un-revoked`.
+- Node joins and renewals use the reloaded set from the tick that applies it. `ca issue-*` is a
+  separate process that reads the file when it starts, so it always sees the current file.
+- The reload never cuts a request short: a request already being handled completes, and the
+  connection's next request is checked against the new set.
 
 A connection's certificate is checked again before each request on it, not only at its
 handshake (B7 slice 5): the server keeps the peer's validity window and identity with the
 connection and refuses the request, then closes the connection, when the certificate has
 expired since (`ZC-E0811`, with the same minute of skew as the handshake) or its name is now in
 `revoked` (`ZC-E0819`). So a keep-alive connection opened before a revocation does not outlive
-it.
+it. The refusal is `403` with `Connection: close`; the body is not read, and the server sends
+`close_notify` before it closes. The check is made when a request starts: a request in flight
+(a long poll included) completes, and the refusal comes with the connection's next request.
 
 ### Validity
 

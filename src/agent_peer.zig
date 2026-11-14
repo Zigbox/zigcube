@@ -14,6 +14,7 @@ const std = @import("std");
 const secure_random = @import("secure_random.zig");
 const assert = std.debug.assert;
 const Ed25519 = std.crypto.sign.Ed25519;
+const api_tls_guard = @import("api_tls_guard.zig");
 const client_mod = @import("agent_client.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
@@ -142,6 +143,29 @@ pub const Peer = struct {
         self.reported = false;
     }
 
+    /// `step`, telling `guard` how it went (B7 slice 5): a success clears the last renewal
+    /// error, and a failure of the exchange with the server becomes it. A failure the guard
+    /// raised itself (the certificate presented is outside its window, ZC-E0811, before any
+    /// connection) is not recorded, so the real cause stays named in the next ZC-E0811.
+    pub fn step_guarded(
+        self: *Peer,
+        guard: ?*api_tls_guard.Guard,
+        transport: client_mod.Transport,
+        arena: Allocator,
+        lease: u64,
+        now_ms: u64,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) Error!void {
+        if (!self.due(now_ms)) return;
+        const raised_before = if (guard) |g| g.raised else 0;
+        self.step(transport, arena, lease, now_ms, timeout_ms, diag) catch |err| {
+            if (guard) |g| g.renewal_failed(diag, raised_before);
+            return err;
+        };
+        if (guard) |g| g.renewed();
+    }
+
     fn join(
         self: *Peer,
         transport: client_mod.Transport,
@@ -211,7 +235,7 @@ pub const Peer = struct {
             diag.cause("zcube-server will not issue node {s} a peer credential", .{self.node});
             diag.cause("the name is on the server's list of removed names (revoked)", .{});
             const sentence = "if the node belongs here, take it off the server's revoked file " ++
-                "(the server rereads it within a second)";
+                "(the server rereads it within 5 seconds)";
             diag.fix(.{ .sentence = sentence });
             return error.Failed;
         }
@@ -895,4 +919,116 @@ test "a renewal that fails keeps the pair the agent has" {
     var restarted = try Peer.open(io, state.path(), "node1", &diag);
     defer restarted.close();
     try std.testing.expectEqualSlices(u8, renewed.slice(), restarted.node_certificate.?.slice());
+}
+
+/// `Canned` behind the agent's check before each connection, as `agent_http.Client.call` does
+/// it: a certificate outside its window fails the call before the server sees it.
+const Guarded = struct {
+    canned: *Canned,
+    guard: *api_tls_guard.Guard,
+    credentials: *@import("api_tls_client.zig").Credentials,
+
+    fn transport(guarded: *Guarded) client_mod.Transport {
+        return .{ .context = guarded, .call_fn = call };
+    }
+
+    fn call(
+        context: *anyopaque,
+        arena: Allocator,
+        request: client_mod.Request,
+        diag: *Diag,
+    ) client_mod.Error!client_mod.Reply {
+        const guarded: *Guarded = @ptrCast(@alignCast(context));
+        guarded.guard.check(guarded.credentials, diag) catch return error.Unreachable;
+        return Canned.call(guarded.canned, arena, request, diag);
+    }
+};
+
+test "a guarded step records the server's refusal, clears it on renewal, and keeps it past E0811" {
+    // Goal: review of slice 5, S1 and S4. The guard is told how each credential step went: a
+    // refusal by the server (ZC-E0807) is the last renewal error, a renewal clears it, and the
+    // guard's own ZC-E0811 (the certificate presented has expired) does not replace it, so the
+    // next ZC-E0811 still names ZC-E0807. Method: a manual clock; the agent presents the node
+    // certificate of its join; the server's answers are canned.
+    const io = std.testing.io;
+    var state: TestState = undefined;
+    try state.make(io);
+    defer state.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    var agent = try Peer.open(io, state.path(), "node1", &diag);
+    defer agent.close();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ca = try Ed25519.KeyPair.generateDeterministic(@splat(11));
+    const mine = agent.key.public_key.toBytes();
+    var canned: Canned = .{ .status = 200, .body = try issued_body(arena, ca, ca, "node1", mine) };
+    try std.testing.expect(try_step(&agent, &canned, 2000, &diag));
+    var clock: @import("clock.zig").ManualClock = .{ .ms = 2000 };
+    var credentials: @import("api_tls_client.zig").Credentials = undefined;
+    credentials.anchor = ca.public_key.toBytes();
+    credentials.server_name = "zcube-server";
+    credentials.certificate = .{};
+    const first = agent.node_certificate.?;
+    try std.testing.expectEqual(null, credentials.present(&first, agent.key, "node1", 2000));
+    var guard: api_tls_guard.Guard = .{
+        .io = io,
+        .wall = clock.clock(),
+        .fallback = null,
+        .silent = true,
+    };
+    var guarded: Guarded = .{ .canned = &canned, .guard = &guard, .credentials = &credentials };
+    const removed =
+        \\{"request_id":"r-2","diagnostics":[{"code":"ZC-E0807","summary":"removed",
+        \\"causes":["node1 is on the list"]}]}
+    ;
+    const later = try certified(arena, ca, mine, .later);
+    const steps = [_]struct { status: u16, body: []const u8, code: ?codes.Code, last: []const u8 }{
+        .{ .status = 403, .body = removed, .code = .E0807, .last = "ZC-E0807" },
+        .{ .status = 200, .body = later, .code = null, .last = "none" },
+        .{ .status = 403, .body = removed, .code = .E0807, .last = "ZC-E0807" },
+    };
+    for (steps) |case| {
+        canned = .{ .status = case.status, .body = case.body };
+        clock.ms = @max(agent.renew_at_ms, agent.retry_at_ms);
+        diag.reset();
+        const passed = guarded_step(&agent, &guard, &guarded, arena, clock.ms, &diag);
+        try std.testing.expectEqual(case.code, diag.code);
+        try std.testing.expectEqual(case.code == null, passed);
+        try std.testing.expect(std.mem.startsWith(u8, guard.renewal_error(), case.last));
+    }
+    // The certificate presented (the join's, which the agent has not switched from) expires.
+    const expired_ms = 1000 + 86_400_000 + constants.peer_clock_skew_ms;
+    for (0..2) |_| {
+        clock.ms = @max(expired_ms, agent.retry_at_ms);
+        diag.reset();
+        canned.calls = 0;
+        try std.testing.expect(!guarded_step(&agent, &guard, &guarded, arena, clock.ms, &diag));
+        try std.testing.expectEqual(@as(?codes.Code, .E0811), diag.code);
+        try std.testing.expectEqual(@as(u32, 0), canned.calls);
+        try std.testing.expect(std.mem.startsWith(u8, guard.renewal_error(), "ZC-E0807"));
+        try std.testing.expect(diag_names(&diag, "last renewal error: ZC-E0807"));
+    }
+}
+
+fn guarded_step(
+    agent: *Peer,
+    guard: *api_tls_guard.Guard,
+    guarded: *Guarded,
+    arena: Allocator,
+    now_ms: u64,
+    diag: *Diag,
+) bool {
+    agent.step_guarded(guard, guarded.transport(), arena, 7, now_ms, 1000, diag) catch
+        return false;
+    return true;
+}
+
+fn diag_names(diag: *const Diag, text: []const u8) bool {
+    var index: u32 = 0;
+    while (index < diag.causes.count) : (index += 1) {
+        if (std.mem.indexOf(u8, diag.causes.items[index].slice(), text) != null) return true;
+    }
+    return false;
 }

@@ -199,7 +199,9 @@ checks the certificate it presents before each new API connection (B7 slice 5,
   with `ZC-E0811`, whose causes name the expiry, the last renewal error and why `--cert` was not
   used; the agent's loop shows it once per streak and paces its retries as for a server it
   cannot reach. Recovery is as above: issue the node a new certificate and give it to the agent
-  as `--cert` and `--key` (the files are read when needed, so a restart is not required).
+  as `--cert` and `--key`. An agent started with `--cert` and `--key` reads those files when it
+  needs them, so writing the new files there is enough; one started without them must be
+  restarted with them.
 
 ## The chunk store, the peer server and `fetch` (C2 slice 6b)
 

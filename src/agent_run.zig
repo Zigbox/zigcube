@@ -120,8 +120,10 @@ const Shell = struct {
         shell.diag.reset();
         const had = shell.peer.credential != null;
         const arena = shell.arena.allocator();
-        shell.peer.step(shell.peer_transport, arena, lease, now_ms, timeout_ms, &shell.diag) catch {
-            if (shell.guard) |guard| guard.renewal_failed(&shell.diag);
+        const transport = shell.peer_transport;
+        const guard = shell.guard;
+        const diag = &shell.diag;
+        shell.peer.step_guarded(guard, transport, arena, lease, now_ms, timeout_ms, diag) catch {
             if (!shell.peer.reported) {
                 shell.peer.reported = true;
                 shell.show("\n", &shell.diag, "zcube-agent: running on; it will try again\n");
@@ -129,7 +131,6 @@ const Shell = struct {
             shell.diag.reset();
             return;
         };
-        if (shell.guard) |guard| guard.renewed();
         if (shell.tls) |credentials| {
             // The CA of `--ca` issued it (the server is pinned to it), so it is presented; one
             // that is not usable keeps the certificate presented so far.

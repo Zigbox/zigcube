@@ -565,14 +565,14 @@ const Kept = struct {
         return out.items;
     }
 
-    /// True once the server has ended the connection: a clean close or a closed transport.
+    /// True once the server has ended the connection cleanly: its close_notify, read as the end
+    /// of the stream. A reset, or a close with no close_notify, is an error and false: the
+    /// refusal must reach the client whole (review of slice 5, S5).
     fn ended(kept: *Kept) bool {
         var diag: Diag = undefined;
         diag.reset();
         var chunk: [256]u8 = undefined;
-        const length = kept.conn.read(&chunk, kept.end_ms, &diag) catch |err| {
-            return err != error.Timeout;
-        };
+        const length = kept.conn.read(&chunk, kept.end_ms, &diag) catch return false;
         return length == 0;
     }
 };

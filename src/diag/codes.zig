@@ -1684,7 +1684,7 @@ pub const registry = [_]Entry{
         \\peers refuse it; a certificate already issued stays valid until it expires.
         \\
         \\For a node that should be in the cluster: remove its name from the revoked
-        \\file; the server rereads it within a second and the agent asks again by
+        \\file; the server rereads it within 5 seconds and the agent asks again by
         \\itself.
         \\For a client: remove its name from the revoked file and run
         \\zcube-server ca issue-client again, or choose another name.

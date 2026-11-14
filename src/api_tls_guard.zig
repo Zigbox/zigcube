@@ -64,10 +64,17 @@ pub const Guard = struct {
     lines: u32 = 0,
     line_buffer: [line_bytes_max]u8 = undefined,
     line_length: u16 = 0,
+    /// How many times `check` failed with its own ZC-E0811. A credential step that fails while
+    /// this moves failed here, before any exchange with the server: `renewal_failed` must not
+    /// record it, or the real cause (say ZC-E0807) is lost (review of slice 5, S1).
+    raised: u32 = 0,
 
     /// Records the agent's latest failed credential step (a join or renewal): its code and its
-    /// last cause.
-    pub fn renewal_failed(guard: *Guard, diag: *const Diag) void {
+    /// last cause. A failure the guard raised itself is not a renewal error; the caller passes
+    /// `raised` as it was before the step (`agent_peer.Peer.step_guarded`).
+    pub fn renewal_failed(guard: *Guard, diag: *const Diag, raised_before: u32) void {
+        assert(raised_before <= guard.raised);
+        if (guard.raised != raised_before) return;
         const code = diag.code orelse return;
         const cause = diag.last_cause() orelse "no cause given";
         const text = std.fmt.bufPrint(&guard.renewal_error_buffer, "ZC-{t}: {s}", .{
@@ -152,6 +159,7 @@ pub const Guard = struct {
                 "agent the two files as --cert and --key (docs/agent.md)",
             .command = "zcube-server ca issue-node NAME --replace",
         });
+        guard.raised += 1;
         return error.Failed;
     }
 

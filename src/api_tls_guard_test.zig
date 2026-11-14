@@ -127,7 +127,7 @@ test "guard: past 3/4 of its life it warns once, naming the expiry and the renew
     failed.reset();
     failed.raise(.E0802);
     failed.cause("the server refused the renewal", .{});
-    rig.guard.renewal_failed(&failed);
+    rig.guard.renewal_failed(&failed, rig.guard.raised);
     try testing.expectEqual(@as(?Code, null), rig.check(late_ms));
     try testing.expectEqual(@as(u32, 1), rig.guard.lines);
     const line = rig.guard.last_line();
@@ -215,4 +215,35 @@ test "teeth: with the agent's check skipped an expired certificate is presented"
     api_tls_guard.set_test_fault(.check, true);
     defer api_tls_guard.set_test_fault(.check, false);
     try testing.expect(!expired_refused(&rig));
+}
+
+test "guard: the --cert note is written once per expired certificate, again for a new one" {
+    // Goal: review of slice 5, S3. The note is keyed on the expired certificate's not_after.
+    // Method: the stored certificate expires and --cert takes its place (one note); the
+    // credentials are made to present the expired one again (as a caller that put it back
+    // would), and the next check switches again with no second note. A different expired
+    // certificate then gets its own note.
+    var rig: Rig = .{};
+    var cert: Issued = .{};
+    try rig.start(&cert, true);
+    try rig.issue(&cert, 3, born_ms + day_ms / 2, born_ms + 4 * day_ms);
+    const after_ms = born_ms + day_ms + 120_000;
+    try testing.expectEqual(@as(?Code, null), rig.check(after_ms));
+    try testing.expectEqual(@as(u32, 1), rig.guard.lines);
+    try testing.expectEqual(null, rig.credentials.present(
+        &rig.stored.der,
+        rig.stored.key,
+        "node1",
+        born_ms,
+    ));
+    try testing.expectEqual(@as(?Code, null), rig.check(after_ms + 60_000));
+    try testing.expect(rig.presents(&cert));
+    try testing.expectEqual(@as(u32, 1), rig.guard.lines);
+    try testing.expectEqual(@as(u32, 2), rig.memory.loads);
+    var other: Issued = .{};
+    try rig.issue(&other, 5, born_ms, born_ms + day_ms + day_ms / 2);
+    try testing.expectEqual(null, rig.credentials.present(&other.der, other.key, "node1", born_ms));
+    try testing.expectEqual(@as(?Code, null), rig.check(born_ms + 2 * day_ms));
+    try testing.expect(rig.presents(&cert));
+    try testing.expectEqual(@as(u32, 2), rig.guard.lines);
 }
