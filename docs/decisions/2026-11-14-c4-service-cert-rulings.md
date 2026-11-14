@@ -82,9 +82,15 @@ and knows a replica's node, epoch and digest can have one for a key of their own
 The strong world changed: the issuer goes through `look_up`, the refusal set gained `short_pin`
 (the report's `refused by` line), M3r runs and the supervisor tick judges it. A `--strong` replay
 line (and any `auto` line, which switches `--strong` on) written before this slice may run a
-different world. Worlds without `--strong` are unchanged: the fix session compared reports of
-non-strong runs against a0a6847 byte for byte (the handoff report lists the seeds). AGENTS.md's
-sim-c1 entry says so.
+different world. These fixes leave worlds without `--strong` unchanged: whole reports of
+`sim_cluster <seed> 120 --c1` (seeds 11, 19, 42) and `sim_cluster 9 60` are byte-identical to the
+merge they start from (f2be6d4). Against a0a6847, as the ruling asked: seeds 3 and 7 (`--c1`) and
+plain seed 5 are identical, but seeds 11, 19, 42 (`--c1`) and plain seed 9 differ in the `world
+hash` line alone (every count the same). Slice 3 as first written (6431405) was identical to
+a0a6847 on seeds 11 and 19; the difference arrives with slice 2's merge (5a266c8), which this
+branch took in, so it is slice 2's, not this slice's: a non-strong replay line from before slice 2
+replays the same run, and its final world hash can differ. AGENTS.md's sim-c1 entry says the
+`--strong` part.
 
 ## 8. No assert on stored data
 
