@@ -4,7 +4,7 @@
 # - a soak that failed is filed under `sim-soak` with its replay and its trace;
 # - a soak that died is recorded as CRASHED with a replay one epoch past its last epoch line;
 # - the binaries are copies, so run.sh may prune its own while a soak runs;
-# - settings that are not numbers are refused.
+# - settings that are not numbers, a second soak and a missing token are refused.
 # Usage: test-soak.sh PATH-TO-sim_fleet. Exits 1 on a failure.
 set -eu
 fleet=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -80,6 +80,20 @@ expect "sim-soak"
 expect "integer overflow"
 expect "zig-out/bin/sim_cluster 42 soak --soak-operations=300 --soak-epoch=100"
 [ -f "$state/soak/last-1.log" ] || fail "the round before was not kept"
+
+case_name="a second soak.sh while one holds the lock"
+code=0
+out=$(flock "$state/soak/lock" env SIM_FLEET_STATE_DIR="$state" SIM_FLEET_DRY_RUN=1 \
+    SIM_SOAK_ROUNDS=1 sh "$here/soak.sh" 2>&1) || code=$?
+[ "$code" -eq 2 ] || fail "exited $code: $out"
+expect "another soak.sh holds $state/soak/lock; exiting"
+
+case_name="no token and no dry run"
+code=0
+out=$(env -u CREDENTIALS_DIRECTORY -u SIM_FLEET_TOKEN_FILE SIM_FLEET_STATE_DIR="$state" \
+    SIM_FLEET_DRY_RUN= sh "$here/soak.sh" 2>&1) || code=$?
+[ "$code" -eq 2 ] || fail "exited $code: $out"
+expect "no token: set SIM_FLEET_TOKEN_FILE"
 
 case_name="a setting that is not a number"
 code=0
