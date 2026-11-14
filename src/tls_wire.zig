@@ -49,8 +49,14 @@ pub const handshake_key_update: u8 = 24;
 pub const suite_aes_128_gcm_sha256: u16 = 0x1301;
 /// x25519, the only group offered.
 pub const group_x25519: u16 = 0x001d;
-/// ed25519, the only signature scheme offered.
+/// ed25519, the only signature scheme a Zigcube client offers.
 pub const scheme_ed25519: u16 = 0x0807;
+/// ecdsa_secp256r1_sha256: a server with a browser identity takes it from a client that does not
+/// offer ed25519 (docs/decisions/2026-11-14-b7-slice6-console-over-tls.md).
+pub const scheme_ecdsa_p256: u16 = 0x0403;
+
+/// The signature scheme of a handshake: each has its own CA, certificates and keys.
+pub const Scheme = enum { ed25519, ecdsa_p256 };
 pub const version_tls13: u16 = 0x0304;
 pub const version_tls12: u16 = 0x0303;
 
@@ -503,6 +509,11 @@ pub fn parse_certificate_request(body: []const u8) Error!Request {
 
 /// A `SignatureSchemeList`: a non-empty, even-length vector of two-byte schemes.
 fn lists_ed25519(data: []const u8) Error!bool {
+    return lists_scheme(data, scheme_ed25519);
+}
+
+/// signature_algorithms: a two-byte length, then two-byte schemes. Whether `wanted` is listed.
+fn lists_scheme(data: []const u8, wanted: u16) Error!bool {
     var reader = Reader.init(data);
     const list = try reader.vector16();
     try reader.finish();
@@ -511,7 +522,7 @@ fn lists_ed25519(data: []const u8) Error!bool {
     var found = false;
     var at: usize = 0;
     while (at < list.len) : (at += 2) {
-        if (std.mem.readInt(u16, list[at..][0..2], .big) == scheme_ed25519) found = true;
+        if (std.mem.readInt(u16, list[at..][0..2], .big) == wanted) found = true;
     }
     return found;
 }
@@ -528,6 +539,10 @@ pub const ClientHello = struct {
     public_key: [32]u8,
     /// The client offers 0-RTT data, which this server never takes.
     early_data: bool,
+    /// signature_algorithms lists ed25519.
+    ed25519: bool,
+    /// signature_algorithms lists ecdsa_secp256r1_sha256 (a browser's).
+    ecdsa_p256: bool,
 };
 
 const ClientExtensions = struct {
@@ -537,6 +552,7 @@ const ClientExtensions = struct {
     key: ?[32]u8 = null,
     /// signature_algorithms lists Ed25519; null if the extension is absent.
     ed25519: ?bool = null,
+    ecdsa_p256: bool = false,
     early_data: bool = false,
 };
 
@@ -570,8 +586,14 @@ pub fn parse_client_hello(body: []const u8) Error!ClientHello {
     if (compression[0] != 0) return error.IllegalParameter;
     const key = parsed.key orelse return error.Group;
     const ed25519 = parsed.ed25519 orelse return error.MissingExtension;
-    if (!ed25519) return error.SignatureScheme;
-    return .{ .session_id = session_id, .public_key = key, .early_data = parsed.early_data };
+    if (!ed25519 and !parsed.ecdsa_p256) return error.SignatureScheme;
+    return .{
+        .session_id = session_id,
+        .public_key = key,
+        .early_data = parsed.early_data,
+        .ed25519 = ed25519,
+        .ecdsa_p256 = parsed.ecdsa_p256,
+    };
 }
 
 fn read_client_extensions(reader: *Reader, parsed: *ClientExtensions) Error!void {
@@ -589,7 +611,10 @@ fn read_client_extensions(reader: *Reader, parsed: *ClientExtensions) Error!void
         switch (kind) {
             ext_supported_versions => parsed.tls13 = try lists_version(data),
             ext_key_share => try read_client_key_share(data, parsed),
-            ext_signature_algorithms => parsed.ed25519 = try lists_ed25519(data),
+            ext_signature_algorithms => {
+                parsed.ed25519 = try lists_ed25519(data);
+                parsed.ecdsa_p256 = try lists_scheme(data, scheme_ecdsa_p256);
+            },
             ext_early_data => {
                 if (data.len != 0) return error.Malformed;
                 parsed.early_data = true;
@@ -689,6 +714,17 @@ pub const certificate_request_message = [_]u8{
     0x08, 0x07,
 };
 
+/// The browser path's CertificateRequest: the same, listing ecdsa_secp256r1_sha256 only.
+pub const certificate_request_message_p256 = [_]u8{
+    handshake_certificate_request, 0, 0, 11, // type, length
+    0, // certificate_request_context: empty
+    0,    8, // extensions
+    0,    @intCast(ext_signature_algorithms),
+    0,    4,
+    0,    2,
+    0x04, 0x03,
+};
+
 /// Bytes of a Certificate message with an empty context and up to `tls_chain_certificates_max`
 /// certificates of `x509_cert_bytes_max` each, without extensions.
 pub const certificate_bytes_max: u32 = 4 + 1 + 3 +
@@ -729,6 +765,41 @@ pub fn write_certificate_verify(signature: *const [64]u8) [certificate_verify_by
     std.mem.writeInt(u16, out[6..8], 64, .big);
     @memcpy(out[8..], signature);
     return out;
+}
+
+/// Bytes of a CertificateVerify message of either scheme at most: an ECDSA signature in DER
+/// takes up to 72 bytes.
+pub const certificate_verify_bytes_max: u32 = 4 + 2 + 2 + ecdsa_der_bytes_max;
+const ecdsa_der_bytes_max: u32 = 72;
+/// The shortest DER ECDSA signature: a sequence of two one-byte integers.
+const ecdsa_der_bytes_min: u32 = 8;
+
+/// An ecdsa_secp256r1_sha256 CertificateVerify with `signature`, a DER ECDSA-Sig-Value.
+pub fn write_certificate_verify_p256(
+    out: *[certificate_verify_bytes_max]u8,
+    signature: []const u8,
+) []const u8 {
+    assert(signature.len >= ecdsa_der_bytes_min);
+    assert(signature.len <= ecdsa_der_bytes_max);
+    out[0] = handshake_certificate_verify;
+    std.mem.writeInt(u24, out[1..4], @intCast(2 + 2 + signature.len), .big);
+    std.mem.writeInt(u16, out[4..6], scheme_ecdsa_p256, .big);
+    std.mem.writeInt(u16, out[6..8], @intCast(signature.len), .big);
+    @memcpy(out[8..][0..signature.len], signature);
+    return out[0 .. 8 + signature.len];
+}
+
+/// An ecdsa_secp256r1_sha256 CertificateVerify: the scheme, and the DER signature it carries
+/// (its encoding is checked where it is verified).
+pub fn parse_certificate_verify_p256(body: []const u8) Error![]const u8 {
+    var reader = Reader.init(body);
+    const scheme = try reader.read_u16();
+    const signature = try reader.vector16();
+    try reader.finish();
+    if (scheme != scheme_ecdsa_p256) return error.SignatureScheme;
+    if (signature.len < ecdsa_der_bytes_min) return error.Malformed;
+    if (signature.len > ecdsa_der_bytes_max) return error.Malformed;
+    return signature;
 }
 
 /// Whether a well-formed Certificate body holds no certificate: the client's way of saying it has

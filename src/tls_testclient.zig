@@ -14,6 +14,8 @@ const schedule = @import("tls_schedule.zig");
 const wire = @import("tls_wire.zig");
 const x509 = @import("x509.zig");
 const x509_test = @import("x509_test.zig");
+const p256 = @import("x509_p256.zig");
+const p256_test = @import("x509_p256_test.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -33,7 +35,8 @@ pub const Hello = struct {
     key_bytes: u16 = 32,
     /// The x25519 key is all zero: a low-order point.
     low_order: bool = false,
-    signature_algorithms: enum { ed25519, other, absent } = .ed25519,
+    /// `chrome` is Chromium's list, which has ecdsa_secp256r1_sha256 and no ed25519.
+    signature_algorithms: enum { ed25519, other, absent, chrome } = .ed25519,
     /// The one compression method offered.
     compression: u8 = 0,
     session_id: bool = true,
@@ -59,8 +62,11 @@ pub const Chain = enum {
     client_kind,
     three,
     tampered,
+    /// A browser client certificate (P-256, from the browser CA) on the Ed25519 path.
+    browser_client,
 };
-pub const Verify = enum { good, omit, wrong_key, server_context, bad_scheme, flipped };
+/// `high_s`: the browser path's ECDSA signature with S replaced by n - S, as a browser may send.
+pub const Verify = enum { good, omit, wrong_key, server_context, bad_scheme, flipped, high_s };
 pub const Finished = enum { good, bad, omit };
 
 /// What the client's last flight gets wrong.
@@ -87,6 +93,10 @@ pub const Faults = struct {
 
 pub const Config = struct {
     ca: Ed25519.KeyPair,
+    /// The browser CA: when set, the client takes the browser path with a P-256 certificate.
+    /// `client_kind` and `node_kind` then present the cluster CA's Ed25519 certificates (the
+    /// cross path), `server_kind` a browser server certificate.
+    browser: ?p256.KeyPair = null,
     now_ms: u64 = x509_test.now,
     random: [32]u8 = @splat(0x44),
     secret: [32]u8 = @splat(0x55),
@@ -109,6 +119,8 @@ pub const Client = struct {
     finished_seen: bool,
     leaf: x509.Der,
     ca_certificate: x509.Der,
+    p256_key: p256.KeyPair,
+    server_point: p256.Point,
 
     pub fn init(self: *Client, config: Config) !void {
         self.config = config;
@@ -117,6 +129,9 @@ pub const Client = struct {
         self.secrets = schedule.Schedule.init();
         self.received_length = 0;
         self.finished_seen = false;
+        self.p256_key = try p256_test.key(0x67);
+        self.server_point = @splat(0);
+        if (config.browser) |browser| return self.issue_browser(browser);
         try self.issue();
     }
 
@@ -144,6 +159,13 @@ pub const Client = struct {
                 const client = x509_test.client_request(key, .jobs);
                 try x509.issue_client(&self.leaf, ca, &client);
             },
+            .browser_client => try p256.issue_client(&self.leaf, try p256_test.ca_key(), &.{
+                .cluster = "prod",
+                .client = "alice",
+                .scope = .jobs,
+                .subject_key = p256.point_of(try p256_test.key(0x67)),
+                .lifetime = p256_test.leaf_lifetime,
+            }),
             else => try x509.issue_workload(&self.leaf, signer, &request),
         }
         if (self.config.faults.chain == .tampered) {
@@ -151,6 +173,49 @@ pub const Client = struct {
             bytes[bytes.len - 10] ^= 0x01; // Inside the signature.
         }
         try x509.issue_ca(&self.ca_certificate, ca, x509_test.window);
+    }
+
+    fn issue_browser(self: *Client, ca: p256.KeyPair) !void {
+        const point = p256.point_of(self.p256_key);
+        var signer = ca;
+        var lifetime = p256_test.leaf_lifetime;
+        switch (self.config.faults.chain) {
+            .other_ca => signer = try p256_test.key(0xCD),
+            .expired => lifetime = .{
+                .not_before_ms = x509_test.now - 3 * x509_test.hour,
+                .not_after_ms = x509_test.now - 2 * x509_test.hour,
+            },
+            else => {},
+        }
+        const ed25519_key = self.key.public_key.toBytes();
+        switch (self.config.faults.chain) {
+            .server_kind => try p256.issue_server(&self.leaf, ca, &.{
+                .dns_name = "client.botpike.com",
+                .sans = &.{},
+                .subject_key = point,
+                .lifetime = lifetime,
+            }),
+            .node_kind => {
+                const cluster_ca = self.config.ca;
+                try x509.issue_node(&self.leaf, cluster_ca, &x509_test.node_request(ed25519_key));
+            },
+            .client_kind => {
+                const client = x509_test.client_request(ed25519_key, .jobs);
+                try x509.issue_client(&self.leaf, self.config.ca, &client);
+            },
+            else => try p256.issue_client(&self.leaf, signer, &.{
+                .cluster = "prod",
+                .client = "alice",
+                .scope = .jobs,
+                .subject_key = point,
+                .lifetime = lifetime,
+            }),
+        }
+        if (self.config.faults.chain == .tampered) {
+            const bytes = self.leaf.bytes[self.leaf.start..];
+            bytes[bytes.len - 10] ^= 0x01; // Inside the signature.
+        }
+        try p256.issue_ca(&self.ca_certificate, ca, x509_test.window);
     }
 
     // ---- The ClientHello ----------------------------------------------------------------------
@@ -201,6 +266,12 @@ pub const Client = struct {
         switch (knobs.signature_algorithms) {
             .ed25519 => w.bytes(&.{ 0, 13, 0, 6, 0, 4, 0x04, 0x03, 0x08, 0x07 }),
             .other => w.bytes(&.{ 0, 13, 0, 4, 0, 2, 0x04, 0x03 }),
+            .chrome => w.bytes(&.{
+                0,    13,   0,    18,   0,    16,
+                0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
+                0x05, 0x03, 0x08, 0x05, 0x05, 0x01,
+                0x08, 0x06, 0x06, 0x01,
+            }),
             .absent => {},
         }
         const version: u8 = if (knobs.tls13) 0x04 else 0x03;
@@ -295,6 +366,16 @@ pub const Client = struct {
             },
             wire.handshake_certificate => {
                 const chain = wire.parse_certificate(body) catch return error.BadFlight;
+                if (self.config.browser) |browser| {
+                    const anchor = p256.point_of(browser);
+                    const parsed = p256.verify(chain.leaf, anchor, self.config.now_ms, .{
+                        .kind = .server,
+                        .name = null,
+                    }) catch return error.BadFlight;
+                    self.server_point = parsed.point(chain.leaf);
+                    self.transcript.add(message);
+                    return wire.handshake_certificate_verify;
+                }
                 const anchor = self.config.ca.public_key.toBytes();
                 const parsed = x509.verify(chain.leaf, anchor, self.config.now_ms, .{
                     .kind = .server,
@@ -305,6 +386,7 @@ pub const Client = struct {
                 return wire.handshake_certificate_verify;
             },
             wire.handshake_certificate_verify => {
+                if (self.config.browser != null) return self.read_browser_verify(message);
                 const signature = wire.parse_certificate_verify(body) catch return error.BadFlight;
                 const hash = self.transcript.hash();
                 const content = schedule.certificate_verify_content(.server, &hash);
@@ -329,6 +411,19 @@ pub const Client = struct {
             },
             else => return error.BadFlight,
         }
+    }
+
+    /// The browser path's server CertificateVerify: ECDSA P-256, strict DER, and a low S (this
+    /// server normalises it, so a high one is a server bug).
+    fn read_browser_verify(self: *Client, message: []const u8) Error!u8 {
+        const signature = wire.parse_certificate_verify_p256(message[4..]) catch
+            return error.BadFlight;
+        const hash = self.transcript.hash();
+        const content = schedule.certificate_verify_content(.server, &hash);
+        p256.signature_verify(self.server_point, &content, signature, .low_s) catch
+            return error.BadFlight;
+        self.transcript.add(message);
+        return wire.handshake_finished;
     }
 
     // ---- The client's flight ------------------------------------------------------------------
@@ -419,6 +514,7 @@ pub const Client = struct {
     fn verify_message(self: *Client, out: []u8) ?[]const u8 {
         const faults = self.config.faults;
         if (faults.verify == .omit) return null;
+        if (self.config.browser != null) return self.verify_message_p256(out);
         const role: schedule.CertificateRole =
             if (faults.verify == .server_context) .server else .client;
         const content = schedule.certificate_verify_content(role, &self.transcript.hash());
@@ -432,6 +528,27 @@ pub const Client = struct {
         var message = wire.write_certificate_verify(&bytes);
         if (faults.verify == .bad_scheme) std.mem.writeInt(u16, message[4..6], 0x0403, .big);
         @memcpy(out[0..message.len], &message);
+        return out[0..message.len];
+    }
+
+    fn verify_message_p256(self: *Client, out: []u8) []const u8 {
+        const faults = self.config.faults;
+        const role: schedule.CertificateRole =
+            if (faults.verify == .server_context) .server else .client;
+        const content = schedule.certificate_verify_content(role, &self.transcript.hash());
+        var key = self.p256_key;
+        if (faults.verify == .wrong_key) {
+            key = p256_test.key(0x99) catch unreachable; // A fixed seed.
+        }
+        var signature = p256.sign(key, &content);
+        if (faults.verify == .high_s) signature.s = p256.negate(signature.s);
+        if (faults.verify == .flipped) signature.r[20] ^= 0x10;
+        var der: [p256.signature_der_bytes_max]u8 = undefined;
+        const encoded = p256.signature_write(&der, signature);
+        var buffer: [wire.certificate_verify_bytes_max]u8 = undefined;
+        const message = wire.write_certificate_verify_p256(&buffer, encoded);
+        @memcpy(out[0..message.len], message);
+        if (faults.verify == .bad_scheme) std.mem.writeInt(u16, out[4..6], 0x0807, .big);
         return out[0..message.len];
     }
 

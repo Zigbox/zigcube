@@ -10,6 +10,12 @@
 //! TLS_AES_128_GCM_SHA256 and Ed25519, no HelloRetryRequest, no session tickets, no PSK, no early
 //! data, client authentication always required, and only this cluster's CA.
 //!
+//! The browser path (docs/decisions/2026-11-14-b7-slice6-console-over-tls.md): a server given a
+//! `Browser` identity answers a ClientHello that does not list ed25519 but lists
+//! ecdsa_secp256r1_sha256 with its P-256 certificate, and then takes only a client certificate
+//! the cluster's browser CA signed (`x509_p256.zig`). The two paths never mix: the scheme the
+//! ClientHello picks decides the CA, the certificates and the signatures of the whole handshake.
+//!
 //! The rules it keeps, the client's: a plaintext change_cipher_spec is dropped before `open`
 //! ever sees it; a failed `open` wipes the record buffer and the keys; bytes behind a key change
 //! in one record are refused; after a fatal error nothing more is produced but the one alert.
@@ -25,6 +31,7 @@ const schedule = @import("tls_schedule.zig");
 const tls_client = @import("tls_client.zig");
 const wire = @import("tls_wire.zig");
 const x509 = @import("x509.zig");
+const p256 = @import("x509_p256.zig");
 
 const Diag = diag_mod.Diag;
 const Code = @import("diag/codes.zig").Code;
@@ -52,6 +59,18 @@ pub const Config = struct {
     /// a client's for the API (docs/decisions/2026-11-13-api-listener-cert-kinds.md). Required:
     /// a listener that forgot it fails to compile instead of taking a default kind.
     client_kinds: x509.Kinds,
+    /// The browser path; null on every listener but the API's.
+    browser: ?Browser = null,
+};
+
+/// The browser path's identity: the browser CA, the P-256 server certificate and its key.
+pub const Browser = struct {
+    /// The browser CA's public key: the only issuer a browser client certificate may have.
+    anchor: p256.Point,
+    /// The P-256 server certificate (and optionally the browser CA's after it). Copied by `init`.
+    certificates: []const []const u8,
+    /// The server certificate's key; it must outlive the connection.
+    key: *const p256.KeyPair,
 };
 
 /// The client the handshake authenticated.
@@ -70,13 +89,15 @@ const peer_name_bytes_max: u32 =
 /// CertificateRequest, Certificate, CertificateVerify and Finished.
 const flight_content_bytes_max: u32 = wire.encrypted_extensions_message.len +
     wire.certificate_request_message.len + wire.certificate_bytes_max +
-    wire.certificate_verify_bytes + 4 + schedule.hash_bytes;
+    wire.certificate_verify_bytes_max + 4 + schedule.hash_bytes;
 
 /// What one step writes at most: the ServerHello record, the change_cipher_spec and the flight.
 pub const output_bytes_max: u32 = header_bytes + wire.server_hello_bytes_max + (header_bytes + 1) +
     header_bytes + flight_content_bytes_max + 1 + schedule.tag_bytes;
 
 comptime {
+    assert(wire.certificate_request_message.len == wire.certificate_request_message_p256.len);
+    assert(wire.certificate_verify_bytes <= wire.certificate_verify_bytes_max);
     assert(flight_content_bytes_max <= constants.tls_record_plaintext_bytes_max);
     assert(output_bytes_max >= schedule.sealed_bytes(flight_content_bytes_max));
     assert(output_bytes_max >= schedule.sealed_bytes(schedule.key_update_bytes));
@@ -136,6 +157,16 @@ pub const Server = struct {
     identity_lengths: [constants.tls_chain_certificates_max]u32,
     identity_count: u32,
     signer: Signer,
+    /// The scheme the ClientHello picked: ed25519 unless the client lists only the browser's.
+    scheme: wire.Scheme,
+    browser_enabled: bool,
+    browser_anchor: p256.Point,
+    browser_identity: [constants.tls_chain_certificates_max][constants.x509_cert_bytes_max]u8,
+    browser_identity_lengths: [constants.tls_chain_certificates_max]u32,
+    browser_identity_count: u32,
+    browser_key: ?*const p256.KeyPair,
+    /// The browser client certificate's P-256 key (the `ecdsa_p256` path's `leaf_key`).
+    leaf_point: p256.Point,
     schedule: schedule.Schedule,
     transcript: schedule.Transcript,
     read: schedule.Direction,
@@ -181,6 +212,7 @@ pub const Server = struct {
         }
         self.identity_count = @intCast(certificates.len);
         self.signer = config.identity.signer;
+        self.init_browser(config.browser);
         self.schedule = schedule.Schedule.init();
         self.transcript = schedule.Transcript.init();
         self.read_next = @splat(0);
@@ -202,6 +234,30 @@ pub const Server = struct {
     }
 
     /// What is ready to send. The caller sends it all and calls `drain` before the next step.
+    fn init_browser(self: *Server, browser: ?Browser) void {
+        self.scheme = .ed25519;
+        self.browser_enabled = browser != null;
+        self.browser_anchor = @splat(0);
+        self.browser_identity_lengths = @splat(0);
+        self.browser_identity_count = 0;
+        self.browser_key = null;
+        self.leaf_point = @splat(0);
+        const identity = browser orelse return;
+        // The browser path serves a client certificate's API; no other kind comes over it.
+        assert(self.client_kinds.contains(.client));
+        assert(identity.certificates.len >= 1);
+        assert(identity.certificates.len <= constants.tls_chain_certificates_max);
+        self.browser_anchor = identity.anchor;
+        self.browser_key = identity.key;
+        for (identity.certificates, 0..) |certificate, index| {
+            assert(certificate.len > 0);
+            assert(certificate.len <= constants.x509_cert_bytes_max);
+            @memcpy(self.browser_identity[index][0..certificate.len], certificate);
+            self.browser_identity_lengths[index] = @intCast(certificate.len);
+        }
+        self.browser_identity_count = @intCast(identity.certificates.len);
+    }
+
     pub fn output(self: *const Server) []const u8 {
         return self.out[0..self.out_length];
     }
@@ -568,6 +624,15 @@ pub const Server = struct {
                 .{},
             );
         }
+        if (!hello.ed25519) {
+            // The ClientHello lists the browser's scheme only; without a browser identity this
+            // server has no certificate the client would take.
+            if (!self.browser_enabled) {
+                return self.wire_failure(diag, error.SignatureScheme, "ClientHello");
+            }
+            assert(hello.ecdsa_p256);
+            self.scheme = .ecdsa_p256;
+        }
         self.transcript.add(message);
         var shared = X25519.scalarmult(self.secret, hello.public_key) catch {
             return self.fail(
@@ -621,27 +686,21 @@ pub const Server = struct {
         defer std.crypto.secureZero(u8, &content);
         var length: u32 = 0;
         length += self.append(&content, length, &wire.encrypted_extensions_message);
-        length += self.append(&content, length, &wire.certificate_request_message);
+        const request = switch (self.scheme) {
+            .ed25519 => &wire.certificate_request_message,
+            .ecdsa_p256 => &wire.certificate_request_message_p256,
+        };
+        length += self.append(&content, length, request);
         var chain: [constants.tls_chain_certificates_max][]const u8 = undefined;
-        for (0..self.identity_count) |index| {
-            chain[index] = self.identity[index][0..self.identity_lengths[index]];
-        }
-        const chain_used = chain[0..self.identity_count];
+        const chain_used = self.server_chain(&chain);
         const certificate = wire.write_certificate(content[length..], chain_used);
         self.transcript.add(certificate);
         length += @intCast(certificate.len);
         const certificate_hash = self.transcript.hash();
         const verify_content = schedule.certificate_verify_content(.server, &certificate_hash);
-        const signature = self.signer.sign(self.signer.context, &verify_content) orelse {
-            return self.fail(
-                diag,
-                .E0820,
-                .internal_error,
-                "the signer holding the server certificate's key did not sign",
-                .{},
-            );
-        };
-        length += self.append(&content, length, &wire.write_certificate_verify(&signature));
+        var verify_buffer: [wire.certificate_verify_bytes_max]u8 = undefined;
+        const verify = try self.sign_certificate_verify(diag, &verify_buffer, &verify_content);
+        length += self.append(&content, length, verify);
         const verify_hash = self.transcript.hash();
         var verify_data = schedule.finished_verify_data(&self.write.secret, &verify_hash);
         defer std.crypto.secureZero(u8, &verify_data);
@@ -662,6 +721,61 @@ pub const Server = struct {
         self.write = schedule.Direction.init(&application.server);
         self.read_next = application.client;
         assert(self.out_length <= output_bytes_max);
+    }
+
+    /// The certificates this server presents on the handshake's path, leaf first.
+    fn server_chain(
+        self: *const Server,
+        chain: *[constants.tls_chain_certificates_max][]const u8,
+    ) []const []const u8 {
+        switch (self.scheme) {
+            .ed25519 => {
+                for (0..self.identity_count) |index| {
+                    chain[index] = self.identity[index][0..self.identity_lengths[index]];
+                }
+                return chain[0..self.identity_count];
+            },
+            .ecdsa_p256 => {
+                assert(self.browser_enabled);
+                for (0..self.browser_identity_count) |index| {
+                    const length = self.browser_identity_lengths[index];
+                    chain[index] = self.browser_identity[index][0..length];
+                }
+                return chain[0..self.browser_identity_count];
+            },
+        }
+    }
+
+    /// The server's CertificateVerify on the handshake's path: Ed25519 through the signer, or
+    /// ECDSA P-256 with the browser key (deterministic, low S, DER).
+    fn sign_certificate_verify(
+        self: *Server,
+        diag: *Diag,
+        out: *[wire.certificate_verify_bytes_max]u8,
+        content: []const u8,
+    ) Error![]const u8 {
+        switch (self.scheme) {
+            .ed25519 => {
+                const signature = self.signer.sign(self.signer.context, content) orelse {
+                    return self.fail(
+                        diag,
+                        .E0820,
+                        .internal_error,
+                        "the signer holding the server certificate's key did not sign",
+                        .{},
+                    );
+                };
+                const message = wire.write_certificate_verify(&signature);
+                @memcpy(out[0..message.len], &message);
+                return out[0..message.len];
+            },
+            .ecdsa_p256 => {
+                const key = self.browser_key orelse unreachable; // Set with browser_enabled.
+                var der: [p256.signature_der_bytes_max]u8 = undefined;
+                const signature = p256.signature_write(&der, p256.sign(key.*, content));
+                return wire.write_certificate_verify_p256(out, signature);
+            },
+        }
     }
 
     /// Copies a whole handshake message into the flight, adds it to the transcript, and returns
@@ -691,6 +805,9 @@ pub const Server = struct {
             ),
             else => return self.wire_failure(diag, err, "Certificate"),
         };
+        if (self.scheme == .ecdsa_p256) {
+            return self.on_browser_certificate(diag, message, chain.leaf);
+        }
         var detail: x509.Detail = .{};
         const parsed = self.verify_client(chain.leaf, &detail) catch |err| {
             x509.raise(diag, err, "the client", &detail);
@@ -706,6 +823,44 @@ pub const Server = struct {
         self.peer_scope = if (parsed.kind == .client) parsed.scope(chain.leaf) else null;
         if (!fault_on(.transcript_client_auth)) self.transcript.add(message);
         self.state = .wait_certificate_verify;
+    }
+
+    /// The browser path's client certificate: a client's, from the browser CA, in its window.
+    fn on_browser_certificate(
+        self: *Server,
+        diag: *Diag,
+        message: []const u8,
+        leaf: []const u8,
+    ) Error!void {
+        assert(self.scheme == .ecdsa_p256);
+        const parsed = self.verify_browser_client(leaf) catch |err| {
+            var detail: x509.Detail = .{};
+            detail.kinds_expected = x509.Kinds.initOne(.client);
+            x509.raise(diag, err, "the client", &detail);
+            return self.refuse(diag, tls_client.certificate_alert(err));
+        };
+        // The kind is checked above, unless a test fault skipped that check.
+        if (!fault_on(.client_kind) and !fault_on(.client_chain)) assert(parsed.kind == .client);
+        self.leaf_point = parsed.point(leaf);
+        const name = parsed.name.of(leaf);
+        assert(name.len <= peer_name_bytes_max);
+        @memcpy(self.peer_name[0..name.len], name);
+        self.peer_name_length = @intCast(name.len);
+        self.peer_kind = p256.cluster_kind(parsed.kind);
+        self.peer_scope = if (parsed.kind == .client) parsed.scope(leaf) else null;
+        if (!fault_on(.transcript_client_auth)) self.transcript.add(message);
+        self.state = .wait_certificate_verify;
+    }
+
+    /// A browser leaf against the browser CA, the window and the client kind; the faults take
+    /// what the check would refuse, as `verify_client`'s do.
+    fn verify_browser_client(self: *const Server, leaf: []const u8) x509.Error!p256.Parsed {
+        const expect: p256.Expect = .{ .kind = .client, .name = null };
+        return p256.verify(leaf, self.browser_anchor, self.now_ms, expect) catch |err| {
+            if (fault_on(.client_chain)) return p256.parse(leaf);
+            if (err == error.WrongUse and fault_on(.client_kind)) return p256.parse(leaf);
+            return err;
+        };
     }
 
     /// The client's leaf against the cluster CA, the window and the configured kind. The faults
@@ -751,15 +906,14 @@ pub const Server = struct {
 
     fn on_certificate_verify(self: *Server, diag: *Diag, kind: u8, message: []const u8) Error!void {
         try self.expect_kind(diag, kind, wire.handshake_certificate_verify, "CertificateVerify");
-        const signature = wire.parse_certificate_verify(message[4..]) catch |err|
-            return self.wire_failure(diag, err, "CertificateVerify");
         // The signature covers the transcript up to and including Certificate, so it is checked
         // before this message joins the transcript.
         const hash = self.transcript.hash();
         const role: schedule.CertificateRole = if (fault_on(.verify_context)) .server else .client;
         const content = schedule.certificate_verify_content(role, &hash);
+        const verifies = try self.client_signature_verifies(diag, message[4..], &content);
         if (!fault_on(.certificate_verify)) {
-            if (!tls_client.ed25519_verifies(&self.leaf_key, &content, signature)) {
+            if (!verifies) {
                 return self.fail(
                     diag,
                     .E0813,
@@ -772,6 +926,31 @@ pub const Server = struct {
         if (!fault_on(.transcript_client_auth)) self.transcript.add(message);
         self.authenticated = true;
         self.state = .wait_finished;
+    }
+
+    /// Whether the client's CertificateVerify, of the handshake's scheme, verifies against its
+    /// certificate's key. ECDSA takes any S here: browsers do not normalise it (the certificate
+    /// path requires a low S; docs/decisions/2026-11-14-b7-slice6-console-over-tls.md).
+    fn client_signature_verifies(
+        self: *Server,
+        diag: *Diag,
+        body: []const u8,
+        content: []const u8,
+    ) Error!bool {
+        switch (self.scheme) {
+            .ed25519 => {
+                const signature = wire.parse_certificate_verify(body) catch |err|
+                    return self.wire_failure(diag, err, "CertificateVerify");
+                return tls_client.ed25519_verifies(&self.leaf_key, content, signature);
+            },
+            .ecdsa_p256 => {
+                const signature = wire.parse_certificate_verify_p256(body) catch |err|
+                    return self.wire_failure(diag, err, "CertificateVerify");
+                p256.signature_verify(self.leaf_point, content, signature, .any_s) catch
+                    return false;
+                return true;
+            },
+        }
     }
 
     fn on_finished(self: *Server, diag: *Diag, kind: u8, message: []const u8) Error!Event {
@@ -923,6 +1102,7 @@ pub const Server = struct {
     fn wipe_secrets(self: *Server) void {
         std.crypto.secureZero(u8, &self.secret);
         std.crypto.secureZero(u8, &self.leaf_key);
+        std.crypto.secureZero(u8, &self.leaf_point);
         std.crypto.secureZero(u8, &self.read_next);
         std.crypto.secureZero(u8, &self.record);
         std.crypto.secureZero(u8, &self.flight);

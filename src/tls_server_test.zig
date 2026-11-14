@@ -13,6 +13,8 @@ const testclient = @import("tls_testclient.zig");
 const wire = @import("tls_wire.zig");
 const x509 = @import("x509.zig");
 const x509_test = @import("x509_test.zig");
+const p256 = @import("x509_p256.zig");
+const p256_test = @import("x509_p256_test.zig");
 
 const Diag = diag_mod.Diag;
 const Code = @import("diag/codes.zig").Code;
@@ -32,6 +34,11 @@ const Rig = struct {
     server_certificate: x509.Der,
     ca_certificate: x509.Der,
     chain: [2][]const u8,
+    browser_ca: p256.KeyPair,
+    browser_key: p256.KeyPair,
+    browser_certificate: x509.Der,
+    browser_ca_certificate: x509.Der,
+    browser_chain: [2][]const u8,
     /// What the server sent.
     sent: [buffer_bytes]u8,
     sent_length: u32,
@@ -49,7 +56,34 @@ const Rig = struct {
         try rig.setup_server_kinds(.initOne(kind));
     }
 
+    /// The API's server ({node, client}) with the browser path, and a client on that path.
+    fn setup_browser(rig: *Rig, faults: testclient.Faults) !void {
+        rig.browser_ca = try p256_test.ca_key();
+        rig.browser_key = try p256_test.key(0x22);
+        try p256.issue_server(&rig.browser_certificate, rig.browser_ca, &.{
+            .dns_name = server_name,
+            .sans = &.{},
+            .subject_key = p256.point_of(rig.browser_key),
+            .lifetime = x509_test.window,
+        });
+        try p256.issue_ca(&rig.browser_ca_certificate, rig.browser_ca, x509_test.window);
+        rig.browser_chain = .{
+            rig.browser_certificate.slice(),
+            rig.browser_ca_certificate.slice(),
+        };
+        try rig.setup_server_browser(.initMany(&.{ .node, .client }), true);
+        var adjusted = faults;
+        if (adjusted.hello.signature_algorithms == .ed25519) {
+            adjusted.hello.signature_algorithms = .chrome;
+        }
+        try rig.client.init(.{ .ca = rig.ca, .browser = rig.browser_ca, .faults = adjusted });
+    }
+
     fn setup_server_kinds(rig: *Rig, kinds: x509.Kinds) !void {
+        try rig.setup_server_browser(kinds, false);
+    }
+
+    fn setup_server_browser(rig: *Rig, kinds: x509.Kinds, browser: bool) !void {
         rig.diag.reset();
         rig.ca = try x509_test.ca_pair();
         rig.server_key = try Ed25519.KeyPair.generateDeterministic(@splat(0x21));
@@ -70,6 +104,11 @@ const Rig = struct {
                 .signer = tls_server.key_pair_signer(&rig.server_key),
             },
             .client_kinds = kinds,
+            .browser = if (browser) .{
+                .anchor = p256.point_of(rig.browser_ca),
+                .certificates = &rig.browser_chain,
+                .key = &rig.browser_key,
+            } else null,
         });
         rig.sent_length = 0;
         rig.data_events = 0;
@@ -795,4 +834,139 @@ test "teeth: without the early-data check data before Finished is passed on" {
     try rig.setup(.{ .early_application_data = true });
     try std.testing.expect(try rig.handshake(4096) == .connected);
     try std.testing.expectEqual(@as(u32, 1), rig.data_events);
+}
+
+// ---- The browser path (docs/decisions/2026-11-14-b7-slice6-console-over-tls.md) ---------------
+
+test "browser path: a P-256 client certificate connects as a client, with its scope" {
+    // Goal: a ClientHello listing ecdsa_secp256r1_sha256 and no ed25519 (Chromium's list) gets
+    // the P-256 server certificate and may present a browser client certificate. Method: the
+    // scripted client on the browser path checks the server's chain and low-S CertificateVerify;
+    // the server names the peer as the client of the certificate, with its scope.
+    var rig: Rig = undefined;
+    for ([_]testclient.Verify{ .good, .high_s }) |verify| {
+        try rig.setup_browser(.{ .verify = verify });
+        try std.testing.expect(try rig.handshake(4096) == .connected);
+        const peer = rig.server.peer().?;
+        try std.testing.expectEqual(x509.Kind.client, peer.kind);
+        try std.testing.expectEqualStrings("spiffe://prod/client/alice", peer.name);
+        try std.testing.expectEqual(x509.Scope.jobs, peer.scope.?);
+    }
+}
+
+test "browser path: a client offering ed25519 too stays on the Ed25519 path" {
+    // A server with a browser identity still answers a Zigcube client with its Ed25519 chain.
+    var rig: Rig = undefined;
+    try rig.setup_browser(.{ .chain = .client_kind });
+    try rig.client.init(.{ .ca = rig.ca, .faults = .{ .chain = .client_kind } });
+    try std.testing.expect(try rig.handshake(4096) == .connected);
+    try std.testing.expectEqualStrings(x509_test.client_uri, rig.server.peer().?.name);
+}
+
+test "browser path: a server without a browser identity refuses Chromium's hello" {
+    var rig: Rig = undefined;
+    try rig.setup(.{ .hello = .{ .signature_algorithms = .chrome } });
+    const record = rig.client.hello(&rig.input);
+    try std.testing.expectError(error.Refused, rig.feed(record, 4096));
+    try rig.expect_code(.E0818);
+}
+
+const browser_misses = [_]NearMiss{
+    .{ .name = "another browser CA", .code = .E0810, .alert = null, .faults = .{
+        .chain = .other_ca,
+    } },
+    .{ .name = "expired", .code = .E0811, .alert = null, .faults = .{ .chain = .expired } },
+    .{ .name = "damaged", .code = .E0810, .alert = null, .faults = .{ .chain = .tampered } },
+    .{ .name = "a browser server certificate", .code = .E0819, .alert = null, .faults = .{
+        .chain = .server_kind,
+    } },
+    .{ .name = "the cluster CA's client certificate", .code = .E0809, .alert = null, .faults = .{
+        .chain = .client_kind,
+    } },
+    .{ .name = "the cluster CA's node certificate", .code = .E0809, .alert = null, .faults = .{
+        .chain = .node_kind,
+    } },
+    .{ .name = "no certificate", .code = .E0814, .alert = null, .faults = .{
+        .chain = .none,
+        .verify = .omit,
+    } },
+    .{ .name = "another key's signature", .code = .E0813, .alert = null, .faults = .{
+        .verify = .wrong_key,
+    } },
+    .{ .name = "a flipped signature", .code = .E0813, .alert = null, .faults = .{
+        .verify = .flipped,
+    } },
+    .{ .name = "the server's context", .code = .E0813, .alert = null, .faults = .{
+        .verify = .server_context,
+    } },
+    .{ .name = "the ed25519 scheme", .code = .E0818, .alert = null, .faults = .{
+        .verify = .bad_scheme,
+    } },
+};
+
+test "browser path: each near miss is refused, the cluster CA's certificates included" {
+    // Goal: the browser path takes only a client certificate of the browser CA, signed over the
+    // client's context with its key, and never one of the cluster CA (the CAs never sign across
+    // paths). Method: one fault per row; each is refused, and its code is reported.
+    var rig: Rig = undefined;
+    var failures: u32 = 0;
+    for (&browser_misses) |*miss| {
+        try rig.setup_browser(miss.faults);
+        if (rig.handshake(4096)) |_| {
+            std.debug.print("browser near miss \"{s}\" connected\n", .{miss.name});
+            failures += 1;
+            continue;
+        } else |_| {}
+        if (rig.diag.code != miss.code) {
+            std.debug.print("browser near miss \"{s}\": {t}\n", .{ miss.name, rig.diag.code.? });
+            failures += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), failures);
+}
+
+test "cross path: a browser client certificate is refused on the Ed25519 path" {
+    var rig: Rig = undefined;
+    try rig.setup_server_kinds(.initMany(&.{ .node, .client }));
+    try rig.client.init(.{ .ca = rig.ca, .faults = .{ .chain = .browser_client } });
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try rig.expect_code(.E0809); // Its algorithm is not Ed25519: refused by the parser.
+}
+
+test "cross path: no single skipped check lets a certificate of the other path through" {
+    // Goal: the cross-path refusal is structural, not one check a bug could skip: each profile's
+    // parser refuses the other's algorithm. Method: every server fault on in turn; the cluster
+    // CA's certificate on the browser path and the browser CA's on the Ed25519 path stay refused.
+    var failures: u32 = 0;
+    for (std.enums.values(tls_server.TestFault)) |fault| {
+        tls_server.set_test_fault(fault, true);
+        defer tls_server.set_test_fault(fault, false);
+        var rig: Rig = undefined;
+        try rig.setup_browser(.{ .chain = .client_kind });
+        if (rig.handshake(4096)) |_| failures += 1 else |_| {}
+        try rig.setup_server_kinds(.initMany(&.{ .node, .client }));
+        try rig.client.init(.{ .ca = rig.ca, .faults = .{ .chain = .browser_client } });
+        if (rig.handshake(4096)) |_| failures += 1 else |_| {}
+    }
+    try std.testing.expectEqual(@as(u32, 0), failures);
+}
+
+fn expect_browser_tooth(fault: tls_server.TestFault, faults: testclient.Faults) !void {
+    var rig: Rig = undefined;
+    try rig.setup_browser(faults);
+    try std.testing.expectError(error.Refused, rig.handshake(4096)); // Negative half.
+    tls_server.set_test_fault(fault, true);
+    defer tls_server.set_test_fault(fault, false);
+    try rig.setup_browser(faults);
+    try std.testing.expect(try rig.handshake(4096) == .connected);
+}
+
+test "teeth: on the browser path each skipped check lets its near miss through" {
+    try expect_browser_tooth(.client_chain, .{ .chain = .other_ca });
+    try expect_browser_tooth(.client_chain, .{ .chain = .tampered });
+    try expect_browser_tooth(.client_chain, .{ .chain = .expired });
+    try expect_browser_tooth(.client_kind, .{ .chain = .server_kind });
+    try expect_browser_tooth(.required_certificate, .{ .chain = .none, .verify = .omit });
+    try expect_browser_tooth(.certificate_verify, .{ .verify = .wrong_key });
+    try expect_browser_tooth(.verify_context, .{ .verify = .server_context });
 }
