@@ -44,6 +44,8 @@ check $PR x "" "src/sim_cluster.zig src/sim_swarm_main.zig" TFFFFFFFF
 check $PR x "" "web/app.js web/mock/c1.js tools/wasm_check.mjs" TFFFFFFFF
 check $PR x "" "src/tidy.zig src/testing/check.zig" TFFFFFFFF
 check $PR x "" "src/console_wasm.zig src/web_embed.zig" TFFFFFFFF
+# The relay teeth's agent roots run only in the check job (`zig build relay-teeth`).
+check $PR x "" "src/zcube_agent_relay_teeth_outlive.zig src/zcube_agent_relay_teeth_unrelayed.zig" TFFFFFFFF
 # One demo, one smoke, the store suites' own files.
 check $PR x "" "src/demo_c0_steps.zig" TFTFFFFFF
 check $PR x "" "src/demo_c1_fleet.zig docs/demos/c1.md" TFFTTFFFT

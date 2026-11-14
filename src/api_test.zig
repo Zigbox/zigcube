@@ -1259,12 +1259,15 @@ test "the jobs watch decodes statuses, filters by label and refuses the name wat
 }
 
 /// A job body with the given extra members (JSON text, starting with a comma or empty).
+const relay_image = "b3:" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++
+    "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03";
+
 fn relay_body(rig: *Rig, name: []const u8, extra: []const u8) ![]const u8 {
     return std.fmt.allocPrint(rig.parsed.allocator(),
-        \\{{"name":"{s}","image":"b3:51aa9c03","command":["true"],"deadline_ms":60000,
+        \\{{"name":"{s}","image":"{s}","command":["true"],"deadline_ms":60000,
     ++
         \\"submit_by_ms":{d}{s}}}
-    , .{ name, rig.world.now_ms() + 30_000, extra });
+    , .{ name, relay_image, rig.world.now_ms() + 30_000, extra });
 }
 
 test "a job names a relay the server configures; any other name or an env override is refused" {
@@ -1301,4 +1304,128 @@ test "a job names a relay the server configures; any other name or an env overri
         try rig.refused(response, 400, "ZC-E0130");
         try testing.expect(std.mem.indexOf(u8, response.body, case.field) != null);
     }
+}
+
+const peer_ca = @import("peer_ca.zig");
+const x509 = @import("x509.zig");
+
+/// Writes `r1`'s assignment to node1, its claim and status as running under that epoch, as the
+/// scheduler and the agent would; returns the epoch.
+/// Places run r1 on node1 with the status `status_state`; its claim is `running` (started now)
+/// when the status is `running` or terminal, else `claimed` with no start yet.
+fn place_relayed_run(rig: *Rig, status_state: records.JobState) !u64 {
+    var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const id = records.job_run_id(&id_buffer, "r1");
+    const assigned = records.assigned_key("node1", id);
+    const put_assigned = [_]store.Op{.{ .put = .{ .key = assigned.slice(), .value = "{}" } }};
+    rig.world.diag.reset();
+    const placed = try rig.world.store_handle().txn(
+        .{ .on_success = &put_assigned },
+        &rig.world.diag,
+    );
+    const epoch: u64 = @intCast(placed.revision);
+    const arena = rig.parsed.allocator();
+    const terminal = records.job_state_terminal(status_state);
+    const begun = terminal or status_state == .running;
+    const started: ?u64 = if (begun) rig.world.now_ms() else null;
+    const now = rig.world.now_ms();
+    const status = try std.json.Stringify.valueAlloc(arena, records.JobStatus{
+        .state = status_state,
+        .node = "node1",
+        .epoch = epoch,
+        .tenure = 1,
+        .started_at_ms = started,
+        .ended_at_ms = if (terminal) now else null,
+        .end = if (terminal) .{ .kind = .cancelled } else null,
+        .reported_at_ms = now,
+    }, .{});
+    const observed = try std.json.Stringify.valueAlloc(arena, records.JobObserved{
+        .run = id,
+        .node = "node1",
+        .tenure = 1,
+        .assignment = epoch,
+        .status = if (begun) .running else .claimed,
+        .started_at_ms = started,
+        .reported_at_ms = now,
+    }, .{});
+    const status_key = records.job_status_key("r1");
+    const claim_key = records.job_observed_key("node1", "r1");
+    const writes = [_]store.Op{
+        .{ .put = .{ .key = status_key.slice(), .value = status } },
+        .{ .put = .{ .key = claim_key.slice(), .value = observed } },
+    };
+    rig.world.diag.reset();
+    _ = try rig.world.store_handle().txn(.{ .on_success = &writes }, &rig.world.diag);
+    return epoch;
+}
+
+fn certificate_body(rig: *Rig, epoch: u64, digest: []const u8, key: [32]u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        rig.parsed.allocator(),
+        "{{\"epoch\":{d},\"image_digest\":\"{s}\",\"public_key\":\"{x}\"}}",
+        .{ epoch, digest, &key },
+    );
+}
+
+test "a relayed run's certificate: issued to its claim, refused (ZC-E0706) to any other" {
+    // Goal: B4's issuance over the agent API. Method: admit a relayed job, write its placement,
+    // ask for a certificate as node1 under the epoch, parse what comes back as a /job/ workload
+    // certificate signed by the CA; then ask as node2, under an older epoch, with another image,
+    // and after the run ended: each is ZC-E0706 and nothing is signed.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const table = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    rig.api.relays = &table;
+    var clock = rig.world.manual.clock();
+    const ca: peer_ca.Ca = .{
+        .key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7)),
+        .revoked = .{},
+        .wall = clock,
+    };
+    _ = &clock;
+    rig.api.ca = &ca;
+    rig.api.cluster = "test.cluster";
+    const extra = ",\"relay\":\"botpike\",\"labels\":[[\"team\",\"x\"]]";
+    const good = try relay_body(&rig, "r1", extra);
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", good).status);
+    const digest = relay_image["b3:".len..];
+    const run_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9)))
+        .public_key.toBytes();
+    const path = "/v1/agent/nodes/node1/runs/r1/certificate";
+    // Claimed, not yet reported running: still settling, so 503 (the agent asks again), not a
+    // refusal for good.
+    const claimed = try place_relayed_run(&rig, .placed);
+    const early = try certificate_body(&rig, claimed, digest, run_key);
+    try rig.refused(post_job(&rig, path, early), 503, "ZC-E0706");
+    const epoch = try place_relayed_run(&rig, .running);
+    const ok = post_job(&rig, path, try certificate_body(&rig, epoch, digest, run_key));
+    if (ok.status != 200) std.debug.print("{s}\n", .{ok.body});
+    try testing.expectEqual(@as(u16, 200), ok.status);
+    const answer = try rig.json(ok);
+    const hex = field(answer, "certificate").string;
+    var der: [constants.x509_cert_bytes_max]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&der, hex);
+    var detail: x509.Detail = .{};
+    const cert = try x509.parse_profile(bytes, .cluster, &detail);
+    try testing.expectEqualSlices(u8, &run_key, cert.public_key.of(bytes));
+    try testing.expect(std.mem.indexOf(u8, bytes, "spiffe://test.cluster/job/r1") != null);
+    const not_after = field(answer, "not_after_ms").integer;
+    try testing.expect(not_after > field(answer, "not_before_ms").integer);
+
+    const other = try certificate_body(&rig, epoch, digest, run_key);
+    const node2 = "/v1/agent/nodes/node2/runs/r1/certificate";
+    // node2 has no claim of its own: settling as far as the server can tell, so 503.
+    try rig.refused(post_job(&rig, node2, other), 503, "ZC-E0706");
+    const stale = try certificate_body(&rig, epoch - 1, digest, run_key);
+    try rig.refused(post_job(&rig, path, stale), 409, "ZC-E0706");
+    const zeros: [64]u8 = @splat('0');
+    const wrong_image = try certificate_body(&rig, epoch, &zeros, run_key);
+    try rig.refused(post_job(&rig, path, wrong_image), 409, "ZC-E0706");
+    const nobody = try certificate_body(&rig, epoch, digest, run_key);
+    const unknown = "/v1/agent/nodes/node1/runs/nope/certificate";
+    try rig.refused(post_job(&rig, unknown, nobody), 409, "ZC-E0706");
+    _ = try place_relayed_run(&rig, .cancelled);
+    const late = try certificate_body(&rig, epoch, digest, run_key);
+    try rig.refused(post_job(&rig, path, late), 409, "ZC-E0706");
+    try rig.refused(post_job(&rig, path, "{\"epoch\":1}"), 400, "ZC-E0104");
 }

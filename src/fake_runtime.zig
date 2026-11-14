@@ -188,6 +188,7 @@ pub const FakeRuntime = struct {
         var path_buffer: [constants.state_path_bytes_max]u8 = undefined;
         const path = try self.container_path(&path_buffer, spec.name, diag);
         if (fetched) try self.write_fetch(dir, spec, diag);
+        self.fault_at_start(dir, spec.name);
         try self.spawn_supervisor(path, spec.name, diag);
         return self.await_start(dir, spec.name, diag);
     }
@@ -277,6 +278,9 @@ pub const FakeRuntime = struct {
             .env = Pairs.env[0..spec.env.len],
             .labels = Pairs.labels[0..spec.labels.len],
             .relay = if (spec.relay.len > 0) spec.relay else null,
+            .relay_server_name = spec.relay_server_name,
+            .relay_server_anchor = spec.relay_server_anchor,
+            .relay_plain = spec.relay_plain,
             .started_at_ms = self.clock.now_ms(),
         };
     }
@@ -767,6 +771,16 @@ pub const FakeRuntime = struct {
         }
     }
 
+    /// `relay_open` must be in place before the supervisor runs: it moves into the container's
+    /// directory, where the supervisor reads it. Other words wait for `list`.
+    fn fault_at_start(self: *FakeRuntime, dir: Dir, name: []const u8) void {
+        var buffer: [32]u8 = undefined;
+        const word = self.faults.readFile(self.io, name, &buffer) catch return;
+        if (!std.mem.eql(u8, std.mem.trim(u8, word, "\n "), "relay_open")) return;
+        files.write_atomic(self.io, dir, files.file_relay_fault, "open\n") catch return;
+        self.faults.deleteFile(self.io, name) catch {}; // Applied: the supervisor reads it.
+    }
+
     /// True if the fault is done with: applied, meaningless or too late.
     fn inject(self: *FakeRuntime, arena: Allocator, name: []const u8, word: []const u8) bool {
         const dir = self.containers.openDir(self.io, name, .{}) catch return false;
@@ -779,6 +793,13 @@ pub const FakeRuntime = struct {
         if (is_limit_word(word)) {
             files.write_atomic(self.io, dir, files.file_forced, word) catch return false;
             signal(child, .KILL);
+            return true;
+        }
+        if (std.mem.eql(u8, word, "relay_stop")) {
+            // The supervisor shuts its relay's listener down, as if the relay had died.
+            const supervisor = files.read_pid(self.io, dir, files.file_supervisor) catch
+                return false;
+            signal(supervisor, .USR1);
             return true;
         }
         if (std.mem.eql(u8, word, "lost")) {

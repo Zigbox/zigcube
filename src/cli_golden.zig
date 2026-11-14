@@ -366,6 +366,11 @@ fn relay_broken(diag: *diag_mod.Diag) void { // relay.zig
     sample(diag, .E0705, &.{cause}, "none needed for a reset; check the network if it repeats");
 }
 
+fn relay_refused_cert(diag: *diag_mod.Diag) void { // agent_relay_cert.zig
+    const cause = "the server refused a certificate for job ingest-7: a stale epoch";
+    sample(diag, .E0706, &.{cause}, "none needed if the run lost its claim");
+}
+
 fn relay_full(diag: *diag_mod.Diag) void { // relay.zig
     const cause = "relay llm has 16 connections open; a seventeenth was closed";
     sample(diag, .W0701, &.{cause}, "reuse connections or close them when done");
@@ -1079,6 +1084,7 @@ const cases = [_]Case{
     relayed(.E0703, relay_unserved),
     relayed(.E0704, relay_timeout),
     relayed(.E0705, relay_broken),
+    relayed(.E0706, relay_refused_cert),
     relayed(.W0701, relay_full),
     relayed(.W0702, relay_bound),
     relayed(.E0707, mesh_no_grant),

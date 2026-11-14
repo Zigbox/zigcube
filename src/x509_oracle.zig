@@ -234,7 +234,7 @@ fn meaning_ok(bytes: []const u8, parsed: *const x509.Parsed) bool {
         .ca => if (!std.mem.eql(u8, issuer, subject)) return false,
         .workload => {
             const spiffe = identity_mod.spiffe_parse(name) catch return false;
-            if (!std.mem.eql(u8, spiffe.service, subject)) return false;
+            if (!std.mem.eql(u8, spiffe.name, subject)) return false;
         },
         .server => {
             if (identity_mod.dns_problem(name, constants.x509_dns_name_bytes_max)) return false;

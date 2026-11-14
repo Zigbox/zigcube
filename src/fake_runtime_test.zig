@@ -778,6 +778,8 @@ fn launch_relayed(rig: *Rig, name: []const u8, echo: *relay_module.Echo) !runtim
         .image = "b3:51aa9c03",
         .command = &.{ "sh", "-c", text },
         .relay = address,
+        .relay_plain = true,
+        .network = .loopback,
         .labels = &labels,
     };
     var local: Diag = undefined;
@@ -898,6 +900,8 @@ test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC
         .image = "b3:51aa9c03",
         .command = &forever,
         .relay = "[]:80",
+        .relay_plain = true,
+        .network = .loopback,
         .labels = &labels,
     };
     var local: Diag = undefined;
@@ -908,4 +912,62 @@ test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC
     try testing.expect(std.mem.find(u8, cause, "HOST:PORT") != null);
     const now = try rig.status(runtime.Handle.init("relay-bad"));
     try testing.expectEqualStrings("ZC-E0702", now.stopped.start_failed.code.slice());
+}
+
+// ---- B4 slice 2: no relay, no workload ----------------------------------------------------------
+// `zig build relay-teeth` runs these two against agents with one half switched off
+// (src/zcube_agent_relay_teeth*.zig) and passes only if they fail.
+
+test "relay fail closed: a relay that cannot be opened starts no command" {
+    // Goal: a relayed job never runs without its relay. Method: the `relay_open` fault; the
+    // start is ZC-E0702, and the command, which would write a file at once, never wrote it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "relay-o", .data = "relay_open\n" });
+    var script: [constants.state_path_bytes_max + 80]u8 = undefined;
+    const text = try std.fmt.bufPrint(
+        &script,
+        "touch {s}/ran; while true; do sleep 1; done",
+        .{rig.path},
+    );
+    const labels = [_]runtime.Label{.{ .key = runtime.label_replica, .value = "relay-o" }};
+    const value: runtime.Spec = .{
+        .name = "relay-o",
+        .image = "b3:51aa9c03",
+        .command = &.{ "sh", "-c", text },
+        .relay = "127.0.0.1:9",
+        .relay_plain = true,
+        .network = .loopback,
+        .labels = &labels,
+    };
+    var local: Diag = undefined;
+    local.reset();
+    const outcome = try rig.fake.interface().start(&value, &local);
+    try testing.io.sleep(.fromMilliseconds(500), .awake);
+    try testing.expectError(error.FileNotFound, rig.tmp.dir.access(testing.io, "ran", .{}));
+    try testing.expect(outcome == .failed);
+    try testing.expectEqualStrings("ZC-E0702", outcome.failed.code.slice());
+}
+
+test "relay fail closed: a relay that stops while the job runs takes the command with it" {
+    // Goal: a run never outlives its relay (Zigcube #228). Method: the `relay_stop` fault shuts
+    // the relay's listener down under a running command; the container ends killed by signal 9
+    // and `relay.log` says ZC-E0702.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const echo = try relay_module.Echo.start();
+    defer echo.stop();
+    const handle = try launch_relayed(rig, "relay-x", echo);
+    try expect_echo(try relay_port_of(rig, "relay-x"));
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "relay-x", .data = "relay_stop\n" });
+    var local: Diag = undefined;
+    local.reset();
+    _ = try rig.fake.interface().list(rig.arena.allocator(), &local);
+    const reason = try rig.wait_stopped(handle);
+    try testing.expectEqual(@as(u8, 9), reason.signaled);
+    const dir = try rig.fake.containers.openDir(testing.io, "relay-x", .{});
+    defer dir.close(testing.io);
+    var buffer: [1024]u8 = undefined;
+    const log = try dir.readFile(testing.io, fake_files.file_relay_log, &buffer);
+    try testing.expect(std.mem.find(u8, log, "ZC-E0702") != null);
 }

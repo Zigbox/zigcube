@@ -85,6 +85,9 @@ pub fn run(demo: *Demo) !void {
 fn start(demo: *Demo) !void {
     const host = demo.host;
     host.section("0. Start: zcube-server with the relay botpike, one guest, a test upstream");
+    host.say("  Debug builds of zcube-server and zcube-agent until B4 slice 4: the zigbox " ++
+        "runtime speaks no TLS to a relay's upstream yet, so botpike is a plain-TCP test " ++
+        "upstream (`.plain = true`), which release builds refuse", .{});
     _ = try host.zcube(&.{"version"});
     try host.start_server(30 * 1000);
     host.say("  zcube-server is up on 127.0.0.1:{d} (SQLite); the guest reaches it at {s}", .{

@@ -3,8 +3,8 @@
 This document describes how Zigcube makes and checks its X.509 certificates. The brief is
 [briefs/mtls-client.md](briefs/mtls-client.md). All eight slices are built: X.509, the CA, the key schedule, the TLS 1.3 client with client
 authentication, the connection, the stock-server interop harness and, in slice 8, the wiring (the
-WASM smoke, `mtls-teeth` in `check`) and this document. The rest of mTLS (the relay's listener,
-issuance in the control plane) is out of scope (brief).
+WASM smoke, `mtls-teeth` in `check`) and this document. B4 slice 2 adds issuance in the control
+plane and the relay's TLS dial (section "Issuance" below).
 
 ## Certificates
 
@@ -207,6 +207,22 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   (decisions/2026-11-06-interop-needs-setpriv.md). The JVM runs with
   `-Dcom.sun.net.ssl.requireCloseNotify=true`, so a client that drops TCP without `close_notify`
   fails the clean-close check.
+
+## Issuance (B4 slice 2)
+
+The server's cluster CA signs a relayed run's key through
+`POST /v1/agent/nodes/{node}/runs/{name}/certificate` (docs/api.md): `spiffe://<cluster>/job/<name>`
+with the image digest, placement epoch and labels, valid until the run's last legitimate moment
+(`job_cert.zig`). The relay presents it to the upstream and checks the upstream with the `foreign`
+server profile against the relay entry's `server_ca` and `server_name`
+(docs/decisions/2026-11-13-b4-relay-tls.md).
+
+Threats this does not answer yet:
+
+- **Issuance is unauthenticated until B7.** Anyone who can reach the server's agent API and names
+  a node, a running relayed job, its epoch and digest gets a certificate for a key of their own.
+  The server checks the claim (`job_cert.decide`), not who asks. Listen on a private address.
+- The Zigbox runtime's relay still dials plain TCP (B4 slice 4).
 
 ## Threats the service mesh adds (C4)
 

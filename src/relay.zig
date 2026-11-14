@@ -23,6 +23,10 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const constants = @import("constants.zig");
 const Pipe = @import("relay_pump.zig").Pipe;
+const relay_tls = @import("relay_tls.zig");
+const tls_conn = @import("tls_conn.zig");
+const diag_mod = @import("diag.zig");
+const peer_stream = @import("peer_stream.zig");
 const codes = @import("diag/codes.zig");
 const Code = codes.Code;
 
@@ -30,6 +34,16 @@ const fd_t = linux.fd_t;
 const ns_per_ms = 1_000_000;
 const nonblock_cloexec: u32 = linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
 const log_line_bytes_max = 256;
+
+const root = @import("root");
+
+/// The tooth of the "relay gone, workload gone" test (B4 slice 2): the relay that ends early
+/// leaves the command running. A constant only a root file can switch on
+/// (`zcube_agent_relay_teeth_outlive.zig`), which only `zig build relay-teeth` compiles.
+const fault_outlive: bool = if (@hasDecl(root, "relay_teeth_outlive"))
+    root.relay_teeth_outlive
+else
+    false;
 
 /// Where the upstream is: a host (a literal address or a name) and a port.
 pub const Upstream = struct {
@@ -65,11 +79,51 @@ pub const Limits = struct {
 
 pub const Counts = struct { accepted: u32 = 0, refused_over_limit: u32 = 0, log_dropped: u32 = 0 };
 
+/// One connection. `client` and `upstream` are read by `stop` (to shut them down, which wakes a
+/// thread waiting on either) and closed by the thread, both under `lock`.
 const Slot = struct {
     relay: *Relay,
     client: fd_t = -1,
+    upstream: fd_t = -1,
+    lock: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(true),
+
+    fn acquire(slot: *Slot) void {
+        while (slot.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release(slot: *Slot) void {
+        slot.lock.store(false, .release);
+    }
+
+    /// `stop` stores `stopping` before it takes any slot's lock: either it sees `fd` here, or
+    /// this sees `stopping` and shuts the socket down itself.
+    fn set_upstream(slot: *Slot, fd: fd_t) void {
+        slot.acquire();
+        defer slot.release();
+        slot.upstream = fd;
+        if (slot.relay.stopping.load(.acquire)) _ = linux.shutdown(fd, linux.SHUT.RDWR);
+    }
+
+    /// Closes both ends, under the lock so that `stop` never shuts down a reused descriptor.
+    fn close_both(slot: *Slot) void {
+        slot.acquire();
+        defer slot.release();
+        if (slot.upstream >= 0) _ = linux.close(slot.upstream);
+        _ = linux.close(slot.client);
+        slot.upstream = -1;
+        slot.client = -1;
+    }
+
+    fn shut_down(slot: *Slot) void {
+        slot.acquire();
+        defer slot.release();
+        if (slot.client >= 0) _ = linux.shutdown(slot.client, linux.SHUT.RDWR);
+        if (slot.upstream >= 0) _ = linux.shutdown(slot.upstream, linux.SHUT.RDWR);
+    }
 };
 
 pub const Relay = struct {
@@ -88,6 +142,15 @@ pub const Relay = struct {
     /// Set before `run`.
     limits: Limits = .{},
     accept_failed: bool = false,
+    /// Set before `run` for an upstream that speaks TLS (B4): its name and anchor, the run's
+    /// credential, and the container's directory, where the agent puts the certificate. Null
+    /// only in tests and in a Debug build's `plain` relay.
+    tls: ?relay_tls.Tls = null,
+    credential: ?*relay_tls.Credential = null,
+    dir_fd: fd_t = -1,
+    /// The command this relay serves, set before `run`; 0 for none. A run never outlives its
+    /// relay (Zigcube #228): if the acceptor ends before `stop`, it kills this process.
+    command_pid: i32 = 0,
 
     pub const OpenError = error{ SocketFailed, BindFailed, ListenFailed, OutOfMemory };
 
@@ -153,10 +216,31 @@ pub const Relay = struct {
         return relay;
     }
 
+    /// Makes the relay's upstream TLS (B4), before `run`: `key` is the run's, made by the caller
+    /// and kept only in this process; `dir_fd` is the container's directory, where the agent
+    /// puts the certificate. The relay owns the credential from here.
+    pub fn secure(
+        relay: *Relay,
+        tls: relay_tls.Tls,
+        key: std.crypto.sign.Ed25519.KeyPair,
+        dir_fd: fd_t,
+    ) error{OutOfMemory}!void {
+        assert(relay.acceptor == null);
+        assert(relay.credential == null);
+        assert(dir_fd >= 0);
+        const credential = try relay.gpa.create(relay_tls.Credential);
+        credential.* = .init(key);
+        relay.tls = tls;
+        relay.credential = credential;
+        relay.dir_fd = dir_fd;
+    }
+
     /// Starts accepting.
     pub fn run(relay: *Relay) !void {
         assert(relay.acceptor == null);
         assert(relay.limits.valid());
+        assert((relay.tls == null) == (relay.credential == null));
+        if (relay.tls != null) assert(relay.dir_fd >= 0);
         relay.acceptor = try std.Thread.spawn(.{}, accept_loop, .{relay});
     }
 
@@ -164,16 +248,26 @@ pub const Relay = struct {
     /// `run`; the relay is gone afterwards.
     pub fn stop(relay: *Relay) void {
         relay.stopping.store(true, .release);
+        // A connection may wait in `poll` for a handshake record or a write: shutting its sockets
+        // down wakes it now (`relay_cancel_ms_max`).
+        if (relay.acceptor != null) {
+            for (&relay.slots) |*slot| slot.shut_down();
+        }
         if (relay.acceptor) |thread| thread.join();
         if (relay.acceptor == null) _ = linux.close(relay.listener);
         if (relay.log_fd >= 0) _ = linux.close(relay.log_fd);
         const gpa = relay.gpa;
+        if (relay.credential) |credential| {
+            std.crypto.secureZero(u8, std.mem.asBytes(&credential.key.secret_key));
+            gpa.destroy(credential);
+        }
         gpa.destroy(relay);
     }
 
     fn accept_loop(relay: *Relay) void {
         while (!relay.stopping.load(.acquire)) {
             relay.reap_finished();
+            relay.look_for_credential();
             var fds = [1]linux.pollfd{
                 .{ .fd = relay.listener, .events = linux.POLL.IN, .revents = 0 },
             };
@@ -182,6 +276,11 @@ pub const Relay = struct {
             switch (linux.errno(accepted)) {
                 .SUCCESS => relay.admit(@intCast(accepted)),
                 .AGAIN, .INTR, .CONNABORTED => {},
+                // The listener itself is gone: no connection can be served again.
+                .INVAL, .BADF, .NOTSOCK => |errno| {
+                    relay.ended_early(@tagName(errno));
+                    break;
+                },
                 else => |errno| {
                     // Out of descriptors, most likely: the connection stays in the backlog and
                     // the listener stays readable, so wait instead of spinning, and say so once.
@@ -200,6 +299,26 @@ pub const Relay = struct {
         _ = linux.close(relay.listener);
     }
 
+    /// The relay stopped while its run was alive: the run goes too, and `relay.log` says why
+    /// (ZC-E0702, the listener). The supervisor then reports the run as killed by signal 9.
+    fn ended_early(relay: *Relay, cause: []const u8) void {
+        // `stop` does not touch the listener while the acceptor runs, so this is not its doing.
+        if (relay.stopping.load(.acquire)) return;
+        relay.note(.E0702, "the relay's listener stopped while the job ran ({s}): " ++
+            "the job's command was killed", .{cause});
+        if (fault_outlive) return;
+        if (relay.command_pid > 1) _ = linux.kill(relay.command_pid, .KILL);
+    }
+
+    fn look_for_credential(relay: *Relay) void {
+        const credential = relay.credential orelse return;
+        if (credential.state.load(.acquire) != .waiting) return;
+        credential.poll(relay.dir_fd);
+        if (credential.state.load(.acquire) == .refused) {
+            relay.note(.E0706, "the server refused the run's certificate: no connection", .{});
+        }
+    }
+
     fn reap_finished(relay: *Relay) void {
         for (&relay.slots) |*slot| {
             if (slot.thread == null or !slot.done.load(.acquire)) continue;
@@ -212,7 +331,9 @@ pub const Relay = struct {
     fn admit(relay: *Relay, client: fd_t) void {
         for (&relay.slots) |*slot| {
             if (slot.thread != null) continue;
+            slot.acquire();
             slot.client = client;
+            slot.release();
             slot.done.store(false, .release);
             slot.thread = std.Thread.spawn(.{}, serve, .{slot}) catch {
                 slot.done.store(true, .release);
@@ -255,11 +376,101 @@ const Ending = enum { clean, stopped, byte_bound, idle, failed };
 fn serve(slot: *Slot) void {
     const relay = slot.relay;
     defer slot.done.store(true, .release);
-    defer _ = linux.close(slot.client);
+    defer slot.close_both();
     set_nodelay(slot.client);
+    if (relay.credential) |credential| {
+        if (!wait_for_credential(relay, credential)) return;
+    }
     const upstream = connect_upstream(relay) orelse return;
-    defer _ = linux.close(upstream);
-    switch (copy_both_ways(relay, slot.client, upstream)) {
+    slot.set_upstream(upstream);
+    if (relay.tls) |tls| return serve_tls(relay, slot.client, upstream, &tls);
+    note_ending(relay, copy_both_ways(relay, PlainSys{}, slot.client, upstream));
+}
+
+/// Waits for the run's certificate, at most the connect timeout: no byte goes upstream without
+/// it. False (the connection is closed) when it was refused, did not come or the relay stops.
+fn wait_for_credential(relay: *Relay, credential: *relay_tls.Credential) bool {
+    const started = monotonic_ms();
+    while (!relay.stopping.load(.acquire)) {
+        switch (credential.state.load(.acquire)) {
+            .ready => return true,
+            .refused => return false, // Said once, by the acceptor.
+            .waiting => {},
+        }
+        if (monotonic_ms() - started >= relay.limits.connect_timeout_ms) {
+            relay.note(.E0705, "the run's certificate had not arrived after {d} ms", .{
+                relay.limits.connect_timeout_ms,
+            });
+            return false;
+        }
+        sleep_ms(constants.relay_poll_ms);
+    }
+    return false;
+}
+
+/// The handshake, as the run's workload, then the copy through the TLS connection.
+fn serve_tls(relay: *Relay, client: fd_t, upstream: fd_t, tls: *const relay_tls.Tls) void {
+    const credential = relay.credential.?;
+    var conn: tls_conn.Conn = undefined;
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const options: tls_conn.Options = .{
+        .io = relay.io,
+        .fd = upstream,
+        .anchor = tls.anchor,
+        .server_name = tls.server_name,
+        .client_auth = .{ .required = credential.identity() },
+        .server_profile = .foreign,
+        .handshake_timeout_ms = relay.limits.connect_timeout_ms,
+    };
+    conn.open(&options, &diag) catch |err| {
+        conn.deinit();
+        if (relay.stopping.load(.acquire)) return;
+        note_tls(relay, &diag, "the handshake with {s}:{d} failed ({s})", .{
+            relay.upstream.host, relay.upstream.port, @errorName(err),
+        });
+        return;
+    };
+    defer conn.deinit();
+    var side: relay_tls.Side = .{
+        .conn = &conn,
+        .fd = upstream,
+        .io = relay.io,
+        .write_ms = relay.limits.idle_ms,
+        .diag = &diag,
+    };
+    const ending = copy_both_ways(relay, relay_tls.Sys{ .side = &side }, client, upstream);
+    switch (ending) {
+        .clean => {
+            const end_ms = peer_stream.boot_ms(relay.io) + constants.tls_alert_flush_ms;
+            conn.close(end_ms, &diag) catch {};
+        },
+        .failed => if (diag.code != null and !relay.stopping.load(.acquire)) {
+            note_tls(relay, &diag, "the TLS connection to {s}:{d} failed", .{
+                relay.upstream.host, relay.upstream.port,
+            });
+            return;
+        },
+        else => {},
+    }
+    note_ending(relay, ending);
+}
+
+/// A TLS failure's line carries the code the diagnostic chose (ZC-E0810 to ZC-E0819).
+fn note_tls(
+    relay: *Relay,
+    diag: *const diag_mod.Diag,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const code = diag.code orelse Code.E0705;
+    relay.note(code, format ++ ": {s}", args ++ .{diag.last_cause() orelse "no cause"});
+}
+
+fn note_ending(relay: *Relay, ending: Ending) void {
+    // Stopping shuts the sockets down, which a copy in the middle may see as a failure.
+    if (relay.stopping.load(.acquire)) return;
+    switch (ending) {
         .clean, .stopped => {},
         .byte_bound => relay.note(.W0702, "a connection reached {d} bytes in one direction", .{
             relay.limits.bytes_max,
@@ -383,10 +594,10 @@ pub const Moved = union(enum) { count: usize, again, failed };
 
 /// The calls the copy makes on a socket, so that `relay_fuzz.zig` can put short counts, would-block
 /// and failures under it.
-const Sys = struct {
+const PlainSys = struct {
     const shutdown_wrong_end = false;
 
-    fn read(_: Sys, fd: fd_t, buffer: []u8) Moved {
+    fn read(_: PlainSys, fd: fd_t, buffer: []u8) Moved {
         const got = linux.read(fd, buffer.ptr, buffer.len);
         return switch (linux.errno(got)) {
             .SUCCESS => .{ .count = got },
@@ -395,7 +606,7 @@ const Sys = struct {
         };
     }
 
-    fn write(_: Sys, fd: fd_t, bytes: []const u8) Moved {
+    fn write(_: PlainSys, fd: fd_t, bytes: []const u8) Moved {
         const sent = linux.sendto(fd, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL, null, 0);
         return switch (linux.errno(sent)) {
             .SUCCESS => .{ .count = sent },
@@ -404,7 +615,7 @@ const Sys = struct {
         };
     }
 
-    fn shutdown_write(_: Sys, fd: fd_t) void {
+    fn shutdown_write(_: PlainSys, fd: fd_t) void {
         _ = linux.shutdown(fd, linux.SHUT.WR);
     }
 };
@@ -421,12 +632,12 @@ pub fn round(sys: anytype, inbound: *Lane, outbound: *Lane) Round {
     return if (first == .moved or second == .moved) .moved else .quiet;
 }
 
-fn copy_both_ways(relay: *Relay, client: fd_t, upstream: fd_t) Ending {
+fn copy_both_ways(relay: *Relay, sys: anytype, client: fd_t, upstream: fd_t) Ending {
     var inbound = Lane.init(client, upstream, relay.limits.bytes_max);
     var outbound = Lane.init(upstream, client, relay.limits.bytes_max);
     var last_progress = monotonic_ms();
     while (!relay.stopping.load(.acquire)) {
-        switch (round(Sys{}, &inbound, &outbound)) {
+        switch (round(sys, &inbound, &outbound)) {
             .failed => return .failed,
             .byte_bound => return .byte_bound,
             .clean => return .clean,
@@ -434,6 +645,8 @@ fn copy_both_ways(relay: *Relay, client: fd_t, upstream: fd_t) Ending {
             .quiet => {},
         }
         if (monotonic_ms() - last_progress >= relay.limits.idle_ms) return .idle;
+        // Bytes a TLS record left over are in memory, where `poll` cannot see them.
+        if (@hasDecl(@TypeOf(sys), "ready") and sys.ready()) continue;
         wait(&inbound, &outbound);
     }
     return .stopped;
@@ -502,7 +715,7 @@ fn wait(inbound: *const Lane, outbound: *const Lane) void {
 
 pub const Bound = struct { fd: fd_t, port: u16 };
 
-fn listen_loopback() error{ SocketFailed, BindFailed, ListenFailed }!Bound {
+pub fn listen_loopback() error{ SocketFailed, BindFailed, ListenFailed }!Bound {
     return listen_loopback_backlog(16);
 }
 

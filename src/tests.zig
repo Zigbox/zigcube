@@ -87,6 +87,8 @@ comptime {
     _ = @import("mesh_plan_fuzz.zig"); // Reads ZCUBE_FUZZ_SEED: native only.
     _ = @import("why_grant.zig"); // A core module: here too, so `-Dtest-filter` finds its tests.
     _ = @import("relay.zig");
+    _ = @import("relay_tls_test.zig");
+    _ = @import("agent_relay_certs_test.zig");
     _ = @import("tls_fuzz.zig"); // The same.
     _ = @import("tls_conn.zig"); // Sockets and the real clock: native only.
     _ = @import("tls_conn_test.zig");
@@ -109,6 +111,7 @@ comptime {
     _ = @import("agent_run.zig");
     _ = @import("demo_c2_check.zig");
     _ = @import("job_api.zig");
+    _ = @import("job_cert.zig");
 }
 
 test {

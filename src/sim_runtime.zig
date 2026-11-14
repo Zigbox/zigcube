@@ -928,7 +928,10 @@ test "a relay's listener is open while its container runs and closed by every en
     for (names) |name| {
         const labels = labels_of.one(name);
         var spec = spec_for(name, "b3:51aa9c03", &labels);
-        if (!std.mem.eql(u8, name, "plain")) spec.relay = "127.0.0.1:9";
+        if (!std.mem.eql(u8, name, "plain")) {
+            spec.relay = "127.0.0.1:9";
+            spec.network = .loopback;
+        }
         _ = try rt.start(&spec, &diag);
     }
     try testing.expectEqual(@as(u32, 5), sim.relay_open_count());
@@ -960,6 +963,7 @@ test "a listener left open on a stopped or forgotten container is a problem" {
     const labels = labels_of.one("r-1");
     var spec = spec_for("r-1", "b3:51aa9c03", &labels);
     spec.relay = "127.0.0.1:9";
+    spec.network = .loopback;
     _ = try rt.start(&spec, &diag);
     sim.containers.items[0].relay_open = false;
     try testing.expect(std.mem.startsWith(u8, sim.relay_problem().?, "R3"));

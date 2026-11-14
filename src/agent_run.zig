@@ -42,6 +42,7 @@ const node_store = @import("node_store.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const agent_peer = @import("agent_peer.zig");
+const agent_relay_certs = @import("agent_relay_certs.zig");
 const dir_images = @import("dir_images.zig");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_server_mod = @import("peer_server.zig");
@@ -91,6 +92,10 @@ const Shell = struct {
     /// The node's peer identity (docs/peer.md) and the transport its join calls use.
     peer: *agent_peer.Peer,
     peer_transport: remote_mod.client.Transport,
+    /// Relayed runs' certificates (B4): asked for before every pass and watch.
+    relay_certs: agent_relay_certs.Asker,
+    /// When the current `relay_step` must be done, on the boot clock.
+    relay_step_end_ms: u64 = 0,
 
     /// Joins the cluster CA or renews the credential when it is due. A failure never stops the
     /// agent: it is shown once per streak and tried again after `peer_join_retry_ms`.
@@ -130,9 +135,50 @@ const Shell = struct {
         std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
     }
 
+    /// Asks for the certificates relayed runs wait for. A failure is shown once per streak; the
+    /// relay of a run without one ends its connections at `relay_connect_timeout_ms`. The whole
+    /// step takes at most `relay_cert_step_ms_max` and never runs past the fence: each ask's
+    /// timeout is recomputed before it is made (`relay_left`), so a slow server cannot hold back
+    /// the keepalive.
+    fn relay_step(shell: *Shell) void {
+        if (shell.before_fence(constants.relay_cert_step_ms_max) == 0) return;
+        shell.relay_step_end_ms = shell.boot.now_ms() +| constants.relay_cert_step_ms_max;
+        shell.arena.reset();
+        shell.diag.reset();
+        const certs = &shell.relay_certs;
+        const state = shell.pair_state.interface();
+        const arena = shell.arena.allocator();
+        const now_ms = shell.clock.now_ms();
+        const host: agent_relay_certs.Host = .{
+            .context = shell,
+            .left_fn = relay_left,
+            .reported_fn = relay_reported,
+        };
+        switch (certs.step(state, shell.peer_transport, arena, now_ms, host, &shell.diag)) {
+            .idle, .asked => {},
+            .failed => if (!certs.reported) {
+                certs.reported = true;
+                shell.show("\n", &shell.diag, "zcube-agent: running on; it will ask again\n");
+            },
+        }
+        shell.diag.reset();
+    }
+
+    fn relay_left(context: *anyopaque) u32 {
+        const shell: *Shell = @ptrCast(@alignCast(context));
+        const left = shell.relay_step_end_ms -| shell.boot.now_ms();
+        return shell.before_fence(@intCast(@min(left, constants.relay_cert_step_ms_max)));
+    }
+
+    fn relay_reported(context: *anyopaque, run_id: []const u8) bool {
+        const shell: *Shell = @ptrCast(@alignCast(context));
+        return shell.agent.running_reported_known(run_id);
+    }
+
     /// One step of the core, with what the policy says to tell the person.
     fn pass(shell: *Shell) loop_mod.Outcome {
         shell.peer_step();
+        shell.relay_step();
         shell.arena.reset();
         shell.diag.reset();
         const ctx: agent_mod.Context = .{
@@ -189,6 +235,7 @@ const Shell = struct {
     /// Holds up to `slice_ms` for a replica change or a container event. `failed` if the server
     /// refused or could not be reached: the loop pauses, then steps (which reports and retries).
     fn watch(shell: *Shell, slice_ms: u32) Watched {
+        shell.relay_step();
         shell.diag.reset();
         const mono = shell.boot.now_ms();
         const held = shell.agent.watch_hold_ms(mono, slice_ms);
@@ -427,6 +474,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .boot_id = boot_id,
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
+        .relay_certs = .{ .node = config.node },
     };
     defer shell.arena.deinit();
     announce(io, config);

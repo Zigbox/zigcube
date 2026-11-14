@@ -514,7 +514,9 @@ configuration** names (`relays` in the ZON file, at most `relays_max` = 8, each 
 listener at `ZCUBE_RELAY` (`http://127.0.0.1:<port>`).
 
 Admission refuses, `400` ZC-E0130 naming the field: `relay` that is not a non-empty string, a name
-the server's configuration does not have, and an `env` that sets `ZCUBE_RELAY` (the relay owns it).
+the server's configuration does not have, an `env` that sets `ZCUBE_RELAY` (the relay owns it), and
+(B4) `labels` whose keys and values together are over `x509_labels_bytes_max` = 256 bytes, because
+the job's relay certificate carries every label; a job without a relay is not held to that.
 The relay is resolved once, at admission: the job record holds the name and the address the
 configuration gave then, so a later edit of the configuration changes jobs submitted afterwards and
 no job already admitted. `GET /v1/jobs/{name}` shows `relay` as the name only. The spec comparison
@@ -533,7 +535,7 @@ are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstrea
 | Code | Blame | Summary |
 | --- | --- | --- |
 | `ZC-E0701` | external | the upstream refused a connection |
-| `ZC-E0702` | environment | the relay could not listen |
+| `ZC-E0702` | environment | a job's relay could not be served |
 | `ZC-E0703` | environment | the agent's build cannot serve a relay |
 | `ZC-E0704` | external | the upstream did not answer in time |
 | `ZC-E0705` | environment | a relayed connection failed in the middle |
@@ -668,6 +670,7 @@ runs unchanged on the far side of HTTP:
 | `txn` of puts and deletes under `/observed/<node>/` | `POST /v1/agent/nodes/{node}/observed` |
 | `list(/job-runs/)`, filtered to the node's assignments (B1 slice 4) | `GET /v1/agent/nodes/{node}/runs` |
 | `get(/job-input/<name>)` | `GET /v1/agent/nodes/{node}/runs/{name}/input` |
+| (no store write: the CA signs a relayed run's key, B4) | `POST /v1/agent/nodes/{node}/runs/{name}/certificate` |
 | `list(/job-observed/<node>/)`; `txn` with one put there | `GET` / `POST /v1/agent/nodes/{node}/job-observed` |
 | (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
 
@@ -866,6 +869,32 @@ would ignore (B2). The agent reports a run only under the assignment it read in 
 report and ends the run on its node. An older
 server stores it; the answer shape is unchanged. An older agent fences on `applied: false`, so
 upgrade agents before the server.
+
+### `POST /v1/agent/nodes/{node}/runs/{name}/certificate` (B4 slice 2)
+
+A relayed run's workload certificate. Body `{"public_key": "<64 hex>", "epoch": N,
+"image_digest": "<64 hex>"}` (the run's Ed25519 key from `relay.pub`, the placement epoch and the
+image digest the node started; at most `peer_join_request_bytes_max` bytes, no unknown fields).
+The server reads the job, its status, the run's claim and its assignment at one revision, and
+`job_cert.decide` checks that the job has a relay, the run is claimed by `{node}` and started,
+has not ended, runs the pinned image under the current epoch. Then the cluster CA signs
+`spiffe://<cluster>/job/{name}` with the digest, epoch and labels, valid until the run's last
+legitimate moment, and answers
+
+```json
+{ "certificate": "<hex DER>", "not_before_ms": 1767225600000, "not_after_ms": 1767229200000 }
+```
+
+Refusals: `404` where the server has no CA or no `.cluster` is set (there is no default trust
+domain, docs/decisions/2026-11-13-b4-cluster-setting.md); `400` for a bad job name, key, digest or
+an `epoch` of 0; **`409` ZC-E0706** for a run the node may not have a certificate for (each cause
+names which check failed). A retry cannot change a 409: the agent marks the run refused and does
+not ask again. Two causes are not final, so they are **`503` ZC-E0706**: no node has claimed the
+run yet (also what a node without a claim of its own sees), and the claim has not started the run
+(its `running` report has not landed). The agent asks again after `peer_join_retry_ms` and never
+marks the run refused for a 503; it asks only for runs it knows the server holds as `running`, so
+a 503 is a narrow race. The call writes no store key. Like every agent endpoint it is unauthenticated
+until B7 (docs/mtls.md, "Issuance").
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 

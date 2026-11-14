@@ -130,10 +130,12 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
         host.port,
     }));
     host.config.store = try std.fmt.allocPrint(arena, "sqlite:{s}/store.db", .{host.work});
-    // The relay `botpike` and where it leads, as the agent (on the guest) reaches it.
+    // The relay `botpike` and where it leads, as the agent (on the guest) reaches it: the plain
+    // test upstream, `.plain = true`, which only the Debug server and agent this demo runs accept
+    // (until B4 slice 4 brings TLS to the zigbox runtime's relay; build.zig, `built_debug`).
     const config_path = try host.path_in_work("server.zon");
     const config_text = try std.fmt.allocPrint(arena,
-        \\.{{ .relays = .{{ .botpike = .{{ .address = "{s}" }} }} }}
+        \\.{{ .relays = .{{ .botpike = .{{ .address = "{s}", .plain = true }} }} }}
         \\
     , .{script.upstream});
     try cwd.writeFile(init.io, .{ .sub_path = config_path, .data = config_text });
