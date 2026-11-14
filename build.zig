@@ -579,7 +579,18 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     const help = "Run HANDOFF's C0 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c0", help).dependOn(&run.step);
     add_demo_c1_step(b, step_options, transcript);
-    add_demo_b1_step(b, step_options, transcript);
+    add_fake_demo_step(b, step_options, transcript, .{
+        .name = "demo-b1",
+        .exe = "demo_b1",
+        .root = "src/demo_b1.zig",
+        .help = "Run B1's demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)",
+    });
+    add_fake_demo_step(b, step_options, transcript, .{
+        .name = "demo-b6",
+        .exe = "demo_b6",
+        .root = "src/demo_b6.zig",
+        .help = "Run B6's demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)",
+    });
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
 }
@@ -623,14 +634,28 @@ fn add_demo_c1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     b.step("demo-c1", help).dependOn(&run.step);
 }
 
-/// `zig build demo-b1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: B1's demo, run for
-/// real (src/demo_b1.zig): the server, two agents and the `zcube` command as real processes.
-/// It does not stop the database, so it needs no `pg-up` control.
-fn add_demo_b1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+/// A demo over `FakeRuntime` that takes the same arguments as demo-b1's.
+const FakeDemo = struct {
+    name: []const u8,
+    exe: []const u8,
+    root: []const u8,
+    help: []const u8,
+};
+
+/// `zig build demo-b1|demo-b6 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: B1's demo
+/// (src/demo_b1.zig, two agents) or B6's (src/demo_b6.zig, three labelled agents), run for real:
+/// the server, the agents and the `zcube` command as real processes. Neither stops the
+/// database, so neither needs a `pg-up` control.
+fn add_fake_demo_step(
+    b: *std.Build,
+    step_options: DemoStepOptions,
+    transcript: ?[]const u8,
+    demo: FakeDemo,
+) void {
     const exe = b.addExecutable(.{
-        .name = "demo_b1",
+        .name = demo.exe,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/demo_b1.zig"),
+            .root_source_file = b.path(demo.root),
             .target = step_options.target,
             .optimize = .Debug,
             .imports = &.{
@@ -658,8 +683,7 @@ fn add_demo_b1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     run.addArg("--images");
     run.addFileArg(b.path("fixtures/images.zon"));
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
-    const help = "Run B1's demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
-    b.step("demo-b1", help).dependOn(&run.step);
+    b.step(demo.name, demo.help).dependOn(&run.step);
 }
 
 /// `zig build demo-c2 [-Dtranscript=FILE]`: SPEC's C2 demo, run for real (src/demo_c2.zig): the

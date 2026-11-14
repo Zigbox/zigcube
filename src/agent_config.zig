@@ -934,7 +934,8 @@ test "node labels come from --label or .labels, are checked, and may not disagre
     const none = (try load(arena, std.testing.io, &base, &diag)).run;
     try testing.expectEqual(@as(usize, 0), none.labels.len);
 
-    const file = try parse_file(arena, ".{ .labels = .{ \"exclusive=tenant\", \"tenant=a\" } }", "agent.zon", &diag);
+    const text = ".{ .labels = .{ \"exclusive=tenant\", \"tenant=a\" } }";
+    const file = try parse_file(arena, text, "agent.zon", &diag);
     var flags = try parse_flags(&two, &diag);
     const same = try merge(arena, std.testing.io, flags, file, &diag);
     try testing.expectEqual(@as(usize, 2), same.labels.len);
