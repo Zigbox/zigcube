@@ -330,7 +330,9 @@ pub const ZigboxRuntime = struct {
         diag: *Diag,
     ) runtime.Error!void {
         const number = if (grace_ms > 0) runtime.signal_term else runtime.signal_kill;
-        return from(context).deliver(handle, number, .wait, diag);
+        const self = from(context);
+        self.probes.forget(handle); // A check of a container that is going would be refused.
+        return self.deliver(handle, number, .wait, diag);
     }
 
     fn signal_impl(
@@ -526,7 +528,7 @@ pub const ZigboxRuntime = struct {
         assert(command.len > 0);
         assert(timeout_ms > 0);
         const self = from(context);
-        _ = try inspect_impl(context, handle, diag);
+        _ = try self.inspect_or_forget(handle, diag);
         const now = self.host.monotonic_ms();
         try self.probes.begin(
             self.io,
@@ -545,9 +547,22 @@ pub const ZigboxRuntime = struct {
         diag: *Diag,
     ) runtime.Error!runtime.ProbeResult {
         const self = from(context);
-        _ = try inspect_impl(context, handle, diag);
+        _ = try self.inspect_or_forget(handle, diag);
         return self.probes.poll(handle, self.host.monotonic_ms()) orelse
             .{ .refused = no_probe() };
+    }
+
+    /// `inspect`; a container that is gone also loses its check in flight, whose worker would
+    /// otherwise hold its slot until its timeout and grace.
+    fn inspect_or_forget(
+        self: *ZigboxRuntime,
+        handle: runtime.Handle,
+        diag: *Diag,
+    ) runtime.Error!runtime.Status {
+        return inspect_impl(self, handle, diag) catch |err| {
+            if (err == error.NotFound) self.probes.forget(handle);
+            return err;
+        };
     }
 
     // ---- events ----
