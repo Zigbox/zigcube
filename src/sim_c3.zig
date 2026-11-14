@@ -178,7 +178,8 @@ fn step_problem(
     request: store.TxnRequest,
     tally: *Tally,
 ) Found {
-    const step = step_of(snap, service, request);
+    var step = step_of(snap, service, request);
+    scaled_down(ctx, snap, service, request, &step);
     if (step.created + step.retired == 0) return null;
     const rollout = rollout_of(ctx, service) orelse return null;
     if (rollout.phase == .paused) {
@@ -201,6 +202,48 @@ fn step_problem(
         return "R1: a retirement left fewer replicas running than replicas - max_unavailable";
     }
     return null;
+}
+
+/// A user's scale-down (a `scale_down` decision on the service in the transaction) removes
+/// replicas of either generation, paused or not: the removals down to `replicas` are not the
+/// rollout's retirements. Any beyond are.
+fn scaled_down(
+    ctx: *const Context,
+    snap: *const Snapshot,
+    service: *const ServiceEntry,
+    request: store.TxnRequest,
+    step: *Step,
+) void {
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_decisions)) continue;
+        const kv: store.KeyValue = .{
+            .key = put.key,
+            .value = put.value,
+            .create_revision = 1,
+            .mod_revision = 1,
+        };
+        const decision = records.read(records.Decision, ctx.arena, kv, ctx.diag) catch {
+            ctx.diag.reset();
+            continue;
+        };
+        if (!std.mem.eql(u8, decision.action, "scale_down")) continue;
+        if (decision.subject.kind != .service) continue;
+        if (!std.mem.eql(u8, decision.subject.name, service.rec.name)) continue;
+        break;
+    } else return;
+    var count: u32 = 0;
+    for (snap.replicas) |*replica| {
+        if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
+        if (stopped(snap, &replica.rec) or on_lost_node(snap, &replica.rec)) continue;
+        count += 1;
+    }
+    const excess = @min(step.retired, count -| service.rec.replicas);
+    step.retired -= excess;
+    step.retired_running -|= excess;
 }
 
 /// R2: once a replica of an active rollout's service is created, the replicas that count toward

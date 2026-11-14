@@ -866,6 +866,11 @@ pub const Cluster = struct {
     /// J4: the client that follows the job endings through the watch, and its own random stream.
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
+    /// C3's pauses and resumes (`--c1` only), from a stream of their own so that a world without
+    /// `--c1` draws as before.
+    rollout_prng: std.Random.DefaultPrng,
+    rollout_pauses: u32,
+    rollout_resumes: u32,
     job_next: u32,
     /// The reuse world (B2.1 slice 4): retention run by a jump of time, so that a name is reused
     /// while a container of its earlier incarnation still stands. Its counters: jumps made,
@@ -943,6 +948,9 @@ pub const Cluster = struct {
         c.jobs = .{};
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
+        c.rollout_prng = .init(seed ^ 0x9a05_e7e5_0c3);
+        c.rollout_pauses = 0;
+        c.rollout_resumes = 0;
         c.job_next = 1;
         c.init_reuse();
         c.strong = options.strong or c1_teeth.strong_world;
@@ -1430,6 +1438,21 @@ pub const Cluster = struct {
         const ctx = c.controller_context();
         _ = apply_mod.delete_service(&ctx, &c.api_source, name, "alex@laptop", id) catch
             c.diag.reset();
+    }
+
+    fn request_rollout(c: *Cluster, name: []const u8, what: rollout_controller.Request) void {
+        const ctx = c.controller_context();
+        const outcome = rollout_controller.request(&ctx, &c.api_source, name, what) catch {
+            c.diag.reset();
+            return;
+        };
+        switch (outcome) {
+            .done => |phase| {
+                if (phase == .paused) c.rollout_pauses += 1 else c.rollout_resumes += 1;
+            },
+            .unchanged, .conflict => {},
+            .refused => c.diag.reset(),
+        }
     }
 
     fn restart_server(c: *Cluster) void {
@@ -2166,7 +2189,17 @@ fn operation(c: *Cluster) void {
         .job_cancel => c.cancel_job(),
         .job_end => c.end_job(),
     }
+    if (c.c1 and c.fault_totals == null) pause_or_resume(c, name);
     c.advance(100);
+}
+
+/// Under `--c1`, before the heal, one operation in four also pauses or resumes the rollout of the
+/// service it drew (just applied, so most often one in progress) through the core's request, the
+/// one slice 11's API calls, for R4.
+fn pause_or_resume(c: *Cluster, name: []const u8) void {
+    const random = c.rollout_prng.random();
+    if (random.uintLessThan(u32, 4) != 0) return;
+    c.request_rollout(name, if (random.uintLessThan(u32, 3) == 0) .resume_rollout else .pause);
 }
 
 // ---- Checks -------------------------------------------------------------------------------------
@@ -2862,6 +2895,8 @@ fn heal(c: *Cluster) void {
         node.fences_at_heal = node.fences;
         node.job_refusals_at_heal = node.job_refusals;
     }
+    // Every paused rollout is resumed, so that the liveness check sees each one finish or fail.
+    if (c.c1) for (service_names) |name| c.request_rollout(name, .resume_rollout);
 }
 
 /// Null if `node` has no container of `name` that is not stopped; else whether it is `running`
@@ -3440,10 +3475,11 @@ fn print_summary(c: *Cluster) void {
         });
         report.print("sim-c1 L1: placements judged={d}\n", .{c.c1_tally.placements_judged});
         report.print("sim-c3 R1 retirements={d} R2 surges={d} R3 versions={d} R4 paused={d} " ++
-            "R6 history={d}\n", .{
+            "R6 history={d}; pauses={d} resumes={d}\n", .{
             c.c3_tally.retirements_judged, c.c3_tally.surges_judged,
             c.c3_tally.versions_judged,    c.c3_tally.paused_judged,
-            c.c3_tally.history_judged,
+            c.c3_tally.history_judged,     c.rollout_pauses,
+            c.rollout_resumes,
         });
         const n = c.recorder.counts;
         report.print("sim-c1 acceptance: decisions={d} complete={d} truncated={d} dropped={d} " ++

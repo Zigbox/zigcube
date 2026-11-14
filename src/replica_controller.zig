@@ -427,8 +427,8 @@ const Run = struct {
         var creations = @min(batch_replicas_max - removed_count, missing);
         // A replica that failed on its own is replaced, of either generation, without waiting
         // for the rollout's budget (c3.md): only the surge bound applies. Stale replicas still
-        // missing are the rollout's to start.
-        if (plan.stale > 0) creations = @min(creations, removed_count);
+        // missing are the rollout's to start, and a paused rollout starts nothing more (R4).
+        if (plan.stale > 0 or roll.paused) creations = @min(creations, removed_count);
         creations = @min(creations, roll.room);
         if (!run.budget()) return;
 
