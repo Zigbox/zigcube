@@ -77,7 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
 <p>A rollout must finish within `progress_deadline_ms` of its start. This one did not: new replicas became ready too slowly, or not at all, though none failed outright. (A rollout stalled for room when its deadline passed fails with ZC-E0305 instead.)</p>
-<p>With `on_failure` rollback (the default) the service is rolled back to the generation it ran before; with `pause` the rollout stops where it is. If the new version is right but slow to start, raise the deadline in the service file and apply it again.</p>
+<p>With `on_failure` rollback (the default) the service is rolled back to the generation it ran before, if it ran one: a failed first generation stays failed. With `pause` the rollout stops where it is. If the new version is right but slow to start, raise the deadline in the service file and apply it again.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0306</pre>

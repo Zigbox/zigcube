@@ -1037,8 +1037,9 @@ pub const registry = [_]Entry{
         \\
         \\The cause line names the replica and what it did. With `on_failure`
         \\rollback (the default) the service is rolled back to the generation it
-        \\ran before; with `pause` the rollout stops where it is. Fix the release,
-        \\then apply it again; `zcube why replica <id>` shows its last failure.
+        \\ran before, if it ran one: a failed first generation stays failed. With
+        \\`pause` the rollout stops where it is. Fix the release, then apply it
+        \\again; `zcube why replica <id>` shows its last failure.
         ,
     },
     .{
@@ -1071,7 +1072,8 @@ pub const registry = [_]Entry{
         \\passed fails with ZC-E0305 instead.)
         \\
         \\With `on_failure` rollback (the default) the service is rolled back to
-        \\the generation it ran before; with `pause` the rollout stops where it is.
+        \\the generation it ran before, if it ran one: a failed first generation
+        \\stays failed. With `pause` the rollout stops where it is.
         \\If the new version is right but slow to start, raise the deadline in the
         \\service file and apply it again.
         ,

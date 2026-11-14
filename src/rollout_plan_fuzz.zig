@@ -191,7 +191,7 @@ fn check_rollout(random: std.Random) !void {
         world.add(.{ .new = false, .ready = random.uintLessThan(u8, 4) != 0, .stopping = false });
     }
     const live_max = @max(desired + policy.max_surge, world.count);
-    var state = plan_mod.begin(&policy, .apply, t0);
+    var state = plan_mod.begin(&policy, .apply, random.boolean(), t0);
     const steps_max = 16 * (world_replicas_max + 2);
     for (0..steps_max) |_| {
         const facts: plan_mod.Facts = .{ .desired = desired, .mix = world.mix(), .now_ms = t0 };
@@ -236,16 +236,19 @@ fn apply(
 const Model = struct {
     phase: Phase,
     reason: plan_mod.Reason,
+    /// The service ran a generation before the target: a failed apply has one to roll back to.
+    earlier: bool,
     started_at_ms: u64,
     deadline_at_ms: u64,
     evidence_from_ms: u64,
     paused_at_ms: ?u64 = null,
     paused_by: ?plan_mod.PauseCause = null,
 
-    fn begun(policy: *const Policy, reason: plan_mod.Reason, now: u64) Model {
+    fn begun(policy: *const Policy, reason: plan_mod.Reason, earlier: bool, now: u64) Model {
         return .{
             .phase = if (reason == .apply) .progressing else .rolling_back,
             .reason = reason,
+            .earlier = earlier,
             .started_at_ms = now,
             .deadline_at_ms = now + policy.progress_deadline_ms,
             .evidence_from_ms = now,
@@ -256,12 +259,18 @@ const Model = struct {
         return .{
             .phase = model.phase,
             .reason = model.reason,
+            .earlier = model.earlier,
             .started_at_ms = model.started_at_ms,
             .deadline_at_ms = model.deadline_at_ms,
             .evidence_from_ms = model.evidence_from_ms,
             .paused_at_ms = model.paused_at_ms,
             .paused_by = model.paused_by,
         };
+    }
+
+    /// A failed rollout owes a rollback only if it was an apply over an earlier generation.
+    fn owes(model: *const Model) bool {
+        return model.reason == .apply and model.earlier;
     }
 
     fn running(model: *const Model) bool {
@@ -314,7 +323,7 @@ fn model_pass(model: *Model, policy: *const Policy, facts: *const plan_mod.Facts
                 model.hold(facts.now_ms, .failure);
                 return .{};
             }
-            return .{ .rollback = model.reason == .apply };
+            return .{ .rollback = model.owes() };
         },
         .progressing, .rolling_back => {},
     }
@@ -329,7 +338,7 @@ fn model_pass(model: *Model, policy: *const Policy, facts: *const plan_mod.Facts
         return .{ .failure = failure };
     }
     model.phase = .failed;
-    return .{ .failure = failure, .rollback = model.reason == .apply };
+    return .{ .failure = failure, .rollback = model.owes() };
 }
 
 fn model_failure(
@@ -387,8 +396,10 @@ fn step(
     switch (op) {
         .begin_apply, .begin_rollback => {
             const reason: plan_mod.Reason = if (op == .begin_apply) .apply else .rollback;
-            state.* = plan_mod.begin(policy, reason, now);
-            model.* = Model.begun(policy, reason, now);
+            // One apply in four is of a first generation; a rollback always restores an earlier.
+            const earlier = reason == .rollback or random.uintLessThan(u8, 4) != 0;
+            state.* = plan_mod.begin(policy, reason, earlier, now);
+            model.* = Model.begun(policy, reason, earlier, now);
         },
         .pause => {
             const refused = model.pause(now);
@@ -414,8 +425,9 @@ fn step(
 fn check_phases(random: std.Random) !void {
     var policy = random_policy(random);
     var now: u64 = t0;
-    var state = plan_mod.begin(&policy, .apply, now);
-    var model = Model.begun(&policy, .apply, now);
+    const earlier = random.boolean();
+    var state = plan_mod.begin(&policy, .apply, earlier, now);
+    var model = Model.begun(&policy, .apply, earlier, now);
     for (0..64) |_| {
         // One step in eight takes no time: a begin, pause or resume in the same millisecond as
         // the step before must be told apart by what it did, not by the clock.
@@ -504,8 +516,8 @@ test "rollout plan fuzz: a begin, pause and resume in the same millisecond" {
     const random = prng.random();
     var policy: Policy = .{};
     const now = t0 + 700_000;
-    var state = plan_mod.begin(&policy, .apply, t0);
-    var model = Model.begun(&policy, .apply, t0);
+    var state = plan_mod.begin(&policy, .apply, true, t0);
+    var model = Model.begun(&policy, .apply, true, t0);
     const all_old: Mix = .{ .old_live = 3, .old_ready = 3 };
     const facts: plan_mod.Facts = .{ .desired = 3, .mix = all_old, .now_ms = now };
     const failed = plan_mod.pass(&policy, &state, &facts);

@@ -23,7 +23,9 @@
 //!
 //!     begin(apply)    ──► progressing          begin(rollback) ──► rolling_back
 //!     progressing, rolling_back ── done ──► complete
-//!     progressing  ── failure, on_failure rollback ──► failed   (a rollback is owed)
+//!     progressing  ── failure, on_failure rollback ──► failed   (a rollback is owed, if the
+//!                                                                  service ran an earlier
+//!                                                                  generation)
 //!     rolling_back ── failure, on_failure rollback ──► failed   (nothing owed: not rolled back)
 //!     progressing, rolling_back ── failure, on_failure pause ──► paused (by the failure)
 //!     failed       ── on_failure pause (a policy changed since) ──► paused (by the failure)
@@ -31,6 +33,8 @@
 //!     failed       ── pause ──► paused (by the failure)
 //!     paused       ── resume ──► progressing or rolling_back, as the rollout's reason says
 //!
+//! A failed rollout that owes nothing (a failed rollback, or a failed first generation: there is
+//! nothing to roll back to) has ended (R7); it waits for the user's next apply.
 //! A rollout leaves `failed` only by `begin` or a pause: the automatic rollback lands as a new
 //! generation (`begin(rollback)`), or a newer user apply does (`begin(apply)`). `begin` from any
 //! phase starts a rollout from the current mix of replicas. `paused` and `failed` start and retire
@@ -217,6 +221,9 @@ pub const PauseCause = enum { user, failure };
 pub const State = struct {
     phase: Phase,
     reason: Reason,
+    /// The service ran a generation before this rollout's target (the `/rollouts` record's
+    /// `from` is not 0), so a failure has something to roll back to. A rollback always has one.
+    earlier: bool,
     started_at_ms: u64,
     deadline_at_ms: u64,
     /// Failures the controller saw before this moment do not count: the start, or the last
@@ -238,17 +245,21 @@ pub const State = struct {
             assert(state.paused_by == null);
         }
         if (active(state.phase)) assert(state.phase == state.reason.active_phase());
+        if (state.reason == .rollback) assert(state.earlier);
         if (state.paused_at_ms) |paused_at| assert(paused_at >= state.evidence_from_ms);
     }
 };
 
 /// A rollout starting at `now_ms` for `reason`. From any phase: a newer generation replaces the
-/// rollout's target.
-pub fn begin(policy: *const Policy, reason: Reason, now_ms: u64) State {
+/// rollout's target. `earlier` says whether the service ran a generation before the target (false
+/// for its first generation, whose failure owes no rollback).
+pub fn begin(policy: *const Policy, reason: Reason, earlier: bool, now_ms: u64) State {
     assert(policy_valid(policy));
+    if (reason == .rollback) assert(earlier);
     const state: State = .{
         .phase = reason.active_phase(),
         .reason = reason,
+        .earlier = earlier,
         .started_at_ms = now_ms,
         .deadline_at_ms = now_ms + policy.progress_deadline_ms,
         .evidence_from_ms = now_ms,
@@ -322,10 +333,13 @@ pub const Pass = struct {
 };
 
 /// Whether a rollout in `state` owes a rollback under `policy`: it failed, its policy says
-/// `rollback`, and it was not itself a rollback (a failed rollback is not rolled back again).
+/// `rollback`, it was not itself a rollback (a failed rollback is not rolled back again), and the
+/// service ran an earlier generation (a failed first generation has nothing to roll back to, so it
+/// ends `failed`: docs/decisions/2026-11-14-c3-first-generation-failure.md).
 pub fn rollback_owed(policy: *const Policy, state: *const State) bool {
     if (state.phase != .failed) return false;
     if (policy.on_failure != .rollback) return false;
+    if (!state.earlier) return false;
     return state.reason == .apply;
 }
 
@@ -484,6 +498,7 @@ fn resumed(policy: *const Policy, state: *const State, now_ms: u64) State {
     return .{
         .phase = state.reason.active_phase(),
         .reason = state.reason,
+        .earlier = state.earlier,
         .started_at_ms = state.started_at_ms,
         .deadline_at_ms = deadline_at_ms,
         .evidence_from_ms = at,
@@ -623,6 +638,7 @@ fn state_in(phase: Phase) State {
     return .{
         .phase = phase,
         .reason = if (phase == .rolling_back) .rollback else .apply,
+        .earlier = true,
         .started_at_ms = t0,
         .deadline_at_ms = t0 + 600_000,
         .evidence_from_ms = t0,
@@ -694,6 +710,7 @@ test "rollout plan: every edge of a pass" {
         try testing.expectEqual(case.failure, result.failure);
         try testing.expectEqual(case.rollback, result.rollback);
         try testing.expectEqual(state.reason, result.state.reason);
+        try testing.expectEqual(state.earlier, result.state.earlier);
         try testing.expectEqual(state.started_at_ms, result.state.started_at_ms);
         try testing.expectEqual(state.deadline_at_ms, result.state.deadline_at_ms);
         if (case.to == .paused and case.from != .paused) {
@@ -831,10 +848,10 @@ test "rollout plan: every edge of pause, resume and begin" {
     try testing.expectError(error.NoRollout, pause_rollout(&complete_state, now));
     try testing.expectError(error.NoRollout, resume_rollout(&policy, &complete_state, now));
     const short: Policy = .{ .progress_deadline_ms = 300_000 };
-    const applied = begin(&short, .apply, now);
+    const applied = begin(&short, .apply, true, now);
     try testing.expectEqual(Phase.progressing, applied.phase);
     try testing.expectEqual(now + 300_000, applied.deadline_at_ms);
-    try testing.expectEqual(Phase.rolling_back, begin(&short, .rollback, now).phase);
+    try testing.expectEqual(Phase.rolling_back, begin(&short, .rollback, true, now).phase);
 }
 
 test "rollout plan: a resumed failure is judged on new evidence only" {
@@ -846,7 +863,7 @@ test "rollout plan: a resumed failure is judged on new evidence only" {
     const Kind = enum { held, restarts, ready_timeout, deadline };
     for ([_]Reason{ .apply, .rollback }) |reason| {
         for (std.enums.values(Kind)) |kind| {
-            const state = begin(&policy, reason, t0);
+            const state = begin(&policy, reason, true, t0);
             const at = state.deadline_at_ms;
             var facts: Facts = .{ .desired = 3, .mix = rolling_mix, .now_ms = at };
             switch (kind) {
@@ -873,4 +890,54 @@ test "rollout plan: a resumed failure is judged on new evidence only" {
             try testing.expectEqual(@as(?Failure, .held), fresh.failure);
         }
     }
+}
+
+test "rollout plan: a failed first generation under on_failure rollback ends" {
+    // Goal: R7 for a service's first generation. The TLA+ model found it never ending (Rollout.tla,
+    // FINDINGS.md item 8): it failed owing a rollback to generation 0, which does not exist, so the
+    // controller would call the rollback handler forever. Now it ends `failed`, owing nothing.
+    // Method: begin a first generation, fail it on each failure, then pass it again long after: it
+    // stays `failed`, owes no rollback, plans nothing and asks for no look.
+    const policy: Policy = .{};
+    assert(policy.on_failure == .rollback);
+    const Kind = enum { held, restarts, ready_timeout, deadline };
+    for (std.enums.values(Kind)) |kind| {
+        const state = begin(&policy, .apply, false, t0);
+        const at = state.deadline_at_ms;
+        var facts: Facts = .{ .desired = 3, .mix = .{ .new_live = 3 }, .now_ms = at };
+        switch (kind) {
+            .held => facts.new_held_at_ms = at,
+            .restarts => facts.new_restarts_exceeded_at_ms = at,
+            .ready_timeout => facts.new_unready_since_ms = at - policy.ready_timeout_ms,
+            .deadline => {},
+        }
+        const failed = pass(&policy, &state, &facts);
+        try testing.expectEqual(Phase.failed, failed.state.phase);
+        try testing.expect(failed.failure != null);
+        try testing.expect(!failed.rollback);
+        try testing.expect(!rollback_owed(&policy, &failed.state));
+        var later = facts;
+        later.now_ms = at + 10 * policy.progress_deadline_ms;
+        const again = pass(&policy, &failed.state, &later);
+        try testing.expectEqualDeep(failed.state, again.state);
+        try testing.expect(!again.rollback);
+        try testing.expectEqual(@as(?Failure, null), again.failure);
+        try testing.expect(again.plan.zero());
+        try testing.expectEqual(@as(?u64, null), again.next_at_ms);
+    }
+    // Under on_failure pause it pauses, as any failed rollout does.
+    var first = state_in(.failed);
+    first.earlier = false;
+    const pause_policy: Policy = .{ .on_failure = .pause };
+    const plain: Facts = .{ .desired = 3, .mix = .{ .new_live = 3 }, .now_ms = t0 + 1 };
+    try testing.expectEqual(Phase.paused, pass(&pause_policy, &first, &plain).state.phase);
+    // The same rollout of a later generation owes its rollback.
+    const later_state = begin(&policy, .apply, true, t0);
+    const facts: Facts = .{
+        .desired = 3,
+        .mix = .{ .new_live = 3 },
+        .now_ms = t0,
+        .new_held_at_ms = t0,
+    };
+    try testing.expect(pass(&policy, &later_state, &facts).rollback);
 }
