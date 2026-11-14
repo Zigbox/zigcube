@@ -1786,7 +1786,10 @@ pub const registry = [_]Entry{
         \\replica is assigned to, at the assignment's epoch, for the digest the
         \\replica runs. It refused: the cause names the run, or the replica and its
         \\service, and which check failed (not this node's, a stale epoch, the run
-        \\has ended or the replica is gone, a different image).
+        \\has ended or the replica is gone, a different image). A service
+        \\that pins its image by a short `b3:` digest is always refused,
+        \\since a certificate names the full digest: pin the full 64-hex
+        \\digest.
         \\
         \\A relay stays closed: the job's connections to it are closed without
         \\reaching the upstream, and the line is in the job's `relay.log`. A replica
@@ -1797,9 +1800,10 @@ pub const registry = [_]Entry{
         \\still this node's, check `zcube job status` or `zcube why replica`, and
         \\compare the agent's and the server's versions.
         \\
-        \\Two causes are not final: no node has claimed the run yet, or the claim has
-        \\not started it. The server then answers 503, not 409, and the agent asks
-        \\again by itself; it marks the run refused only on a 409.
+        \\For a run, two causes are not final: no node has claimed it yet,
+        \\or the claim has not started it. The server then answers 503, not
+        \\409, and the agent asks again by itself; it marks the run refused
+        \\only on a 409.
         ,
     },
     .{

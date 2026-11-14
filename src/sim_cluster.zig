@@ -3535,7 +3535,8 @@ fn print_mesh(c: *Cluster) void {
         c.report.print(" {s}={d}", .{ sim_mesh_certs.reason_name(index), count });
     }
     c.report.print("\n", .{});
-    c.report.print("mesh: longest wait for a certificate after the heal {d} ms (M3r bound {d})\n", .{
+    const wait = "mesh: longest wait for a certificate after the heal {d} ms (M3r bound {d})\n";
+    c.report.print(wait, .{
         mesh.due_max_ms, sim_mesh_certs.ask_interval_ms + sim_mesh_certs.renew_cut_ms,
     });
 }
