@@ -11,7 +11,8 @@
 //         shows and the why view renders.
 // mock:   opens <base>/?mock=b1&at=3 (the JavaScript mock, B1's jobs, docs/console.md "Jobs"):
 //         the list, the state filter, one job page per ending cause, the logs placeholder (and no
-//         log request), and that no environment value or input text is on any page.
+//         log request), and that no environment value or input text is on any page; then
+//         ?mock=c3 (C3, a paused rollout): the service page's Rollout and Generations cards.
 // All: no request leaves the origin, no page error, no console error.
 // Prints one PASS/FAIL line per check and exits non-zero if any failed.
 
@@ -72,6 +73,18 @@ if (mode === "sim") {
     const why = await page.evaluate(() => window.zc.sim.request("GET", "/v1/why/service/hello"));
     must(why.body.state.text === "service hello: 2/2 running", `state: ${why.body.state.text}`);
     await shot(page, "sim-overview");
+  });
+  await check("sim: the real core answers rollout and history; the service page shows both cards", async () => {
+    // C3 slice 11: no controller writes /rollouts/ yet (slice 7), so the rollout is null.
+    const ro = await page.evaluate(() => window.zc.sim.request("GET", "/v1/services/hello/rollout"));
+    must(ro.status === 200 && ro.body.rollout === null && ro.body.policy?.strategy === "rolling", `rollout: ${ro.status} ${JSON.stringify(ro.body).slice(0, 120)}`);
+    const hist = await page.evaluate(() => window.zc.sim.request("GET", "/v1/services/hello/history"));
+    must(hist.status === 200 && hist.body.generations?.length >= 1, `history: ${hist.status}`);
+    const steer = await page.evaluate(() => window.zc.sim.request("POST", "/v1/services/hello/rollout/pause"));
+    // The sim sends no body, which the API takes as no applied_by.
+    must(steer.status === 409 && /ZC-E0129/.test(JSON.stringify(steer.body)), `pause with no rollout: ${steer.status}`);
+    await page.evaluate(() => { location.hash = "#/services/hello"; });
+    await page.waitForFunction(() => /No rollout/.test(document.querySelector("#h-ro")?.closest("section")?.innerText || "") && document.querySelectorAll("tr[data-generation]").length >= 1, null, { timeout: 15000 });
   });
   await check("sim: hello's replicas show the node they are assigned to", async () => {
     // Placement is /assigned/<node>/<id> (Replica v2 has no node): the replicas list joins on it.
@@ -188,6 +201,31 @@ if (mode === "sim") {
   });
   await check("mock: no log request was made", async () => { must(!logRequests.length, logRequests.join(", ")); });
   await page.context().close();
+  // C3 slice 11: the service page's Rollout and Generations cards over ?mock=c3 (a paused rollout).
+  for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 800 }]) {
+    const c3 = await open(viewport, `${base}/?mock=c3&at=4#/services/hello`);
+    const card = id => c3.$eval(id, el => el.closest("section").innerText);
+    await check(`mock c3 ${viewport.width}px: the rollout card shows the paused rollout`, async () => {
+      await c3.waitForFunction(() => /paused/.test(document.querySelector("#h-ro")?.closest("section")?.innerText || ""), null, { timeout: 15000 });
+      const t = await card("#h-ro");
+      must(/1 → 2/.test(t), "no 1 → 2");
+      must(/by user/.test(t), "no paused by user");
+      must(/zcube rollout resume hello/.test(t), "no resume command");
+      must(/on failure rollback/.test(t), "no policy");
+      must(!/\bnull\b|undefined|NaN/.test(t), "null, undefined or NaN on the card");
+    });
+    await check(`mock c3 ${viewport.width}px: the generations card lists both, newest first`, async () => {
+      await c3.waitForFunction(() => document.querySelectorAll("tr[data-generation]").length === 2, null, { timeout: 15000 });
+      const gens = await c3.$$eval("tr[data-generation]", trs => trs.map(t => t.dataset.generation));
+      must(gens.join(",") === "2,1", `generations ${gens}`);
+      const t = await card("#h-gen");
+      must(/now/.test(t) && /apply/.test(t), "no current mark or reason");
+      must(!/\bnull\b|undefined|NaN/.test(t), "null, undefined or NaN on the card");
+      must(!(await c3.content()).includes("s3cr3t-c3"), "an env value is on the page");
+      await shot(c3, `mock-c3-${viewport.width}`);
+    });
+    await c3.context().close();
+  }
 } else {
   if (flag("--seed-hello")) {
     const body = { name: "hello", image: "b3:51aa9c03", replicas: 2, command: ["sh", "-c", "while true; do sleep 1; done"], applied_by: "browser-check" };

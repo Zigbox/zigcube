@@ -198,7 +198,7 @@ pub fn history_text(arena: Allocator, body: Value) TextError![]const u8 {
     var cells: std.ArrayList([]const []const u8) = .empty;
     for (items) |item| try cells.append(arena, try history_row(arena, item, current));
     var out: Writer.Allocating = .init(arena);
-    const head: []const []const u8 = &.{ "GEN", "IMAGE", "REPLICAS", "APPLIED BY", "REQUEST" };
+    const head: []const []const u8 = &.{ "GEN", "IMAGE", "REASON", "APPLIED BY", "REQUEST" };
     cli_view.write_table(&out.writer, head, cells.items) catch return error.OutOfMemory;
     return out.toOwnedSlice() catch error.OutOfMemory;
 }
@@ -207,7 +207,7 @@ fn history_row(arena: Allocator, item: Value, current: u64) TextError![]const []
     const generation = cli_data.number(item, "generation") orelse return error.Contract;
     const value = cli_data.member(item, "value") orelse return error.Contract;
     const image = cli_data.text(value, "image") orelse return error.Contract;
-    const replicas = cli_data.number(value, "replicas") orelse return error.Contract;
+    const reason = cli_data.text(value, "reason") orelse return error.Contract;
     const by = cli_data.text(value, "applied_by") orelse "";
     const request = cli_data.text(value, "request_id") orelse "";
     const shown = if (image.len > image_shown_bytes)
@@ -219,7 +219,10 @@ fn history_row(arena: Allocator, item: Value, current: u64) TextError![]const []
         generation, if (generation == current) "*" else "",
     });
     row[1] = shown;
-    row[2] = try std.fmt.allocPrint(arena, "{d}", .{replicas});
+    row[2] = if (cli_data.number(value, "restores")) |restores|
+        try std.fmt.allocPrint(arena, "{s} of {d}", .{ reason, restores })
+    else
+        reason;
     row[3] = if (by.len > 0) by else "-";
     row[4] = if (request.len > 0) request else "-";
     return row;
@@ -288,15 +291,16 @@ test "rollout pause and resume: the change, or no change" {
     );
 }
 
-test "history: newest first, the current generation marked, long images shortened" {
+test "history: newest first, the current generation marked, long images shortened, reasons" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const body = try parse_test(arena,
         \\{"service":"hello","generation":2,"generations":[
-        \\{"generation":2,"value":{"image":"b3:0123456789abcdef0123","replicas":3,
+        \\{"generation":3,"value":{"image":"b3:51aa9c03","reason":"rollback","restores":1}},
+        \\{"generation":2,"value":{"image":"b3:0123456789abcdef0123","reason":"apply",
         \\ "applied_by":"alex@laptop","request_id":"r-0000002"}},
-        \\{"generation":1,"value":{"image":"b3:51aa9c03","replicas":2}}]}
+        \\{"generation":1,"value":{"image":"b3:51aa9c03","reason":"apply"}}]}
     );
     const text = try history_text(arena, body);
     try testing.expect(std.mem.indexOf(u8, text, "2*") != null);
@@ -304,6 +308,7 @@ test "history: newest first, the current generation marked, long images shortene
     try testing.expect(std.mem.indexOf(u8, text, "alex@laptop") != null);
     try testing.expect(std.mem.indexOf(u8, text, "r-0000002") != null);
     try testing.expect(std.mem.indexOf(u8, text, "b3:51aa9c03") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "rollback of 1") != null);
     const empty = try parse_test(arena, "{\"generation\":1,\"generations\":[]}");
     try testing.expectEqualStrings("no generations are stored\n", try history_text(arena, empty));
 }

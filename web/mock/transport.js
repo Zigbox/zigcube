@@ -54,6 +54,8 @@ export function createMockTransport(engine, faults) {
         const found = CODES.find(c => c.code === m[1]);
         return found ? reply(200, found, requestId) : fail(404, [diagNotFound(`code ${m[1]}`)], requestId);
       }
+      m = path.match(/^\/v1\/services\/([\w.-]+)\/(history|rollout)(?:\/(pause|resume))?$/);
+      if (m && (m[3] ? method === "POST" : method === "GET")) return services(m[1], m[2], m[3], body, requestId);
       m = path.match(/^\/v1\/why\/(service|replica|node|job)\/([\w.-]+)$/);
       if (m) return reply(200, why(m[1], m[2], q.get("decision")), requestId);
       return fail(404, [diagNotFound(`route ${path}`)], requestId);
@@ -80,6 +82,30 @@ export function createMockTransport(engine, faults) {
     if (at > engine.rev) throw Object.assign(new Error("future"), { status: 400, diagnostic: diagFutureRevision(at, engine.rev) });
     const r = engine.list(q.get("prefix") || "/", { at, reverse: q.get("reverse") === "true", limit: Math.min(500, Number(q.get("limit") || 500)), after: q.get("continue") });
     return { revision: at, kvs: r.kvs, continue: r.more ? r.last : null };
+  }
+
+  // ---- Rollouts and history (docs/api.md, C3 slice 11) -------------------------------------
+
+  const POLICY = { strategy: "rolling", max_surge: 1, max_unavailable: 0, min_ready_ms: 5000, ready_timeout_ms: 120000, progress_deadline_ms: 600000, grace_ms: 10000, on_failure: "rollback" };
+  // The console reads with a read-only token: environment values come back as null, as the server redacts them.
+  const redact = value => (value.env ? { ...value, env: value.env.map(([k]) => [k, null]) } : value);
+
+  function services(name, what, verb, body, requestId) {
+    const svc = engine.getKv(`/services/${name}`);
+    if (!svc) return fail(404, [diagNotFound(`service ${name}`)], requestId);
+    if (verb) {
+      const r = engine.steerRollout(name, verb, body?.applied_by, requestId);
+      return r.diagnostic ? fail(r.status, [r.diagnostic], requestId) : reply(r.status, r.body, requestId);
+    }
+    const base = { revision: engine.rev, service: name, generation: svc.value.generation };
+    if (what === "history") {
+      const kvs = engine.list(`/history/${name}/`).kvs.filter(kv => kv.value.generation <= svc.value.generation);
+      const generations = kvs.sort((a, b) => b.value.generation - a.value.generation)
+        .map(kv => ({ generation: kv.value.generation, mod_revision: kv.mod_revision, value: redact(kv.value) }));
+      return reply(200, { ...base, generations }, requestId);
+    }
+    const kv = engine.rolloutOf(name);
+    return reply(200, { ...base, replicas: svc.value.replicas, policy: { ...POLICY, ...(svc.value.rollout || {}) }, rollout: kv ? kv.value : null, mod_revision: kv ? kv.mod_revision : 0 }, requestId);
   }
 
   function leases() {

@@ -153,6 +153,11 @@ export const STATES = {
   lost: { glyph: "✕", label: "lost", tone: "err" },
   gone: { glyph: "○", label: "gone", tone: "muted" },
   idle: { glyph: "○", label: "idle", tone: "muted" },
+  // Rollout phases (docs/keys.md, /rollouts/<service>).
+  progressing: { glyph: "◐", label: "progressing", tone: "info" },
+  rolling_back: { glyph: "◐", label: "rolling back", tone: "warn" },
+  paused: { glyph: "▲", label: "paused", tone: "warn" },
+  complete: { glyph: "●", label: "complete", tone: "ok" },
 };
 export function pill(state) {
   const el = h("span", { class: "pill" }, h("span", { "aria-hidden": "true", class: "pg" }), h("span", { class: "pt" }));

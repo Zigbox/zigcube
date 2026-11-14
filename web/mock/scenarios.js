@@ -20,6 +20,21 @@ export const SCENARIOS = {
   },
 };
 
+// `?mock=c3`: a new generation of hello, its rollout record as slice 7's controller writes it
+// (the mock's own controller still replaces replicas at once), then `zcube rollout pause hello`.
+// It carries an environment value, which the history and the console must never show.
+const helloC3 = () => ({ ...helloWith(3), env: [["API_TOKEN", "s3cr3t-c3"]] });
+SCENARIOS.c3 = {
+  title: "C3 · Rollout record, paused",
+  setup() {},
+  steps: [
+    SCENARIOS.c1.steps[0],
+    { title: "Apply hello with 3 replicas", cli: "zcube apply hello.zon", go: "#/services/hello", run: e => e.apply(helloC3()) },
+    { title: "Apply a new image; a rollout starts", cli: "zcube apply hello.zon  # image b3:9d20c4f1", go: "#/services/hello", run: e => { e.apply({ ...helloC3(), image: "b3:9d20c4f1" }); e.startRollout("hello", { from: 1, to: 2 }); } },
+    { title: "Pause the rollout", cli: "zcube rollout pause hello", go: "#/services/hello", run: e => e.steerRollout("hello", "pause") },
+  ],
+};
+
 // `?mock=c1-compacted`: the C1 run, then the service is scaled and the store compacted, so the
 // replicas' causes (the old /services/hello) are gone: `why replica hello-1` ends `compacted`.
 SCENARIOS["c1-compacted"] = {
