@@ -1836,6 +1836,12 @@ const c1_regressions = [_][]const []const u8{
         "--c1",                 "--strong",           "--profile=slow_store",
         "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=99",
     },
+    // C3 slice 7 review: R4's checker counted a user's scale-down while paused on fewer replicas
+    // than the controller keeps (held ones, and ones on a node not ready but within its lost
+    // grace), so it called the removal a retirement
+    // (docs/decisions/2026-11-14-c3-paused-scale-down.md).
+    &.{ "202", "150", "0", "--c3", "--heal-at=125" },
+    &.{ "207", "150", "0", "--c3", "--heal-at=127" },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).

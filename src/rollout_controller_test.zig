@@ -33,7 +33,8 @@ const min_ready_ms = (records.RolloutPolicy{}).min_ready_ms;
 
 /// What the fixture's store does to the next transaction that deletes a replica record (a
 /// retirement), before it commits: the interleavings TLA+ gap 1 and the pause write race name.
-const Interleave = enum { none, stop_kept, pause };
+/// `pause_create` pauses before the next transaction that creates replicas and deletes none.
+const Interleave = enum { none, stop_kept, pause, pause_create };
 
 const Fixture = struct {
     manual: ManualClock,
@@ -207,6 +208,40 @@ const Fixture = struct {
         try self.settle();
     }
 
+    /// Rolls `web` to generation 2 and fails its first new replica's start by the user's fault:
+    /// the rollout fails (ZC-E0304) with three old replicas and the held new one.
+    fn fail(self: *Fixture) !void {
+        try self.roll();
+        var collector: Diag = undefined;
+        collector.reset();
+        collector.raise(.E0206);
+        collector.cause("digest b3:9d20c4f1 is not in this node's store", .{});
+        var finished: records.Diagnostic = undefined;
+        diag_mod.to_diagnostic(&finished, &collector);
+        const ctx = self.context();
+        const raw = try records.diagnostic_raw(ctx.arena, &finished, &self.diag);
+        const text = try testing.allocator.dupe(u8, raw.text);
+        defer testing.allocator.free(text);
+        const new = (try self.replicas())[3];
+        try testing.expectEqual(@as(u64, 2), new.rec.generation);
+        const id = try testing.allocator.dupe(u8, new.rec.id);
+        defer testing.allocator.free(id);
+        const observed: records.Observed = .{
+            .replica = id,
+            .node = "node1",
+            .generation = 2,
+            .status = .stopped,
+            .exit = .{ .kind = .start_failed },
+            .diagnostic = .{ .text = text },
+            .reported_at_ms = self.manual.ms,
+        };
+        try self.put(.{ .agent = "node1" }, records.observed_key("node1", id).slice(), observed);
+        try self.settle();
+        self.manual.advance(min_ready_ms);
+        try self.settle();
+        try testing.expectEqual(records.RolloutPhase.failed, (try self.rollout()).phase);
+    }
+
     fn request(self: *Fixture, what: rollout_controller.Request) !rollout_controller.Outcome {
         const ctx = self.context();
         return rollout_controller.request(&ctx, &self.api, web.name, what);
@@ -228,10 +263,7 @@ const Fixture = struct {
     fn interleave_before(pointer: *anyopaque, txn_request: store.TxnRequest) void {
         const self: *Fixture = @ptrCast(@alignCast(pointer));
         if (self.interleave == .none) return;
-        const prefix = records.replicas_prefix(web.name);
-        for (txn_request.on_success) |op| {
-            if (op == .delete and std.mem.startsWith(u8, op.delete, prefix.slice())) break;
-        } else return;
+        if (!interleaved_here(self.interleave, txn_request)) return;
         const what = self.interleave;
         self.interleave = .none;
         self.interleaved = txn_request.on_success.ptr;
@@ -256,12 +288,26 @@ const Fixture = struct {
         switch (what) {
             .none => unreachable,
             .stop_kept => stop_kept(&ctx, txn_request) catch @panic("stop_kept failed"),
-            .pause => {
+            .pause, .pause_create => {
                 const outcome = rollout_controller.request(&ctx, &self.api, web.name, .pause) catch
                     @panic("pause failed");
                 assert(outcome == .done);
             },
         }
+    }
+
+    /// Whether `what` interleaves before this transaction: one that deletes a replica of `web`,
+    /// or for `pause_create` one that creates replicas of it and deletes none.
+    fn interleaved_here(what: Interleave, txn_request: store.TxnRequest) bool {
+        const prefix = records.replicas_prefix(web.name);
+        var deletes = false;
+        var creates = false;
+        for (txn_request.on_success) |op| switch (op) {
+            .delete => |key| deletes = deletes or std.mem.startsWith(u8, key, prefix.slice()),
+            .put => |item| creates = creates or std.mem.startsWith(u8, item.key, prefix.slice()),
+        };
+        if (what == .pause_create) return creates and !deletes;
+        return deletes;
     }
 
     /// Reports `stopped` for the first generation-1 replica the transaction keeps.
@@ -533,40 +579,98 @@ test "a held new replica fails the rollout with ZC-E0304 and nothing more starts
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
-    try fixture.roll();
-    var collector: Diag = undefined;
-    collector.reset();
-    collector.raise(.E0206);
-    collector.cause("digest b3:9d20c4f1 is not in this node's store", .{});
-    var finished: records.Diagnostic = undefined;
-    diag_mod.to_diagnostic(&finished, &collector);
-    const ctx = fixture.context();
-    const raw = try records.diagnostic_raw(ctx.arena, &finished, &fixture.diag);
-    const text = try testing.allocator.dupe(u8, raw.text);
-    defer testing.allocator.free(text);
-    const new = (try fixture.replicas())[3];
-    try testing.expectEqual(@as(u64, 2), new.rec.generation);
-    const id = try testing.allocator.dupe(u8, new.rec.id);
-    defer testing.allocator.free(id);
-    const observed: records.Observed = .{
-        .replica = id,
-        .node = "node1",
-        .generation = 2,
-        .status = .stopped,
-        .exit = .{ .kind = .start_failed },
-        .diagnostic = .{ .text = text },
-        .reported_at_ms = fixture.manual.ms,
-    };
-    try fixture.put(.{ .agent = "node1" }, records.observed_key("node1", id).slice(), observed);
-    try fixture.settle();
-    fixture.manual.advance(min_ready_ms);
-    try fixture.settle();
-    try testing.expectEqual(records.RolloutPhase.failed, (try fixture.rollout()).phase);
+    try fixture.fail();
     try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
     try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
     try testing.expect(try fixture.request(.resume_rollout) == .refused);
     try testing.expect(fixture.diag.code.? == .E0129);
     fixture.diag.reset();
+}
+
+/// Applies `web` again at generation 2's spec with `replicas` replicas (no new generation).
+fn rescale(fixture: *Fixture, replicas: u32) !void {
+    var next = web;
+    next.image = "b3:9d20c4f1";
+    next.replicas = replicas;
+    next.request_id = "r-0002b13";
+    try fixture.apply(next);
+}
+
+test "a pause between the read and the commit fails a scale-up of a failed rollout" {
+    // Goal: seam b on `scale_up`. A failed rollout's service scaled up creates replicas past
+    // what it ran; a pause that lands before the commit must fail it, since a paused rollout
+    // starts nothing (R4). Method: the pause lands inside the creating transaction.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.fail();
+    try rescale(&fixture, 5);
+    fixture.interleave = .pause_create;
+    try fixture.settle();
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+}
+
+test "a pause between the read and the commit fails a scale-down of a failed rollout" {
+    // Goal: seam b on `scale_down`: what it removes rests on the rollout's phase as read (a
+    // halted rollout keeps `max_surge` more), so a pause that lands first fails the commit.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.fail();
+    try rescale(&fixture, 1);
+    fixture.interleave = .pause;
+    try fixture.settle();
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+}
+
+test "a rollout record that does not decode halts its service only (RB-S2)" {
+    // Goal: an undecodable `/rollouts/web` (ZC-E0301) fails the rollout pass, which runs before
+    // the replicas' controller; that must not stop the replicas of other services, and `web`'s
+    // own replicas must not move on a rollout nobody can read. Method: corrupt the record, apply
+    // a second service, and step the whole plane: each step returns the rollout pass's error
+    // and the second service still gets its replicas.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    const ctx = fixture.context();
+    const key = records.rollout_key(web.name);
+    const bad = [_]store.Op{.{ .put = .{ .key = key.slice(), .value = "{no" } }};
+    const role: writers.Role = .rollout_controller;
+    const done = try writers.txn(ctx.store, role, .{ .on_success = &bad }, &fixture.diag);
+    try testing.expect(done.succeeded);
+    var other = web;
+    other.name = "hello";
+    other.replicas = 2;
+    try fixture.apply(other);
+    var failed: u32 = 0;
+    for (0..6) |_| {
+        const again = fixture.context();
+        _ = fixture.plane.reconcile(&again) catch {
+            try testing.expectEqual(.E0301, fixture.diag.code.?);
+            failed += 1;
+            fixture.diag.reset();
+        };
+        fixture.manual.advance(10);
+    }
+    try testing.expectEqual(@as(u32, 6), failed);
+    const list_ctx = fixture.context();
+    const hello = try controller.list_all(
+        records.Replica,
+        &list_ctx,
+        records.replicas_prefix("hello").slice(),
+        null,
+        constants.replicas_max,
+    );
+    try testing.expectEqual(@as(usize, 2), hello.items.len);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
 }
 
 test "a pause of a service with no rollout is refused with ZC-E0129" {

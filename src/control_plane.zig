@@ -101,11 +101,25 @@ pub const ControlPlane = struct {
             ctx.diag.reset();
         }
         // The rollout controller runs right before the replicas' controller, so the budget it
-        // stores is the one the replicas' pass spends (C3 slice 7).
-        const rolled = try plane.rollouts.reconcile(ctx);
+        // stores is the one the replicas' pass spends (C3 slice 7). A rollout pass that fails
+        // is held like the job pass's (RB-S2): the replicas still run on the budgets stored.
+        var rollout_diag: @TypeOf(ctx.diag.*) = undefined;
+        var rollout_error: ?Error = null;
+        var rolled: Wakeup = undefined;
+        if (plane.rollouts.reconcile(ctx)) |woken| {
+            rolled = woken;
+        } else |err| {
+            rollout_error = err;
+            rollout_diag = ctx.diag.*;
+            ctx.diag.reset();
+        }
         const third = try plane.replicas.reconcile(ctx);
         if (job_error) |err| {
             ctx.diag.* = job_diag;
+            return err;
+        }
+        if (rollout_error) |err| {
+            ctx.diag.* = rollout_diag;
             return err;
         }
         return .{

@@ -745,16 +745,16 @@ pub fn history_of(service: *const Service, applied_at_ms: u64) History {
 
 pub const RolloutPhase = enum { progressing, paused, rolling_back, complete, failed };
 
-/// What the replica controller may do now for a rollout: start this many new replicas, retire
-/// this many ready old ones (`retire`, the count R1 limits) and this many old ones that are not
-/// ready (`retire_unready`). A replica counted as unready that is ready when the controller acts
-/// is not retired on `retire_unready`.
 /// Why a rollout runs: a generation the user applied, or a rollback that landed as one.
 pub const RolloutReason = enum { apply, rollback };
 
 /// Who paused a rollout: the user (`zcube rollout pause`) or a failure under `on_failure: pause`.
 pub const RolloutPauseCause = enum { user, failure };
 
+/// What the replica controller may do now for a rollout: start this many new replicas, retire
+/// this many ready old ones (`retire`, the count R1 limits) and this many old ones that are not
+/// ready (`retire_unready`). A replica counted as unready that is ready when the controller acts
+/// is not retired on `retire_unready`.
 pub const RolloutBudget = struct {
     start: u32 = 0,
     retire: u32 = 0,

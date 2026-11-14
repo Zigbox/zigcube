@@ -11,6 +11,7 @@ const std = @import("std");
 const controller = @import("controller.zig");
 const constants = @import("constants.zig");
 const records = @import("records.zig");
+const replica_controller = @import("replica_controller.zig");
 const rollout_controller = @import("rollout_controller.zig");
 const rollout_plan = @import("rollout_plan.zig");
 const store = @import("store.zig");
@@ -268,7 +269,10 @@ fn compared(request: store.TxnRequest, key: []const u8) bool {
 
 /// A user's scale-down (a `scale_down` decision on the service in the transaction) removes
 /// replicas of either generation, paused or not: the removals down to `replicas` are not the
-/// rollout's retirements. Any beyond are.
+/// rollout's retirements. Any beyond are. The replicas counted are the controller's: every record
+/// but one that stopped for its host's reason (it is replaced, not kept), so a replica held for
+/// its user's fault and one on a node that is not ready but not yet past its lost grace count
+/// (docs/decisions/2026-11-14-c3-paused-scale-down.md; seeds 202 and 207).
 fn scaled_down(
     ctx: *const Context,
     snap: *const Snapshot,
@@ -300,7 +304,10 @@ fn scaled_down(
     var count: u32 = 0;
     for (snap.replicas) |*replica| {
         if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
-        if (stopped(snap, &replica.rec) or on_lost_node(snap, &replica.rec)) continue;
+        if (snap.observed_of(&replica.rec)) |observed| {
+            const held = replica_controller.user_fault(&observed.rec);
+            if (observed.rec.status == .stopped and !held) continue;
+        }
         count += 1;
     }
     const excess = @min(step.retired, count -| service.rec.replicas);

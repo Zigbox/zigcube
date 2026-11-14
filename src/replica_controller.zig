@@ -257,7 +257,9 @@ const Run = struct {
         var plan: ServicePlan = .{};
         try run.classify(service, &plan);
         if (!try run.hold_pass(service, &plan)) return;
-        const roll = try run.roll_of(service, &plan);
+        // A rollout record that does not decode halts this service only (ZC-E0301 is the rollout
+        // pass's to report): every write of its replicas rests on what the rollout allows.
+        const roll = try run.roll_of(service, &plan) orelse return;
         if (plan.dead > 0) return run.replace(service, &plan, &roll);
         if (plan.stale > 0 and roll.starts) return run.roll_out(service, &plan, &roll);
         // A halted rollout (failed or paused) keeps its stale replicas, which then count as
@@ -489,8 +491,9 @@ const Run = struct {
     // ---- Rolling out (C3 slice 7) ----
 
     /// The service's rollout as this pass reads it (`/rollouts/<service>` at the snapshot's
-    /// revision), if it is one of this incarnation and generation, and what it allows.
-    fn roll_of(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!Roll {
+    /// revision), if it is one of this incarnation and generation, and what it allows. Null if
+    /// the record does not decode.
+    fn roll_of(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!?Roll {
         var roll: Roll = .{ .policy = service.rec.rollout_policy() };
         var live = rollout_controller.stopping_orphans(run.snap, service.rec.name);
         for (plan.slice()) |item| {
@@ -505,7 +508,11 @@ const Run = struct {
         roll.rollout_key = try controller.key_copy(ctx, &key);
         roll.rollout_revision = if (got.kv) |found| found.mod_revision else 0;
         const kv = got.kv orelse return roll;
-        const rec = try records.read(records.Rollout, run.ctx.arena, kv, run.ctx.diag);
+        const rec = records.read(records.Rollout, run.ctx.arena, kv, run.ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            ctx.diag.reset();
+            return null;
+        };
         if (!records.rollout_of(&rec, service.kv.create_revision)) return roll;
         if (rec.to != service.rec.generation) return roll;
         roll.rollout = .{ .kv = kv, .rec = rec };
@@ -542,6 +549,7 @@ const Run = struct {
             service,
             plan,
             roll,
+            started_since(&rollout, counter),
             retired[0 .. batch_replicas_max - creations],
         );
         if (creations + retired_count == 0) return;
@@ -627,18 +635,30 @@ const Run = struct {
         return @intCast(@as(u64, start) -| used);
     }
 
+    /// Whether a replica of the service was created since the rollout's budget was computed
+    /// (the counter moved): a start of the rollout's, or a replacement of a dead replica.
+    fn started_since(rollout: *const RolloutEntry, counter: ?NumberEntry) bool {
+        const now: ?u64 = if (counter) |found| found.rec.next else null;
+        return !std.meta.eql(now, rollout.rec.budget_next);
+    }
+
     /// Picks the stale replicas to retire in this transaction into `out`; returns how many.
+    /// `budget.retire` was computed on the replicas ready then: once a replica was created since
+    /// (it replaced one that counted, and is not ready), no running replica is retired on it
+    /// until the rollout controller counts again (R1 is about ready replicas, the floor here
+    /// about running ones).
     fn choose_retired(
         run: *Run,
         service: *const ServiceEntry,
         plan: *const ServicePlan,
         roll: *const Roll,
+        started: bool,
         out: []*const Item,
     ) u32 {
         _ = run;
         const rollout = &roll.rollout.?.rec;
         const used = rollout.budget_old -| plan.stale;
-        var ready_left = rollout.budget.retire -| used;
+        var ready_left = if (started) 0 else rollout.budget.retire -| used;
         var unready_left = (rollout.budget.retire + rollout.budget.retire_unready) -| used;
         const ready_min = service.rec.replicas -| roll.policy.max_unavailable;
         const rolling = roll.policy.strategy == .rolling;
