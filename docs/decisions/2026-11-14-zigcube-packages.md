@@ -55,3 +55,17 @@ Where: `docs/briefs/packaging.md`; later `docs/releases/automation.md` and `pack
   have refused.)
 - Units ship disabled; `zigbox-dev` depends on the SQLite server only; no maintainer scripts; the
   package tool is built in ReleaseSafe. All accepted.
+
+## Verified on 2026-11-14 (implementer)
+
+- `zcube-server` built in `rockylinux:9` (glibc 2.34) for both flavours needs GLIBC_2.34 at most and
+  links only libsqlite3 or libpq plus libc. Each started and answered `--version` on Debian 12,
+  Ubuntu 24.04, Fedora (latest) and Rocky 9 with the distro's own libsqlite3 and libpq. The
+  `postgres:` placeholder is refused with ZC-E0106; the wrong-backend flavour with ZC-E0217. Only
+  x86_64 was built here; aarch64 needs a native arm64 runner (CI only).
+- Debian and Ubuntu print "libpq.so.5: no version information available" for the Postgres flavour
+  (the RHEL libpq it was linked against has versioned symbols, Debian's does not). It is a warning
+  from the loader and harmless; the package description does not need to mention it.
+- `zigbox-dev` lands in the pool at `pool/main/z/zigbox-dev/`, not under `zigcube*`. The signing
+  script's asset allowlist accepts it, and the Zigbox website's deploy allowlist
+  (`pool/main/z/zigcube*/**` as first written) must accept it too: a slice 4 item.
