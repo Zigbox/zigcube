@@ -360,8 +360,10 @@ fn random_faults(random: std.Random, good: *bool, ccs_only: *bool) testclient.Fa
         },
         15 => faults.context = "x",
         16 => {
+            // A high S is a valid ECDSA signature the browser path accepts, and changes nothing
+            // on the Ed25519 path: neither is a fault.
             faults.verify = random.enumValue(testclient.Verify);
-            good.* = faults.verify == .good;
+            good.* = faults.verify == .good or faults.verify == .high_s;
         },
         17 => {
             faults.finished = random.enumValue(testclient.Finished);
