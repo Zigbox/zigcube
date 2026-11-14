@@ -2321,8 +2321,9 @@ test "services and observations written before C4 still read, with no mesh membe
     // Version 3 is also read from a real capture (the test above); version 4 and observed
     // version 3 are written by hand, because no build before C4 writes them through its API or
     // agent (C3 slice 5, 3c5df94, has no `health` in an apply and no agent health check). A
-    // capture replaces them once a C3 build that writes them exists (src/testdata/README.md); a v5 service with a bad address or grant, or a v4 observation
-    // with a bad endpoint, is malformed (ZC-E0301), not taken in.
+    // capture replaces them once a C3 build that writes them exists (src/testdata/README.md).
+    // A v5 service with a bad address or grant, or a v4 observation with a bad endpoint, is
+    // malformed (ZC-E0301), not taken in.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
