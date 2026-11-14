@@ -15,4 +15,4 @@ issues: the peer credential, the node certificate and the client certificate.
   Until then a revoked client's certificate lapses within `x509_leaf_ttl_ms_max` (7 days), and
   a node's within the credential's day.
 
-Where: `src/peer_ca.zig`, `src/server_issue_client.zig`, docs/peer.md, docs/mtls.md.
+Where: `src/peer_ca.zig`, `src/server_issue.zig`, docs/peer.md, docs/mtls.md.
