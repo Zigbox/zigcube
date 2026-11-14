@@ -931,26 +931,46 @@ fn add_store_faults_step(
 /// the commands (docs/releases/packaging.md).
 fn add_packages_steps(b: *std.Build) void {
     const bin = b.option([]const u8, "bin", "Directory of the built executables for `packages`");
-    const zigbox_help = "Version of the zigbox package that zigbox-dev depends on";
-    const zigbox_version = b.option([]const u8, "zigbox-version", zigbox_help);
+    const zigbox_help = "Version of the zigbox package that zigbox-dev depends on " ++
+        "(default: the Zigbox tag build.zig.zon pins)";
+    const zigbox_given = b.option([]const u8, "zigbox-version", zigbox_help);
+    const zigbox_version = zigbox_given orelse pinned_zigbox_version();
     const signatures_help = "Directory of the owner's signatures for `packages`";
     const signatures = b.option([]const u8, "signatures", signatures_help);
     const test_key_help = "Sign the packages with the fixed test key";
     const test_key = b.option(bool, "test-key", test_key_help) orelse false;
+    const signed_at_help = "Unix seconds of the signing: the apt Release gets this Date and a " ++
+        "Valid-Until 21 days later, and repomd.xml this revision";
+    const signed_at = b.option([]const u8, "signed-at", signed_at_help);
+    const arch_help = "Build and check only this architecture's packages (x86_64 or aarch64; " ++
+        "CI's single-architecture build; a release has both)";
+    const arch = b.option([]const u8, "package-arch", arch_help);
+    const version_help = "Version written into the packages (default: build.zig.zon's; " ++
+        "the install test builds two to upgrade between)";
+    const version = b.option([]const u8, "package-version", version_help) orelse
+        @import("build.zig.zon").version;
     const tool = package_tool(b);
     var steps: [2]*std.Build.Step.Run = undefined;
     for (&steps, [_]bool{ false, true }) |*slot, checking| {
         const run = b.addRunArtifact(tool);
         run.setCwd(b.path("."));
-        run.addArgs(&.{ "--version", @import("build.zig.zon").version });
-        run.addArgs(&.{ "--zigbox-version", zigbox_version orelse "0.0.0" });
+        // A refused run prints one line naming the file; `zig build` must show it.
+        run.stdio = .inherit;
+        run.addArgs(&.{ "--version", version });
         run.addArgs(&.{ "--bin", bin orelse "zig-out/release-bin" });
         run.addArgs(&.{ "--assets", "packaging", "--license", "LICENSE" });
         run.addArgs(&.{ "--out", "zig-out/packages" });
+        if (zigbox_version) |text| run.addArgs(&.{ "--zigbox-version", text });
         if (signatures) |directory| run.addArgs(&.{ "--signatures", directory });
         if (test_key) run.addArg("--test-key");
+        if (signed_at) |seconds| run.addArgs(&.{ "--signed-at", seconds });
+        if (arch) |name| run.addArgs(&.{ "--arch", name });
         if (checking) run.addArg("--check");
         run.has_side_effects = true;
+        if (zigbox_version == null) {
+            const fail = b.addFail("build.zig.zon pins Zigbox by no tag: give -Dzigbox-version");
+            run.step.dependOn(&fail.step);
+        }
         slot.* = run;
     }
     steps[1].step.dependOn(&steps[0].step);
@@ -958,6 +978,39 @@ fn add_packages_steps(b: *std.Build) void {
         .dependOn(&steps[0].step);
     b.step("packages-check", "Place the signatures, then check every package file")
         .dependOn(&steps[1].step);
+    add_redate_step(b, tool, signed_at);
+}
+
+/// The version of the Zigbox tag `build.zig.zon` pins (`.../tags/vX.Y.Z.tar.gz`), which the
+/// agent is built against and `zigbox-dev` depends on; null when the pin is not a tag.
+fn pinned_zigbox_version() ?[]const u8 {
+    const url = @import("build.zig.zon").dependencies.zigbox.url;
+    const marker = "/refs/tags/v";
+    const start = (std.mem.indexOf(u8, url, marker) orelse return null) + marker.len;
+    if (!std.mem.endsWith(u8, url, ".tar.gz")) return null;
+    if (start >= url.len - ".tar.gz".len) return null;
+    return url[start .. url.len - ".tar.gz".len];
+}
+
+/// `zig build packages-redate -Dsigned-at=N [-Dpackages-dir=DIR]` rewrites the `Date` and
+/// `Valid-Until` of DIR's apt `Release` (default `zig-out/packages`) and drops the signature
+/// files that no longer match it, without rebuilding any package; the result is signed again.
+fn add_redate_step(b: *std.Build, tool: *std.Build.Step.Compile, signed_at: ?[]const u8) void {
+    const packages_help = "Package tree for packages-redate and release-assets";
+    const directory = b.option([]const u8, "packages-dir", packages_help);
+    const redate_help = "Re-date an existing apt Release (-Dsigned-at, -Dpackages-dir)";
+    const step = b.step("packages-redate", redate_help);
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    run.stdio = .inherit;
+    run.addArg("--redate");
+    run.addArgs(&.{ "--out", directory orelse "zig-out/packages" });
+    run.addArgs(&.{ "--signed-at", signed_at orelse "0" });
+    run.has_side_effects = true;
+    if (signed_at == null) {
+        step.dependOn(&b.addFail("packages-redate needs -Dsigned-at=SECONDS").step);
+    }
+    step.dependOn(&run.step);
 }
 
 fn package_tool(b: *std.Build) *std.Build.Step.Compile {
