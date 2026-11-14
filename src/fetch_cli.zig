@@ -21,6 +21,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const agent_config = @import("agent_config.zig");
 const agent_peer = @import("agent_peer.zig");
+const api_tls_client = @import("api_tls_client.zig");
 const constants = @import("constants.zig");
 const chunk_summary = @import("chunk_summary.zig");
 const dir_images = @import("dir_images.zig");
@@ -37,6 +38,7 @@ const zigbox = @import("zigbox");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const zigbox_image = @import("zigbox_image.zig");
 const pull_report = @import("pull_report.zig");
+const x509 = @import("x509.zig");
 
 const Zsha256 = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
 const IpAddress = std.Io.net.IpAddress;
@@ -104,6 +106,8 @@ pub const Net = struct {
     progress_lines: u32 = 0,
     /// Tests only: a clock the fetch reads instead of `boot_ms`, and no write to fetch.log.
     test_clock_ms: ?*u64 = null,
+    /// The server is read over TLS (B7 slice 7); null: plain HTTP.
+    server_tls: ?*ServerTls = null,
 
     fn clock_ms(net: *const Net) u64 {
         if (net.test_clock_ms) |fake| return fake.*;
@@ -309,6 +313,54 @@ pub const Net = struct {
         diag.reset();
         fetch_worker.raise_bad_tree(&diag, net.peers[index].name, net.digest);
         emit(net.io, &diag);
+    }
+
+    /// The answer to `GET path` from the server over TLS (B7 slice 7), as `http_get` gives it.
+    /// A connection the TLS layer refused or broke says its code once, in one line
+    /// (`ServerTls.say`): the fetch then goes on with the peers it was named and the registry.
+    fn https_get(net: *Net, tls: *ServerTls, path: []const u8, out: []u8) PeerReply {
+        const end = peer_stream.boot_ms(net.io) + constants.fetch_request_timeout_ms;
+        const fd = peer_stream.connect(net.io, tls.address, end) catch return .timeout;
+        defer _ = std.os.linux.close(fd);
+        var arena_state = std.heap.ArenaAllocator.init(tls.gpa);
+        defer arena_state.deinit();
+        var request: [512]u8 = undefined;
+        const form = "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\n" ++
+            "Content-Length: 0\r\n\r\n";
+        const text = std.fmt.bufPrint(&request, form, .{ path, tls.credentials.server_name }) catch
+            return .timeout;
+        var diag: diag_mod.Diag = undefined;
+        diag.reset();
+        const done = api_tls_client.exchange(
+            &tls.credentials,
+            net.io,
+            fd,
+            arena_state.allocator(),
+            &.{text},
+            net.reply.len,
+            api_tls_client.reply_is_whole,
+            end,
+            &diag,
+        ) catch return .timeout; // Out of memory: as a server that did not answer.
+        switch (done.ending) {
+            .done => {},
+            .silent => return .timeout,
+            .failed => {
+                tls.say(net.io, &diag);
+                return .timeout;
+            },
+        }
+        if (done.reply.len > net.reply.len) {
+            net.oversize = true;
+            return .refused;
+        }
+        const body = http_body(done.reply) orelse {
+            if (http_status(done.reply) == null) return .timeout;
+            return tls.refused(net.io, done.reply);
+        };
+        if (body.len > out.len) return .timeout;
+        @memcpy(out[0..body.len], body);
+        return .{ .bytes = out[0..body.len] };
     }
 
     /// The answer to a plain-HTTP `GET path` from `address`, copied into `out`: the body of a
@@ -743,6 +795,13 @@ pub const Args = struct {
     first_skipped: []const u8 = "",
     /// Where a successful fetch writes its `records.Pull` (the agent publishes it); empty: none.
     report: []const u8 = "",
+    /// The server is read over TLS (B7 slice 7) when `ca` is given: the CA certificate it pins,
+    /// the DNS name the server's certificate must carry, and the agent's `--cert`/`--key` (by
+    /// path), presented when the node's own `node.crt` in `state_dir` cannot be.
+    ca: []const u8 = "",
+    tls_name: []const u8 = "",
+    cert: []const u8 = "",
+    key: []const u8 = "",
 };
 
 pub fn parse(args: []const []const u8) ?Args {
@@ -772,10 +831,11 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.server = parse_address(value) orelse return null;
         } else if (std.mem.eql(u8, flag, "--peer")) {
             if (!parse_peer(&parsed, value)) return null;
-        } else return null;
+        } else if (!parse_tls(&parsed, flag, value)) return null;
     }
     const complete = parsed.node.len > 0 and parsed.state_dir.len > 0;
     if (!complete or !digest_valid(parsed.digest)) return null;
+    if (!tls_complete(&parsed)) return null;
     if (parsed.zigbox_store.len > 0) {
         // Zigbox mode: the store and the manifest come together; the digest is a full one.
         if (parsed.images_dir.len > 0 or parsed.digest.len != constants.tree_digest_bytes) {
@@ -789,6 +849,31 @@ pub fn parse(args: []const []const u8) ?Args {
         return null;
     }
     return parsed;
+}
+
+/// `--ca`, `--tls-name`, `--cert` and `--key`: false for any other flag or an empty value.
+fn parse_tls(parsed: *Args, flag: []const u8, value: []const u8) bool {
+    const field: *[]const u8 = if (std.mem.eql(u8, flag, "--ca"))
+        &parsed.ca
+    else if (std.mem.eql(u8, flag, "--tls-name"))
+        &parsed.tls_name
+    else if (std.mem.eql(u8, flag, "--cert"))
+        &parsed.cert
+    else if (std.mem.eql(u8, flag, "--key"))
+        &parsed.key
+    else
+        return false;
+    if (value.len == 0) return false;
+    field.* = value;
+    return true;
+}
+
+/// The TLS flags go with `--server` and `--ca`, and `--cert` with `--key`.
+fn tls_complete(parsed: *const Args) bool {
+    if ((parsed.cert.len > 0) != (parsed.key.len > 0)) return false;
+    const any = parsed.ca.len > 0 or parsed.tls_name.len > 0 or parsed.cert.len > 0;
+    if (!any) return true;
+    return parsed.ca.len > 0 and parsed.server != null;
 }
 
 /// `b3:` and 8 to 64 lower-case hex digits. The digest goes into request lines (the registry's
@@ -844,7 +929,7 @@ fn parse_address(text: []const u8) ?IpAddress {
 pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
     "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX) " ++
     "--digest b3:HEX [--registry HOST:PORT] [--server HOST:PORT] [--report FILE] " ++
-    "[--peer NAME=HOST:PORT]...";
+    "[--ca FILE [--tls-name NAME] [--cert FILE --key FILE]] [--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
 /// memory), 3 is that no source had the tree (the supervisor says ZC-W0603 and pulls from the
@@ -887,6 +972,28 @@ fn identity_or_say(io: std.Io, parsed: *const Args, diag: *diag_mod.Diag) ?peer.
     return loaded;
 }
 
+/// The server's TLS client when `--ca` is given, else null (plain HTTP). Credentials that cannot
+/// be used are one line in the fetch's log (their code and cause), and the server is then not
+/// read at all: plain HTTP to a TLS listener would only be refused (ZC-E0815).
+fn server_tls_or_say(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    parsed: *Args,
+    identity: ?peer.Identity,
+    tls: *ServerTls,
+) ?*ServerTls {
+    if (parsed.ca.len == 0) return null;
+    tls.* = .{ .gpa = gpa, .address = parsed.server.?, .credentials = undefined };
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    tls.load(io, parsed, identity, &diag) catch {
+        tls.say(io, &diag);
+        parsed.server = null;
+        return null;
+    };
+    return tls;
+}
+
 pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     // Not `init.io`: that is a threaded Io. A Zigbox store is written in Zigbox's store
     // namespace, which only a process of one thread may make, and this Io never starts another.
@@ -894,7 +1001,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     const io = threaded.io();
     var diag: diag_mod.Diag = undefined;
     diag.reset();
-    const parsed = parse(args) orelse {
+    var parsed = parse(args) orelse {
         diag.raise(.E0505);
         diag.cause("the arguments of zcube-agent fetch are not complete or not valid", .{});
         diag.fix(.{ .sentence = usage });
@@ -906,6 +1013,9 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         emit(io, &diag); // The peers will not be asked; the registry may still answer.
         diag.reset();
     }
+    var server_tls: ServerTls = undefined;
+    defer if (parsed.ca.len > 0) server_tls.credentials.deinit();
+    const tls = server_tls_or_say(io, gpa, &parsed, identity, &server_tls);
     const reply = gpa.alloc(u8, reply_bytes) catch
         return no_memory(io, &diag);
     defer gpa.free(reply);
@@ -922,6 +1032,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         .digest = parsed.digest,
         .conns = conns,
         .environ = init.minimal.environ,
+        .server_tls = tls,
     };
     defer net.close_peers();
     if (parsed.zigbox_store.len > 0) return fetch_in_namespace(gpa, &net, &parsed, &diag);
@@ -1428,13 +1539,98 @@ fn continue_key_valid_in(prefix: []const u8, key: []const u8) bool {
     return true;
 }
 
+/// The server read over TLS (B7 slice 7): the node's credentials, loaded once, and whether the
+/// one line on a failure was said.
+pub const ServerTls = struct {
+    gpa: std.mem.Allocator,
+    address: IpAddress,
+    credentials: api_tls_client.Credentials,
+    said: bool = false,
+
+    /// One line in the fetch's log, once per fetch: the server's node list could not be read
+    /// over TLS, with the code and cause `diag` holds. The fetch goes on without it.
+    fn say(tls: *ServerTls, io: std.Io, diag: *const diag_mod.Diag) void {
+        const code = diag.code orelse return;
+        if (tls.said) return;
+        tls.said = true;
+        var buffer: [400]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "zcube-agent fetch: ZC-{t}: the server's node " ++
+            "list could not be read over TLS: {s}; peers: only those named\n", .{
+            code, diag.last_cause() orelse "no cause given",
+        }) catch "zcube-agent fetch: the server's node list could not be read over TLS\n";
+        note(io, text);
+    }
+
+    /// The server answered with a status other than 200: said once with the first line of its
+    /// body (the server's diagnostic, ZC-E0822 for a scope), and `.refused`.
+    fn refused(tls: *ServerTls, io: std.Io, reply: []const u8) PeerReply {
+        if (tls.said) return .refused;
+        tls.said = true;
+        const split = std.mem.find(u8, reply, "\r\n\r\n") orelse reply.len;
+        const status = reply[0..(std.mem.findScalar(u8, reply, '\r') orelse 0)];
+        const body = if (split + 4 <= reply.len) reply[split + 4 ..] else "";
+        const first = body[0..(std.mem.findScalar(u8, body, '\n') orelse body.len)];
+        var buffer: [400]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "zcube-agent fetch: the server refused its node " ++
+            "list over TLS: {s}: {s}; peers: only those named\n", .{
+            status[0..@min(status.len, 64)], first[0..@min(first.len, 240)],
+        }) catch "zcube-agent fetch: the server refused its node list over TLS\n";
+        note(io, text);
+        return .refused;
+    }
+
+    /// Loads what the node presents (`api_tls_client.present_node`, the agent's own choice and
+    /// checks): its stored `node.crt` over `peer.key` when usable now, else `--cert`/`--key`.
+    /// ZC-E0806 or ZC-E0811 in `diag` when neither can be.
+    fn load(
+        tls: *ServerTls,
+        io: std.Io,
+        parsed: *const Args,
+        identity: ?peer.Identity,
+        diag: *diag_mod.Diag,
+    ) api_tls_client.LoadError!void {
+        assert(parsed.ca.len > 0);
+        const name = if (parsed.tls_name.len > 0)
+            parsed.tls_name
+        else
+            api_tls_client.server_name_default;
+        const c = &tls.credentials;
+        try c.load_ca(io, parsed.ca, name, diag);
+        var stored: x509.Der = .{};
+        var stored_found = false;
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{
+            parsed.state_dir, agent_peer.node_certificate_file,
+        })) |path| {
+            var ignored: diag_mod.Diag = undefined;
+            ignored.reset();
+            // Absent or damaged is said below as why `--cert` was needed.
+            api_tls_client.read_certificate_file(io, path, &stored, &ignored) catch {};
+            stored_found = ignored.code == null;
+        } else |_| {}
+        const node_identity: api_tls_client.NodeIdentity = .{
+            .where = parsed.state_dir,
+            .node = parsed.node,
+            .stored = if (stored_found) &stored else null,
+            .key_pair = if (identity) |held| held.key else null,
+            .cert = if (parsed.cert.len > 0) parsed.cert else null,
+            .key = if (parsed.key.len > 0) parsed.key else null,
+        };
+        _ = try api_tls_client.present_node(c, io, node_identity, real_ms(io), diag);
+    }
+};
+
 /// `collect_pages` over the control plane's HTTP.
 const HttpGetter = struct {
     net: *Net,
     server: IpAddress,
 
     fn get(getter: HttpGetter, path: []const u8, out: []u8) ?[]const u8 {
-        return switch (getter.net.http_get(getter.server, path, out)) {
+        const reply = if (getter.net.server_tls) |tls|
+            getter.net.https_get(tls, path, out)
+        else
+            getter.net.http_get(getter.server, path, out);
+        return switch (reply) {
             .bytes => |body| body,
             .refused, .timeout, .busy => null,
         };

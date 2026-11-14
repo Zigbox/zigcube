@@ -81,6 +81,12 @@ pub const Fetch = struct {
     server: []const u8 = "",
     /// `NAME=HOST:PORT`, fixed peers.
     peers: []const []const u8 = &.{},
+    /// The agent's `--ca`, `--tls-name`, `--cert` and `--key`, by path (B7 slice 7): the fetch
+    /// reads `server` over TLS with them when `ca` is set. Empty: not given.
+    ca: []const u8 = "",
+    tls_name: []const u8 = "",
+    cert: []const u8 = "",
+    key: []const u8 = "",
     /// The wait after one failed fetch on the node, doubling to the cap (`fetch_backoff.zig`).
     backoff_base_ms: u32 = constants.fetch_backoff_base_ms,
     backoff_cap_ms: u32 = constants.fetch_backoff_cap_ms,
@@ -223,7 +229,7 @@ pub const FakeRuntime = struct {
         diag: *Diag,
     ) runtime.Error!void {
         const fetch = self.options.fetch.?;
-        var argv: [12 + 2 + 2 + 2 * constants.fetch_peers_max][]const u8 = undefined;
+        var argv: [12 + 2 + 2 + 8 + 2 * constants.fetch_peers_max][]const u8 = undefined;
         var count: usize = 0;
         var report_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const report = std.fmt.bufPrint(&report_buffer, "{s}/containers/{s}/{s}", .{
@@ -244,6 +250,16 @@ pub const FakeRuntime = struct {
         if (fetch.server.len > 0) {
             argv[count] = "--server";
             argv[count + 1] = fetch.server;
+            count += 2;
+        }
+        const tls = [_][2][]const u8{
+            .{ "--ca", fetch.ca },     .{ "--tls-name", fetch.tls_name },
+            .{ "--cert", fetch.cert }, .{ "--key", fetch.key },
+        };
+        for (tls) |pair| {
+            if (pair[1].len == 0 or fetch.server.len == 0 or fetch.ca.len == 0) continue;
+            argv[count] = pair[0];
+            argv[count + 1] = pair[1];
             count += 2;
         }
         for (fetch.peers) |peer| {

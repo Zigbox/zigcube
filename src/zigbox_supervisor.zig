@@ -209,10 +209,21 @@ fn fetch_argv(
         argv[count + 1] = swarm.fetch.server;
         count += 2;
     }
+    const fetch = swarm.fetch;
+    const tls = [_][2][]const u8{
+        .{ "--ca", fetch.ca },     .{ "--tls-name", fetch.tls_name },
+        .{ "--cert", fetch.cert }, .{ "--key", fetch.key },
+    };
+    for (tls) |pair| {
+        if (pair[1].len == 0 or fetch.server.len == 0 or fetch.ca.len == 0) continue;
+        argv[count] = pair[0];
+        argv[count + 1] = pair[1];
+        count += 2;
+    }
     return argv[0..count];
 }
 
-const fetch_argv_max = 20;
+const fetch_argv_max = 28;
 
 /// `<state dir>/containers/<name>/<file>` for this container.
 fn container_file(buffer: []u8, swarm: Swarm, file: []const u8) ?[]const u8 {

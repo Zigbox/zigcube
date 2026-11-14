@@ -729,21 +729,16 @@ fn open_tls(
 ) api_tls_client.LoadError!?*api_tls_client.Credentials {
     const tls = config.tls orelse return null;
     try credentials.load_ca(io, tls.ca, tls.server_name, diag);
-    var stored_problem: []const u8 = "it does not exist";
-    if (peer.node_certificate) |*certificate| {
-        const problem = credentials.present(certificate, peer.key, config.node, now_ms);
-        stored_problem = problem orelse return credentials;
-    }
-    const cert = tls.cert orelse
-        return api_tls_client.refuse_no_identity(diag, peer.where, stored_problem);
-    credentials.load_identity(io, cert, tls.key.?, diag) catch |err| {
-        diag.cause("the stored node.crt was not used either: {s}", .{stored_problem});
-        return err;
+    const identity: api_tls_client.NodeIdentity = .{
+        .where = peer.where,
+        .node = config.node,
+        .stored = if (peer.node_certificate) |*certificate| certificate else null,
+        .key_pair = peer.key,
+        .cert = tls.cert,
+        .key = tls.key,
     };
-    credentials.require_node(cert, config.node, now_ms, diag) catch |err| {
-        diag.cause("the stored node.crt was not used either: {s}", .{stored_problem});
-        return err;
-    };
+    const presented = api_tls_client.present_node(credentials, io, identity, now_ms, diag);
+    const stored_problem = try presented orelse return credentials;
     if (peer.node_certificate != null) {
         var buffer: [256]u8 = undefined;
         const note = std.fmt.bufPrint(&buffer, "zcube-agent: the stored node.crt is not " ++
@@ -842,11 +837,33 @@ const Backend = struct {
     /// `server` (from `fetch_server_text`) and the config's strings.
     fn fetch_options(config: config_mod.Config, server: []const u8) ?fake_runtime.Fetch {
         const registry = config.registry orelse return null;
+        const tls = fetch_tls(config);
         return .{
             .node = config.node,
             .images_dir = config.images_dir.?,
             .registry = registry,
             .server = server,
+            .ca = tls.ca,
+            .tls_name = tls.tls_name,
+            .cert = tls.cert,
+            .key = tls.key,
+        };
+    }
+
+    /// The agent's TLS flags, by path, for the fetch child's read of the server's node list
+    /// (B7 slice 7); all empty without `--ca`. Never key bytes: the child reads the files.
+    fn fetch_tls(config: config_mod.Config) struct {
+        ca: []const u8 = "",
+        tls_name: []const u8 = "",
+        cert: []const u8 = "",
+        key: []const u8 = "",
+    } {
+        const tls = config.tls orelse return .{};
+        return .{
+            .ca = tls.ca,
+            .tls_name = tls.server_name,
+            .cert = tls.cert orelse "",
+            .key = tls.key orelse "",
         };
     }
 
@@ -876,6 +893,7 @@ const Backend = struct {
         var writer = std.Io.Writer.fixed(&box.server_text);
         writer.print("{f}", .{config.server}) catch return error.StartFailed;
         const server = writer.buffered();
+        const tls = fetch_tls(config);
         box.runtime.init(init.io, box.host_real.interface(), .{
             .gpa = gpa,
             .state_dir = config.state_dir,
@@ -886,6 +904,10 @@ const Backend = struct {
                 .node = config.node,
                 .state_dir = config.state_dir,
                 .server = server,
+                .ca = tls.ca,
+                .tls_name = tls.tls_name,
+                .cert = tls.cert,
+                .key = tls.key,
             },
         }, diag) catch return error.StartFailed;
         errdefer box.runtime.deinit();

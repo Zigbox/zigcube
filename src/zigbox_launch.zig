@@ -42,6 +42,12 @@ pub const Fetch = struct {
     server: []const u8 = "",
     /// `HOST:PORT` of the registry; empty: peers only.
     registry: []const u8 = "",
+    /// The agent's `--ca`, `--tls-name`, `--cert` and `--key`, by path (B7 slice 7): the fetch
+    /// reads `server` over TLS with them when `ca` is set. Empty: not given.
+    ca: []const u8 = "",
+    tls_name: []const u8 = "",
+    cert: []const u8 = "",
+    key: []const u8 = "",
 };
 
 /// What the supervisor is to run. `tree` is the locked Zigbox tree digest (`b3:...`, the
