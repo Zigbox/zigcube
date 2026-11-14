@@ -14,8 +14,10 @@ any run long enough to show a slow leak or a counter creeping toward its range.
 `src/sim_cluster.zig`): index, virtual time from the run's start, the operation, the service it
 acted on. It is printed after a failure's `step:` line. It draws nothing and is not hashed, so
 no world changes: a passing report is byte for byte what it was, and a failing one differs only by
-its `trace:` lines (checked on seeds of the base build against this one; numbers in the slice
-report). 24 is enough to show the fault and what followed it in the failures seen so far, and
+its `trace:` lines. Checked against the base build (cb10544), both ReleaseSafe: seeds 1 to 30 of
+`sim_cluster <seed> auto --profile=auto` and of `<seed> 150 --c1` (60 runs, all passing) are byte
+for byte the same; seeds 1 to 10 of `sim_teeth <seed> 100` and `sim_teeth --seeds 1..10 100
+--shrink` (all failing) are the same once the `trace:` lines are removed. 24 is enough to show the fault and what followed it in the failures seen so far, and
 keeps the issue short; the fleet's block caps at 32 lines of 200 bytes, so a soak's detail lines
 fit beside it. After `--shrink` the runner reruns the smallest failing run for its trace, because
 the bisection's last run need not be the smallest. The trace is not in the fingerprint, so an
@@ -52,8 +54,9 @@ not the product, and no fleet run (800 operations at most) comes near either val
 **`--c1` soaks are refused.** The per-revision tap keeps its own copy of the history: about 1 GB
 by 2,000 operations. A C1 soak needs that tap bounded first.
 
-**Reach.** Operations per second fall as the history grows (166 at the start, 22 by 2,750
-operations), because `MemoryStore` scans its whole table on every `get` and `list` (`docs/core.md`,
+**Reach.** Operations per second fall as the history grows (103 over the first 500 operations of
+seed 7, 13 at 4,000, 3 at 8,000; 8,000 operations took 36 minutes and held, peak heap 433 MB),
+because `MemoryStore` scans its whole table on every `get` and `list` (`docs/core.md`,
 "The fleet's per-seed budget"; gdb samples of the soak put the time in `find`, `list_impl` and
 `snapshot` under the controllers and retention). A soak of hours therefore reaches thousands of
 operations, not millions. The fix is a hash index in `MemoryStore`, a `Store` change with its own
