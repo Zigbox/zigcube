@@ -1,7 +1,9 @@
-# J6 has no bound while the runs read fails and keepalives succeed (pending the owner)
+# J6 has no bound while the runs read fails and keepalives succeed (owner: option B)
 
-*Recorded 2026-11-14, by the fix slice of #142 (claude/b3-j6-142). **Pending the owner's
-choice**: nothing here is decided, and no code implements either option.*
+*Recorded 2026-11-14, by the fix slice of #142 (claude/b3-j6-142). **Decided by the owner,
+2026-11-14: option B**, a jobs-only local fence from the last good runs read, with the same term
+as J6's fence. Not built yet: it is a named follow-up (below), and until it lands the tooth
+stays an expected failure.*
 
 ## The gap
 
@@ -40,6 +42,17 @@ B. **A local job fence from the last good runs read** (reviewer B's recommendati
 
 Either changes the agent's stopping behaviour under a fault, so the choice is the owner's
 (AGENTS.md: a user-visible bound or behaviour).
+
+## Decision
+
+The owner chose **B** (2026-11-14, relayed by the supervisor): a local fence for jobs only,
+measured from the monotonic time of the last successful runs read, with the same term as J6's
+fence. Replicas and the lease are untouched.
+
+Follow-up (not in the #142 fix slice): build B in the agent (the timer, `next_wake`, unit tests
+of a stalled runs read with keepalives answered), then turn `sim-c1-teeth-job_runs_unread` into
+a positive run in which J6 must hold in the tooth's world, as `sim-c1-offline` is for
+`job_deadline_offline`.
 
 Where: `src/c1_teeth.zig` (`job_runs_unread`), `src/agent_api.zig` (`runs`),
 `src/sim_c1_teeth_job_runs_unread_main.zig`, `build.zig` (`c1_teeth_roots`),
