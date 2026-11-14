@@ -11,6 +11,7 @@ const net = std.Io.net;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const http = @import("agent_http.zig");
+const harness_tls = @import("harness_tls.zig");
 const host_procs = @import("host_procs.zig");
 
 const Allocator = std.mem.Allocator;
@@ -44,6 +45,10 @@ pub const Config = struct {
     server_config: ?[]const u8 = null,
     /// `--listen` (TLS) as well as `--insecure-listen`, which the host's own calls use (demo-b7).
     tls_listen: ?[]const u8 = null,
+    /// The server serves `--listen` (TLS) on the demo's port and no `--insecure-listen`: the
+    /// demo, its `zcube` commands and its agents present certificates of the server's CA
+    /// (B7 slice 6). `ca issue-client operator --scope admin` is the demo's own.
+    tls_only: bool = false,
 };
 
 /// What a `zcube` command did: its exit code (255 if a signal ended it) and both streams.
@@ -69,6 +74,10 @@ pub const Host = struct {
     /// The step being run, named in every failure.
     step: []const u8 = "setup",
     transcript: ?std.Io.File = null,
+    /// With `Config.tls_only`: the CA and the certificates issued from it, and the operator's
+    /// credentials once loaded.
+    pki: ?harness_tls.Pki = null,
+    credentials: ?*harness_tls.Credentials = null,
 
     pub fn arena(host: *Host) Allocator {
         return host.arena_state.allocator();
@@ -154,11 +163,20 @@ pub const Host = struct {
         // highest revision it saw (ZC-E0106 without it); the same one serves every restart.
         const state_dir = try host.path_in_work("server-state");
         var args: std.ArrayList([]const u8) = .empty;
+        const listener = if (host.config.tls_only) "--listen" else "--insecure-listen";
+        if (host.config.tls_only and host.pki == null) host.pki = .{
+            .io = host.io,
+            .arena = arena_allocator,
+            .server_exe = host.config.server_exe,
+            .store = host.config.store,
+            .state_dir = state_dir,
+            .certs = try host.path_in_work("certs"),
+        };
         try args.appendSlice(arena_allocator, &.{
-            "--insecure-listen", listen,
-            "--store",           host.config.store,
-            "--state-dir",       state_dir,
-            "--create-store",    "--quiet",
+            listener,         listen,
+            "--store",        host.config.store,
+            "--state-dir",    state_dir,
+            "--create-store", "--quiet",
         });
         if (host.config.lost_grace_ms) |grace| {
             try args.appendSlice(arena_allocator, &.{ "--lost-grace-ms", grace });
@@ -175,6 +193,7 @@ pub const Host = struct {
         host.server = try host.spawn(host.config.server_exe, args.items, log);
         const ready = struct {
             fn check(_: void, h: *Host) !bool {
+                if (!try h.tls_ready()) return false;
                 const reply = h.call("GET", "/v1/status", "") catch return false;
                 return reply.status == 200;
             }
@@ -196,7 +215,49 @@ pub const Host = struct {
             "--images",       host.config.images,
             "--verbose",
         };
-        host.agent = try host.spawn(host.config.agent_exe, &args, log);
+        const tls = try host.agent_tls(node);
+        const all = try std.mem.concat(arena_allocator, []const u8, &.{ &args, tls });
+        host.agent = try host.spawn(host.config.agent_exe, all, log);
+    }
+
+    /// With `Config.tls_only`, whether the operator's credentials are loaded: once the server
+    /// wrote its CA, `ca issue-client operator --scope admin` (the first time), then loaded and
+    /// exported to the `zcube` commands. True at once without it.
+    fn tls_ready(host: *Host) !bool {
+        if (!host.config.tls_only) return true;
+        if (host.credentials != null) return true;
+        const pki = &host.pki.?;
+        if (try pki.find_ca() == null) return false;
+        const issued = pki.issue("operator", "admin") catch {
+            host.say("  {s}", .{pki.said});
+            return false;
+        };
+        if (issued) {
+            host.say("$ zcube-server ca issue-client operator --scope admin " ++
+                "--store <the store> --state-dir server-state --out certs", .{});
+            host.print_indented(pki.said);
+        }
+        host.credentials = try pki.load("operator");
+        try pki.export_to(&host.cli_environ, "operator");
+        return true;
+    }
+
+    /// With `Config.tls_only`, an agent's `--ca`, `--cert` and `--key`: a node certificate
+    /// issued for `node` the first time (`ca issue-node`). Empty without it.
+    pub fn agent_tls(host: *Host, node: []const u8) ![]const []const u8 {
+        if (!host.config.tls_only) return &.{};
+        const pki = &host.pki.?;
+        const issued = pki.issue(node, null) catch |err| {
+            host.say("  {s}", .{pki.said});
+            return err;
+        };
+        if (issued) {
+            host.say("$ zcube-server ca issue-node {s} --store <the store> " ++
+                "--state-dir server-state --out certs", .{node});
+            host.print_indented(pki.said);
+        }
+        const flags = try pki.flags(node);
+        return host.arena().dupe([]const u8, &flags);
     }
 
     /// SIGTERM, then wait: a clean stop is exit 0.
@@ -216,7 +277,9 @@ pub const Host = struct {
 
     pub fn call(host: *Host, method: []const u8, path: []const u8, body: []const u8) !http.Reply {
         const address = try net.IpAddress.parse("127.0.0.1", host.port);
-        const client: http.Client = .{ .io = host.io, .address = address };
+        const tls = if (host.config.tls_only) host.credentials orelse
+            return error.ApiUnreachable else null;
+        const client: http.Client = .{ .io = host.io, .address = address, .tls = tls };
         var diag: Diag = undefined;
         diag.reset();
         return client.call(host.arena(), .{

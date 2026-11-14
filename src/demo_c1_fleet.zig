@@ -68,8 +68,10 @@ pub const Fleet = struct {
             "--images",       host.config.images,
             "--verbose",
         };
+        const tls = try host.agent_tls(names[index]);
+        const all = try std.mem.concat(arena, []const u8, &.{ &args, tls });
         const log = try log_name(arena, index, fleet.starts[index]);
-        fleet.agents[index] = try host.spawn(host.config.agent_exe, &args, log);
+        fleet.agents[index] = try host.spawn(host.config.agent_exe, all, log);
     }
 
     /// Power off: SIGKILL of the agent, so it cannot revoke its lease, then of every supervisor's
