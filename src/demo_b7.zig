@@ -149,4 +149,5 @@ fn script(demo: *Demo) !void {
     try steps.jobs_client_refused(demo);
     try steps.no_certificate(demo);
     try steps.node_scope(demo);
+    try steps.large_reply(demo);
 }

@@ -34,7 +34,7 @@ pub const Demo = struct {
 const join_wait_ms: u32 = b1.start_wait_ms;
 /// A call over TLS, handshake included.
 const call_ms: u64 = 10_000;
-const reply_bytes_max: usize = 64 * 1024;
+const reply_bytes_max: usize = 256 * 1024;
 
 // ---- 0. The server, its CA and two certificates ----
 
@@ -53,6 +53,11 @@ pub fn start(demo: *Demo) !void {
     const certs = try host.path_in_work("certs");
     try server_command(host, &.{
         "ca",      "issue-client",    "app",         "--scope", "jobs",
+        "--store", host.config.store, "--state-dir", state_dir, "--out",
+        certs,
+    });
+    try server_command(host, &.{
+        "ca",      "issue-client",    "ops",         "--scope", "admin",
         "--store", host.config.store, "--state-dir", state_dir, "--out",
         certs,
     });
@@ -83,17 +88,23 @@ fn find_ca(host: *Host, state_dir: []const u8) ![]const u8 {
     return found orelse host.fail("the server wrote no CA certificate in {s}", .{state_dir});
 }
 
-/// `zcube-server <args>`, shown; it must exit 0.
+/// `zcube-server <args>`, shown; it must exit 0 within `demo_host.command_timeout_ms`.
 fn server_command(host: *Host, args: []const []const u8) !void {
     const argv = try host.arena().alloc([]const u8, args.len + 1);
     argv[0] = host.config.server_exe;
     @memcpy(argv[1..], args);
     host.say("$ zcube-server {s}", .{try std.mem.join(host.arena(), " ", args)});
-    const result = try std.process.run(host.arena(), host.io, .{
+    const result = std.process.run(host.arena(), host.io, .{
         .argv = argv,
         .stdout_limit = .limited(demo_host.output_bytes_max),
         .stderr_limit = .limited(demo_host.output_bytes_max),
-    });
+        .timeout = .{ .duration = .{
+            .raw = .fromMilliseconds(demo_host.command_timeout_ms),
+            .clock = .awake,
+        } },
+    }) catch |err| {
+        return host.fail("zcube-server {s} {s} did not finish: {t}", .{ args[0], args[1], err });
+    };
     host.out(result.stdout);
     host.out(result.stderr);
     const ok = switch (result.term) {
@@ -139,11 +150,18 @@ fn node1_ready(_: void, host: *Host) !bool {
 /// Whether `/nodes/<name>` is in the store, read through the insecure listener (the demo's jobs
 /// client may not read nodes). The agent puts it on its lease once it has joined.
 fn node_registered(host: *Host, name: []const u8) !bool {
-    const listed = try host.json("/v1/list?prefix=/nodes/");
+    const key = try std.fmt.allocPrint(host.arena(), "/nodes/{s}", .{name});
+    return key_listed(host, "/nodes/", key);
+}
+
+/// Whether `key` is in the store under `prefix`, read through the insecure listener.
+fn key_listed(host: *Host, prefix: []const u8, key: []const u8) !bool {
+    assert(std.mem.startsWith(u8, key, prefix));
+    const path = try std.fmt.allocPrint(host.arena(), "/v1/list?prefix={s}", .{prefix});
+    const listed = try host.json(path);
     if (listed != .object) return host.fail("GET /v1/list is not an object", .{});
     const kvs = listed.object.get("kvs") orelse return host.fail("no kvs in /v1/list", .{});
     if (kvs != .array) return host.fail("GET /v1/list: kvs is not an array", .{});
-    const key = try std.fmt.allocPrint(host.arena(), "/nodes/{s}", .{name});
     for (kvs.array.items) |item| {
         if (item != .object) continue;
         const listed_key = item.object.get("key") orelse continue;
@@ -195,10 +213,8 @@ pub fn jobs_client_refused(demo: *Demo) !void {
     host.say("  POST /v1/services -> {s}", .{status_line(posted)});
     try host.check(b1.contains(posted, " 403 "), "the jobs client was refused it (403)", .{});
     try host.check(b1.contains(posted, "ZC-E0822"), "the refusal is ZC-E0822", .{});
-    const reply = try host.call("GET", "/v1/services/web", "");
-    try host.check(reply.status == 404, "no service web exists (GET /v1/services/web: {d})", .{
-        reply.status,
-    });
+    const web = try key_listed(host, "/services/", "/services/web");
+    try host.check(!web, "no service web was written (/services/web is absent)", .{});
 }
 
 // ---- 4. No certificate ----
@@ -218,6 +234,7 @@ pub fn no_certificate(demo: *Demo) !void {
     try host.check(got == .refused, "the request got no answer: {t}", .{got});
     const client_code = if (got.refused) |code| codes.full_name(code) else "the server closed";
     host.say("  the client: {s}", .{client_code});
+    try host.check(got.refused == .E0814, "the client reports ZC-E0814", .{});
     const want = "tls: ZC-E0814: the client sent no certificate";
     try host.wait_for(Logged{ .path = log, .from = mark, .text = want }, logged, "the log", 5_000);
     host.say("  the server's log: {s}", .{std.mem.trim(u8, read_log(host, log)[mark..], "\n")});
@@ -305,8 +322,10 @@ fn node1_credentials(demo: *Demo, credentials: *api_tls_client.Credentials) !voi
         return host.fail("the agent has no peer.key in {s}", .{host.state});
     defer std.crypto.secureZero(u8, &seed);
     const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
-    const presented = credentials.present(&certificate, key_pair);
-    try host.check_quiet(presented, "node.crt is not of the demo's CA", .{});
+    const now_ms = peer_stream.wall_ms(host.io);
+    if (credentials.present(&certificate, key_pair, "node1", now_ms)) |why| {
+        return host.fail("state/node.crt cannot be presented: {s}", .{why});
+    }
 }
 
 /// One request over TLS as `credentials`; the raw reply.
@@ -343,6 +362,48 @@ fn call_as(
     const ended = got.ending == .done;
     try host.check_quiet(ended, "{s} {s} over TLS: {t}", .{ method, path, got.ending });
     return got.reply;
+}
+
+// ---- 6. A reply longer than one TLS record ----
+
+pub fn large_reply(demo: *Demo) !void {
+    const host = demo.host;
+    host.section("6. An admin reads a reply longer than one TLS record");
+    host.say("  # certs/ops.crt (scope admin): GET /v1/codes, every code the server knows", .{});
+    var credentials: api_tls_client.Credentials = undefined;
+    defer credentials.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    try credentials.load(host.io, .{
+        .ca = demo.ca,
+        .cert = try host.path_in_work("certs/ops.crt"),
+        .key = try host.path_in_work("certs/ops.key"),
+    }, &diag);
+    const reply = try call_as(demo, &credentials, "GET", "/v1/codes", "");
+    host.say("  GET /v1/codes -> {s}", .{status_line(reply)});
+    try host.check(b1.contains(reply, " 200 "), "the admin may read the codes (200)", .{});
+    const split = std.mem.find(u8, reply, "\r\n\r\n") orelse
+        return host.fail("GET /v1/codes: no end of head", .{});
+    const length = content_length(reply[0..split]) orelse
+        return host.fail("GET /v1/codes: no Content-Length", .{});
+    const body = reply[split + 4 ..];
+    host.say("  Content-Length {d}, body {d} bytes", .{ length, body.len });
+    try host.check(length > tls_record_plaintext_max, "the reply is longer than one record", .{});
+    try host.check(body.len == length, "the whole body arrived ({d} bytes)", .{body.len});
+}
+
+/// The largest plaintext of one TLS record.
+const tls_record_plaintext_max: usize = 16 * 1024;
+
+fn content_length(head: []const u8) ?usize {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], "content-length")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+        return std.fmt.parseInt(usize, value, 10) catch null;
+    }
+    return null;
 }
 
 fn status_line(reply: []const u8) []const u8 {

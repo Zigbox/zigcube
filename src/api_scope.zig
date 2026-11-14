@@ -1,7 +1,8 @@
 //! Who may call what (B7, docs/mtls.md, "Scopes"). The shell names the caller from the client
 //! certificate the TLS handshake verified, never from a header; `Api.handle` asks `refusal`
 //! before it routes, and a request the caller may not make is refused with 403 ZC-E0822 before
-//! anything is read or written.
+//! anything is read or written. The HTTP shell asks it too, before it reads a request's body, so
+//! a refused body is never read (`server_http.zig`, `refused_unread`).
 //!
 //! - A node's certificate (an agent) may call the agent API under its own node's name only:
 //!   `/v1/agent/nodes/<its name>` and below. The agent handlers keep every key they write under

@@ -597,10 +597,15 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.mtls_interop == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
+      # Its server rows build zcube-server, which links both client libraries.
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
       - name: mtls-interop
         shell: bash
         run: |

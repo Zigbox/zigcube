@@ -35,7 +35,9 @@ const client_name = "app";
 /// The seed of the key in the expired and the other CA's certificates.
 const client_seed: [32]u8 = @splat(0x3C);
 
-const ClientKind = enum { openssl, java };
+/// `java_eager` writes its request at once after its Finished (`-Dinterop.eager=true`): the
+/// refusal's alert must still reach it, not a reset (`linger_refused` in `server_http.zig`).
+const ClientKind = enum { openssl, java, java_eager };
 const Cert = enum { jobs, none, expired, other_ca };
 /// A certificate file and its key file, or null for no certificate.
 const Files = ?[2][]const u8;
@@ -111,6 +113,18 @@ const rows = [_]Row{
     .{
         .name = "zcube-server refuses the java client with another CA's certificate",
         .client = .java,
+        .cert = .other_ca,
+        .expect = refused(other_ca_says, "(unknown_ca)"),
+    },
+    .{
+        .name = "zcube-server's alert reaches a java client that writes at once, no certificate",
+        .client = .java_eager,
+        .cert = .none,
+        .expect = refused(no_certificate, "(certificate_required)"),
+    },
+    .{
+        .name = "zcube-server's alert reaches a java client that writes at once, another CA",
+        .client = .java_eager,
         .cert = .other_ca,
         .expect = refused(other_ca_says, "(unknown_ca)"),
     },
@@ -274,16 +288,24 @@ fn call(h: *Harness, zcube: *const Zcube, row: *const Row, path: []const u8) ![]
     const files = try files_of(h, zcube, row.cert);
     return switch (row.client) {
         .openssl => s_client(h, zcube, files, path),
-        .java => java_client(h, zcube, files, path),
+        .java => java_client(h, zcube, files, path, false),
+        .java_eager => java_client(h, zcube, files, path, true),
     };
 }
 
-fn java_client(h: *Harness, zcube: *const Zcube, files: Files, path: []const u8) ![]const u8 {
+fn java_client(
+    h: *Harness,
+    zcube: *const Zcube,
+    files: Files,
+    path: []const u8,
+    eager: bool,
+) ![]const u8 {
     const scratch = h.scratch.allocator();
     var argv: std.ArrayList([]const u8) = .empty;
     const port = try std.fmt.allocPrint(scratch, "{d}", .{zcube.port});
+    const eager_flag = if (eager) "-Dinterop.eager=true" else "-Dinterop.eager=false";
     try argv.appendSlice(scratch, &.{
-        h.java, "-cp", h.classes, "InteropClient", zcube.ca, port, tls_name, path,
+        h.java, eager_flag, "-cp", h.classes, "InteropClient", zcube.ca, port, tls_name, path,
     });
     if (files) |pair| try argv.appendSlice(scratch, &pair);
     return interop.run_tool(h, argv.items);
@@ -352,5 +374,5 @@ fn wait_text(h: *Harness, path: []const u8, from: usize, text: []const u8, ms: u
 }
 
 comptime {
-    assert(rows.len == 8);
+    assert(rows.len == 10);
 }

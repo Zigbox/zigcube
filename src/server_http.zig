@@ -24,6 +24,7 @@ const http = std.http;
 const net = std.Io.net;
 const agent_api = @import("agent_api.zig");
 const api_mod = @import("api.zig");
+const api_scope = @import("api_scope.zig");
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
 const Clock = @import("clock.zig").Clock;
@@ -50,8 +51,10 @@ pub const Options = struct {
 /// bounded by the idle timeout, working and holding are not (the store has timeouts of its own,
 /// and a hold is bounded by its own deadline). `reading` is the body of a request: the whole
 /// body must arrive within the idle timeout, so a client that stalls half way cannot hold the
-/// slot. `handshake` is a TLS handshake, bounded by `tls_handshake_timeout_ms`.
-const State = enum { handshake, waiting, reading, working, holding, writing };
+/// slot. `handshake` is a TLS handshake, bounded by `tls_handshake_timeout_ms`. `lingering` is
+/// a refused handshake waiting for its alert to reach the client, bounded by
+/// `tls_alert_flush_ms` (decisions/2026-11-14-b7-linger-bound.md).
+const State = enum { handshake, lingering, waiting, reading, working, holding, writing };
 
 const Slot = struct {
     mutex: std.Io.Mutex = .init,
@@ -163,10 +166,11 @@ pub const Shared = struct {
             const stream = slot.stream orelse continue;
             if (slot.state == .working) continue;
             if (slot.state == .holding) continue;
-            const limit_ms: u64 = if (slot.state == .handshake)
-                constants.tls_handshake_timeout_ms
-            else
-                constants.http_idle_timeout_ms;
+            const limit_ms: u64 = switch (slot.state) {
+                .handshake => constants.tls_handshake_timeout_ms,
+                .lingering => constants.tls_alert_flush_ms,
+                else => constants.http_idle_timeout_ms,
+            };
             if (now -| slot.since_ms < limit_ms) continue;
             stream.shutdown(shared.io, .both) catch {}; // Already closing is the goal.
         }
@@ -310,11 +314,10 @@ fn serve_requests(shared: *Shared, slot: u32, transport: *const Transport) void 
 }
 
 /// The server is stopping and this connection is done, but the client closes it first. Whoever
-/// sends the first FIN keeps the connection in TIME_WAIT on its port, and a server whose port is
-/// held cannot start again on it (the server does not set `SO_REUSEADDR`, docs/core.md, "Known
-/// limit: reuse_address"). A client that reads its reply and closes, as the agent does, closes
-/// at once; any other is ended by the watchdog (the idle timeout) or by the stop itself after
-/// `server_stop_ms`.
+/// sends the first FIN keeps the connection in TIME_WAIT on its port. On Linux the server sets
+/// `SO_REUSEADDR` and can start again on such a port; elsewhere it cannot (`server_listen.zig`).
+/// A client that reads its reply and closes, as the agent does, closes at once; any other is
+/// ended by the watchdog (the idle timeout) or by the stop itself after `server_stop_ms`.
 fn wait_for_client(shared: *Shared, slot: u32, transport: *const Transport) void {
     shared.set_state(slot, .waiting);
     if (transport.tls) |conn| conn.close();
@@ -335,9 +338,10 @@ fn linger(shared: *Shared, slot: u32, transport: *const Transport) void {
 /// A refused handshake ends as `linger` does, for the same reason: a TLS 1.3 server judges the
 /// client's certificate before it has read the client's Finished, so closing at once resets the
 /// connection, and the reset can destroy the alert that says why (a JDK client then reports a
-/// broken pipe, not the alert; `zig build mtls-interop`).
+/// broken pipe, not the alert; `zig build mtls-interop`). The client is unauthenticated, so it
+/// may keep the slot only `tls_alert_flush_ms`, not the idle timeout.
 fn linger_refused(shared: *Shared, slot: u32, stream: net.Stream, raw: *std.Io.Reader) void {
-    shared.set_state(slot, .waiting);
+    shared.set_state(slot, .lingering);
     stream.shutdown(shared.io, .send) catch return;
     _ = raw.discardShort(constants.http_linger_bytes_max) catch {}; // Gone is fine.
 }
@@ -352,13 +356,19 @@ fn answer(work: *Work, request: *http.Server.Request) Closed!bool {
     const started = shared.clock.now_ms();
     const ctx = work.context();
     const parsed = copy_head(&ctx, request) orelse return error.Closed;
+    if (is_api(parsed.path) and refused_unread(work.transport.caller, parsed)) {
+        // The API refuses it from its method and path (ZC-E0822) without its body, which is
+        // left unread: the reply closes the connection.
+        const response = serve_api(work, &ctx, parsed, "");
+        return respond_api(work, request, response, started, parsed, false);
+    }
     const body = read_body(work, &ctx, request, parsed) catch |err| switch (err) {
         error.Refused => return false,
         error.Closed => return error.Closed,
     };
     if (is_api(parsed.path)) {
         const response = serve_api(work, &ctx, parsed, body);
-        return respond_api(work, request, response, started, parsed);
+        return respond_api(work, request, response, started, parsed, true);
     }
     return respond_static(work, &ctx, request, parsed, started);
 }
@@ -466,6 +476,14 @@ fn read_body(
     return buffer;
 }
 
+/// Whether the caller may not make the request and it announces a body: the server then
+/// refuses it before reading a byte of the body (api_scope.zig).
+fn refused_unread(caller: api_scope.Caller, parsed: Parsed) bool {
+    const announced = parsed.transfer_encoded or (parsed.content_length orelse 0) > 0;
+    if (!announced) return false;
+    return api_scope.refusal(caller, parsed.method, parsed.path) != null;
+}
+
 fn is_read(method: []const u8) bool {
     if (std.mem.eql(u8, method, "GET")) return true;
     return std.mem.eql(u8, method, "HEAD");
@@ -569,6 +587,7 @@ fn respond_api(
     response: api_mod.Response,
     started_ms: u64,
     parsed: Parsed,
+    keep_alive: bool,
 ) Closed!bool {
     const shared = work.shared;
     shared.set_state(work.slot, .writing);
@@ -576,11 +595,15 @@ fn respond_api(
         .{ .name = "x-request-id", .value = response.request_id },
     };
     const status = std.enums.fromInt(http.Status, response.status) orelse .internal_server_error;
-    request.respond(response.body, .{ .status = status, .extra_headers = &headers }) catch {
+    request.respond(response.body, .{
+        .status = status,
+        .keep_alive = keep_alive,
+        .extra_headers = &headers,
+    }) catch {
         return error.Closed;
     };
     log_request(shared, parsed, response.request_id, response.status, started_ms);
-    return request.head.keep_alive;
+    return keep_alive and request.head.keep_alive;
 }
 
 /// A reply made by the shell: the failure raised on `ctx.diag`, in the API's error body.
@@ -673,7 +696,7 @@ fn respond_static(
         .command = "GET /v1/status",
     });
     const response = api_mod.refusal(ctx, shared.new_id(ctx), status);
-    return respond_api(work, request, response, started_ms, parsed);
+    return respond_api(work, request, response, started_ms, parsed, true);
 }
 
 /// A task for a connection the server will not serve (too many open): tells the client why, stops

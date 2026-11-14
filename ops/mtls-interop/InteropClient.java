@@ -30,6 +30,11 @@ import javax.net.ssl.TrustManagerFactory;
  *
  * It prints one line: `STATUS <status line>` when a reply came, or `FAILED <exception>: <message>`.
  * The server's certificate must chain to CA.pem and name SERVER-NAME (endpoint identification).
+ *
+ * With `-Dinterop.eager=true` it writes its request at once after its Finished, without waiting
+ * for an alert, and a failed write is reported, not ignored: a server that refuses the certificate
+ * must still deliver its alert (it lingers, reading, before it closes) and not reset the
+ * connection under the request (src/server_http.zig, `linger_refused`).
  */
 public final class InteropClient {
     public static void main(String[] args) throws Exception {
@@ -39,6 +44,7 @@ public final class InteropClient {
         int port = Integer.parseInt(args[1]);
         String name = args[2];
         String path = args[3];
+        boolean eager = Boolean.getBoolean("interop.eager");
         try {
             SSLContext context = SSLContext.getInstance("TLSv1.3");
             KeyManager[] keys = args.length == 6 ? keyManagers(args[4], args[5]) : null;
@@ -59,23 +65,27 @@ public final class InteropClient {
             // as an alert after the handshake "completed". Wait briefly for one before writing:
             // a write into a closed connection fails with a broken pipe that hides the alert.
             PushbackInputStream in = new PushbackInputStream(socket.getInputStream());
-            socket.setSoTimeout(500);
-            try {
-                int first = in.read();
-                if (first >= 0) in.unread(first);
-            } catch (SocketTimeoutException quiet) {
-                // No alert: the server accepted the certificate.
+            if (!eager) {
+                socket.setSoTimeout(500);
+                try {
+                    int first = in.read();
+                    if (first >= 0) in.unread(first);
+                } catch (SocketTimeoutException quiet) {
+                    // No alert: the server accepted the certificate.
+                }
+                socket.setSoTimeout(5000);
             }
-            socket.setSoTimeout(5000);
             OutputStream out = socket.getOutputStream();
             String request = "GET " + path + " HTTP/1.1\r\nHost: " + name
                 + "\r\nConnection: close\r\n\r\n";
             try {
                 out.write(request.getBytes(StandardCharsets.US_ASCII));
                 out.flush();
-            } catch (java.io.IOException ignored) {
+            } catch (java.io.IOException failed) {
                 // A server that refused our certificate sent its alert and closed: the write
-                // fails, and the read below reports the alert, which says why.
+                // fails, and the read below reports the alert, which says why. An eager client
+                // writes before the alert can have come, so its write must not fail.
+                if (eager) throw failed;
             }
             String line = statusLine(in);
             socket.close();

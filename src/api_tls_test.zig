@@ -384,6 +384,35 @@ test "an agent presents its stored node.crt only while it is valid and its own (
     try testing.expectEqualSlices(u8, der.slice(), node.certificate.slice());
 }
 
+test "a refused handshake frees its slot within the alert flush, not the idle timeout (B7)" {
+    // Goal: review SHOULD 1 of slice 4, a refused client kept its slot for the idle timeout
+    // (docs/decisions/2026-11-14-b7-linger-bound.md). Method: send plain HTTP to the TLS port,
+    // which refuses the handshake, then hold the socket open without reading or closing; the
+    // slot must be free within `tls_alert_flush_ms` plus a few watchdog periods.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const io = rig.io;
+    const stream = try rig.server.tls_address().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll("GET /v1/status HTTP/1.1\r\nHost: x\r\n\r\n");
+    try writer.interface.flush();
+    var tries: u32 = 0;
+    while (rig.server.shared.connections() == 0) : (tries += 1) {
+        try testing.expect(tries < 500);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const limit_ms = constants.tls_alert_flush_ms + 3 * constants.http_watchdog_ms;
+    comptime std.debug.assert(limit_ms < constants.http_idle_timeout_ms);
+    var waited_ms: u32 = 0;
+    while (rig.server.shared.connections() > 0) : (waited_ms += 50) {
+        try testing.expect(waited_ms <= limit_ms);
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+}
+
 test "the API over TLS: replies larger than the server's write buffer arrive whole (B7)" {
     // Goal: review MUST 1, the TLS writer's drain consumed only its buffer, so a reply longer
     // than it spun. Method: GET a console file of 64 KiB or more and the 25 KB stylesheet over
@@ -404,6 +433,40 @@ test "the API over TLS: replies larger than the server's write buffer arrive who
     }
     try testing.expect(server_static.find("/mock/codes.js").?.bytes.len >= 64 * 1024);
     try testing.expect(server_static.find("/css/console.css").?.bytes.len >= 25_000);
+}
+
+test "a request the caller may not make is refused before its body is read (B7)" {
+    // Goal: review B SHOULD 2 of slice 4, the body was read before the scope check. Method: a
+    // jobs client announces a 60,000-byte body to node1's store endpoint and sends none of it;
+    // the 403 ZC-E0822 must come back at once, closing the connection, not after the body.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    var app: api_tls_client.Credentials = undefined;
+    try rig.load("app", &app);
+    defer app.deinit();
+    const stream = try rig.server.tls_address().connect(rig.io, .{ .mode = .stream });
+    defer stream.close(rig.io);
+    const head = "POST /v1/agent/nodes/node1/store HTTP/1.1\r\nHost: zcube-server\r\n" ++
+        "Content-Length: 60000\r\n\r\n";
+    var diag: Diag = undefined;
+    diag.reset();
+    const end_ms = peer_stream.boot_ms(rig.io) + 3_000;
+    const got = try api_tls_client.exchange(
+        &app,
+        rig.io,
+        stream.socket.handle,
+        rig.arena.allocator(),
+        &.{head},
+        1 << 20,
+        api_tls_client.reply_is_whole,
+        end_ms,
+        &diag,
+    );
+    try testing.expectEqual(.done, got.ending);
+    try testing.expect(std.mem.startsWith(u8, got.reply, "HTTP/1.1 403"));
+    try testing.expect(std.mem.indexOf(u8, got.reply, "ZC-E0822") != null);
+    try testing.expect(std.ascii.findIgnoreCase(got.reply, "connection: close") != null);
 }
 
 test "TLS clients fill at most their slots, and the loopback listener is still served (B7)" {

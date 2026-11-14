@@ -76,8 +76,9 @@ Both commands follow the same rules:
   kinds, as before (decisions/2026-11-14-revoked-names-by-kind.md, which supersedes
   2026-11-13-revoked-names-shared.md). A revoked name stops being issued at once.
 
-A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`), so a
-certificate already issued stops working once its name is in `revoked`.
+A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`). The server
+reads `revoked` when it starts, so a certificate already issued stops working once its name is
+in `revoked` and the server has restarted.
 
 ### Validity
 
@@ -120,7 +121,9 @@ or whose SPIFFE ID is not of this cluster, is refused at the handshake (`ZC-E081
 ### Scopes
 
 `Api.handle` checks the caller before it routes (`api_scope.zig`); a request the caller may not
-make is refused with **403 `ZC-E0822`** before anything is read or written.
+make is refused with **403 `ZC-E0822`** before anything is read or written. The HTTP shell asks
+the same question before it reads a request's body: a refused request's body is not read, and the
+reply closes the connection.
 
 | Caller | May call |
 |---|---|
@@ -424,7 +427,12 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   A refused handshake now ends with a lingering close (`linger_refused` in `server_http.zig`):
   the server judges the client's certificate before it reads the client's Finished, and closing
   at once made the kernel answer that Finished with a reset that destroyed the alert, so the JDK
-  saw only a broken pipe.
+  saw only a broken pipe. Two more rows run the JDK client eagerly: it writes its request at
+  once after its Finished, before any alert can come, and a failed write fails the row; the alert
+  must still reach it (`certificate_required`, `unknown_ca`).
+  The client is not authenticated, so that close keeps its connection slot at most
+  `tls_alert_flush_ms` (1 s) after the refusal, not the idle timeout
+  (decisions/2026-11-14-b7-linger-bound.md).
 
 ## Diagnostics
 
