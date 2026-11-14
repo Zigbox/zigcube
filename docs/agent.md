@@ -329,8 +329,9 @@ monotonic clock from the step and never block.
   returns at once; `Runtime.probe_poll(handle)` says `running`, `exited` (0 passes, anything else
   fails), `timed_out` (a failure, ZC-W0502) or `refused` (the check could not run). The runtime
   kills a check at its `timeout_ms`. FakeRuntime settles a check from the fault file
-  (`unhealthy` exits 1, `probe_timeout` times out, `probe_refused` is refused, otherwise exit 0);
-  SimRuntime from `set_health`; ZigboxRuntime runs it in the container (below).
+  (`unhealthy` exits 1, `probe_timeout` times out, `probe_refused` is refused, otherwise exit 0;
+  the word stays until the container ends); SimRuntime from `set_health`; ZigboxRuntime runs it
+  in the container (below).
 - **ZigboxRuntime (C3 slice 10).** `probe_begin` starts a worker, `zcube-agent probe <replica>
   <timeout_ms> <command...>` (internal, `src/probe_worker.zig`), in a process group of its own
   with its stdout on a pipe. The worker runs the command in the container with Zigbox's
@@ -345,7 +346,16 @@ monotonic clock from the step and never block.
 - **When.** The first check begins the step the agent first sees the container running; the next
   is due `interval_ms` after the last one began (or at once, if it ran longer). At most
   `probes_concurrent_max` (8) are in flight per node; the due ones go in order of due time, then
-  name.
+  name. A check in flight is polled `probe_poll_ms_min` (100 ms) after it began, then each
+  time it has run twice as long, and at its timeout (and on the same doubling past it, until the
+  runtime reports it): a check that ends early is seen early, at a few polls per check.
+- **Cost.** Each due check and each poll wakes the agent for a whole step (heartbeat, listing,
+  store reads), so a node with N checked containers at an interval of I steps about 2N/I more
+  times a second; the cluster simulation's busy-loop bound (200 steps a minute) holds at a 5 s
+  interval, not at 1 s with three replicas a node.
+- **A stored check is valid.** `records.read` refuses (ZC-E0301) a service, replica or history
+  record whose `health` breaks a bound `apply` enforces (`records.health_valid`), so a bad record
+  in the store fails one read, never an assertion in the agent's step.
 - **Counting.** `failure_threshold` failures in a row make the replica `unhealthy`;
   `success_threshold` passes in a row make it `healthy`. A failure inside `start_period_ms`, counted
   from the container's `started_at_ms`, is not counted; a pass inside it counts, and does not end

@@ -603,6 +603,28 @@ pub const Health = struct {
     }
 };
 
+/// Whether a health check is one `apply` admits (ZC-E0125 says which rule a check breaks): a
+/// command of 1 to `runtime_command_words_max` words with a first word, times that nest, and the
+/// bounds `health_interval_ms_max` and `health_verdict_ms_max`. `read` refuses a stored service,
+/// replica or history record whose check is not, so no such value reaches the agent's scheduler.
+pub fn health_valid(health: Health) bool {
+    if (health.command.len == 0) return false;
+    if (health.command.len > constants.runtime_command_words_max) return false;
+    if (health.command[0].len == 0) return false;
+    if (health.interval_ms == 0 or health.timeout_ms == 0) return false;
+    if (health.timeout_ms > health.interval_ms) return false;
+    if (health.failure_threshold == 0 or health.success_threshold == 0) return false;
+    if (health.interval_ms > constants.health_interval_ms_max) return false;
+    if (health.start_period_ms > constants.health_interval_ms_max) return false;
+    const threshold = @max(health.failure_threshold, health.success_threshold);
+    return @as(u64, threshold) * health.interval_ms <= constants.health_verdict_ms_max;
+}
+
+fn health_absent_or_valid(health: ?Health) bool {
+    const check = health orelse return true;
+    return health_valid(check);
+}
+
 pub fn health_equal(first: ?Health, second: ?Health) bool {
     const left = first orelse return second == null;
     const right = second orelse return false;
@@ -1223,6 +1245,10 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         if (!job_valid(record)) return malformed(diag, kv.key, @typeName(T));
     }
     if (T == Assigned and !assigned_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    // `apply` refuses these (ZC-E0125); the agent's health scheduler asserts what it checks.
+    if (T == Service or T == Replica or T == History) {
+        if (!health_absent_or_valid(record.health)) return malformed(diag, kv.key, @typeName(T));
+    }
     if (T == JobStatus and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobObserved and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobAdmission and !admission_valid(record)) {
@@ -1777,6 +1803,107 @@ test "C3: services and replicas are version 4 only with health or a rollout" {
     // A change of health is a change of what a replica runs.
     try testing.expect(replica_runs_service(&probed_back, &checked));
     try testing.expect(!replica_runs_service(&replica, &checked));
+}
+
+test "C3: read refuses a stored health check that apply would refuse" {
+    // Goal: no stored check the apply would refuse reaches the agent's scheduler, whose
+    // assertions hold for admitted checks only (a bad row crash-looped the agent). Method: a
+    // service, a replica and a history record, each with one field out of bounds at a time, read
+    // with ZC-E0301; each boundary value reads back.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const interval_max = constants.health_interval_ms_max;
+    const words_most: [constants.runtime_command_words_max][]const u8 = @splat("w");
+    const words_too_many: [constants.runtime_command_words_max + 1][]const u8 = @splat("w");
+    const bad = [_]Health{
+        with_health(.{ .command = &.{} }),
+        with_health(.{ .command = &words_too_many }),
+        with_health(.{ .command = &.{ "", "x" } }),
+        with_health(.{ .interval_ms = 0 }),
+        with_health(.{ .timeout_ms = 0 }),
+        with_health(.{ .timeout_ms = test_health.interval_ms + 1 }),
+        with_health(.{ .failure_threshold = 0 }),
+        with_health(.{ .success_threshold = 0 }),
+        with_health(.{ .interval_ms = interval_max + 1, .timeout_ms = 1 }),
+        with_health(.{ .start_period_ms = interval_max + 1 }),
+        with_health(.{ .interval_ms = interval_max, .failure_threshold = std.math.maxInt(u32) }),
+        with_health(.{ .interval_ms = interval_max, .success_threshold = std.math.maxInt(u32) }),
+    };
+    const good = [_]Health{
+        test_health,
+        with_health(.{ .interval_ms = interval_max, .start_period_ms = interval_max }),
+        with_health(.{ .timeout_ms = test_health.interval_ms }),
+        with_health(.{ .command = &words_most }),
+        with_health(.{
+            .interval_ms = interval_max,
+            .failure_threshold = @intCast(constants.health_verdict_ms_max / interval_max),
+        }),
+    };
+    for (bad) |health| {
+        try testing.expect(!health_valid(health));
+        try expect_health_read(arena, health, &diag, false);
+    }
+    for (good) |health| {
+        try testing.expect(health_valid(health));
+        try expect_health_read(arena, health, &diag, true);
+    }
+}
+
+const HealthChange = struct {
+    command: ?[]const []const u8 = null,
+    interval_ms: ?u32 = null,
+    timeout_ms: ?u32 = null,
+    start_period_ms: ?u32 = null,
+    failure_threshold: ?u32 = null,
+    success_threshold: ?u32 = null,
+};
+
+fn with_health(change: HealthChange) Health {
+    var health = test_health;
+    if (change.command) |command| health.command = command;
+    if (change.interval_ms) |value| health.interval_ms = value;
+    if (change.timeout_ms) |value| health.timeout_ms = value;
+    if (change.start_period_ms) |value| health.start_period_ms = value;
+    if (change.failure_threshold) |value| health.failure_threshold = value;
+    if (change.success_threshold) |value| health.success_threshold = value;
+    return health;
+}
+
+fn expect_health_read(arena: Allocator, health: Health, diag: *Diag, valid: bool) !void {
+    const service: Service = .{
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 1,
+        .command = &.{"run"},
+        .generation = 3,
+        .health = health,
+    };
+    const replica: Replica = .{
+        .id = "hello-1",
+        .service = "hello",
+        .generation = 3,
+        .image = "b3:51aa9c03",
+        .command = &.{"run"},
+        .health = health,
+    };
+    var history = std.mem.zeroes(History);
+    history.v = version_current(History);
+    history.health = health;
+    inline for (.{ service, replica, history }) |value| {
+        const T = @TypeOf(value);
+        const bytes = try encode(arena, value, diag);
+        const result = read(T, arena, kv_of("/k", bytes), diag);
+        if (valid) {
+            _ = try result;
+        } else {
+            try testing.expectError(error.Malformed, result);
+            try testing.expectEqual(codes.Code.E0301, diag.code.?);
+        }
+        diag.reset();
+    }
 }
 
 test "C3: an observation is version 3 only with a health verdict" {

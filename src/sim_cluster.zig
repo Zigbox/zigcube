@@ -147,6 +147,24 @@ const fixtures = [_][]const u8{ hello_digest, next_digest };
 const images = [_][]const u8{ hello_digest, next_digest, broken_digest };
 const service_names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
 
+/// The check of the health world's services (`Options.health`): `alpha` and `gamma` have it.
+const sim_health: records.Health = .{
+    .command = &.{ "check", "--quiet" },
+    .interval_ms = 5_000,
+    .timeout_ms = 1_000,
+    .failure_threshold = 2,
+    .success_threshold = 1,
+};
+
+/// How the health world scripts checks, in turn: every outcome the seam reports.
+const health_scripts = [_]sim_runtime.HealthScript{
+    .unhealthy, .hangs, .healthy, .refuses, .refuses_to_begin, .healthy,
+};
+
+fn checked(name: []const u8) bool {
+    return std.mem.eql(u8, name, "alpha") or std.mem.eql(u8, name, "gamma");
+}
+
 comptime {
     assert(broken_digest.len == 64);
 }
@@ -878,6 +896,10 @@ pub const Cluster = struct {
     relay_spec_wrong: bool = false,
     /// `Options.strong`, or a tooth that needs it (`c1_teeth.strong_world`).
     strong: bool,
+    /// `Options.health`: services get a health check and runtime faults script checks.
+    health_on: bool,
+    /// The health scripts set so far (`script_health`); the next one's index.
+    health_scripts: u32,
     /// The host crashes injected so far (the wipe takes every other one, from the first).
     host_crashes: u32,
 
@@ -941,8 +963,7 @@ pub const Cluster = struct {
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
         c.init_reuse();
-        c.strong = options.strong or c1_teeth.strong_world;
-        c.host_crashes = 0;
+        c.init_worlds(options);
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
         c.server.check_i6 = true;
@@ -1416,7 +1437,24 @@ pub const Cluster = struct {
             .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
             .applied_by = "alex@laptop",
             .request_id = id,
+            .health = if (c.health_on and checked(name)) sim_health else null,
         }) catch c.diag.reset();
+    }
+
+    fn init_worlds(c: *Cluster, options: Options) void {
+        c.strong = options.strong or c1_teeth.strong_world;
+        c.host_crashes = 0;
+        c.health_on = options.health;
+        c.health_scripts = 0;
+    }
+
+    /// The health world's runtime fault also scripts how the checks of one running container on
+    /// `node` come out, in turn through `health_scripts`; no draw.
+    fn script_health(c: *Cluster, node: *Node) void {
+        assert(c.health_on);
+        const n = c.health_scripts;
+        const script = health_scripts[n % health_scripts.len];
+        if (node.sim.containers.script_health(n, script) != null) c.health_scripts += 1;
     }
 
     fn delete_service(c: *Cluster, name: []const u8) void {
@@ -2107,8 +2145,10 @@ fn operation(c: *Cluster) void {
         .delete => c.delete_service(name),
         .broken => c.apply(name, broken_digest, 1 + c.replicas_for(random, 2)),
         .runtime_fault => {
-            const injected = c.pick_node().sim.containers.random_fault();
+            const node = c.pick_node();
+            const injected = node.sim.containers.random_fault();
             if (injected != null) c.stats.runtime_faults += 1;
+            if (c.health_on) c.script_health(node);
         },
         .crash => c.crash(c.pick_node()),
         .partition => c.partition(c.pick_node()),
@@ -3091,6 +3131,10 @@ pub const Options = struct {
     /// world it was before those faults existed, bit for bit (a replay line of an older failure
     /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
     strong: bool = false,
+    /// The health world of C3 slice 9: `alpha` and `gamma` have a health check, and every
+    /// runtime fault also scripts how one running container's checks come out (pass, fail, hang,
+    /// refused at poll or at begin), in turn, with no draw. Off, a run is the world it was before.
+    health: bool = false,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -3450,6 +3494,17 @@ fn print_jobs(c: *Cluster) void {
         c.report.print("jobs: reuse jumps={d} dropped={d} reused creates={d} met a " ++
             "container={d}\n", .{
             c.reuse_jumps, c.reuse_cursor.dropped, c.reuse_made, c.reuse_met,
+        });
+    }
+    if (c.health_on) {
+        var begun: u32 = 0;
+        var refused: u32 = 0;
+        for (c.nodes) |node| {
+            begun += node.sim.containers.probes_begun;
+            refused += node.sim.containers.probes_refused;
+        }
+        c.report.print("health: on; scripted={d} checks begun={d} refused at begin={d}\n", .{
+            c.health_scripts, begun, refused,
         });
     }
     if (c.strong) {

@@ -237,15 +237,16 @@ pub const Table = struct {
     }
 
     /// When the agent must step again for its checks, monotonic; maxInt if never. A check in
-    /// flight is polled at its timeout (the resync polls it sooner); a waiting one at its due
-    /// time, unless every slot is taken (a check that ends frees one, and is itself a wake).
+    /// flight is polled on `poll_at`'s schedule; a waiting one at its due time, unless every
+    /// slot is taken (a check that ends frees one, and is itself a wake).
     pub fn wake_ms(table: *const Table, now: u64) u64 {
         const full = table.in_flight() >= constants.probes_concurrent_max;
         var wake: u64 = maxInt(u64);
         for (table.entries[0..table.count]) |*entry| {
             if (entry.began_ms) |began_at| {
-                const timeout_at = began_at + entry.timeout_ms;
-                if (timeout_at > now) wake = @min(wake, timeout_at);
+                // `now` may be the start of the agent's step, and the check began later in it.
+                const at = @max(now, began_at);
+                wake = @min(wake, poll_at(began_at, entry.timeout_ms, at));
             } else if (!full and entry.due_ms > now) {
                 wake = @min(wake, entry.due_ms);
             }
@@ -281,6 +282,22 @@ fn fresh(
         .refusal_len = 0,
         .seen = true,
     };
+}
+
+/// When to poll next a check that began at `began_at` and still runs at `now`: after
+/// `probe_poll_ms_min`, then each time it has run twice as long, and at its timeout. A check that
+/// ends early is seen within its own run time again (at least the minimum), so its result does
+/// not wait for the timeout, and a long check costs a few polls, not one per minimum. Past the
+/// timeout, where the runtime has yet to report it timed out, the same doubling counts from the
+/// timeout, so the report is not left to the resync either.
+pub fn poll_at(began_at: u64, timeout_ms: u32, now: u64) u64 {
+    assert(began_at <= now);
+    const timeout_at = began_at + timeout_ms;
+    const from = if (now < timeout_at) began_at else timeout_at;
+    const step = @max(constants.probe_poll_ms_min, 2 * (now - from));
+    const next = from + step;
+    assert(next > now);
+    return if (now < timeout_at) @min(next, timeout_at) else next;
 }
 
 fn before(first: *const Entry, second: *const Entry) bool {
@@ -424,7 +441,10 @@ test "probe_scheduler: the next check is due an interval after the last began" {
     try testing.expect(table.next_to_begin(99) == null);
     entry.began(table.next_to_begin(100).?.due_ms);
     try testing.expect(table.next_to_begin(100) == null);
-    try testing.expectEqual(@as(u64, 600), table.wake_ms(100));
+    // In flight: polled after the minimum, not first at the timeout (600).
+    try testing.expectEqual(100 + constants.probe_poll_ms_min, table.wake_ms(100));
+    // The agent asks with the time its step began, and the check began later in that step.
+    try testing.expectEqual(100 + constants.probe_poll_ms_min, table.wake_ms(40));
     entry.finished(.{ .exited = 0 }, 300);
     try testing.expectEqual(@as(u64, 1_100), entry.due_ms);
     try testing.expectEqual(@as(u64, 1_100), table.wake_ms(300));
@@ -433,6 +453,30 @@ test "probe_scheduler: the next check is due an interval after the last began" {
     entry.began(1_100);
     entry.finished(.timed_out, 2_500);
     try testing.expectEqual(@as(u64, 2_500), entry.due_ms);
+}
+
+test "probe_scheduler: a check in flight is polled soon, then as it doubles, and at its timeout" {
+    // Goal: a check that ends early is seen within its own run time again, not at its timeout,
+    // and one the runtime has not yet reported at its timeout is polled again soon. Method: the
+    // schedule of `poll_at` for a check begun at 1,000 with a timeout of 5,000.
+    const least = constants.probe_poll_ms_min;
+    const timeout_at: u64 = 6_000;
+    var now: u64 = 1_000;
+    try testing.expectEqual(now + least, poll_at(1_000, 5_000, now));
+    // Each poll comes when the check has run twice as long as at the last one.
+    var polls: u32 = 0;
+    while (now < timeout_at) : (polls += 1) {
+        const next = poll_at(1_000, 5_000, now);
+        try testing.expect(next > now);
+        try testing.expect(next <= timeout_at);
+        try testing.expect(next - 1_000 <= @max(least, 2 * (now - 1_000)));
+        now = next;
+    }
+    try testing.expectEqual(timeout_at, now);
+    try testing.expect(polls <= 8);
+    // Past the timeout, the doubling counts from the timeout.
+    try testing.expectEqual(timeout_at + least, poll_at(1_000, 5_000, timeout_at));
+    try testing.expectEqual(timeout_at + 2 * 400, poll_at(1_000, 5_000, timeout_at + 400));
 }
 
 test "probe_scheduler: at most probes_concurrent_max in flight, soonest due first" {
@@ -457,8 +501,8 @@ test "probe_scheduler: at most probes_concurrent_max in flight, soonest due firs
     }
     try testing.expect(table.next_to_begin(1_000) == null);
     try testing.expectEqual(constants.probes_concurrent_max, table.in_flight());
-    // Waiting checks are no wake while every slot is taken; the timeouts are.
-    try testing.expectEqual(@as(u64, 1_500), table.wake_ms(1_000));
+    // Waiting checks are no wake while every slot is taken; the checks in flight are.
+    try testing.expectEqual(1_000 + constants.probe_poll_ms_min, table.wake_ms(1_000));
     previous.?.finished(.{ .exited = 0 }, 1_100);
     try testing.expect(table.next_to_begin(1_100) != null);
 }

@@ -1011,6 +1011,9 @@ const SimStepOptions = struct {
     /// `-Dauto-shape`: sim-cluster, sim-c1 and sim-swarm draw their operations (and the cluster
     /// its nodes, lease ttl and replica counts) from the seed; `-Dops` and `-Dnodes` are ignored.
     auto_shape: bool = false,
+    /// `-Dc1-health`: sim-c1 runs in the health world (`--health`), so `check` drives the probe
+    /// seam of C3 slice 9. On by default.
+    c1_health: bool = true,
 };
 
 /// The operations argument of a simulator: `auto` or the number.
@@ -1075,6 +1078,8 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     sim.swarm_profile = b.option([]const u8, "swarm-profile", swarm_help) orelse "mixed";
     const shape_help = "Draw operations (and nodes, lease ttl, replicas) from the seed";
     sim.auto_shape = b.option(bool, "auto-shape", shape_help) orelse false;
+    const health_help = "sim-c1 in the health world, --health (default true)";
+    sim.c1_health = b.option(bool, "c1-health", health_help) orelse true;
     add_sim_step(b, sim);
     add_sim_cluster_step(b, sim);
     add_sim_swarm_step(b, sim);
@@ -1429,6 +1434,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1" });
     run.addArg(b.fmt("--profile={s}", .{sim.profile}));
+    if (sim.c1_health) run.addArg("--health");
     const native_report = run.captureStdOut(.{});
     const step = b.step("sim-c1", "Run sim-c1 natively and as WASM, and compare (-Dseed=N)");
     for (v8_modes) |mode| {
@@ -1438,6 +1444,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(sim.library.getEmittedBin());
         node.addArgs(&.{ seed_text, ops_text, nodes_text, "true", sim.profile });
         node.addFileArg(native_report);
+        if (sim.c1_health) node.addArg("--health");
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");

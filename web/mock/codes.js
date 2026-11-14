@@ -173,14 +173,14 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "a service's health check is not valid",
-    "explanation": "The service file's `health` block describes a check that cannot run as\nwritten. A health check is a command run inside each replica's container:\nit needs 1 to 64 words with a non-empty first word, an `interval_ms` above\nzero, a `timeout_ms` above zero and no longer than the interval, and\n`failure_threshold` and `success_threshold` of at least 1. The cause line\nnames the field.\n\nNothing was applied. Correct the service file and apply it again. C3\nchecks are commands only; a TCP or HTTP check waits for a network path\ninto the container."
+    "explanation": "The service file's `health` block describes a check that cannot run as\nwritten. A health check is a command run inside each replica's container:\nit needs 1 to 64 words with a non-empty first word, an `interval_ms` above\nzero and at most an hour, a `timeout_ms` above zero and no longer than the\ninterval, a `start_period_ms` of at most an hour, and `failure_threshold`\nand `success_threshold` of at least 1, each reaching its verdict within a\nday (threshold times interval). The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again. C3\nchecks are commands only; a TCP or HTTP check waits for a network path\ninto the container."
   },
   {
     "code": "ZC-E0126",
     "severity": "error",
     "blame": "user",
     "summary": "a service's rollout policy is not valid",
-    "explanation": "The service file's `rollout` block cannot be followed. A rolling update\nmust be able to move: `max_surge` and `max_unavailable` may not both be 0,\nand neither may exceed the 128 replicas a service may have. The times must\nnest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no\nlonger than `progress_deadline_ms`. The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again; a\nservice with no `rollout` block uses the default policy, which is valid."
+    "explanation": "The service file's `rollout` block cannot be followed. A rolling update\nmust be able to move: `max_surge` and `max_unavailable` may not both be 0,\nand neither may exceed the 128 replicas a service may have. The times must\nnest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no\nlonger than `progress_deadline_ms`, which is at most a day. `grace_ms` is\nat most a minute. The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again; a\nservice with no `rollout` block uses the default policy, which is valid."
   },
   {
     "code": "ZC-E0127",
@@ -355,7 +355,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "external",
     "summary": "a stored record can't be read",
-    "explanation": "A controller, the agent or the API read a value from the store that is\nnot a record of the kind its key says: not JSON, a field of the wrong\ntype, or a name that breaks the naming rules. The API validates what it\nwrites, so something else wrote this key, or the store was edited by hand.\n\nThe cause line names the key. Fix or delete that key (zcube get shows\nit); the controller skips nothing silently and tries again on its next\npass."
+    "explanation": "A controller, the agent or the API read a value from the store that is\nnot a record of the kind its key says: not JSON, a field of the wrong\ntype, a name that breaks the naming rules, or a health check outside the\nbounds apply enforces. The API validates what it writes, so something\nelse wrote this key, or the store was edited by hand.\n\nThe cause line names the key. Fix or delete that key (zcube get shows\nit); the controller skips nothing silently and tries again on its next\npass."
   },
   {
     "code": "ZC-E0302",
