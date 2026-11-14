@@ -983,8 +983,9 @@ pub const registry = [_]Entry{
         .explanation =
         \\A controller, the agent or the API read a value from the store that is
         \\not a record of the kind its key says: not JSON, a field of the wrong
-        \\type, or a name that breaks the naming rules. The API validates what it
-        \\writes, so something else wrote this key, or the store was edited by hand.
+        \\type, a name that breaks the naming rules, or fields that contradict each
+        \\other (a rollout back to generation 0). Zigcube validates what it writes,
+        \\so something else wrote this key, or the store was edited by hand.
         \\
         \\The cause line names the key. Fix or delete that key (zcube get shows
         \\it); the controller skips nothing silently and tries again on its next
