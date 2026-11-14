@@ -595,9 +595,8 @@ fn relays_valid(relays: []const Relay, diag: *Diag) Error![]const Relay {
 
 // ---- Settings -----------------------------------------------------------------------------------
 
-/// "127.0.0.1:7070" or "[::1]:7070": an IP address and a port. A name is refused, because
-/// resolving one at start-up could quietly choose a different interface than the user meant.
-/// An address of this machine's loopback interface: 127.0.0.0/8 or ::1.
+/// An address of this machine's loopback interface: 127.0.0.0/8 or ::1. An IPv4-mapped address
+/// (`::ffff:127.0.0.1`) is not: the check names only the plain forms (refused, not guessed).
 pub fn is_loopback(address: IpAddress) bool {
     return switch (address) {
         .ip4 => |ip4| ip4.bytes[0] == 127,
@@ -622,6 +621,8 @@ fn tls_name_of(name: []const u8, diag: *Diag) Error![]const u8 {
     return name;
 }
 
+/// "127.0.0.1:7070" or "[::1]:7070": an IP address and a port. A name is refused, because
+/// resolving one at start-up could quietly choose a different interface than the user meant.
 pub fn parse_listen(text: []const u8, diag: *Diag) Error!IpAddress {
     const reason = "use an IP address and a port, like 127.0.0.1:7070";
     if (text.len == 0) return bad(diag, "the listen address is empty", .{}, reason);
@@ -908,7 +909,13 @@ test "--insecure-listen is loopback only, and --tls-name is a DNS name (B7)" {
     _ = try parse_insecure_listen("127.0.0.1:7070", &diag);
     _ = try parse_insecure_listen("[::1]:7070", &diag);
     _ = try parse_insecure_listen("127.0.0.2:7070", &diag); // All of 127.0.0.0/8.
-    for ([_][]const u8{ "0.0.0.0:7070", "10.0.0.1:7070", "[::]:7070" }) |input| {
+    const outside = [_][]const u8{
+        "0.0.0.0:7070",
+        "10.0.0.1:7070",
+        "[::]:7070",
+        "[::ffff:127.0.0.1]:7070", // IPv4-mapped: not taken for loopback.
+    };
+    for (outside) |input| {
         diag.reset();
         try expect_bad(parse_insecure_listen(input, &diag), &diag);
     }

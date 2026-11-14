@@ -16,15 +16,22 @@ const records = @import("records.zig");
 const x509 = @import("x509.zig");
 const x509_identity = @import("x509_identity.zig");
 
-/// The names of removed nodes: one per line, `#` starts a comment, blank lines are ignored.
+/// The removed names: one per line, `#` starts a comment, blank lines are ignored. A bare `NAME`
+/// is refused for every kind; `node/NAME` only as a node and `client/NAME` only as a client
+/// (decisions/2026-11-14-revoked-names-by-kind.md).
 pub const Revoked = struct {
     names: [constants.peer_revoked_max][peer.name_bytes_max]u8 = undefined,
     lengths: [constants.peer_revoked_max]u8 = undefined,
+    /// The kind a line names, or null for a bare name (every kind).
+    kinds: [constants.peer_revoked_max]?Kind = undefined,
     count: u32 = 0,
     /// After a failed `parse`, the 1-based line that was refused.
     bad_line: u32 = 0,
 
     pub const ParseError = error{ TooMany, BadName };
+
+    /// Who a revoked name is refused to.
+    pub const Kind = enum { node, client };
 
     /// Replaces the list with `text`'s names. A name that is not a node name, or more than
     /// `peer_revoked_max` names, is refused whole (and the list is then empty).
@@ -36,9 +43,11 @@ pub const Revoked = struct {
         while (lines.next()) |raw| {
             line_number += 1;
             const hash = std.mem.indexOfScalar(u8, raw, '#') orelse raw.len;
-            const line = std.mem.trim(u8, raw[0..hash], " \t\r");
-            if (line.len == 0) continue;
+            const trimmed = std.mem.trim(u8, raw[0..hash], " \t\r");
+            if (trimmed.len == 0) continue;
             revoked.bad_line = line_number;
+            const kind = kind_of(trimmed);
+            const line = if (kind) |known| trimmed[@tagName(known).len + 1 ..] else trimmed;
             if (records.name_problem(line, peer.name_bytes_max) != null) {
                 revoked.count = 0;
                 return error.BadName;
@@ -51,16 +60,27 @@ pub const Revoked = struct {
             revoked.names[slot] = @splat(0);
             @memcpy(revoked.names[slot][0..line.len], line);
             revoked.lengths[slot] = @intCast(line.len);
+            revoked.kinds[slot] = kind;
             revoked.count += 1;
         }
         revoked.bad_line = 0;
     }
 
-    pub fn contains(revoked: *const Revoked, node: []const u8) bool {
+    fn kind_of(line: []const u8) ?Kind {
+        inline for (comptime std.enums.values(Kind)) |kind| {
+            if (std.mem.startsWith(u8, line, @tagName(kind) ++ "/")) return kind;
+        }
+        return null;
+    }
+
+    /// True when `name` is revoked for `kind`: by a bare line or by one of that kind.
+    pub fn contains(revoked: *const Revoked, kind: Kind, name: []const u8) bool {
         assert(revoked.count <= constants.peer_revoked_max);
         for (0..revoked.count) |index| {
-            const name = revoked.names[index][0..revoked.lengths[index]];
-            if (std.mem.eql(u8, name, node)) return true;
+            const listed = revoked.names[index][0..revoked.lengths[index]];
+            if (!std.mem.eql(u8, listed, name)) continue;
+            const listed_kind = revoked.kinds[index] orelse return true;
+            if (listed_kind == kind) return true;
         }
         return false;
     }
@@ -90,7 +110,7 @@ pub const Ca = struct {
     /// public key, which no handshake could use. The caller has checked the node's name.
     pub fn issue(ca: *const Ca, node: []const u8, node_key: [32]u8) IssueError!peer.Credential {
         assert(records.name_problem(node, peer.name_bytes_max) == null);
-        if (ca.revoked.contains(node)) return error.Removed;
+        if (ca.revoked.contains(.node, node)) return error.Removed;
         // On the curve and in the prime-order subgroup: a small-order or mixed-order point is
         // refused, so no credential vouches for a key no honest node holds.
         const point = Edwards25519.fromBytes(node_key) catch return error.BadKey;
@@ -172,7 +192,7 @@ pub const Ca = struct {
         out: *x509.Der,
         request: *const NodeArgs,
     ) IssueCertificateError!void {
-        if (ca.revoked.contains(request.node)) return error.Removed;
+        if (ca.revoked.contains(.node, request.node)) return error.Removed;
         try ca.check_leaf_key(request.subject_key);
         var cluster_buffer: [cluster_bytes]u8 = undefined;
         try x509.issue_node(out, ca.key, &.{
@@ -191,14 +211,14 @@ pub const Ca = struct {
         return lifetime;
     }
 
-    /// A client's certificate (B7) for `request.client` with `request.scope`. A name in the
-    /// `revoked` file is refused: the file holds node and client names alike.
+    /// A client's certificate (B7) for `request.client` with `request.scope`. A bare name in the
+    /// `revoked` file is refused, and so is `client/<name>`; `node/<name>` is not.
     pub fn issue_client_certificate(
         ca: *const Ca,
         out: *x509.Der,
         request: *const ClientArgs,
     ) IssueCertificateError!void {
-        if (ca.revoked.contains(request.client)) return error.Removed;
+        if (ca.revoked.contains(.client, request.client)) return error.Removed;
         try ca.check_leaf_key(request.subject_key);
         const lifetime = try lifetime_from(ca.wall.now_ms(), request.ttl_ms);
         var cluster_buffer: [cluster_bytes]u8 = undefined;
@@ -305,15 +325,33 @@ test "the revoked list: names, comments, blanks, and refusals" {
     var revoked: Revoked = .{};
     try revoked.parse("# removed\nnode3\n\n  node4  # moved\r\n");
     try std.testing.expectEqual(@as(u32, 2), revoked.count);
-    try std.testing.expect(revoked.contains("node3"));
-    try std.testing.expect(revoked.contains("node4"));
-    try std.testing.expect(!revoked.contains("node"));
-    try std.testing.expect(!revoked.contains("node5"));
+    try std.testing.expect(revoked.contains(.node, "node3"));
+    try std.testing.expect(revoked.contains(.client, "node4"));
+    try std.testing.expect(!revoked.contains(.node, "node"));
+    try std.testing.expect(!revoked.contains(.node, "node5"));
     try std.testing.expectError(error.BadName, revoked.parse("node3\nBad Name\n"));
     try std.testing.expectEqual(@as(u32, 2), revoked.bad_line);
     try std.testing.expectEqual(@as(u32, 0), revoked.count);
     try revoked.parse("");
     try std.testing.expectEqual(@as(u32, 0), revoked.count);
+}
+
+test "the revoked list: a kind prefix revokes that kind only, a bare name every kind" {
+    // Goal: a node and a client of one name are told apart (decisions/2026-11-14-revoked-names-
+    // by-kind.md). Method: parse each form and ask for both kinds.
+    var revoked: Revoked = .{};
+    try revoked.parse("client/ops-1\nnode/node7\nboth\n");
+    try std.testing.expectEqual(@as(u32, 3), revoked.count);
+    try std.testing.expect(revoked.contains(.client, "ops-1"));
+    try std.testing.expect(!revoked.contains(.node, "ops-1"));
+    try std.testing.expect(revoked.contains(.node, "node7"));
+    try std.testing.expect(!revoked.contains(.client, "node7"));
+    try std.testing.expect(revoked.contains(.node, "both"));
+    try std.testing.expect(revoked.contains(.client, "both"));
+    // The prefix is the whole kind: anything else stays a name, and a name has no slash.
+    try std.testing.expectError(error.BadName, revoked.parse("workload/x\n"));
+    try std.testing.expectError(error.BadName, revoked.parse("client/\n"));
+    try std.testing.expectError(error.BadName, revoked.parse("client/node/x\n"));
 }
 
 test "the revoked list holds peer_revoked_max names and refuses one more" {

@@ -29,8 +29,9 @@ Date: 2026-11-13. Branch `claude/b7-slice3`, from `claude/b7-slice2`.
 
 - Merged claude/b7-slice2's fix (f58f605): its `ca issue-node` and `--replace`
   (`server_issue.zig`) replace this slice's `server_issue_client.zig`; the usage keeps both
-  slices' flags. The credential endpoint over `--listen` is the node's own or an admin's
-  (`api_scope`; the endpoint x caller table refuses node2 and a jobs client,
+  slices' flags. The credential endpoint over `--listen` is the node's own certificate's
+  only, never a client's, admin included (`api_scope` `.node_only`, fixed after review on
+  2026-11-14; the endpoint x caller table refuses node2, a jobs client and an admin,
   `2026-11-13-node-cert-bootstrap.md`); over `--insecure-listen` the old join path stays.
 
 ## Open questions for the supervisor

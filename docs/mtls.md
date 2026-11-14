@@ -57,7 +57,7 @@ The decision is in decisions/2026-11-04-x509-two-profiles.md.
 
 `zcube-server ca issue-node NAME [--out DIR] [--replace]` writes a node's first `node`
 certificate and key the same way. The operator copies the two files to the node
-(decisions/2026-11-13-node-cert-bootstrap.md); the agent presents them with `--cert` and `--key`.
+(decisions/2026-11-13-node-cert-bootstrap.md); the agent presents them as `--cert`/`--key`.
 
 Both commands follow the same rules:
 
@@ -71,9 +71,10 @@ Both commands follow the same rules:
   `ZC-E0806`. Both files are written under temporary names and renamed without overwriting, so a
   failure leaves neither file. A run killed between the two renames leaves a lone `NAME.key`,
   which a rerun with `--replace` replaces.
-- **Removed names.** A name in the server's `revoked` file is `ZC-E0807`. The file holds node and
-  client names alike (decisions/2026-11-13-revoked-names-shared.md), and a revoked name stops
-  being issued at once.
+- **Removed names.** A name in the server's `revoked` file is `ZC-E0807`. A line `node/NAME`
+  revokes the node NAME only and `client/NAME` the client NAME only; a bare `NAME` revokes both
+  kinds, as before (decisions/2026-11-14-revoked-names-by-kind.md, which supersedes
+  2026-11-13-revoked-names-shared.md). A revoked name stops being issued at once.
 
 A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`), so a
 certificate already issued stops working once its name is in `revoked`.
@@ -107,6 +108,10 @@ are sorted by key, with no key twice.
   (`zcube local up`) and the test harnesses. A request on it is the caller `local`, which may
   call everything: whoever can reach loopback already runs on the server's host.
 
+The two listeners share the server's 96 connection slots, but when both run TLS clients take at
+most 88: 8 are kept for `--insecure-listen`, so TLS clients cannot lock out the loopback listener
+(decisions/2026-11-14-loopback-slot-reserve.md).
+
 With neither given, the server serves TLS on `127.0.0.1:7070`, the old default address. The server names the caller from the certificate the
 handshake verified, never from a header: a node's certificate is the caller `node <name>`, a
 client certificate is `client <name>` with its scope. A certificate whose name is in `revoked`,
@@ -121,8 +126,15 @@ make is refused with **403 `ZC-E0822`** before anything is read or written.
 |---|---|
 | `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only |
 | `client`, scope `jobs` | `/v1/jobs` and below, and `GET /v1/why/job/<name>` |
-| `client`, scope `admin` | everything |
+| `client`, scope `admin` | everything but the credential endpoint |
 | `local` (`--insecure-listen`) | everything |
+
+`POST /v1/agent/nodes/<name>/credential` signs a node's peer key and returns its `node.crt`, so
+over TLS only node `<name>`'s own certificate may call it: every client certificate, `admin`
+included, gets 403 `ZC-E0822` there (an admin cannot mint a node's identity through the API;
+`ca issue-node` on the server host is the only bootstrap). A node renews and registers only on
+the lease of its own registration: a keepalive of another node's lease is `ZC-E0205`, and a
+registration on a lease another node is registered on is `ZC-E0104` (`agent_api.zig`).
 
 The agent handlers keep every key they write under the node of the path, so an agent writes only
 under its own node's keys. That per-node rule holds on the TLS listener only: on
@@ -136,7 +148,7 @@ refused; `api_tls_test.zig` does it end to end over TLS.
 
 | Flag | `zcube` environment | Agent ZON key | Meaning |
 |---|---|---|---|
-| `--ca FILE` | `ZCUBE_CA` | `.ca` | the CA certificate (`ca.crt` in the server's state directory); the client pins its key |
+| `--ca FILE` | `ZCUBE_CA` | `.ca` | the CA certificate (`ca-<hash>.crt` in the server's state directory, one per store); the client pins its key |
 | `--cert FILE` | `ZCUBE_CERT` | `.cert` | the certificate to present (PEM) |
 | `--key FILE` | `ZCUBE_KEY` | `.key` | its Ed25519 key (PKCS#8 PEM, mode 0600) |
 | `--tls-name NAME` | `ZCUBE_TLS_NAME` | `.tls_name` | the DNS name the server's certificate must carry (default `zcube-server`) |
@@ -152,11 +164,15 @@ refused at the handshake with `ZC-E0812`, which names both names.
 (`POST /v1/agent/nodes/<name>/credential`) is under its node's path. On the server host,
 `zcube-server ca issue-node NAME [--out DIR]` (with the server's `--store` and `--state-dir`)
 writes `NAME.key` and `NAME.crt`, mode 0600: a node certificate for NAME, 7 days, signed by the
-store's CA. It refuses a name in `revoked`, never overwrites a file and never makes a CA; it is
+store's CA. It refuses a name in `revoked`, overwrites an existing file only with `--replace`
+and never makes a CA; it is
 `ca issue-client`'s code path with the node kind. The agent presents those as `--cert` and
 `--key` until it holds a `node.crt` over its own peer key that the CA of `--ca` issued, then that
 `node.crt` (and the new one after every renewal). Its `--cert` must be a node certificate for its
-own `--node`: an admin's or another node's is refused before it connects (`ZC-E0806`). And the
+own `--node`, in its validity window: an admin's, another node's or an expired one is refused
+before it connects (`ZC-E0806`). A stored `node.crt` is presented only under the same checks
+(issued by the CA of `--ca`, in its window, naming this node, over the key beside it); otherwise
+the agent falls back to `--cert` ([agent.md](agent.md), "Node certificates"). And the
 server holds a bootstrap certificate for NAME to NAME's paths, so it can join and act as NAME
 only (`api_tls_test.zig`: node1's certificate gets 403 joining as node2). Without `--cert` and
 without a `node.crt`, the agent does not start (`ZC-E0806`).

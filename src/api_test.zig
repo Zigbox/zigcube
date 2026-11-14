@@ -1259,7 +1259,7 @@ test "a job names a relay the server configures; any other name or an env overri
     }
 }
 
-const Allowed = struct { node1: bool, jobs: bool };
+const Allowed = struct { node1: bool, jobs: bool, admin: bool = true };
 const ScopeRow = struct {
     method: []const u8,
     path: []const u8,
@@ -1269,7 +1269,10 @@ const ScopeRow = struct {
 const scope_none: Allowed = .{ .node1 = false, .jobs = false };
 const scope_jobs: Allowed = .{ .node1 = false, .jobs = true };
 const scope_own: Allowed = .{ .node1 = true, .jobs = false };
-/// Every endpoint, and who besides an admin may call it (docs/mtls.md, "Scopes").
+/// The credential endpoint: node1's own certificate and nothing else, no admin bootstrap
+/// (decisions/2026-11-13-node-cert-bootstrap.md).
+const scope_own_only: Allowed = .{ .node1 = true, .jobs = false, .admin = false };
+/// Every endpoint, and who may call it besides an admin (who may call all but the credential).
 const scope_rows = [_]ScopeRow{
     .{ .method = "GET", .path = "/v1/status", .allowed = scope_none },
     .{ .method = "GET", .path = "/v1/list", .allowed = scope_none },
@@ -1285,6 +1288,7 @@ const scope_rows = [_]ScopeRow{
     .{ .method = "POST", .path = "/v1/apply", .query = "dry_run=1", .allowed = scope_none },
     .{ .method = "DELETE", .path = "/v1/services/hello", .allowed = scope_none },
     .{ .method = "GET", .path = "/v1/check/allocations", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/store/accept-rollback", .allowed = scope_none },
     .{ .method = "POST", .path = "/v1/repair/allocations/node1", .allowed = scope_none },
     .{ .method = "POST", .path = "/v1/jobs", .allowed = scope_jobs },
     .{ .method = "GET", .path = "/v1/jobs", .allowed = scope_jobs },
@@ -1292,7 +1296,7 @@ const scope_rows = [_]ScopeRow{
     .{ .method = "GET", .path = "/v1/jobs/watch", .query = "timeout=0", .allowed = scope_jobs },
     .{ .method = "POST", .path = "/v1/jobs/build/cancel", .allowed = scope_jobs },
     .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease", .allowed = scope_own },
-    .{ .method = "POST", .path = "/v1/agent/nodes/node1/credential", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/credential", .allowed = scope_own_only },
     .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease/1/keepalive", .allowed = scope_own },
     .{ .method = "PUT", .path = "/v1/agent/nodes/node1", .allowed = scope_own },
     .{ .method = "PUT", .path = "/v1/agent/nodes/node1/store", .allowed = scope_own },
@@ -1314,7 +1318,11 @@ const scope_rows = [_]ScopeRow{
     // Another node's keys: node1's agent may not write or read them.
     .{ .method = "PUT", .path = "/v1/agent/nodes/node2", .allowed = scope_none },
     .{ .method = "POST", .path = "/v1/agent/nodes/node2/lease", .allowed = scope_none },
-    .{ .method = "POST", .path = "/v1/agent/nodes/node2/credential", .allowed = scope_none },
+    .{
+        .method = "POST",
+        .path = "/v1/agent/nodes/node2/credential",
+        .allowed = .{ .node1 = false, .jobs = false, .admin = false },
+    },
     .{ .method = "POST", .path = "/v1/agent/nodes/node2/observed", .allowed = scope_none },
     .{ .method = "POST", .path = "/v1/agent/nodes/node2/job-observed", .allowed = scope_none },
     .{
@@ -1345,7 +1353,7 @@ test "scopes: every endpoint as an agent, a jobs client and an admin client (B7)
             .{ .caller = node1, .allowed = row.allowed.node1 },
             .{ .caller = node2, .allowed = node2_owns(row.path) },
             .{ .caller = app, .allowed = row.allowed.jobs },
-            .{ .caller = ops, .allowed = true },
+            .{ .caller = ops, .allowed = row.allowed.admin },
         };
         for (cases) |case| {
             const response = rig.call(.{

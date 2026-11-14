@@ -171,6 +171,24 @@ unreachable server, `ZC-E0807` for a removed node) is shown once and retried eve
 `peer_join_retry_ms`; it never stops the agent or its containers. Nothing yet uses the credential:
 slice 6b's chunk server does.
 
+### Node certificates (B7 slice 3)
+
+At start, with `--ca`, the agent picks the certificate it presents to the server:
+
+1. Its stored `node.crt`, if the CA of `--ca` issued it, it is in its validity window now (with
+   a minute of skew), it names this agent's `--node`, and it is over the key beside it
+   (`peer.key`). Otherwise the agent says why on stderr and goes on to the next.
+2. `--cert` and `--key`, under the same checks.
+3. Neither: the agent does not start, with one `ZC-E0806` whose causes name both problems.
+
+So an agent that was down past its certificate's 7 days, or whose state directory came from
+another node, does not offer a certificate the server would refuse. **Recovery:** on the server
+host run `zcube-server ca issue-node NAME --replace` (with the server's `--store` and
+`--state-dir`), copy `NAME.crt` and `NAME.key` to the node, and start the agent with them as
+`--cert` and `--key`. It joins again and the next renewal replaces `node.crt`. These checks run
+at start-up only: a `node.crt` that expires while the agent runs is renewed at half its life,
+long before.
+
 ## The chunk store, the peer server and `fetch` (C2 slice 6b)
 
 With `--registry HOST:PORT` (needs `--images-dir`; `.registry` in the ZON file) the fake runtime

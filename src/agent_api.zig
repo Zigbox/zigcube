@@ -34,8 +34,8 @@
 //! (`Reply.hold_ms`), as for `GET /v1/watch`.
 //!
 //! **These endpoints return `env` values** (the agent must start the container with them) and
-//! write the store, and they are unauthenticated until the API has auth. They are for a private
-//! address, like the write endpoints.
+//! write the store. Over `--listen` only node `{node}`'s own certificate may call them
+//! (`api_scope.zig`, B7); `--insecure-listen` is loopback only.
 //!
 //! **Validation.** A body comes from the network and is never trusted to satisfy an assertion of
 //! `Store`: keys are built here from validated names, the observed records must name the node and
@@ -230,9 +230,8 @@ const Call = struct {
 
     /// Signs the node's peer key (docs/peer.md), for a node that is registered under the live
     /// lease the request names. It reads `/nodes/<node>` and writes no store key: the CA is not a
-    /// store writer (authority.md), so there is no chain pair in the answer either. The API is
-    /// unauthenticated, so this binds an honest node only: whoever can reach the port and read
-    /// `/nodes/<node>` can name its lease.
+    /// store writer (authority.md), so there is no chain pair in the answer either. Over
+    /// `--listen` only node `{node}`'s own certificate may ask (`api_scope.zig`, `.node_only`).
     fn credential(call: Call) Failure!Reply {
         const ctx = call.ctx;
         try call.require_method("POST");
@@ -250,7 +249,8 @@ const Call = struct {
         if (decoded.len != node_key.len) {
             return bad_request(ctx, "node_key", "is not 64 hex digits");
         }
-        try call.registered_on(input.lease);
+        const why = "a peer credential is issued only to a registered node";
+        try call.registered_on(input.lease, why);
         const issued = ca.issue(call.node, node_key) catch |err| switch (err) {
             error.Removed => return removed(ctx, call.node),
             error.BadKey => return bad_request(ctx, "node_key", "is not an Ed25519 public key"),
@@ -292,15 +292,35 @@ const Call = struct {
 
     /// The node's record is on `lease`, and `lease` is not 0 (ZC-E0205 otherwise). A lease that
     /// ended deleted its keys, so a record on it is a live registration.
-    fn registered_on(call: Call, lease_id: store.LeaseId) Failure!void {
+    fn registered_on(call: Call, lease_id: store.LeaseId, why: []const u8) Failure!void {
         const ctx = call.ctx;
         if (lease_id == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
         const key = records.node_key(call.node);
         const found = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
             return propagate(ctx);
         };
-        const kv = found.kv orelse return not_registered(ctx, call.node, lease_id);
-        if (kv.lease != lease_id) return not_registered(ctx, call.node, lease_id);
+        const kv = found.kv orelse return not_registered(ctx, call.node, lease_id, why);
+        if (kv.lease != lease_id) return not_registered(ctx, call.node, lease_id, why);
+    }
+
+    /// No other node is registered on `lease_id`: a node that put its record on another node's
+    /// lease could then keep that node alive with its own keepalives (B7 slice 3).
+    fn lease_not_elsewhere(call: Call, lease_id: store.LeaseId) Failure!void {
+        const ctx = call.ctx;
+        var skipped: u32 = 0;
+        const nodes = controller.list_all_tolerant(
+            records.Node,
+            ctx,
+            records.prefix_nodes,
+            null,
+            constants.nodes_max,
+            &skipped,
+        ) catch return propagate(ctx);
+        for (nodes.items) |entry| {
+            if (entry.kv.lease != lease_id) continue;
+            if (std.mem.eql(u8, entry.kv.key, records.node_key(call.node).slice())) continue;
+            return bad_request(ctx, "lease", "is the lease of another node's registration");
+        }
     }
 
     // ---- PUT /v1/agent/nodes/{node} ----
@@ -311,6 +331,7 @@ const Call = struct {
         try call.only_known();
         const input = try parse_body(RegisterBody, ctx, call.body);
         if (input.lease == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
+        try call.lease_not_elsewhere(input.lease);
         const capacity = input.capacity;
         if (capacity.cpu_millis == 0) return bad_request(ctx, "capacity", "needs cpu_millis");
         if (capacity.memory_bytes == 0) return bad_request(ctx, "capacity", "needs memory_bytes");
@@ -350,6 +371,9 @@ const Call = struct {
         const id = std.fmt.parseInt(u64, id_text, 10) catch
             return bad_request(ctx, "lease", "is not a number");
         if (id == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
+        // Only the lease of this node's registration: a node certificate may keep its own node
+        // alive and no other (B7 slice 3).
+        try call.registered_on(id, "a node keeps alive only the lease of its registration");
         const granted = ctx.store.lease_keepalive(id, ctx.diag) catch return propagate(ctx);
         const lease_reply = .{ .id = granted.id, .ttl_ms = granted.ttl_ms };
         return reply(ctx, .{ .lease = lease_reply, .chain = try call.chain() });
@@ -1205,11 +1229,16 @@ fn removed(ctx: *const Context, node: []const u8) Failure {
     return error.Failed;
 }
 
-fn not_registered(ctx: *const Context, node: []const u8, lease_id: store.LeaseId) Failure {
+fn not_registered(
+    ctx: *const Context,
+    node: []const u8,
+    lease_id: store.LeaseId,
+    why: []const u8,
+) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0205);
     ctx.diag.cause("node {s} is not registered under lease {d}", .{ node, lease_id });
-    ctx.diag.cause("a peer credential is issued only to a registered node", .{});
+    ctx.diag.cause("{s}", .{why});
     ctx.diag.fix(.{ .sentence = "the agent registers first and asks again by itself" });
     return error.Failed;
 }

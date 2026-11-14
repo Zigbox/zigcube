@@ -3,8 +3,9 @@
 //! Shared by `zcube` (`cli_http.zig`) and `zcube-agent` (`agent_http.zig`). Shell code: files and
 //! sockets.
 //!
-//! The three files are the ones `zcube-server ca issue-client` and the server's state directory
-//! hold: the CA certificate (`ca.crt`, PEM), a `client` or `node` certificate (PEM) and its
+//! The three files are the ones `zcube-server ca issue-client` (or `issue-node`) and the server's
+//! state directory hold: the CA certificate (`ca-<hash>.crt`, or `ca.crt` for a store with no
+//! file of its own; PEM), a `client` or `node` certificate (PEM) and its
 //! Ed25519 key (PKCS#8 PEM, mode 0600). A file that cannot be used is ZC-E0806 and names the
 //! file. The client pins the CA's key: the server's certificate must be signed by it and carry
 //! the DNS name `server_name` (`--tls-name`, default `zcube-server`).
@@ -104,36 +105,34 @@ pub const Credentials = struct {
     }
 
     /// The agent's bootstrap certificate (`--cert`, from `ca issue-node`) must be a node
-    /// certificate for `node` itself: never an admin's or another node's (B7 slice 3).
+    /// certificate for `node` itself, valid at wall time `now_ms`: never an admin's, another
+    /// node's or an expired one (B7 slice 3).
     pub fn require_node(
         c: *const Credentials,
         cert: []const u8,
         node: []const u8,
+        now_ms: u64,
         diag: *Diag,
     ) LoadError!void {
-        const bytes = c.certificate.slice();
-        const parsed = x509.parse(bytes) catch unreachable; // `load_identity` parsed it.
-        const why = "it is not a node certificate for this agent's --node " ++
-            "(zcube-server ca issue-node NAME writes one)";
-        if (parsed.kind != .node) return refuse(diag, cert, "use", why);
-        const spiffe = x509_identity.spiffe_parse(parsed.name.of(bytes)) catch
-            return refuse(diag, cert, "use", why);
-        if (spiffe.path != .node or !std.mem.eql(u8, spiffe.name, node)) {
-            return refuse(diag, cert, "use", why);
-        }
+        const why = node_problem(c.anchor, &c.certificate, c.key_pair, node, now_ms) orelse
+            return;
+        return peer_files.unusable_fix(diag, dir_of(cert), base_of(cert), "use", why, node_fix);
     }
 
-    /// Presents `certificate` with `key_pair` from now on (the agent's own `node.crt`), when the
-    /// CA of `--ca` issued it; false, changing nothing, when another CA did.
-    pub fn present(c: *Credentials, certificate: *const x509.Der, key_pair: Ed25519.KeyPair) bool {
-        const bytes = certificate.slice();
-        const parsed = x509.parse(bytes) catch return false;
-        if (!std.mem.eql(u8, parsed.text(parsed.issuer_cn, bytes), &x509.ca_cn(c.anchor))) {
-            return false;
-        }
+    /// Presents `certificate` with `key_pair` from now on (the agent's own `node.crt`) when it is
+    /// a node certificate for `node` that the CA of `--ca` issued, valid at wall time `now_ms`,
+    /// for `key_pair`'s key. Else changes nothing and returns why not.
+    pub fn present(
+        c: *Credentials,
+        certificate: *const x509.Der,
+        key_pair: Ed25519.KeyPair,
+        node: []const u8,
+        now_ms: u64,
+    ) ?[]const u8 {
+        if (node_problem(c.anchor, certificate, key_pair, node, now_ms)) |why| return why;
         c.certificate = certificate.*;
         c.key_pair = key_pair;
-        return true;
+        return null;
     }
 
     /// True once there is a certificate to present.
@@ -235,16 +234,44 @@ pub fn reply_is_whole(raw: []const u8) bool {
     return false;
 }
 
-/// The agent has neither a `node.crt` of the CA of `--ca` in `where` nor `--cert`.
-pub fn refuse_no_identity(diag: *Diag, where: []const u8) LoadError {
-    const why = "it does not exist or the CA of --ca did not issue it, and --cert was not given";
-    const fix = "give --cert and --key (zcube-server ca issue-client NAME --scope admin), " ++
-        "or the state directory of an agent that joined (docs/mtls.md)";
-    return peer_files.unusable_fix(diag, where, "node.crt", "use", why, fix);
+/// Why `certificate` cannot be an agent's for `node` at wall time `now_ms`, or null: it must be
+/// a node certificate the CA `anchor` issued, in its window, naming `node`, of `key_pair`.
+fn node_problem(
+    anchor: [32]u8,
+    certificate: *const x509.Der,
+    key_pair: Ed25519.KeyPair,
+    node: []const u8,
+    now_ms: u64,
+) ?[]const u8 {
+    const bytes = certificate.slice();
+    if (bytes.len == 0) return "it does not exist";
+    const expect: x509.Expect = .{ .kind = .node, .name = null };
+    const parsed = x509.verify(bytes, anchor, now_ms, expect) catch |err| return x509.reason(err);
+    const wrong_node = "it names another node than this agent's --node";
+    const spiffe = x509_identity.spiffe_parse(parsed.name.of(bytes)) catch return wrong_node;
+    if (spiffe.path != .node) return wrong_node;
+    if (!std.mem.eql(u8, spiffe.name, node)) return wrong_node;
+    const public = key_pair.public_key.toBytes();
+    if (!std.mem.eql(u8, parsed.public_key.of(bytes), &public)) {
+        return "it is not the certificate of the key beside it";
+    }
+    return null;
+}
+
+const node_fix = "on the server host, run zcube-server ca issue-node NAME --replace for this " ++
+    "node and give the agent the two files as --cert and --key (docs/agent.md)";
+
+/// The agent has no usable `node.crt` in `where` (`why` says what is wrong with it) and no
+/// `--cert`: one start-up error, with the way back in.
+pub fn refuse_no_identity(diag: *Diag, where: []const u8, why: []const u8) LoadError {
+    var buffer: [160]u8 = undefined;
+    const because = std.fmt.bufPrint(&buffer, "{s}, and --cert was not given", .{why}) catch why;
+    return peer_files.unusable_fix(diag, where, "node.crt", "use", because, node_fix);
 }
 
 fn refuse(diag: *Diag, path: []const u8, verb: []const u8, why: []const u8) LoadError {
-    const fix = "give the files zcube-server ca issue-client wrote, and the CA's ca.crt " ++
+    const fix = "give the files zcube-server ca issue-client (a client) or ca issue-node (an " ++
+        "agent) wrote, and the CA's ca-<hash>.crt from the server's state directory " ++
         "(docs/mtls.md)";
     return peer_files.unusable_fix(diag, dir_of(path), base_of(path), verb, why, fix);
 }

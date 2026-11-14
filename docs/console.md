@@ -5,7 +5,7 @@ client and model, and the first two are the product:
 
 | Mode | How | What answers `/v1` |
 | --- | --- | --- |
-| **Live server** | open the page `zcube-server` serves at `/` (or `/console/`) | the real server, on the same origin |
+| **Live server** | open the page `zcube-server` serves at `/` (or `/console/`) on `--insecure-listen` (loopback), or behind the operator's proxy that presents a client certificate to `--listen` (B7: a browser holds no client certificate of the cluster) | the real server, on the same origin |
 | **Simulation** | `?sim=c0` | the **real control-plane core compiled to WebAssembly**, in the browser, over a memory store and the simulated runtime, on virtual time (`web/sim/`, `src/console_wasm.zig`) |
 | **Mock** | `?mock=c1`, `?mock=b1` | a JavaScript model of the proposed API (`web/mock/`). It remains for **C1** (several nodes, failover) and **B1** (jobs in every state and ending), which the simulation does not run; the UI says "mock" |
 

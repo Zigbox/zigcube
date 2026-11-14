@@ -139,31 +139,46 @@ pub const Setup = struct {
     /// `conn`.
     pub fn caller(setup: *const Setup, conn: *const Conn, diag: *Diag) ?api_scope.Caller {
         const peer = conn.peer();
-        const spiffe = x509_identity.spiffe_parse(peer.name) catch return refuse(diag, peer.name);
+        const spiffe = x509_identity.spiffe_parse(peer.name) catch return refuse(diag, peer);
         const cluster = setup.cluster_buffer[0..setup.cluster_length];
-        if (!std.mem.eql(u8, spiffe.cluster, cluster)) return refuse(diag, peer.name);
-        if (setup.ca.revoked.contains(spiffe.name)) return refuse(diag, peer.name);
+        if (!std.mem.eql(u8, spiffe.cluster, cluster)) return refuse(diag, peer);
+        const revoked_kind: peer_ca.Revoked.Kind = switch (peer.kind) {
+            .node => .node,
+            .client => .client,
+            else => unreachable, // The server takes these two kinds only.
+        };
+        if (setup.ca.revoked.contains(revoked_kind, spiffe.name)) return refuse(diag, peer);
         switch (peer.kind) {
             .node => {
-                if (spiffe.path != .node) return refuse(diag, peer.name);
+                if (spiffe.path != .node) return refuse(diag, peer);
                 return .{ .node = spiffe.name };
             },
             .client => {
-                if (spiffe.path != .client) return refuse(diag, peer.name);
-                const scope = peer.scope orelse return refuse(diag, peer.name);
+                if (spiffe.path != .client) return refuse(diag, peer);
+                const scope = peer.scope orelse return refuse(diag, peer);
                 return .{ .client = .{ .name = spiffe.name, .scope = scope } };
             },
             else => unreachable, // The server takes these two kinds only.
         }
     }
 
-    fn refuse(diag: *Diag, name: []const u8) ?api_scope.Caller {
+    /// ZC-E0819, with the fix for the certificate's kind: a node's comes from `issue-node`, a
+    /// client's from `issue-client`.
+    fn refuse(diag: *Diag, peer: tls_server.Peer) ?api_scope.Caller {
         diag.raise(.E0819);
-        diag.cause("the client certificate {s} is revoked or not of this cluster", .{name});
-        diag.fix(.{
-            .sentence = "issue the client a certificate from this server's CA",
-            .command = "zcube-server ca issue-client NAME --scope jobs",
-        });
+        diag.cause("the client certificate {s} is revoked or not of this cluster", .{peer.name});
+        switch (peer.kind) {
+            .node => diag.fix(.{
+                .sentence = "issue the node a certificate from this server's CA, under a name" ++
+                    " not in the revoked file",
+                .command = "zcube-server ca issue-node NAME",
+            }),
+            else => diag.fix(.{
+                .sentence = "issue the client a certificate from this server's CA, under a name" ++
+                    " not in the revoked file",
+                .command = "zcube-server ca issue-client NAME --scope jobs|admin",
+            }),
+        }
         return null;
     }
 };
@@ -344,14 +359,21 @@ pub const Conn = struct {
 
     const writer_vtable: Writer.VTable = .{ .drain = drain };
 
-    /// Seals what is buffered as one record and sends it. It takes nothing from `data`: the
-    /// caller then finds the buffer empty and fills it.
+    /// Seals what is buffered as one record and sends it, then copies as much of `data` (the
+    /// last element `splat` times) into the emptied buffer as fits, and returns that count.
+    /// Taking from `data` is what lets a write larger than one record make progress: a drain
+    /// that returned 0 with the buffer empty would be called again for ever.
     fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
-        _ = data;
-        _ = splat;
+        assert(data.len > 0);
         const conn: *Conn = @alignCast(@fieldParentPtr("writer", w));
         if (conn.phase != .open) return error.WriteFailed;
-        if (w.end == 0) return 0;
+        if (w.end > 0) try conn.seal_buffered(w);
+        assert(w.end == 0);
+        return copy_into(w, data, splat);
+    }
+
+    fn seal_buffered(conn: *Conn, w: *Writer) Writer.Error!void {
+        assert(w.end > 0);
         const plain = w.buffer[0..w.end];
         w.end = 0;
         const sealed = conn.server.seal_application(plain, &conn.sealed, conn.diag) catch {
@@ -362,6 +384,32 @@ pub const Conn = struct {
             conn.phase = .broken;
             return error.WriteFailed;
         };
-        return 0;
+    }
+
+    /// Copies the bytes of `data`, its last element repeated `splat` times, into `w`'s buffer
+    /// until it is full. Returns the bytes taken.
+    fn copy_into(w: *Writer, data: []const []const u8, splat: usize) usize {
+        const head = data[0 .. data.len - 1];
+        const pattern = data[data.len - 1];
+        var taken: usize = 0;
+        for (head) |bytes| {
+            const room = w.buffer.len - w.end;
+            const count = @min(room, bytes.len);
+            @memcpy(w.buffer[w.end..][0..count], bytes[0..count]);
+            w.end += count;
+            taken += count;
+            if (count < bytes.len) return taken;
+        }
+        if (pattern.len == 0) return taken;
+        var repeat: usize = 0;
+        while (repeat < splat) : (repeat += 1) {
+            const room = w.buffer.len - w.end;
+            const count = @min(room, pattern.len);
+            @memcpy(w.buffer[w.end..][0..count], pattern[0..count]);
+            w.end += count;
+            taken += count;
+            if (count < pattern.len) return taken;
+        }
+        return taken;
     }
 };
