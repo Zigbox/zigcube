@@ -35,6 +35,7 @@ const files = @import("fake_files.zig");
 const launch = @import("zigbox_launch.zig");
 const process_session = @import("process_session.zig");
 const map = @import("zigbox_map.zig");
+const zigbox_probes = @import("zigbox_probes.zig");
 const runtime = @import("runtime.zig");
 
 const Allocator = std.mem.Allocator;
@@ -100,6 +101,8 @@ pub const ZigboxRuntime = struct {
     children_count: u32,
     known: [constants.runtime_handles_max]Known,
     known_count: u32,
+    /// The health checks in flight, each a `zcube-agent probe` worker.
+    probes: zigbox_probes.Probes,
 
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
@@ -126,6 +129,7 @@ pub const ZigboxRuntime = struct {
         self.options = options;
         self.children_count = 0;
         self.known_count = 0;
+        self.probes = .{};
         self.state = Dir.openDirAbsolute(io, options.state_dir, .{}) catch
             return state_dir_failed(diag, options.state_dir, "open it");
         errdefer self.state.close(io);
@@ -149,6 +153,7 @@ pub const ZigboxRuntime = struct {
     }
 
     pub fn deinit(self: *ZigboxRuntime) void {
+        self.probes.deinit();
         self.options.gpa.free(self.entries);
         self.lock.close(self.io);
         self.root.close(self.io);
@@ -501,9 +506,10 @@ pub const ZigboxRuntime = struct {
 
     // ---- health checks ----
 
-    /// Health checks over Zigbox `exec` arrive with C3 slice 10. Until then a check begins (an
-    /// unknown container is still `NotFound`) and comes to `refused`, which the agent reports as
-    /// ZC-E0516 and counts as neither a pass nor a failure.
+    /// A check is a `zcube-agent probe` worker that runs the command with Zigbox `exec`
+    /// (`zigbox_probes.zig`, `probe_worker.zig`). An unknown container is `NotFound`; one that is
+    /// not running comes to `refused` with Zigbox's own code (ZBX-E0220, the container is not
+    /// running), which the agent reports as ZC-E0516.
     fn probe_begin_impl(
         context: *anyopaque,
         handle: runtime.Handle,
@@ -513,7 +519,18 @@ pub const ZigboxRuntime = struct {
     ) runtime.Error!void {
         assert(command.len > 0);
         assert(timeout_ms > 0);
+        const self = from(context);
         _ = try inspect_impl(context, handle, diag);
+        const now = self.host.monotonic_ms();
+        try self.probes.begin(
+            self.io,
+            self.options.supervisor_exe,
+            handle,
+            command,
+            timeout_ms,
+            now,
+            diag,
+        );
     }
 
     fn probe_poll_impl(
@@ -521,8 +538,10 @@ pub const ZigboxRuntime = struct {
         handle: runtime.Handle,
         diag: *Diag,
     ) runtime.Error!runtime.ProbeResult {
+        const self = from(context);
         _ = try inspect_impl(context, handle, diag);
-        return .{ .refused = probe_not_built() };
+        return self.probes.poll(handle, self.host.monotonic_ms()) orelse
+            .{ .refused = no_probe() };
     }
 
     // ---- events ----
@@ -717,13 +736,13 @@ fn refusal_diagnostic(reason: map.Refusal, spec: *const runtime.Spec) Diagnostic
     return out;
 }
 
-/// Why a health check did not run in a Zigbox container: this build has no probe yet.
-fn probe_not_built() Diagnostic {
+/// A poll with no check in flight (none begun, or its result already read).
+fn no_probe() Diagnostic {
     var collector: Diag = undefined;
     collector.reset();
     collector.raise(.E0502);
-    collector.cause("this build does not run health checks in Zigbox containers", .{});
-    collector.fix(.{ .sentence = "use a build with C3's probe over Zigbox exec" });
+    collector.cause("no health check is in flight", .{});
+    collector.fix(.{ .sentence = "begin a check before polling it" });
     var out: Diagnostic = undefined;
     diag_mod.to_diagnostic(&out, &collector);
     return out;

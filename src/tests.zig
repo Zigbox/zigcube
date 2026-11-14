@@ -105,6 +105,8 @@ comptime {
     _ = @import("secure_random.zig");
     _ = @import("peer_server.zig");
     _ = @import("fetch_cli.zig");
+    _ = @import("probe_worker.zig");
+    _ = @import("zigbox_probes.zig");
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
     _ = @import("agent_run.zig");
