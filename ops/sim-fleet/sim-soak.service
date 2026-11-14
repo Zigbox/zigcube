@@ -1,0 +1,46 @@
+[Unit]
+Description=Zigcube simulation soak (one sim_cluster seed for hours, ops/sim-fleet/README.md item 8)
+Documentation=https://github.com/Zigbox/zigcube/blob/main/ops/sim-fleet/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=simfleet
+Group=simfleet
+WorkingDirectory=/var/lib/sim-fleet
+EnvironmentFile=-/etc/sim-fleet/fleet.env
+# systemd reads the token as root and hands the service a private copy under
+# $CREDENTIALS_DIRECTORY; the service user cannot read /etc/sim-fleet/token itself.
+LoadCredential=token:/etc/sim-fleet/token
+ExecStart=/var/lib/sim-fleet/zigcube/ops/sim-fleet/soak.sh
+Restart=always
+RestartSec=30
+Nice=15
+# soak.sh stops each seed at SIM_SOAK_MINUTES; this bounds a hang of the shell itself.
+TimeoutStopSec=60
+# Beside sim-fleet.service (MemoryMax=7G) on an 8 GB host: a soak whose heap passes this is
+# killed, recorded as CRASHED (killed by signal 9) and filed; the next seed starts.
+MemoryMax=2G
+OOMPolicy=continue
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sim-fleet
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

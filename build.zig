@@ -2003,6 +2003,13 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     bias.addFileInput(b.path("ops/sim-fleet/run.sh"));
     bias.expectExitCode(0);
     test_step.dependOn(&bias.step);
+    // The long soak's loop (`soak.sh`): held, failed and crashed soaks against the reporter.
+    const soak = b.addSystemCommand(&.{"sh"});
+    soak.addFileArg(b.path("ops/sim-fleet/test-soak.sh"));
+    soak.addArtifactArg(exe);
+    soak.addFileInput(b.path("ops/sim-fleet/soak.sh"));
+    soak.expectExitCode(0);
+    test_step.dependOn(&soak.step);
     const store_faults = b.addSystemCommand(&.{"sh"});
     store_faults.addFileArg(b.path("ops/sim-fleet/test-store-faults.sh"));
     store_faults.addArtifactArg(exe);

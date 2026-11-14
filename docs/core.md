@@ -373,6 +373,30 @@ Before each seed's run it also writes `replay: <command>` (the concrete command,
 prints it), so the last such line names the seed a crash or a timeout was in and how to replay it.
 A seed whose world cannot be built (out of memory) reports `step: setup`.
 
+**The trace (C3 fleet 7).** A failing report prints, after its `step:` line, the last 24
+operations of the run (`trace: op <index> at <ms> ms: <operation> [<service>]`, the time virtual
+and counted from the run's start; a service is named for `apply`, `scale`, `delete` and
+`broken`). The ring (`OpTrace`) draws nothing and is not hashed, so no world changes. The range
+form prints the trace under the failing seed's replay; with `--shrink` it reruns the smallest
+failing run for its trace. `sim_fleet ingest` puts it in the issue (`ops/sim-fleet/README.md`,
+item 7).
+
+**The soak (C3 fleet 6).** `sim_cluster <seed> soak [nodes] [flags] --soak-minutes=M |
+--soak-operations=K [--soak-epoch=E]` (E 500 by default; K a multiple of E) runs one seed with
+liveness off until the budget or a failure: the world does not depend on the run's length without
+liveness, so a soak stopped at K operations is `sim_cluster <seed> K [nodes] --liveness=false`,
+and a core failure replays as that. `Options.on_epoch` (core) hands the shell an `Epoch` every E
+operations: virtual time, the revision, transactions, agent and server steps, decisions kept and
+dropped, store keys, log and leases, jobs and the start ledger. `src/sim_soak.zig` (shell) prints
+each as a `soak: epoch` line with wall time, operations per second and the heap's live and peak
+bytes (a counting allocator), and fails the soak if virtual time or the revision stood still, if a
+counter passed half its range, or if live bytes per item of history (keys + log + revision +
+decisions + ledger) grew past 4 times their value at the fourth epoch. Wall time is printed, never
+judged, so the verdict is the seed's. `--c1` is refused (its tap grows about 1 GB by 2,000
+operations). The decisions check now reads up to 1,024 pages (`decision_pages_max`, 512,000
+decisions; it was 64, which a soak passes near 10,000 operations). Operations per second fall as
+the history grows, for the `MemoryStore` reason of the fleet's per-seed budget below.
+
 **Lost nodes in the report.** The report's `lost nodes:` line counts the `mark_lost` decisions and
 the replicas replaced after a lost node's grace (a `mark_replica_lost` caused by a decision). A
 leased node's partition (1 to 9 s) is shorter than the 10 s lease, so it alone never expires a

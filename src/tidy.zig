@@ -44,6 +44,11 @@ const shell_allowlist = [_][]const u8{
     // calls `zig build` and pipes `sim_cluster` into `sim_fleet`; the logic is Zig.
     "ops/sim-fleet/setup.sh",
     "ops/sim-fleet/run.sh",
+    // The opt-in soak's loop (item 8), the same kind of script as `run.sh`: it copies the
+    // binaries `run.sh` built and pipes one long `sim_cluster` run into `sim_fleet`.
+    "ops/sim-fleet/soak.sh",
+    // Runs `soak.sh` end to end against a fake `sim_cluster` and the built `sim_fleet`.
+    "ops/sim-fleet/test-soak.sh",
     // Each sources run.sh to test its shell functions, which only a shell can call:
     // `test-canary.sh` runs its canary cycle against fake fault-on runners and the built
     // `sim_fleet`, `test-crash-record.sh` feeds its crash records to `sim_fleet`, and
