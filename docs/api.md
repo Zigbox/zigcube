@@ -466,9 +466,12 @@ configuration** names (`relays` in the ZON file, at most `relays_max` = 8, each 
 listener at `ZCUBE_RELAY` (`http://127.0.0.1:<port>`).
 
 Admission refuses, `400` ZC-E0130 naming the field: `relay` that is not a non-empty string, a name
-the server's configuration does not have, an `env` that sets `ZCUBE_RELAY` (the relay owns it), and
-(B4) `labels` whose keys and values together are over `x509_labels_bytes_max` = 256 bytes, because
-the job's relay certificate carries every label; a job without a relay is not held to that.
+the server's configuration does not have, an `env` that sets `ZCUBE_RELAY` (the relay owns it);
+and, because the job's relay certificate (B4) names its image and carries every label: an `image`
+that is not `b3:` and 64 lowercase hex digits, `labels` whose keys and values together are over
+`x509_labels_bytes_max` = 256 bytes, and `labels` with a key that is not printable ASCII without
+spaces (bytes 0x21 to 0x7E) or a value that is not UTF-8 or holds a control character (below 0x20,
+or 0x7F). A job without a relay is not held to these three.
 The relay is resolved once, at admission: the job record holds the name and the address the
 configuration gave then, so a later edit of the configuration changes jobs submitted afterwards and
 no job already admitted. `GET /v1/jobs/{name}` shows `relay` as the name only. The spec comparison
