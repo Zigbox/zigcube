@@ -390,9 +390,15 @@ operations: virtual time, the revision, transactions, agent and server steps, de
 dropped, store keys, log and leases, jobs and the start ledger. `src/sim_soak.zig` (shell) prints
 each as a `soak: epoch` line with wall time, operations per second and the heap's live and peak
 bytes (a counting allocator), and fails the soak if virtual time or the revision stood still, if a
-counter passed half its range, or if live bytes per item of history (keys + log + revision +
-decisions + ledger) grew past 4 times their value at the fourth epoch. Wall time is printed, never
-judged, so the verdict is the seed's. `--c1` is refused (its tap grows about 1 GB by 2,000
+counter passed half its range, if live bytes per item of history (keys + log + revision +
+decisions + ledger) grew past 4 times their value at the fourth epoch, or if bytes added per item
+added since that epoch passed 4 times their first value (once the history has doubled). After the
+world's teardown the counting allocator must hold nothing (`soak: memory still held after the
+world was torn down`). `--soak-bytes=B` (1.5 GiB by default) ends the soak as held at the epoch
+whose live bytes reach B (`budget reached`), and a held soak prints its world hash. Wall time is
+printed, never judged, so the verdict is the seed's. The tooth, `src/sim_soak_teeth_main.zig`
+(16 KiB never freed per operation), must fail the teardown check; `ops/sim-fleet/test-soak.sh`
+runs it in `zig build test` (`docs/decisions/2026-11-14-c3-soak-leak-judge.md`). `--c1` is refused (its tap grows about 1 GB by 2,000
 operations). The decisions check now reads up to 1,024 pages (`decision_pages_max`, 512,000
 decisions; it was 64, which a soak passes near 10,000 operations). Operations per second fall as
 the history grows, for the `MemoryStore` reason of the fleet's per-seed budget below.

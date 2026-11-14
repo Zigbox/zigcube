@@ -2322,7 +2322,10 @@ fn why_terminates(
 /// Pages of decisions the decisions check reads, and so the decisions a world may hold before
 /// it fails with "there are more decisions than the check reads". A soak (src/sim_soak.zig) holds
 /// about three per operation and retention keeps a week, so the bound is a soak's, not a
-/// fleet run's (800 operations at most): 64 pages lasted about 10,000 operations.
+/// fleet run's (800 operations at most): 64 pages lasted about 10,000 operations. The check reads
+/// every decision whenever the revision moved, so a soak's cost per operation grows with its
+/// history; reading only the new ones would make the soak a different check from the plain run
+/// it must replay as (docs/decisions/2026-11-14-c3-soak-leak-judge.md).
 pub const decision_pages_max: u32 = 1024;
 pub const decisions_read_max: u32 = decision_pages_max * constants.store_list_limit_max;
 

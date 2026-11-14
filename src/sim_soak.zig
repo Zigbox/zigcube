@@ -425,7 +425,8 @@ test "each counter fails past half its range and holds at half" {
         try std.testing.expect(failure(&soak) == null);
         @field(epoch, case[0]) = case[2] / 2 + 1;
         judge(&soak, &epoch);
-        try std.testing.expectEqualStrings("soak: " ++ case[1] ++ " past half its range", failure(&soak).?);
+        const want = "soak: " ++ case[1] ++ " past half its range";
+        try std.testing.expectEqualStrings(want, failure(&soak).?);
     }
 }
 
@@ -526,7 +527,8 @@ test "the teardown: a byte still held after the run fails the soak, unless it al
         "soak: memory still held after the world was torn down",
         failure(&soak).?,
     );
-    try std.testing.expectEqualStrings("1 bytes after a run of 300 operations", failure_detail(&soak));
+    const detail = "1 bytes after a run of 300 operations";
+    try std.testing.expectEqualStrings(detail, failure_detail(&soak));
     try std.testing.expectEqual(@as(u32, 300), soak.failed_at);
     // The first failure stays the one replayed.
     soak = test_soak(&counting, &out);
