@@ -4,14 +4,13 @@
 docs/decisions/2026-11-14-b7-slice6-console-over-tls.md (path A); none adds a code or a
 user-visible bound beyond those it lists, except as marked.*
 
-- **Low S: the supervisor's ruling (2026-11-14), pending the owner's OK.** Certificates (both
+- **Low S: the supervisor's ruling, approved by the owner on 2026-11-14.** Certificates (both
   directions) must carry a low S, and the server signs its CertificateVerify with a low S. A
   browser's CertificateVerify is accepted with any S in range: browsers do not normalise S, and
   a CertificateVerify signs a transcript that holds the server's fresh random, so a malleated
   copy replays nothing. Strict DER (no padding, r and s in 1..n-1, no trailing bytes) holds
   everywhere; r or s equal to n or n+1 is refused though canonical DER. `x509_p256_test.zig` and
-  `tls_server_test.zig` test both. If the owner rules otherwise, this bullet changes with the
-  code.
+  `tls_server_test.zig` test both.
 - **The browser CA's key** is made at server start when absent (`server_browser_ca.zig`). A
   new key locks out nobody who was not already out. `ca issue-client --p12` refuses a store
   without one (`ZC-E0806`) rather than make it, since a key it made the running server would
