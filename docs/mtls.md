@@ -378,6 +378,16 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   (decisions/2026-11-06-interop-needs-setpriv.md). The JVM runs with
   `-Dcom.sun.net.ssl.requireCloseNotify=true`, so a client that drops TCP without `close_notify`
   fails the clean-close check.
+  Its server rows (B7 slice 4, `src/mtls_interop_server.zig`, `ops/mtls-interop/InteropClient.java`)
+  turn it round: `openssl s_client` and a JDK 21 `SSLSocket` call a real `zcube-server --listen`.
+  Each is accepted with a `client` certificate of scope `jobs` from `ca issue-client`
+  (`GET /v1/jobs` is 200, `GET /v1/status` is 403 ZC-E0822), and each is refused at the handshake
+  with no certificate (alert `certificate_required`; the server logs ZC-E0814), with an expired
+  one (`certificate_expired`; ZC-E0811) and with one from another CA (`unknown_ca`; ZC-E0810).
+  A refused handshake now ends with a lingering close (`linger_refused` in `server_http.zig`):
+  the server judges the client's certificate before it reads the client's Finished, and closing
+  at once made the kernel answer that Finished with a reset that destroyed the alert, so the JDK
+  saw only a broken pipe.
 
 ## Diagnostics
 
