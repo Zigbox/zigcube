@@ -16,6 +16,7 @@ in the order the supervisor gave. None was already an ancestor of `main`.
 | 6 | `claude/b5-slice4` | 7c44b31 | f7575fd |
 | 7 | `claude/b6-slice2` | 1668b53 | 97bd1c0 |
 | 8 | `origin/main` (#247, #248) | ebfbac5 | 9806d67 |
+| 9 | `claude/b6-slice3` | 2120075 | 40a9729 |
 
 Every merge commit's message lists its conflicts. The summary is below. Each conflict was resolved on
 its merits, and both behaviours were kept. A whole file was never taken from one side.
@@ -99,13 +100,24 @@ its merits, and both behaviours were kept. A whole file was never taken from one
      relay, which only a Debug build accepts (`relay_plain_allowed`). That relay is now in the
      table only where it is allowed.
 
+9. **B6 slice 3 (demo-b6).**
+   - **ZC-E0505.** Its explanation names B6's label causes and B5's `--trust-policy` file. It is
+     the same code, reworded, and `site/errors/E0505.html` was regenerated.
+   - **The agent's settings.** They carry B5's trust policy, B7's TLS settings and B6's labels.
+     The registry check moved into `registry_of` to keep `merge` under 70 lines.
+   - **The agent's start.** It keeps the bundle's `new_agent` (trust, TLS) and runs B6's
+     `refuse_relabel` before the pair is loaded. The agent is given the labels.
+   - **CI.** `demo_b6` is the twelfth verdict column, after `demo_b7` and `demo_b5`. Each side's
+     table rows were run against the merged rules with their own columns unchanged.
+     `ci-changes-test.sh` passes 78 cases.
+
 ## Diagnostic codes
 
 There is no collision.
 - B7 registered ZC-E0822. ZC-E0810 to ZC-E0821 were already on `main`.
 - B4 registered ZC-E0706.
 - B5 uses Zigbox's ZBX-E0905 and ZBX-E0906 and adds no ZC- code.
-- B6 adds none.
+- B6 adds none. Slice 3 only rewords ZC-E0505.
 - #615 only rewords ZC-E0806.
 
 No bound, limit or default was changed by the integration itself.
@@ -135,7 +147,7 @@ at aa4d64c, which is the pin every merged branch already used.
 5. **sim-c1 now always runs the strong world.** This holds since B4 slice 3. B5 added the signed
    comparison and B6 added `-Dtenants`. B6's `plan` turns `--tenants` on for `auto` operations, so a
    pre-B6 `auto` replay line no longer replays its old world.
-6. **Demos still pending.** demo-b4 lives on `claude/b4-slice4` and demo-b6 on `claude/b6-slice3`,
-   and this bundle has neither. demo-b3 and demo-b5 need KVM and were not run in the cloud.
+6. **Demos still pending.** demo-b4 lives on `claude/b4-slice4`, which this bundle does not have.
+   demo-b6 came in with B6 slice 3. demo-b3 and demo-b5 need KVM and were not run in the cloud.
 
 Where: the merge commits' messages, `docs/releases/b4-b7.md`.
