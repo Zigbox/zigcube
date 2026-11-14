@@ -130,4 +130,4 @@ below), ReleaseSafe, 2026-11-14, on the world with `stop_takes_grace`:
 | `sim_c1_teeth_relay_stop_leak` | 95 of 240 | 95 | 0.25 | 80 | 1.0e-10 |
 
 The positive run, `sim_cluster --seeds 1..240 auto --profile=auto --c1 --strong` with every tooth
-off: POSITIVE_RESULT.
+off: 0 of 240 failed.

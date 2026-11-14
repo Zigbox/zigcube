@@ -1464,8 +1464,8 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const ops_text = ops_argument(b, sim);
     const nodes_text = b.fmt("{d}", .{if (sim.auto_shape) 0 else nodes});
     const run = b.addRunArtifact(exe);
-    // The strong world (wipes, relayed jobs, certificates) costs no measurable time here (B4 slice 3
-    // fixes); `tools/wasm_check.mjs --sim-c1` sets it on the WASM side too.
+    // The strong world (wipes, relayed jobs, certificates) costs no measurable time here (B4
+    // slice 3 fixes); `tools/wasm_check.mjs --sim-c1` sets it on the WASM side too.
     run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1", "--strong" });
     run.addArg(b.fmt("--profile={s}", .{sim.profile}));
     const native_report = run.captureStdOut(.{});
