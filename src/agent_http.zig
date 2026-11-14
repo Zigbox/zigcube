@@ -17,6 +17,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const net = std.Io.net;
 const agent_api = @import("agent_api.zig");
+const api_tls_client = @import("api_tls_client.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 
@@ -34,6 +35,9 @@ pub const Client = struct {
     address: net.IpAddress,
     /// How long a read waits for the next piece of a reply, on top of the request's own hold.
     io_timeout_ms: u32 = constants.agent_io_timeout_ms,
+    /// The API over TLS (docs/mtls.md): the CA pinned and the certificate presented, which the
+    /// agent switches to its own `node.crt` once it has one. Null: plain HTTP.
+    tls: ?*api_tls_client.Credentials = null,
 
     /// Sends the request and returns the reply, whatever its status. `Unreachable` and `BadReply`
     /// leave a diagnostic in `diag`.
@@ -53,6 +57,7 @@ pub const Client = struct {
         const end_ms = client.now_ms() + request.hold_ms + io_ms;
         var stream = try client.connect(end_ms, diag);
         defer stream.close(client.io);
+        if (client.tls) |tls| return client.call_tls(tls, arena, &stream, request, end_ms, diag);
         try client.send(&stream, request, diag);
         return client.receive(arena, &stream, end_ms, diag);
     }
@@ -129,13 +134,64 @@ pub const Client = struct {
         }
     }
 
+    /// `call` over TLS: one exchange, then the same checks of the reply as `receive`.
+    fn call_tls(
+        client: *const Client,
+        tls: *api_tls_client.Credentials,
+        arena: Allocator,
+        stream: *net.Stream,
+        request: Request,
+        end_ms: u64,
+        diag: *Diag,
+    ) Error!Reply {
+        const head = std.fmt.allocPrint(arena, head_format, .{
+            request.method, request.target, client.address, request.body.len,
+        }) catch return error.OutOfMemory;
+        const limit = head_bytes_max + constants.agent_response_bytes_max;
+        const done = api_tls_client.exchange(
+            tls,
+            client.io,
+            stream.socket.handle,
+            arena,
+            &.{ head, request.body },
+            limit,
+            api_tls_client.reply_is_whole,
+            end_ms,
+            diag,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Failed => return error.Unreachable,
+        };
+        switch (done.ending) {
+            .done => {},
+            .silent => return unreachable_server(diag, client, "it did not answer in time"),
+            .failed => {
+                assert(diag.code != null);
+                return error.Unreachable;
+            },
+        }
+        const raw = done.reply;
+        const end = std.mem.find(u8, raw, "\r\n\r\n") orelse {
+            if (raw.len > head_bytes_max) {
+                return bad_reply(diag, "the reply's headers are longer than the agent reads");
+            }
+            return unreachable_server(diag, client, "the connection was lost");
+        };
+        const parsed = try parse_head(raw[0 .. end + 4], diag);
+        const promised = parsed.content_length orelse
+            return bad_reply(diag, "the reply has no Content-Length");
+        if (promised > constants.agent_response_bytes_max) {
+            return bad_reply(diag, "the reply is larger than the agent reads");
+        }
+        const body = raw[end + 4 ..];
+        if (body.len < promised) return unreachable_server(diag, client, "the connection was lost");
+        return .{ .status = parsed.status, .body = body[0..promised] };
+    }
+
     fn send(client: *const Client, stream: *net.Stream, request: Request, diag: *Diag) Error!void {
         var buffer: [4096]u8 = undefined;
         var writer = stream.writer(client.io, &buffer);
-        const head = "{s} {s} HTTP/1.1\r\nHost: {f}\r\n" ++
-            "Accept: application/json\r\nContent-Type: application/json\r\n" ++
-            "Content-Length: {d}\r\n\r\n";
-        writer.interface.print(head, .{
+        writer.interface.print(head_format, .{
             request.method, request.target, client.address, request.body.len,
         }) catch return unreachable_server(diag, client, "the request could not be sent");
         writer.interface.writeAll(request.body) catch
@@ -203,6 +259,10 @@ fn connect_reason(code: std.os.linux.E) []const u8 {
         else => "the connection could not be made",
     };
 }
+
+const head_format = "{s} {s} HTTP/1.1\r\nHost: {f}\r\n" ++
+    "Accept: application/json\r\nContent-Type: application/json\r\n" ++
+    "Content-Length: {d}\r\n\r\n";
 
 /// The status line and headers of a reply fit in this many bytes, or the reply is not the server's.
 const head_bytes_max: u32 = 16 * 1024;

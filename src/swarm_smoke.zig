@@ -219,9 +219,9 @@ const Smoke = struct {
         const listen = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{smoke.port});
         const store = try smoke.path("store.db");
         const args = [_][]const u8{
-            "--listen",       listen,
-            "--store",        try std.fmt.allocPrint(arena, "sqlite:{s}", .{store}),
-            "--create-store", "--quiet",
+            "--insecure-listen", listen,
+            "--store",           try std.fmt.allocPrint(arena, "sqlite:{s}", .{store}),
+            "--create-store",    "--quiet",
         };
         smoke.server = try smoke.spawn(smoke.server_exe, &args, "server.log");
         const ready = struct {

@@ -185,7 +185,8 @@ pub fn decode(bytes: []const u8) ?Verdict {
     };
 }
 
-/// The kind from the number of extensions, the name from the SAN, the identity from the last.
+/// The kind from the number of extensions and the SAN (a DNS name, or the path of a URI), the
+/// name from the SAN, the identity from the last.
 fn extensions(bytes: []const u8, wrapper: Element, parsed: *x509.Parsed) bool {
     const list = only_child(bytes, wrapper.value, 0x30) orelse return false;
     var items: [5]Element = undefined;
@@ -197,17 +198,44 @@ fn extensions(bytes: []const u8, wrapper: Element, parsed: *x509.Parsed) bool {
         return true;
     }
     if (all.len != 4 and all.len != 5) return false;
-    parsed.kind = if (all.len == 5) .workload else .server;
     const san = extension_value(bytes, all[3]) orelse return false;
     const general = only_child(bytes, san, 0x30) orelse return false;
-    const name = only_child(bytes, general.value, if (all.len == 5) 0x86 else 0x82);
-    parsed.name = (name orelse return false).value;
-    if (all.len == 5) {
+    var names: [1]Element = undefined;
+    const name_list = children(bytes, general.value, &names) orelse return false;
+    if (name_list.len != 1) return false;
+    parsed.name = name_list[0].value;
+    parsed.kind = switch (name_list[0].tag) {
+        0x82 => .server,
+        0x86 => uri_kind(parsed.name.of(bytes)) orelse return false,
+        else => return false,
+    };
+    const with_identity = parsed.kind == .workload or parsed.kind == .client;
+    if (all.len != @as(usize, if (with_identity) 5 else 4)) return false;
+    if (with_identity) {
         const value = extension_value(bytes, all[4]) orelse return false;
-        _ = identity_mod.decode(value.of(bytes)) catch return false;
+        if (parsed.kind == .workload) {
+            _ = identity_mod.decode(value.of(bytes)) catch return false;
+        } else {
+            _ = identity_mod.decode_client(value.of(bytes)) catch return false;
+        }
         parsed.identity = value;
     }
     return true;
+}
+
+/// The kind a SPIFFE URI's first path segment names, by plain text: `spiffe://<cluster>/<path>/`.
+fn uri_kind(uri: []const u8) ?x509.Kind {
+    const prefix = "spiffe://";
+    if (uri.len < prefix.len or !std.mem.eql(u8, uri[0..prefix.len], prefix)) return null;
+    const rest = uri[prefix.len..];
+    const first = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const after = rest[first + 1 ..];
+    const second = std.mem.indexOfScalar(u8, after, '/') orelse return null;
+    const segment = after[0..second];
+    if (std.mem.eql(u8, segment, "service")) return .workload;
+    if (std.mem.eql(u8, segment, "node")) return .node;
+    if (std.mem.eql(u8, segment, "client")) return .client;
+    return null;
 }
 
 /// The OCTET STRING of an extension: its last child.
@@ -232,9 +260,9 @@ fn meaning_ok(bytes: []const u8, parsed: *const x509.Parsed) bool {
     }
     switch (parsed.kind) {
         .ca => if (!std.mem.eql(u8, issuer, subject)) return false,
-        .workload => {
+        .workload, .node, .client => {
             const spiffe = identity_mod.spiffe_parse(name) catch return false;
-            if (!std.mem.eql(u8, spiffe.service, subject)) return false;
+            if (!std.mem.eql(u8, spiffe.name, subject)) return false;
         },
         .server => {
             if (identity_mod.dns_problem(name, constants.x509_dns_name_bytes_max)) return false;
@@ -244,7 +272,7 @@ fn meaning_ok(bytes: []const u8, parsed: *const x509.Parsed) bool {
     if (parsed.not_after_ms <= parsed.not_before_ms) return false;
     const bound = switch (parsed.kind) {
         .ca => constants.x509_ca_ttl_ms_max,
-        .workload, .server => constants.x509_leaf_ttl_ms_max,
+        .workload, .server, .node, .client => constants.x509_leaf_ttl_ms_max,
     };
     return parsed.not_after_ms - parsed.not_before_ms <= bound;
 }

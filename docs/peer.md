@@ -53,7 +53,9 @@ The control plane is the cluster CA.
 2. An agent has an Ed25519 **node key**, generated on its first run into
    `<state dir>/peer.key` (mode 0600, same format). At join it sends the public key and receives
    a signed **credential** binding that key to its node name. It stores the credential in
-   `<state dir>/peer.cred` and the CA's public key in `<state dir>/ca.pub`.
+   `<state dir>/peer.cred` and the CA's public key in `<state dir>/ca.pub`. Since B7 the same
+   answer carries a node certificate over the same key (`<state dir>/node.crt`, docs/mtls.md),
+   for the API over TLS.
 3. A peer accepts only credentials signed by the CA key it holds, inside their validity window.
 
 The join call is `POST /v1/agent/nodes/{node}/credential` (docs/api.md). Like every agent
@@ -185,8 +187,8 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
 | E0803 | the server's credential names another node than the one asked for |
 | E0804 | the handshake failed: malformed or tampered message, wrong version, bad transcript signature, weak key, or a cut stream |
 | E0805 | a record failed authentication, or a direction reached its record counter limit |
-| E0806 | (environment) the CA key or the node key could not be read, written or parsed |
-| E0807 | (user) a node was refused a credential because it was removed from the cluster |
+| E0806 | (user) a peer key, certificate or trust file (the CA key, the node key, `peer.cred`, `node.crt`, `ca.pub`, or a file `ca issue-client` or `ca issue-node` writes) could not be read, written or parsed |
+| E0807 | (user) a name on the removed list (`revoked`: a bare name for every kind, `node/NAME` or `client/NAME` for one) was refused a certificate |
 | E0808 | (user) a peer's handshake was refused: its address already has as many unfinished as one may, started too many in a window, or the table of addresses is full |
 
 ## Lifetime, renewal and removal
@@ -197,8 +199,10 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
   lease-time concern in spirit (a node that stays up keeps a current credential) but it is a call
   of its own: the credential is not a store key and is not tied to the lease's revision.
 - **Removal.** A node removed from the cluster is named in the server's `<state dir>/revoked`
-  (one node name per line, `#` comments), read at start. The server refuses to issue or renew
-  for a listed name (ZC-E0807) and the node's credential lapses within a day. That is the
+  (one name per line, `#` comments; `node/NAME` or `client/NAME` names one kind, a bare name
+  both, decisions/2026-11-14-revoked-names-by-kind.md), read at start. The server refuses to issue or renew
+  for a listed name (ZC-E0807), node certificates included; since B7 a client name listed there
+  is refused by `ca issue-client` too and the node's credential lapses within a day. That is the
   denylist: cheap, but read only at start and not a store key, because C2 has no node removal
   command to drive a store-backed list. When one exists it writes this list. A listed node whose
   credential has not yet expired is still accepted by peers until it does: **a day is the bound
@@ -216,9 +220,10 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
 - **Issuance names a lease.** `POST .../credential` carries `{"node_key", "lease"}` and the
   server issues only when the node's record is registered under that live lease (a store read;
   ZC-E0205 otherwise). The CA reads node and lease records and writes none.
-- **The API is unauthenticated.** Revocation (`revoked`, the lease check) binds an honest node
-  only until API auth lands: anyone who can reach the API can register a name and ask for a
-  credential.
+- **Who may ask.** Over `--listen` (TLS, B7) only node NAME's own certificate may ask for NAME's
+  credential, renew NAME's lease or register NAME; a client certificate, admin included, is 403
+  ZC-E0822 there (docs/mtls.md, "Scopes"). `--insecure-listen` is loopback only and its caller,
+  `local`, may do all of it.
 
 ## X.509 certificates from the CA (mTLS slice 2)
 

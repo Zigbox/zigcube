@@ -1,5 +1,5 @@
-error[ZC-E0807]: a node was refused a credential: it was removed
-  cause  node node3 is on the server's list of removed nodes
+error[ZC-E0807]: a name on the removed list was refused a certificate
+  cause  node node3 is on the server's list of removed names (revoked)
   fix    remove its name from the revoked file, then restart zcube-server
   more   zcube explain E0807 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0807.html

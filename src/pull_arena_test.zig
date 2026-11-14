@@ -70,6 +70,7 @@ fn ask(s: store.Store) !u64 {
     };
     var api: api_mod.Api = .{ .version = "0.0.0", .backend = "test", .started_at_ms = 0 };
     const response = api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/stats/pull",
         .query = "limit=500",

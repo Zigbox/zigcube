@@ -199,9 +199,7 @@ fn make_identity(io: std.Io, state: []const u8, name: []const u8, ca: Ed25519.Ke
     var opened = try agent_peer.Peer.open(io, state, name, &diag);
     defer opened.close();
     const now = peer_stream.wall_ms(io);
-    const key = opened.key.public_key.toBytes();
-    opened.credential = peer.issue(ca, name, key, now - 1000, now + 100_000);
-    opened.ca_public = ca.public_key.toBytes();
+    try opened.hold_for_test(ca, now - 1000, now + 100_000);
     try opened.store(&diag);
 }
 

@@ -18,21 +18,39 @@ const fencing = @import("fencing.zig");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const x509_identity = @import("x509_identity.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const IpAddress = std.Io.net.IpAddress;
 
 pub const listen_default = "127.0.0.1:7070";
+/// The DNS name in the TLS listener's certificate, which clients check (`--tls-name`).
+pub const tls_name_default = "zcube-server";
 
 pub const usage =
-    \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--store SPEC] [--create-store]
-    \\                    [--new-ca] [--verbose] [--quiet]
+    \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--insecure-listen HOST:PORT]
+    \\                    [--tls-name NAME] [--store SPEC] [--create-store] [--new-ca]
+    \\                    [--verbose] [--quiet]
+    \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]
+    \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
+    \\       zcube-server ca issue-node NAME [--out DIR] [--replace]
+    \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
     \\       zcube-server --version | --help
     \\
-    \\  --config FILE     a ZON file with .listen, .store, .create_store and .relays
-    \\                    (the upstreams a job's relay may name)
-    \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
+    \\  --config FILE     a ZON file with .listen, .insecure_listen, .tls_name, .store,
+    \\                    .create_store and .relays (the upstreams a job's relay may name)
+    \\  --listen ADDR     where to serve the API over TLS, an IP address and a port (default
+    \\                    127.0.0.1:7070 unless --insecure-listen is given). Every client
+    \\                    presents a certificate of this server's CA: an agent its node's
+    \\                    (from ca issue-node until it has joined), anyone else one from
+    \\                    ca issue-client
+    \\  --insecure-listen ADDR
+    \\                    also serve plain HTTP, with no certificate and every request
+    \\                    allowed, on a loopback address only (127.0.0.1:PORT or [::1]:PORT):
+    \\                    for zcube local, the console in a browser, and tests
+    \\  --tls-name NAME   the DNS name in the server's certificate, which clients check
+    \\                    (default zcube-server)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
     \\  --lost-grace-ms N how long a lost node's replicas stay before they are replaced under
@@ -45,7 +63,18 @@ pub const usage =
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
     \\
-    \\Writes to the API are unauthenticated: listen on a loopback or private address.
+    \\ca issue-client signs a client certificate with the store's CA (on the server host; the
+    \\server need not run): NAME.key and NAME.crt, mode 0600, in --out (default: the working
+    \\directory). --scope is what the client may do: jobs, or admin. ca issue-node does the
+    \\same for a node's first certificate, which the operator copies to the node. Either is
+    \\valid for 7 days: run it again with --replace (by hand or from cron) to re-issue; without
+    \\--replace an existing NAME.key or NAME.crt is refused. A name in the revoked file is
+    \\refused.
+    \\
+    \\ca issue-node signs a node certificate the same way, for a new agent's --cert and --key:
+    \\it may join and act as NAME only. Once joined, the agent presents its own node.crt.
+    \\
+    \\The insecure listener allows anything to anyone who can reach it: keep it on loopback.
     \\
 ;
 
@@ -60,7 +89,12 @@ pub const Store = union(enum) {
 };
 
 pub const Config = struct {
-    listen: IpAddress,
+    /// The TLS listener (`--listen`); at least one of the two listeners is set.
+    listen: ?IpAddress = null,
+    /// The plain-HTTP listener (`--insecure-listen`): a loopback address only.
+    insecure_listen: ?IpAddress = null,
+    /// The DNS name of the TLS listener's certificate.
+    tls_name: []const u8 = tls_name_default,
     store: Store,
     create_store: bool,
     /// Where the remembered revision is kept; null: beside the SQLite file. A Postgres store
@@ -78,7 +112,23 @@ pub const Config = struct {
     relays: []const Relay = &.{},
 };
 
-pub const Command = union(enum) { run: Config, version, help };
+pub const Command = union(enum) { run: Config, ca_issue: Issue, version, help };
+
+/// `zcube-server ca issue-client NAME --scope jobs|admin` or `ca issue-node NAME`: the store
+/// settings find the CA key (`config`), and the files are written in `out_dir`.
+pub const Issue = struct {
+    config: Config,
+    /// What the certificate is for: a client (with `scope`) or a node.
+    subject: Subject,
+    name: []const u8,
+    out_dir: []const u8 = ".",
+    /// Replace an existing `NAME.key` and `NAME.crt` (`--replace`); refused otherwise.
+    replace: bool = false,
+
+    pub const Subject = union(enum) { client: Scope, node };
+};
+
+pub const Scope = @import("x509.zig").Scope;
 
 /// One relay: the name a job gives and the `host:port` the node agent connects to for it.
 pub const Relay = @import("records.zig").JobRelay;
@@ -87,6 +137,8 @@ pub const Relay = @import("records.zig").JobRelay;
 /// file's own and so are read from the syntax tree.
 const File = struct {
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: ?bool = null,
     lease_ttl_ms: ?u32 = null,
@@ -99,6 +151,8 @@ const File = struct {
 /// the names itself, because it parses these with the relays left out).
 const Fields = struct {
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: ?bool = null,
     lease_ttl_ms: ?u32 = null,
@@ -110,6 +164,8 @@ const Fields = struct {
 const Flags = struct {
     config: ?[]const u8 = null,
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: bool = false,
     lease_ttl_ms: ?u32 = null,
@@ -127,6 +183,7 @@ pub const Error = error{ BadConfig, OutOfMemory };
 /// Reads the flags and the file they name, merges them (flags win), and checks every setting.
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "ca")) return load_ca(arena, io, args, diag);
     const flags = try parse_flags(args, diag);
     if (flags.version) return .version;
     if (flags.help) return .help;
@@ -135,11 +192,98 @@ pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag)
     return .{ .run = try merge(flags, file, diag) };
 }
 
+/// `ca issue-client NAME --scope S` or `ca issue-node NAME`, `[--out DIR] [--replace]`, and the
+/// store flags of a run. `--help` anywhere after `ca` is the help.
+fn load_ca(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
+    assert(std.mem.eql(u8, args[0], "ca"));
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help")) return .help;
+        if (std.mem.eql(u8, arg, "-h")) return .help;
+    }
+    const node = args.len >= 2 and std.mem.eql(u8, args[1], "issue-node");
+    const client = args.len >= 2 and std.mem.eql(u8, args[1], "issue-client");
+    if (!node and !client) {
+        const problem = "zcube-server ca has two commands, issue-client and issue-node";
+        return bad(diag, problem, .{}, "run it with --help");
+    }
+    const what = if (node) "ca issue-node needs a node name" else "ca issue-client needs a name";
+    if (args.len < 3 or std.mem.startsWith(u8, args[2], "-")) {
+        return bad(diag, "{s}", .{what}, "run it with --help");
+    }
+    var request: Issue = .{ .config = undefined, .subject = .node, .name = args[2] };
+    var scope: ?Scope = null;
+    var out: ?[]const u8 = null;
+    var rest: std.ArrayList([]const u8) = .empty;
+    var index: usize = 3;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--scope")) {
+            if (scope != null) return bad(diag, "--scope is given twice", .{}, "give it once");
+            scope = try scope_of(args, &index, diag);
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            if (out != null) return bad(diag, "--out is given twice", .{}, "give it once");
+            out = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, args[index], "--replace")) {
+            request.replace = true;
+        } else {
+            try rest.append(arena, args[index]);
+        }
+    }
+    if (out) |directory| request.out_dir = directory;
+    request.subject = try subject_of(node, scope, diag);
+    request.config = try issue_config(arena, io, rest.items, diag);
+    return .{ .ca_issue = request };
+}
+
+fn scope_of(args: []const []const u8, index: *usize, diag: *Diag) Error!Scope {
+    const text = try value_of(args, index, diag);
+    return Scope.parse(text) orelse
+        bad(diag, "--scope is jobs or admin, not {s}", .{text}, "run it with --help");
+}
+
+/// A client needs a scope; a node has none (it may call the agent API for itself only).
+fn subject_of(node: bool, scope: ?Scope, diag: *Diag) Error!Issue.Subject {
+    if (node) {
+        if (scope != null) {
+            const problem = "a node certificate has no --scope: a node may act for itself only";
+            return bad(diag, problem, .{}, "leave out --scope");
+        }
+        return .node;
+    }
+    const given = scope orelse {
+        return bad(diag, "ca issue-client needs --scope jobs or --scope admin", .{}, "add one");
+    };
+    return .{ .client = given };
+}
+
+/// The store settings of a run, read as the server reads them, without the ones that make a CA.
+fn issue_config(arena: Allocator, io: std.Io, rest: []const []const u8, diag: *Diag) Error!Config {
+    const flags = try parse_flags(rest, diag);
+    if (flags.version) {
+        return bad(diag, "--version is not a setting of ca", .{}, "run zcube-server --version");
+    }
+    assert(!flags.help); // `load_ca` answered it.
+    if (flags.new_ca or flags.create_store) {
+        const problem = "ca signs with the CA a server already made";
+        return bad(diag, problem, .{}, "leave out --new-ca and --create-store");
+    }
+    var file: File = .{};
+    if (flags.config) |path| file = try read_file(arena, io, path, diag);
+    return merge(flags, file, diag);
+}
+
 fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
-    const listen_text = flags.listen orelse file.listen orelse listen_default;
+    const insecure_text = flags.insecure_listen orelse file.insecure_listen;
+    // With neither listener named, the TLS one listens on the default address.
+    const listen_text = flags.listen orelse file.listen orelse
+        if (insecure_text == null) @as([]const u8, listen_default) else null;
     const store_text = flags.store orelse file.store orelse "memory";
     return .{
-        .listen = try parse_listen(listen_text, diag),
+        .listen = if (listen_text) |text| try parse_listen(text, diag) else null,
+        .insecure_listen = if (insecure_text) |t| try parse_insecure_listen(t, diag) else null,
+        .tls_name = try tls_name_of(
+            flags.tls_name orelse file.tls_name orelse tls_name_default,
+            diag,
+        ),
         .store = try parse_store(store_text, diag),
         .create_store = if (flags.create_store) true else (file.create_store orelse false),
         .state_dir = flags.state_dir orelse file.state_dir,
@@ -203,6 +347,10 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.config = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--listen")) {
             flags.listen = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--insecure-listen")) {
+            flags.insecure_listen = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--tls-name")) {
+            flags.tls_name = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--store")) {
             flags.store = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
@@ -303,7 +451,8 @@ fn parse_tree(
 }
 
 const known_settings = [_][]const u8{
-    "listen", "store", "create_store", "lease_ttl_ms", "lost_grace_ms", "state_dir", "relays",
+    "listen",       "insecure_listen", "tls_name",  "store",  "create_store",
+    "lease_ttl_ms", "lost_grace_ms",   "state_dir", "relays",
 };
 
 /// The relays of the file's root struct, after its field names are checked. A relay is
@@ -446,6 +595,32 @@ fn relays_valid(relays: []const Relay, diag: *Diag) Error![]const Relay {
 
 // ---- Settings -----------------------------------------------------------------------------------
 
+/// An address of this machine's loopback interface: 127.0.0.0/8 or ::1. An IPv4-mapped address
+/// (`::ffff:127.0.0.1`) is not: the check names only the plain forms (refused, not guessed).
+pub fn is_loopback(address: IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| std.mem.eql(u8, &ip6.bytes, &(@as([15]u8, @splat(0)) ++ [1]u8{1})),
+    };
+}
+
+/// `--insecure-listen`: an address as for `--listen`, and on loopback (ZC-E0106 otherwise).
+pub fn parse_insecure_listen(text: []const u8, diag: *Diag) Error!IpAddress {
+    const address = try parse_listen(text, diag);
+    if (is_loopback(address)) return address;
+    return bad(diag, "--insecure-listen {s} is not a loopback address", .{text}, "serve plain " ++
+        "HTTP on 127.0.0.1 or [::1] only, and everything else with --listen (TLS)");
+}
+
+/// The TLS name: a DNS name the certificate can carry (ZC-E0106 otherwise).
+fn tls_name_of(name: []const u8, diag: *Diag) Error![]const u8 {
+    if (x509_identity.dns_problem(name, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "--tls-name {s} is not a DNS name", .{name}, "use letters, digits, " ++
+            "hyphens and dots, as zcube-server or api.example.com");
+    }
+    return name;
+}
+
 /// "127.0.0.1:7070" or "[::1]:7070": an IP address and a port. A name is refused, because
 /// resolving one at start-up could quietly choose a different interface than the user meant.
 pub fn parse_listen(text: []const u8, diag: *Diag) Error!IpAddress {
@@ -567,7 +742,7 @@ test "flags win over the file, unknown flags and settings are refused" {
     const typed = [_][]const u8{ "--listen", "127.0.0.1:9", "--store", "memory", "-v" };
     const flags = try parse_flags(&typed, &diag);
     const config = try merge(flags, file, &diag);
-    try testing.expectEqual(@as(u16, 9), config.listen.getPort());
+    try testing.expectEqual(@as(u16, 9), config.listen.?.getPort());
     try testing.expect(config.store == .memory);
     try testing.expect(config.create_store);
     try testing.expect(config.verbose);
@@ -580,6 +755,67 @@ test "flags win over the file, unknown flags and settings are refused" {
     try expect_bad(parse_zon(arena, ".{ .listn = \"x\" }", "server.zon", &diag), &diag);
     diag.reset();
     try expect_bad(parse_zon(arena, "this is not zon", "server.zon", &diag), &diag);
+}
+
+test "ca issue-client and issue-node take a name, a scope (a client's), --out and --replace" {
+    // Goal: the subcommands' parsing. Method: full commands and their defaults, --help anywhere,
+    // then a missing name, a missing, repeated or unknown scope, a node given a scope, a repeated
+    // --out, an unknown subcommand and --new-ca, each ZC-E0106.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    var diag: Diag = undefined;
+    diag.reset();
+    const full = [_][]const u8{
+        "ca", "issue-client", "ops-1", "--store", "sqlite:/a", "--scope", "jobs", "--out", "/o",
+    };
+    const command = (try load(arena, io, &full, &diag)).ca_issue;
+    try testing.expectEqualStrings("ops-1", command.name);
+    try testing.expectEqual(Scope.jobs, command.subject.client);
+    try testing.expectEqualStrings("/o", command.out_dir);
+    try testing.expectEqualStrings("/a", command.config.store.sqlite);
+    try testing.expect(!command.replace);
+    const short = [_][]const u8{ "ca", "issue-client", "ops-1", "--scope", "admin", "--replace" };
+    const plain = (try load(arena, io, &short, &diag)).ca_issue;
+    try testing.expectEqualStrings(".", plain.out_dir);
+    try testing.expectEqual(Scope.admin, plain.subject.client);
+    try testing.expect(plain.replace);
+    const node = [_][]const u8{ "ca", "issue-node", "node-1", "--out", "/n" };
+    const for_node = (try load(arena, io, &node, &diag)).ca_issue;
+    try testing.expectEqual(Issue.Subject.node, for_node.subject);
+    try testing.expectEqualStrings("node-1", for_node.name);
+    try testing.expectEqualStrings("/n", for_node.out_dir);
+    // `--help` anywhere after `ca` is the help, not a refusal.
+    const helps = [_][]const []const u8{
+        &.{ "ca", "--help" },
+        &.{ "ca", "issue-client", "--help" },
+        &.{ "ca", "issue-node", "node-1", "-h" },
+    };
+    for (helps) |args| try testing.expectEqual(Command.help, try load(arena, io, args, &diag));
+
+    const refusals = [_][]const []const u8{
+        &.{ "ca", "issue-client" },
+        &.{ "ca", "issue-client", "--scope", "jobs" },
+        &.{ "ca", "issue-client", "ops-1" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "root" },
+        &.{ "ca", "issue-client", "ops-1", "--scope" },
+        &.{ "ca", "revoke", "ops-1" },
+        &.{"ca"},
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--new-ca" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--bogus" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--scope", "admin" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--out", "a", "--out", "b" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--version" },
+        &.{ "ca", "issue-node" },
+        &.{ "ca", "issue-node", "--out", "x" },
+        &.{ "ca", "issue-node", "node-1", "--scope", "jobs" },
+        &.{ "ca", "issue-node", "node-1", "--create-store" },
+    };
+    for (refusals) |args| {
+        diag.reset();
+        try expect_bad(load(arena, io, args, &diag), &diag);
+    }
 }
 
 test "a lease ttl an agent cannot fence in time is ZC-E0121" {
@@ -664,5 +900,29 @@ test "relays are a table of names and addresses; every malformed entry is ZC-E01
         };
         diag.reset();
         try expect_bad(merge(.{}, parsed, &diag), &diag);
+    }
+}
+
+test "--insecure-listen is loopback only, and --tls-name is a DNS name (B7)" {
+    var diag: Diag = undefined;
+    diag.reset();
+    _ = try parse_insecure_listen("127.0.0.1:7070", &diag);
+    _ = try parse_insecure_listen("[::1]:7070", &diag);
+    _ = try parse_insecure_listen("127.0.0.2:7070", &diag); // All of 127.0.0.0/8.
+    const outside = [_][]const u8{
+        "0.0.0.0:7070",
+        "10.0.0.1:7070",
+        "[::]:7070",
+        "[::ffff:127.0.0.1]:7070", // IPv4-mapped: not taken for loopback.
+    };
+    for (outside) |input| {
+        diag.reset();
+        try expect_bad(parse_insecure_listen(input, &diag), &diag);
+    }
+    diag.reset();
+    try testing.expectEqualStrings("api.example.com", try tls_name_of("api.example.com", &diag));
+    for ([_][]const u8{ "", "has space", "-lead.example" }) |input| {
+        diag.reset();
+        try expect_bad(tls_name_of(input, &diag), &diag);
     }
 }

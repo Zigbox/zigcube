@@ -1111,8 +1111,8 @@ pub const Cluster = struct {
         node: u32,
         request: agent_client.Request,
     ) agent_client.Reply {
-        _ = node;
         const c: *Cluster = @ptrCast(@alignCast(context));
+        assert(c.nodes[node].index == node);
         c.net_diag.reset();
         const ctx: controller.Context = .{
             .store = c.store_handle(),
@@ -1121,7 +1121,10 @@ pub const Cluster = struct {
             .diag = &c.net_diag,
         };
         const cut = std.mem.indexOfScalar(u8, request.target, '?');
+        // The caller is the node the request came from, as the TLS shell names it from the
+        // node's certificate: every agent call passes the scope check (B7).
         const response = c.api.handle(&ctx, .{
+            .caller = .{ .node = c.nodes[node].name() },
             .method = request.method,
             .path = request.target[0 .. cut orelse request.target.len],
             .query = if (cut) |at| request.target[at + 1 ..] else "",

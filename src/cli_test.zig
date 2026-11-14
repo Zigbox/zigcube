@@ -126,7 +126,7 @@ const World = struct {
         diag.reset();
         const listen = try config_mod.parse_listen("127.0.0.1:0", &diag);
         world.server = try server_mod.Server.start(testing.allocator, world.io, .{
-            .listen = listen,
+            .insecure_listen = listen,
             .store = .{ .sqlite = database },
             .create_store = true,
             .verbose = false,
@@ -732,7 +732,7 @@ test "a server can be restarted on its port right after zcube has used it" {
         world.dir,
     });
     world.server = try server_mod.Server.start(testing.allocator, world.io, .{
-        .listen = address,
+        .insecure_listen = address,
         .store = .{ .sqlite = database },
         .create_store = false,
         .verbose = false,

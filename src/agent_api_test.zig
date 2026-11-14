@@ -68,6 +68,7 @@ const Rig = struct {
     ) api_mod.Response {
         const ctx = rig.world.controller_context();
         return rig.api.handle(&ctx, .{
+            .caller = .local,
             .method = method,
             .path = path,
             .query = query,
@@ -211,6 +212,27 @@ test "a lease that has ended is ZC-E0205, for a keepalive and for a registration
     var path: [96]u8 = undefined;
     const keepalive = try keepalive_path(&path, lease);
     try rig.refused(rig.call("POST", keepalive, "", ""), 503, "ZC-E0205");
+}
+
+test "a node may not renew or register on the lease of another node's registration (B7)" {
+    // Goal: a node certificate keeps its own node alive and no other. Method: node1 registers on
+    // its lease; node2 renews that lease (ZC-E0205: node2 is not registered on it) and registers
+    // on it (ZC-E0104); node1 renews it and registers on it again.
+    var rig = try Rig.start(3);
+    defer rig.stop();
+    const lease = try rig.grant("node1");
+    var buffer: [512]u8 = undefined;
+    const body = try register_text(&buffer, lease);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node1", "", body);
+    var path: [96]u8 = undefined;
+    const theirs = try keepalive_path(&path, lease); // Node2's path.
+    try rig.refused(rig.call("POST", theirs, "", ""), 503, "ZC-E0205");
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", body), 400, "ZC-E0104");
+    const own = try std.fmt.bufPrint(&path, "/v1/agent/nodes/node1/lease/{d}/keepalive", .{lease});
+    _ = try rig.ok("POST", own, "", "");
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node1", "", body);
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/", "");
+    try testing.expectEqual(@as(usize, 1), field(listed, "kvs").array.items.len);
 }
 
 test "a request the endpoints cannot understand is ZC-E0104 or ZC-E0101 and writes nothing" {
@@ -446,6 +468,7 @@ test "the watch says whether an assignment of the node changed, and holds when n
     // The shell asks again with `hold` false after a hold ended: no second hold.
     const ctx = rig.world.controller_context();
     const again = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = base,
         .query = hold_query,
@@ -688,6 +711,7 @@ const NoHashTransport = struct {
         const split = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
         const query = if (split < request.target.len) request.target[split + 1 ..] else "";
         const response = self.rig.api.handle(&ctx, .{
+            .caller = .local,
             .method = request.method,
             .path = request.target[0..split],
             .query = query,
@@ -715,6 +739,7 @@ test "a store with no hash at the agent's revision: no known_hash, and the agent
     var plain = rig.world.controller_context();
     plain.store = .{ .context = plain.store.context, .vtable = &no_hash_vtable };
     const response = rig.api.handle(&plain, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/agent/nodes/node1/replicas",
         .query = below,
@@ -1133,6 +1158,7 @@ test "a run's input is read at one revision" {
     vtable.get = GetSpy.get;
     ctx.store.vtable = &vtable;
     const response = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/agent/nodes/node2/runs/train/input",
         .query = "",

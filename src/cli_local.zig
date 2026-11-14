@@ -460,7 +460,7 @@ const Local = struct {
         const database = std.fmt.allocPrint(local.arena, "sqlite:{s}/zcube.db", .{local.dir}) catch
             return local.out_of_memory();
         return local.spawn(.server, &.{
-            "--listen", address, "--store", database, "--create-store", "--quiet",
+            "--insecure-listen", address, "--store", database, "--create-store", "--quiet",
         });
     }
 

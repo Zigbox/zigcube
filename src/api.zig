@@ -33,6 +33,7 @@ const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const codes = @import("diag/codes.zig");
 const agent_api = @import("agent_api.zig");
+const api_scope = @import("api_scope.zig");
 const apply_mod = @import("apply.zig");
 const job_api = @import("job_api.zig");
 const constants = @import("constants.zig");
@@ -53,7 +54,12 @@ const Context = controller.Context;
 const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 
+pub const Caller = api_scope.Caller;
+
 pub const Request = struct {
+    /// Who calls, from the client certificate the shell's TLS handshake verified (B7); `.local`
+    /// for the loopback `--insecure-listen` listener, the console module and the simulators.
+    caller: Caller,
     method: []const u8,
     /// Without the query: "/v1/list".
     path: []const u8,
@@ -150,6 +156,9 @@ pub const Api = struct {
     fn route(api: *Api, ctx: *const Context, request: Request, id: []const u8) Failure!Reply {
         if (request.request_id) |sent| {
             if (id_problem(sent)) |problem| return bad_request(ctx, "X-Request-Id", problem);
+        }
+        if (api_scope.refusal(request.caller, request.method, request.path)) |need| {
+            return not_allowed(ctx, request, need);
         }
         const prefix = "/v1/";
         if (!std.mem.startsWith(u8, request.path, prefix)) return no_such(ctx, request.path);
@@ -616,6 +625,46 @@ fn bad_request(ctx: *const Context, what: []const u8, problem: []const u8) Failu
     return error.Failed;
 }
 
+/// ZC-E0822: the caller's certificate does not allow the request; nothing was read or written.
+fn not_allowed(ctx: *const Context, request: Request, need: api_scope.Need) Failure {
+    assert(ctx.diag.code == null);
+    raise_not_allowed(ctx.diag, request.caller, request.method, request.path, need);
+    return error.Failed;
+}
+
+/// Raises ZC-E0822 for `caller`'s request (public for the CLI's golden test).
+pub fn raise_not_allowed(
+    diag: *Diag,
+    caller: api_scope.Caller,
+    method: []const u8,
+    path: []const u8,
+    need: api_scope.Need,
+) void {
+    diag.raise(.E0822);
+    diag.cause("{f} may not {s} {s}: it needs {f}", .{ caller, method, path, need });
+    switch (need) {
+        .node, .node_only => |name| {
+            var buffer: [constants.diag_command_bytes_max]u8 = undefined;
+            const command =
+                std.fmt.bufPrint(&buffer, "zcube-server ca issue-node {s}", .{name}) catch
+                    "zcube-server ca issue-node NAME";
+            diag.fix(.{
+                .sentence = "check that the agent's --node names the node of its certificate," ++
+                    " or ask an operator for this node's certificate:",
+                .command = command,
+            });
+        },
+        .jobs => diag.fix(.{
+            .sentence = "ask an operator for a client certificate of scope jobs:",
+            .command = "zcube-server ca issue-client NAME --scope jobs",
+        }),
+        .admin => diag.fix(.{
+            .sentence = "ask an operator for a client certificate of scope admin:",
+            .command = "zcube-server ca issue-client NAME --scope admin",
+        }),
+    }
+}
+
 fn no_such(ctx: *const Context, path: []const u8) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0101);
@@ -669,6 +718,7 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
         .user => {
             if (code == .E0101) return 404;
             if (code == .E0203) return 410;
+            if (code == .E0822) return 403;
             // The state the request rested on is not (or no longer) there.
             if (code == .E0105 or code == .E0402 or code == .E0403) return 409;
             if (code == .E0131) return 409;

@@ -133,6 +133,7 @@ pub const Code = enum(u8) {
     E0819,
     E0820,
     E0821,
+    E0822,
     B0001,
     B0002,
     B0003,
@@ -1645,39 +1646,50 @@ pub const registry = [_]Entry{
         .code = .E0806,
         .severity = .@"error",
         .blame = .user,
-        .summary = "a peer key or trust file can't be used",
+        .summary = "a peer key, certificate or trust file can't be used",
         .explanation =
         \\The server's CA key (ca*.key in its state directory), the list of removed
-        \\nodes (revoked), or an agent's node key (peer.key), credential (peer.cred)
-        \\or trusted CA key (ca.pub) could not be read, created, written or parsed,
-        \\or its file or directory has permissions that let other users read a secret
-        \\or write a trust file. Key files must be owned by the process, mode 0600,
-        \\and hold one line of 64 hex digits; the state directory must not be
-        \\writable by group or others. A revoked line must be a node name.
+        \\names (revoked), an agent's node key (peer.key), credential (peer.cred),
+        \\node certificate (node.crt) or trusted CA key (ca.pub), or a file that
+        \\zcube-server ca issue-client or issue-node writes (NAME.key, NAME.crt)
+        \\could not be read, created, written or parsed, or its file or directory has
+        \\permissions that let other users read a secret or write a trust file. Key
+        \\files must be owned by the process, mode 0600; the state directory must not
+        \\be writable by group or others. A revoked line must be a node or client
+        \\name.
         \\
         \\The secret is never printed. If the file is damaged and there is a backup,
-        \\put it back. An agent's files are caches: it ignores a damaged peer.cred
-        \\or ca.pub and joins again by itself; delete peer.key to get a new node key.
-        \\A server whose CA key is missing although its store has run refuses to
-        \\start: put the key back, or start once with --new-ca to make a new CA on
-        \\purpose (every agent then joins again by itself).
+        \\put it back. An agent's files are caches: it ignores a damaged peer.cred,
+        \\node.crt or ca.pub and joins or renews again by itself; delete peer.key to
+        \\get a new node key. A server whose CA key is missing although its store has
+        \\run refuses to start: put the key back, or start once with --new-ca to make
+        \\a new CA on purpose (every agent then joins again by itself).
+        \\
+        \\ca issue-client and ca issue-node never make a CA: if the store has none,
+        \\give the --store and --state-dir the server runs with, or start the server
+        \\with this --store first. They never replace an existing NAME.key or NAME.crt
+        \\unless run with --replace, which is how a certificate is re-issued.
         ,
     },
     .{
         .code = .E0807,
         .severity = .@"error",
         .blame = .user,
-        .summary = "a node was refused a credential: it was removed",
+        .summary = "a name on the removed list was refused a certificate",
         .explanation =
-        \\The server will not issue or renew a peer credential for this node,
-        \\because its name is on the server's list of removed nodes (the revoked
-        \\file in its state directory). The node's current credential stays valid
-        \\until it expires, within a day, and then its peers refuse it.
+        \\The server will not issue or renew a credential or certificate for this
+        \\name, because it is on the server's list of removed names (the revoked file
+        \\in its state directory), which holds node and client names alike. A node's
+        \\current credential stays valid until it expires, within a day, and then its
+        \\peers refuse it; a certificate already issued stays valid until it expires.
         \\
-        \\If the node should be in the cluster, remove its name from the revoked
-        \\file and restart zcube-server; the agent asks again by itself. The API is
-        \\unauthenticated, so this binds an honest node only: until the API has auth,
-        \\anyone who can reach it can register a name and ask for a credential.
+        \\For a node that should be in the cluster: remove its name from the revoked
+        \\file and restart zcube-server; the agent asks again by itself.
+        \\For a client: remove its name from the revoked file and run
+        \\zcube-server ca issue-client again, or choose another name.
+        \\
+        \\Over --listen only a node's own certificate may ask for its credential;
+        \\the loopback --insecure-listen caller is trusted, as anyone on the host.
         ,
     },
     .{
@@ -1870,12 +1882,13 @@ pub const registry = [_]Entry{
         .blame = .user,
         .summary = "an identity could not be issued",
         .explanation =
-        \\A workload or server certificate was not made because its request breaks a
-        \\bound: more labels than x509_labels_max, a label key or value over its limit
-        \\or with a character that is not allowed, label keys not sorted and unique,
-        \\labels together over x509_labels_bytes_max, a cluster or service name that
-        \\does not make a SPIFFE ID spiffe://<cluster>/service/<name>, a DNS name that
-        \\is not lowercase, has a wildcard or an all-digit label, or a lifetime that
+        \\A workload, server, node or client certificate was not made because its
+        \\request breaks a bound: more labels than x509_labels_max, a label key or
+        \\value over its limit or with a character that is not allowed, label keys not
+        \\sorted and unique, labels together over x509_labels_bytes_max, a cluster,
+        \\service, node or client name that does not make a SPIFFE ID
+        \\spiffe://<cluster>/<service|node|client>/<name>, a DNS name that is not
+        \\lowercase, has a wildcard or an all-digit label, or a lifetime that
         \\is empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA), or a
         \\subject key that is not a valid Ed25519 public key (off the curve, or in a
         \\small subgroup), which no honest holder has.
@@ -1906,9 +1919,11 @@ pub const registry = [_]Entry{
         .summary = "a certificate is of another kind than this use needs",
         .explanation =
         \\The certificate is genuine and well formed, but it is not for this use: a
-        \\workload's client certificate presented as a server's, a CA certificate
-        \\presented as a leaf, or, under a foreign anchor, a certificate whose
-        \\extended key usage lacks serverAuth or whose basic constraints say CA.
+        \\workload's, node's or client's certificate presented as a server's, one of
+        \\those three where another of them is needed (a workload's where the API
+        \\needs a node's or a client's), a CA certificate presented as a leaf, or,
+        \\under a foreign anchor, a certificate whose extended key usage lacks
+        \\serverAuth or whose basic constraints say CA.
         \\
         \\The cause names the kind found and the kind needed. Give the peer a
         \\certificate issued for its role: a server certificate for a server.
@@ -1947,6 +1962,28 @@ pub const registry = [_]Entry{
         \\
         \\Check that getrandom works where this runs: the kernel, the seccomp profile
         \\and the container sandbox must allow it. Then run the command again.
+        ,
+    },
+    .{
+        .code = .E0822,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the caller's certificate does not allow this request",
+        .explanation =
+        \\The server refused a request because the client certificate it came with
+        \\does not give the scope the request needs. The diagnostic names the caller
+        \\and the scope it would need. The answer is HTTP 403, and nothing was read
+        \\or written.
+        \\
+        \\A node's certificate (an agent) may call only the agent API under its own
+        \\node's name: /v1/agent/nodes/<its name>/. A client certificate of scope
+        \\`jobs` may submit, list, watch and cancel jobs (/v1/jobs) and ask why about
+        \\a job. Everything else needs a client certificate of scope `admin`, but
+        \\no client may call /v1/agent/nodes/<name>/credential: it signs a node's
+        \\own certificate, so only that node's certificate may ask.
+        \\
+        \\Use a certificate with the scope the request needs: an operator issues one
+        \\with `zcube-server ca issue-client NAME --scope admin`.
         ,
     },
     .{

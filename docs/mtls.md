@@ -18,11 +18,22 @@ reads a clock (the wall time is an argument) and never uses a randomness source.
 The decision is in decisions/2026-11-04-x509-two-profiles.md.
 
 - **`cluster`** (`x509.parse`, `verify`) covers what this cluster's CA writes.
-  - There are three kinds:
+  - There are five kinds:
     - `ca`: BasicConstraints and KeyUsage.
     - `server`: BasicConstraints, KeyUsage, ExtKeyUsage serverAuth, and a SAN with one DNS name.
     - `workload`: BasicConstraints, KeyUsage, ExtKeyUsage clientAuth, a SAN with one SPIFFE ID
-      (`spiffe://<cluster>/service/<name>`), and the identity extension.
+      (`spiffe://<cluster>/service/<name>`), and the identity extension, version 1 (labels).
+    - `node` (B7): BasicConstraints, KeyUsage, ExtKeyUsage clientAuth and a SAN with
+      `spiffe://<cluster>/node/<name>`; no identity extension. The server issues it at join
+      and at each renewal, over the node's peer key and for the credential's lifetime; the
+      agent keeps it as `<state dir>/node.crt`.
+    - `client` (B7): as `node`, with `spiffe://<cluster>/client/<name>` and the identity
+      extension, version 2: `SEQUENCE { INTEGER 2, ENUMERATED scope }`, scope `jobs` (1) or
+      `admin` (2). The server needs no table of clients
+      (decisions/2026-11-13-identity-extension-v2-scope.md). `zcube-server ca issue-client
+      NAME --scope jobs|admin` writes one on the server host (below).
+  - `<cluster>` is `zc-` and 16 hex digits of SHA-256 of the CA's public key
+    (decisions/2026-11-13-cluster-name-from-ca-key.md).
   - Each kind has its extensions in a fixed order, and its bytes are exact. The issuer's CN is
     `zcube-ca-` followed by 16 hex digits.
   - A certificate parsed and then written again gives back its exact input bytes.
@@ -32,6 +43,42 @@ The decision is in decisions/2026-11-04-x509-two-profiles.md.
   - It allows any Name, a serial of up to 20 bytes, key identifiers, and extensions in any order.
   - It refuses an extension that appears twice and an unknown critical extension.
   - It requires serverAuth, a leaf (not a CA), and exactly one DNS name or SPIFFE ID.
+
+### Client and node certificates
+
+`zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]` does the following:
+
+- **What it needs.** Give it the `--store` (and `--state-dir`, or `--config`) that the server runs
+  with. The server need not be running.
+- **What it writes.** It signs a `client` certificate with that store's CA and writes two files
+  in `DIR` (default: the working directory), both mode 0600:
+  - `NAME.key`: Ed25519, PKCS#8 PEM, which openssl and the JDK read.
+  - `NAME.crt`: PEM.
+
+`zcube-server ca issue-node NAME [--out DIR] [--replace]` writes a node's first `node`
+certificate and key the same way. The operator copies the two files to the node
+(decisions/2026-11-13-node-cert-bootstrap.md); the agent presents them as `--cert`/`--key`.
+
+Both commands follow the same rules:
+
+- **Lifetime.** Each certificate lives `x509_leaf_ttl_ms_max` (7 days), and there is no flag to
+  change it.
+- **Weekly re-issue.** A client, such as Botpike's app, must be re-issued weekly: run the command
+  again with `--replace`, by hand or from cron on the server host.
+- **Never a CA.** Neither command makes a CA. A store with no CA key yet is `ZC-E0806`: start the
+  server with that `--store` first.
+- **No overwrite without `--replace`.** Without it, an existing `NAME.key` or `NAME.crt` is
+  `ZC-E0806`. Both files are written under temporary names and renamed without overwriting, so a
+  failure leaves neither file. A run killed between the two renames leaves a lone `NAME.key`,
+  which a rerun with `--replace` replaces.
+- **Removed names.** A name in the server's `revoked` file is `ZC-E0807`. A line `node/NAME`
+  revokes the node NAME only and `client/NAME` the client NAME only; a bare `NAME` revokes both
+  kinds, as before (decisions/2026-11-14-revoked-names-by-kind.md, which supersedes
+  2026-11-13-revoked-names-shared.md). A revoked name stops being issued at once.
+
+A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`). The server
+reads `revoked` when it starts, so a certificate already issued stops working once its name is
+in `revoked` and the server has restarted.
 
 ### Validity
 
@@ -48,6 +95,91 @@ A label key is at most 63 bytes and a value at most 256 bytes. There are at most
 together they total at most 256 bytes (decisions/2026-11-04-identity-label-bytes-256.md). They
 are sorted by key, with no key twice.
 
+## The API over TLS (B7 slice 3)
+
+`zcube-server` has two listeners:
+
+- `--listen HOST:PORT` serves the API and the console over TLS 1.3 (`server_tls.zig` around
+  `tls_server.zig`). Every client must present a certificate this store's CA issued: a `client`
+  certificate (`ca issue-client`) or a node's `node.crt` (issued at join). The server's own
+  certificate is made from the CA at start, carries the DNS name `--tls-name` (default
+  `zcube-server`), and is made again when half its life is gone.
+- `--insecure-listen HOST:PORT` serves plain HTTP on a loopback address only (127.0.0.1 or ::1;
+  anything else is `ZC-E0106`). It is for the console on the same host, the local mode
+  (`zcube local up`) and the test harnesses. A request on it is the caller `local`, which may
+  call everything: whoever can reach loopback already runs on the server's host.
+
+The two listeners share the server's 96 connection slots, but when both run TLS clients take at
+most 88: 8 are kept for `--insecure-listen`, so TLS clients cannot lock out the loopback listener
+(decisions/2026-11-14-loopback-slot-reserve.md).
+
+With neither given, the server serves TLS on `127.0.0.1:7070`, the old default address. The server names the caller from the certificate the
+handshake verified, never from a header: a node's certificate is the caller `node <name>`, a
+client certificate is `client <name>` with its scope. A certificate whose name is in `revoked`,
+or whose SPIFFE ID is not of this cluster, is refused at the handshake (`ZC-E0819`).
+
+### Scopes
+
+`Api.handle` checks the caller before it routes (`api_scope.zig`); a request the caller may not
+make is refused with **403 `ZC-E0822`** before anything is read or written. The HTTP shell asks
+the same question before it reads a request's body: a refused request's body is not read, and the
+reply closes the connection.
+
+| Caller | May call |
+|---|---|
+| `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only |
+| `client`, scope `jobs` | `/v1/jobs` and below, and `GET /v1/why/job/<name>` |
+| `client`, scope `admin` | everything but the credential endpoint |
+| `local` (`--insecure-listen`) | everything |
+
+`POST /v1/agent/nodes/<name>/credential` signs a node's peer key and returns its `node.crt`, so
+over TLS only node `<name>`'s own certificate may call it: every client certificate, `admin`
+included, gets 403 `ZC-E0822` there (an admin cannot mint a node's identity through the API;
+`ca issue-node` on the server host is the only bootstrap). A node renews and registers only on
+the lease of its own registration: a keepalive of another node's lease is `ZC-E0205`, and a
+registration on a lease another node is registered on is `ZC-E0104` (`agent_api.zig`).
+
+The agent handlers keep every key they write under the node of the path, so an agent writes only
+under its own node's keys. That per-node rule holds on the TLS listener only: on
+`--insecure-listen` every request is `local` and may write any node's keys, which is why that
+listener binds nothing but a loopback address. `api_test.zig` calls every endpoint as each caller, allowed and
+refused; `api_tls_test.zig` does it end to end over TLS.
+
+### Clients
+
+`zcube` and `zcube-agent` take the same four settings (`api_tls_client.zig`):
+
+| Flag | `zcube` environment | Agent ZON key | Meaning |
+|---|---|---|---|
+| `--ca FILE` | `ZCUBE_CA` | `.ca` | the CA certificate (`ca-<hash>.crt` in the server's state directory, one per store); the client pins its key |
+| `--cert FILE` | `ZCUBE_CERT` | `.cert` | the certificate to present (PEM) |
+| `--key FILE` | `ZCUBE_KEY` | `.key` | its Ed25519 key (PKCS#8 PEM, mode 0600) |
+| `--tls-name NAME` | `ZCUBE_TLS_NAME` | `.tls_name` | the DNS name the server's certificate must carry (default `zcube-server`) |
+
+Without `--ca` a client speaks plain HTTP (to `--insecure-listen`). `zcube` needs all three
+files together. A file that cannot be used is `ZC-E0806` naming it; a certificate not issued by
+the CA of `--ca`, or a key that is not the certificate's, is refused before any connection.
+
+A client checks the server's certificate against `--tls-name`; a certificate for another name is
+refused at the handshake with `ZC-E0812`, which names both names.
+
+**Agent bootstrap.** A new agent has no `node.crt` yet, and the join endpoint
+(`POST /v1/agent/nodes/<name>/credential`) is under its node's path. On the server host,
+`zcube-server ca issue-node NAME [--out DIR]` (with the server's `--store` and `--state-dir`)
+writes `NAME.key` and `NAME.crt`, mode 0600: a node certificate for NAME, 7 days, signed by the
+store's CA. It refuses a name in `revoked`, overwrites an existing file only with `--replace`
+and never makes a CA; it is
+`ca issue-client`'s code path with the node kind. The agent presents those as `--cert` and
+`--key` until it holds a `node.crt` over its own peer key that the CA of `--ca` issued, then that
+`node.crt` (and the new one after every renewal). Its `--cert` must be a node certificate for its
+own `--node`, in its validity window: an admin's, another node's or an expired one is refused
+before it connects (`ZC-E0806`). A stored `node.crt` is presented only under the same checks
+(issued by the CA of `--ca`, in its window, naming this node, over the key beside it); otherwise
+the agent falls back to `--cert` ([agent.md](agent.md), "Node certificates"). And the
+server holds a bootstrap certificate for NAME to NAME's paths, so it can join and act as NAME
+only (`api_tls_test.zig`: node1's certificate gets 403 joining as node2). Without `--cert` and
+without a `node.crt`, the agent does not start (`ZC-E0806`).
+
 ## Tests
 
 - **`src/x509_test.zig`**: the writer and parser, the time rows, and the identity labels.
@@ -60,7 +192,7 @@ are sorted by key, with no key twice.
     keys and dates each time.
 - **`zig build x509-format`**: openssl, keytool and others read the certificates the writer
   makes. It needs those tools, so it is not in `check`.
-- **`src/x509_fuzz.zig`**: mutates good certificates of all three kinds, plus the foreign
+- **`src/x509_fuzz.zig`**: mutates good certificates of all five kinds, plus the foreign
   fixtures.
   - **Cluster profile.** Every result the parser gives must agree with an independent naive
     decoder, `src/x509_oracle.zig`. That decoder has its own TLV walker and its own checks.
@@ -190,14 +322,12 @@ It has no HelloRetryRequest, no PSK, no tickets and no early data.
 
 **A client certificate is always required.** Every flight carries a CertificateRequest (empty
 context, `signature_algorithms` = ed25519). The chain the client sends (at most two certificates)
-is verified against the CA for `Config.client_kind`, which has no default: each listener names
-the kind it takes. Slice 1 has no listener; the tests and the fuzzer use `workload`, the kind a
-job's relay listener takes. The API listener of slice 3 serves the agent (`node`, slice 2) and
-`zcube` (`client`, slice 2), so it needs two kinds where `Config` holds one; that is an open
-question for the supervisor before slice 3. A CA-signed certificate of another kind is
-ZC-E0819. An empty Certificate is ZC-E0814 with the `certificate_required` alert; one that echoes
-a request context but carries no certificate is ZC-E0813 with `illegal_parameter`. `peer()`
-returns the verified kind and name.
+is verified against the CA for the kinds in `Config.client_kinds`, a required set: `workload` for
+a sidecar, `node` and `client` for the API. The leaf is checked once, against its own kind when
+the set holds it; a CA-signed certificate of another kind is ZC-E0819, and its cause names every
+kind the listener takes (docs/decisions/2026-11-13-api-listener-cert-kinds.md). An empty Certificate is ZC-E0814
+with the `certificate_required` alert; one that echoes a request context but carries no
+certificate is ZC-E0813 with `illegal_parameter`. `peer()` returns the verified kind and name.
 
 **Its rules.** These are the client's, mirrored:
 
@@ -308,6 +438,21 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   (decisions/2026-11-06-interop-needs-setpriv.md). The JVM runs with
   `-Dcom.sun.net.ssl.requireCloseNotify=true`, so a client that drops TCP without `close_notify`
   fails the clean-close check.
+  Its server rows (B7 slice 4, `src/mtls_interop_server.zig`, `ops/mtls-interop/InteropClient.java`)
+  turn it round: `openssl s_client` and a JDK 21 `SSLSocket` call a real `zcube-server --listen`.
+  Each is accepted with a `client` certificate of scope `jobs` from `ca issue-client`
+  (`GET /v1/jobs` is 200, `GET /v1/status` is 403 ZC-E0822), and each is refused at the handshake
+  with no certificate (alert `certificate_required`; the server logs ZC-E0814), with an expired
+  one (`certificate_expired`; ZC-E0811) and with one from another CA (`unknown_ca`; ZC-E0810).
+  A refused handshake now ends with a lingering close (`linger_refused` in `server_http.zig`):
+  the server judges the client's certificate before it reads the client's Finished, and closing
+  at once made the kernel answer that Finished with a reset that destroyed the alert, so the JDK
+  saw only a broken pipe. Two more rows run the JDK client eagerly: it writes its request at
+  once after its Finished, before any alert can come, and a failed write fails the row; the alert
+  must still reach it (`certificate_required`, `unknown_ca`).
+  The client is not authenticated, so that close keeps its connection slot at most
+  `tls_alert_flush_ms` (1 s) after the refusal, not the idle timeout
+  (decisions/2026-11-14-b7-linger-bound.md).
 
 ## Diagnostics
 

@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     });
     add_agent_smoke_step(b, built, zigbox_module);
     add_swarm_smoke_steps(b, shared_options, built);
-    add_mtls_interop_step(b, shared_options);
+    add_mtls_interop_step(b, shared_options, built);
     add_mtls_teeth_step(b, shared_options);
     add_local_smoke_step(b, built);
     add_x509_format_step(b, zigbox_module);
@@ -366,9 +366,10 @@ fn add_mtls_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
 }
 
 /// `zig build mtls-interop` (src/mtls_interop.zig): the mTLS client against `openssl s_server` and
-/// a JDK 21 server. Needs OpenSSL and a JDK, so it is not in `check`; CI runs it in a job of its
-/// own. An interop check, never a demo.
-fn add_mtls_interop_step(b: *std.Build, options: ExecutablesOptions) void {
+/// a JDK 21 server, and `openssl s_client` and a JDK 21 client against `zcube-server`
+/// (src/mtls_interop_server.zig). Needs OpenSSL and a JDK, so it is not in `check`; CI runs it in
+/// a job of its own. An interop check, never a demo.
+fn add_mtls_interop_step(b: *std.Build, options: ExecutablesOptions, built: Built) void {
     const exe = b.addExecutable(.{
         .name = "mtls_interop",
         .root_module = b.createModule(.{
@@ -382,8 +383,10 @@ fn add_mtls_interop_step(b: *std.Build, options: ExecutablesOptions) void {
     b.getInstallStep().dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.addFileArg(b.path("ops/mtls-interop/InteropServer.java"));
+    run.addFileArg(b.path("ops/mtls-interop/InteropClient.java"));
+    run.addArtifactArg(built.server);
     run.has_side_effects = true;
-    const help = "Run the mTLS client against openssl s_server and a JDK 21 server (not a demo)";
+    const help = "Run the mTLS client and server against OpenSSL and a JDK 21 (not a demo)";
     b.step("mtls-interop", help).dependOn(&run.step);
 }
 
@@ -580,6 +583,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     b.step("demo-c0", help).dependOn(&run.step);
     add_demo_c1_step(b, step_options, transcript);
     add_demo_b1_step(b, step_options, transcript);
+    add_demo_b7_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
 }
@@ -660,6 +664,39 @@ fn add_demo_b1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run B1's demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-b1", help).dependOn(&run.step);
+}
+
+/// `zig build demo-b7 [-Dtranscript=FILE]`: B7's demo, run for real (src/demo_b7.zig): the server
+/// on SQLite serving the API over TLS, one `zcube-agent` with `FakeRuntime` and the `zcube`
+/// command, each with a certificate of the server's CA. No KVM; docs/demos/b7.md.
+fn add_demo_b7_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const exe = b.addExecutable(.{
+        .name = "demo_b7",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b7.zig"),
+            .target = step_options.target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addArtifactArg(built.agent);
+    run.addArg("--images");
+    run.addFileArg(b.path("fixtures/images.zon"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run B7's demo for real: the API over mTLS (-Dtranscript=FILE)";
+    b.step("demo-b7", help).dependOn(&run.step);
 }
 
 /// `zig build demo-c2 [-Dtranscript=FILE]`: SPEC's C2 demo, run for real (src/demo_c2.zig): the

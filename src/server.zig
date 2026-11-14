@@ -24,6 +24,7 @@ const server_listen = @import("server_listen.zig");
 const Remembered = @import("server_remember.zig").Remembered;
 const peer_ca = @import("peer_ca.zig");
 const server_ca = @import("server_ca.zig");
+const server_tls = @import("server_tls.zig");
 const RealClock = @import("server_store.zig").RealClock;
 const store_verified = @import("store_verified.zig");
 
@@ -59,9 +60,15 @@ pub const Server = struct {
     has_history: bool = false,
     /// Unix milliseconds, for the credentials the CA signs.
     wall: RealClock,
-    listener: net.Server,
+    /// `--listen`: TLS, every client presenting a certificate of this CA (docs/mtls.md).
+    listener: ?net.Server,
+    /// `--insecure-listen`: plain HTTP on a loopback address, every request allowed.
+    insecure_listener: ?net.Server,
+    /// The TLS listener's certificate and key; set up when there is a TLS listener.
+    tls: server_tls.Setup,
     group: std.Io.Group,
     accept_future: ?std.Io.Future(void),
+    insecure_accept_future: ?std.Io.Future(void),
     driver_future: ?std.Io.Future(void),
     watchdog_future: ?std.Io.Future(void),
 
@@ -88,8 +95,8 @@ pub const Server = struct {
         errdefer server.unguard();
         try server.open_ca(config, diag);
         server.first_check(diag);
-        server.listener = try listen(io, config.listen, diag);
-        errdefer server.listener.deinit(io);
+        try server.open_listeners(config, diag);
+        errdefer server.close_listeners();
         try server.spawn(diag);
         return server;
     }
@@ -147,9 +154,12 @@ pub const Server = struct {
             .remembered = null,
             .ca = undefined,
             .wall = .{ .io = io },
-            .listener = undefined,
+            .listener = null,
+            .insecure_listener = null,
+            .tls = undefined,
             .group = .init,
             .accept_future = null,
+            .insecure_accept_future = null,
             .driver_future = null,
             .watchdog_future = null,
         };
@@ -288,6 +298,39 @@ pub const Server = struct {
         }
     }
 
+    /// The TLS listener (with the server's certificate, issued by the CA now) and the insecure
+    /// one, each if configured. On failure nothing is left open.
+    fn open_listeners(server: *Server, config: config_mod.Config, diag: *Diag) Error!void {
+        assert(!(config.listen == null and config.insecure_listen == null));
+        errdefer server.close_listeners();
+        if (config.listen) |where| {
+            server.tls.init(server.io, &server.ca, config.tls_name, diag) catch
+                return error.StartFailed;
+            server.listener = listen(server.io, where, diag) catch |err| {
+                server.tls.deinit();
+                return err;
+            };
+        }
+        if (config.insecure_listen) |where| {
+            assert(config_mod.is_loopback(where));
+            server.insecure_listener = try listen(server.io, where, diag);
+        }
+        server.shared.tls_slots = constants.http_connections_max;
+        if (server.listener != null and server.insecure_listener != null) {
+            server.shared.tls_slots -= constants.http_loopback_reserved;
+        }
+    }
+
+    fn close_listeners(server: *Server) void {
+        if (server.listener) |*listener| {
+            listener.deinit(server.io);
+            server.tls.deinit();
+        }
+        server.listener = null;
+        if (server.insecure_listener) |*listener| listener.deinit(server.io);
+        server.insecure_listener = null;
+    }
+
     fn listen(io: std.Io, where: net.IpAddress, diag: *Diag) Error!net.Server {
         return server_listen.listen(io, where) catch |err| {
             diag.raise(.E0107);
@@ -314,7 +357,14 @@ pub const Server = struct {
         errdefer server.cancel_tasks();
         server.watchdog_future = io.concurrent(http.Shared.watchdog, .{&server.shared}) catch
             return no_threads(diag);
-        server.accept_future = io.concurrent(accept_loop, .{server}) catch return no_threads(diag);
+        if (server.listener != null) {
+            server.accept_future = io.concurrent(accept_loop, .{ server, .tls }) catch
+                return no_threads(diag);
+        }
+        if (server.insecure_listener != null) {
+            server.insecure_accept_future = io.concurrent(accept_loop, .{ server, .insecure }) catch
+                return no_threads(diag);
+        }
     }
 
     fn no_threads(diag: *Diag) Error {
@@ -325,9 +375,15 @@ pub const Server = struct {
         return error.StartFailed;
     }
 
-    /// Where the server listens (with the port the system chose, if the configuration said 0).
+    /// Where the insecure listener listens (with the port the system chose, if the
+    /// configuration said 0). The server must have one.
     pub fn address(server: *const Server) net.IpAddress {
-        return server.listener.socket.address;
+        return server.insecure_listener.?.socket.address;
+    }
+
+    /// Where the TLS listener listens. The server must have one.
+    pub fn tls_address(server: *const Server) net.IpAddress {
+        return server.listener.?.socket.address;
     }
 
     /// Tells a client it is refused, on a task and a slot of its own so the accept loop never
@@ -361,10 +417,12 @@ pub const Server = struct {
         server.shared.stopping.store(true, .release);
         if (server.accept_future) |*future| future.cancel(server.io);
         server.accept_future = null;
+        if (server.insecure_accept_future) |*future| future.cancel(server.io);
+        server.insecure_accept_future = null;
         server.drain();
         server.group.cancel(server.io);
         server.cancel_tasks();
-        server.listener.deinit(server.io);
+        server.close_listeners();
         const gpa = server.gpa;
         if (!server.verified.flush()) {
             const line = "zcube-server: could not save the remembered revision (ZC-E0216); " ++
@@ -392,13 +450,24 @@ pub const Server = struct {
     }
 };
 
-/// Accepts connections until cancelled. A connection past the limit is answered 503 and closed on
-/// the spot; the rest each get a task of their own.
-fn accept_loop(server: *Server) void {
+const Listener = enum { tls, insecure };
+
+/// Accepts connections until cancelled. A connection past the limit is answered 503 (on the
+/// insecure listener; a TLS client is just closed) and closed on the spot; the rest each get a
+/// task of their own.
+fn accept_loop(server: *Server, which: Listener) void {
     const shared = &server.shared;
     const io = server.io;
+    const listener = switch (which) {
+        .tls => &server.listener.?,
+        .insecure => &server.insecure_listener.?,
+    };
+    const tls: ?*server_tls.Setup = switch (which) {
+        .tls => &server.tls,
+        .insecure => null,
+    };
     while (!shared.stopping.load(.acquire)) {
-        const stream = server.listener.accept(io) catch |err| switch (err) {
+        const stream = listener.accept(io) catch |err| switch (err) {
             error.Canceled, error.SocketNotListening => return,
             else => {
                 // A failed accept (descriptors, memory) is retried after a breath, not spun on.
@@ -406,11 +475,16 @@ fn accept_loop(server: *Server) void {
                 continue;
             },
         };
-        const slot = shared.take_slot(stream, .connection) orelse {
+        const kind: http.SlotKind = if (tls != null) .connection_tls else .connection;
+        const slot = shared.take_slot(stream, kind) orelse {
+            if (tls != null) {
+                stream.close(io);
+                continue;
+            }
             server.refuse(stream, "too many connections are open");
             continue;
         };
-        server.group.concurrent(io, http.serve, .{ shared, slot, stream }) catch {
+        server.group.concurrent(io, http.serve, .{ shared, slot, stream, tls }) catch {
             http.release(shared, slot);
         };
     }

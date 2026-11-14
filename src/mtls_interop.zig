@@ -19,13 +19,18 @@
 //! The JDK and OpenSSL are test tools only: nothing here ships
 //! (docs/decisions/2026-11-05-interop-tools-are-test-only.md). It prints to stdout only (the
 //! build runner counts stderr as a failure) and kills every server it started.
-//! Usage: `mtls_interop <InteropServer.java>`. `ZCUBE_JAVA_HOME` names the JDK, else `java` is
-//! taken from PATH.
+//!
+//! Then the other way round (B7 slice 4, `mtls_interop_server.zig`): `openssl s_client` and a JDK
+//! 21 client (`ops/mtls-interop/InteropClient.java`) against a real `zcube-server --listen`.
+//!
+//! Usage: `mtls_interop <InteropServer.java> <InteropClient.java> <zcube-server>`.
+//! `ZCUBE_JAVA_HOME` names the JDK, else `java` is taken from PATH.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const diag_mod = @import("diag.zig");
 const peer_stream = @import("peer_stream.zig");
+const server_rows = @import("mtls_interop_server.zig");
 const tls_client = @import("tls_client.zig");
 const tls_conn = @import("tls_conn.zig");
 const x509 = @import("x509.zig");
@@ -37,7 +42,7 @@ const Conn = tls_conn.Conn;
 const Diag = diag_mod.Diag;
 const Ed25519 = std.crypto.sign.Ed25519;
 
-const Failed = error{CaseFailed};
+pub const Failed = error{CaseFailed};
 
 const hour_ms: u64 = 3_600_000;
 const server_name = "broker.botpike.com";
@@ -45,10 +50,10 @@ const cluster = "prod.example";
 const job = "broker-1";
 const spiffe_id = "spiffe://prod.example/service/broker-1";
 const java_major = "21";
-const step_ms: u64 = 5000;
+pub const step_ms: u64 = 5000;
 const events_count = 20;
 /// The longest a helper tool (`javac`, `java --decode`, `openssl x509`) may go without output.
-const tool_timeout: std.Io.Timeout = .{ .duration = .{
+pub const tool_timeout: std.Io.Timeout = .{ .duration = .{
     .raw = .fromMilliseconds(120_000),
     .clock = .awake,
 } };
@@ -138,7 +143,7 @@ const Pki = struct {
 };
 
 /// PEM text for `bytes` under `label`.
-fn pem(arena: Allocator, label: []const u8, bytes: []const u8) ![]u8 {
+pub fn pem(arena: Allocator, label: []const u8, bytes: []const u8) ![]u8 {
     const encoder = std.base64.standard.Encoder;
     const body = try arena.alloc(u8, encoder.calcSize(bytes.len));
     _ = encoder.encode(body, bytes);
@@ -193,7 +198,7 @@ const Server = struct {
     }
 };
 
-const Harness = struct {
+pub const Harness = struct {
     io: std.Io,
     gpa: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -212,30 +217,30 @@ const Harness = struct {
     why: [320]u8 = undefined,
     why_len: u32 = 0,
 
-    fn say(h: *Harness, comptime format: []const u8, args: anytype) void {
+    pub fn say(h: *Harness, comptime format: []const u8, args: anytype) void {
         var buffer: [640]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "mtls-interop: " ++ format ++ "\n", args) catch
             return;
         std.Io.File.stdout().writeStreamingAll(h.io, line) catch {}; // Nowhere else to say it.
     }
 
-    fn check(h: *Harness, ok: bool, comptime what: []const u8, args: anytype) Failed!void {
+    pub fn check(h: *Harness, ok: bool, comptime what: []const u8, args: anytype) Failed!void {
         if (ok) return;
         const text = std.fmt.bufPrint(&h.why, what, args) catch h.why[0..0];
         h.why_len = @intCast(text.len);
         return error.CaseFailed;
     }
 
-    fn path(h: *Harness, name: []const u8) []const u8 {
+    pub fn path(h: *Harness, name: []const u8) []const u8 {
         return std.fmt.allocPrint(h.arena.allocator(), "{s}/{s}", .{ h.work, name }) catch
             @panic("out of memory");
     }
 
-    fn write_file(h: *Harness, name: []const u8, data: []const u8) !void {
+    pub fn write_file(h: *Harness, name: []const u8, data: []const u8) !void {
         try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = h.path(name), .data = data });
     }
 
-    fn sleep_ms(h: *Harness, ms: i64) void {
+    pub fn sleep_ms(h: *Harness, ms: i64) void {
         h.io.sleep(.fromMilliseconds(ms), .awake) catch {}; // Cancelled: the run is ending.
     }
 
@@ -280,7 +285,7 @@ const Harness = struct {
     }
 };
 
-fn free_port(io: std.Io) !u16 {
+pub fn free_port(io: std.Io) !u16 {
     const any = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try any.listen(io, .{});
     defer listener.deinit(io);
@@ -665,7 +670,7 @@ fn check_openssl_view(h: *Harness, server: *Server, expected: []const u8) !void 
     try h.check(std.mem.eql(u8, std.mem.trim(u8, decoded, "\n"), want), "decoded {s}", .{decoded});
 }
 
-fn run_tool(h: *Harness, argv: []const []const u8) ![]const u8 {
+pub fn run_tool(h: *Harness, argv: []const []const u8) ![]const u8 {
     const result = try std.process.run(h.scratch.allocator(), h.io, .{
         .argv = argv,
         .timeout = tool_timeout,
@@ -856,7 +861,7 @@ fn bulk_java(h: *Harness) !void {
     try close_clean(h, &live.server);
 }
 
-fn finish(h: *Harness, name: []const u8, result: anyerror!void) void {
+pub fn finish(h: *Harness, name: []const u8, result: anyerror!void) void {
     h.cases += 1;
     result catch |err| {
         h.failures += 1;
@@ -870,12 +875,13 @@ fn finish(h: *Harness, name: []const u8, result: anyerror!void) void {
 pub fn main(init: std.process.Init) u8 {
     const io = init.io;
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return 2;
-    if (args.len != 2) {
-        const usage = "usage: mtls_interop <InteropServer.java>\n";
+    if (args.len != 4) {
+        const usage = "usage: mtls_interop <InteropServer.java> <InteropClient.java> " ++
+            "<zcube-server>\n";
         std.Io.File.stderr().writeStreamingAll(io, usage) catch {}; // Nowhere else to say it.
         return 2;
     }
-    return run(init, args[1]) catch |err| {
+    return run(init, args[1..4]) catch |err| {
         var buffer: [128]u8 = undefined;
         const text = "mtls-interop: setup failed: {s}\n";
         const line = std.fmt.bufPrint(&buffer, text, .{@errorName(err)}) catch "setup failed\n";
@@ -884,7 +890,7 @@ pub fn main(init: std.process.Init) u8 {
     };
 }
 
-fn run(init: std.process.Init, source: []const u8) !u8 {
+fn run(init: std.process.Init, sources: []const []const u8) !u8 {
     const gpa = init.gpa;
     const pki = try gpa.create(Pki);
     defer gpa.destroy(pki);
@@ -909,7 +915,7 @@ fn run(init: std.process.Init, source: []const u8) !u8 {
     defer h.scratch.deinit();
     try make_work_dir(&h);
     defer std.Io.Dir.cwd().deleteTree(h.io, h.work) catch {}; // Best effort: it is in /tmp.
-    try prepare(&h, source);
+    try prepare(&h, sources[0..2]);
     for (&cases) |*case| {
         _ = h.scratch.reset(.retain_capacity);
         h.diag.reset();
@@ -922,6 +928,7 @@ fn run(init: std.process.Init, source: []const u8) !u8 {
         finish(&h, scenario.name, scenario.run(&h));
         conn.deinit();
     }
+    server_rows.run(&h, sources[2]);
     h.say("{d} cases, {d} failed", .{ h.cases, h.failures });
     return if (h.failures == 0) 0 else 1;
 }
@@ -938,9 +945,9 @@ fn make_work_dir(h: *Harness) !void {
 }
 
 /// The files the servers read, and the compiled Java.
-fn prepare(h: *Harness, source: []const u8) !void {
+fn prepare(h: *Harness, sources: []const []const u8) !void {
     try find_setpriv(h);
-    try find_java(h, source);
+    try find_java(h, sources);
     try pki_files(h);
 }
 
@@ -960,7 +967,7 @@ fn find_setpriv(h: *Harness) !void {
     }
 }
 
-fn find_java(h: *Harness, source: []const u8) !void {
+fn find_java(h: *Harness, sources: []const []const u8) !void {
     const arena = h.arena.allocator();
     const home = h.environ.get("ZCUBE_JAVA_HOME");
     h.java = if (home) |dir| try std.fmt.allocPrint(arena, "{s}/bin/java", .{dir}) else "java";
@@ -982,7 +989,7 @@ fn find_java(h: *Harness, source: []const u8) !void {
         return error.WrongJdk;
     }
     h.classes = h.path("classes");
-    _ = try run_tool(h, &.{ javac, "-d", h.classes, source });
+    _ = try run_tool(h, &.{ javac, "-d", h.classes, sources[0], sources[1] });
     // A KeyUpdate after 1 MiB, so a 3 MiB transfer crosses one.
     const props = "jdk.tls.keyLimits=AES/GCM/NoPadding KeyUpdate 1048576\n";
     try h.write_file("jdk.props", props);

@@ -134,6 +134,7 @@ const Answer = struct { status: u16, body: []const u8 };
 fn get(api: *api_mod.Api, ctx: *const Context, path: []const u8, query: []const u8) Answer {
     ctx.diag.reset();
     const response = api.handle(ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = path,
         .query = query,

@@ -16,15 +16,22 @@ const records = @import("records.zig");
 const x509 = @import("x509.zig");
 const x509_identity = @import("x509_identity.zig");
 
-/// The names of removed nodes: one per line, `#` starts a comment, blank lines are ignored.
+/// The removed names: one per line, `#` starts a comment, blank lines are ignored. A bare `NAME`
+/// is refused for every kind; `node/NAME` only as a node and `client/NAME` only as a client
+/// (decisions/2026-11-14-revoked-names-by-kind.md).
 pub const Revoked = struct {
     names: [constants.peer_revoked_max][peer.name_bytes_max]u8 = undefined,
     lengths: [constants.peer_revoked_max]u8 = undefined,
+    /// The kind a line names, or null for a bare name (every kind).
+    kinds: [constants.peer_revoked_max]?Kind = undefined,
     count: u32 = 0,
     /// After a failed `parse`, the 1-based line that was refused.
     bad_line: u32 = 0,
 
     pub const ParseError = error{ TooMany, BadName };
+
+    /// Who a revoked name is refused to.
+    pub const Kind = enum { node, client };
 
     /// Replaces the list with `text`'s names. A name that is not a node name, or more than
     /// `peer_revoked_max` names, is refused whole (and the list is then empty).
@@ -36,9 +43,11 @@ pub const Revoked = struct {
         while (lines.next()) |raw| {
             line_number += 1;
             const hash = std.mem.indexOfScalar(u8, raw, '#') orelse raw.len;
-            const line = std.mem.trim(u8, raw[0..hash], " \t\r");
-            if (line.len == 0) continue;
+            const trimmed = std.mem.trim(u8, raw[0..hash], " \t\r");
+            if (trimmed.len == 0) continue;
             revoked.bad_line = line_number;
+            const kind = kind_of(trimmed);
+            const line = if (kind) |known| trimmed[@tagName(known).len + 1 ..] else trimmed;
             if (records.name_problem(line, peer.name_bytes_max) != null) {
                 revoked.count = 0;
                 return error.BadName;
@@ -51,16 +60,27 @@ pub const Revoked = struct {
             revoked.names[slot] = @splat(0);
             @memcpy(revoked.names[slot][0..line.len], line);
             revoked.lengths[slot] = @intCast(line.len);
+            revoked.kinds[slot] = kind;
             revoked.count += 1;
         }
         revoked.bad_line = 0;
     }
 
-    pub fn contains(revoked: *const Revoked, node: []const u8) bool {
+    fn kind_of(line: []const u8) ?Kind {
+        inline for (comptime std.enums.values(Kind)) |kind| {
+            if (std.mem.startsWith(u8, line, @tagName(kind) ++ "/")) return kind;
+        }
+        return null;
+    }
+
+    /// True when `name` is revoked for `kind`: by a bare line or by one of that kind.
+    pub fn contains(revoked: *const Revoked, kind: Kind, name: []const u8) bool {
         assert(revoked.count <= constants.peer_revoked_max);
         for (0..revoked.count) |index| {
-            const name = revoked.names[index][0..revoked.lengths[index]];
-            if (std.mem.eql(u8, name, node)) return true;
+            const listed = revoked.names[index][0..revoked.lengths[index]];
+            if (!std.mem.eql(u8, listed, name)) continue;
+            const listed_kind = revoked.kinds[index] orelse return true;
+            if (listed_kind == kind) return true;
         }
         return false;
     }
@@ -90,7 +110,7 @@ pub const Ca = struct {
     /// public key, which no handshake could use. The caller has checked the node's name.
     pub fn issue(ca: *const Ca, node: []const u8, node_key: [32]u8) IssueError!peer.Credential {
         assert(records.name_problem(node, peer.name_bytes_max) == null);
-        if (ca.revoked.contains(node)) return error.Removed;
+        if (ca.revoked.contains(.node, node)) return error.Removed;
         // On the curve and in the prime-order subgroup: a small-order or mixed-order point is
         // refused, so no credential vouches for a key no honest node holds.
         const point = Edwards25519.fromBytes(node_key) catch return error.BadKey;
@@ -156,7 +176,81 @@ pub const Ca = struct {
         });
         assert(out.slice().len <= constants.x509_cert_bytes_max);
     }
+
+    /// The cluster's name in SPIFFE IDs: `zc-` and the first 8 bytes of SHA-256 of the CA's
+    /// public key in hex, so one CA names one cluster and nothing else has to be configured
+    /// (docs/decisions/2026-11-13-cluster-name-from-ca-key.md).
+    pub fn cluster(ca: *const Ca, buffer: *[cluster_bytes]u8) []const u8 {
+        return cluster_of(ca.public(), buffer);
+    }
+
+    /// A node's certificate (B7) for `request.node` over `request.lifetime`: at join and on
+    /// renewal the peer credential's own window, so the two are one grant (one clock reading);
+    /// from `zcube-server ca issue-node`, `window`'s. A removed node is refused, as for `issue`.
+    pub fn issue_node_certificate(
+        ca: *const Ca,
+        out: *x509.Der,
+        request: *const NodeArgs,
+    ) IssueCertificateError!void {
+        if (ca.revoked.contains(.node, request.node)) return error.Removed;
+        try ca.check_leaf_key(request.subject_key);
+        var cluster_buffer: [cluster_bytes]u8 = undefined;
+        try x509.issue_node(out, ca.key, &.{
+            .cluster = ca.cluster(&cluster_buffer),
+            .node = request.node,
+            .subject_key = request.subject_key,
+            .lifetime = request.lifetime,
+        });
+        assert(out.slice().len <= constants.x509_cert_bytes_max);
+    }
+
+    /// The window from the CA's clock now for `ttl_ms`, for a certificate issued on its own.
+    pub fn window(ca: *const Ca, ttl_ms: u64) CertificateError!x509.Lifetime {
+        const lifetime = try lifetime_from(ca.wall.now_ms(), ttl_ms);
+        assert(lifetime.not_after_ms >= lifetime.not_before_ms);
+        return lifetime;
+    }
+
+    /// A client's certificate (B7) for `request.client` with `request.scope`. A bare name in the
+    /// `revoked` file is refused, and so is `client/<name>`; `node/<name>` is not.
+    pub fn issue_client_certificate(
+        ca: *const Ca,
+        out: *x509.Der,
+        request: *const ClientArgs,
+    ) IssueCertificateError!void {
+        if (ca.revoked.contains(.client, request.client)) return error.Removed;
+        try ca.check_leaf_key(request.subject_key);
+        const lifetime = try lifetime_from(ca.wall.now_ms(), request.ttl_ms);
+        var cluster_buffer: [cluster_bytes]u8 = undefined;
+        try x509.issue_client(out, ca.key, &.{
+            .cluster = ca.cluster(&cluster_buffer),
+            .client = request.client,
+            .scope = request.scope,
+            .subject_key = request.subject_key,
+            .lifetime = lifetime,
+        });
+        assert(out.slice().len <= constants.x509_cert_bytes_max);
+    }
 };
+
+const cluster_prefix = "zc-";
+pub const cluster_bytes = cluster_prefix.len + 16;
+
+/// The cluster name of the CA whose public key is `ca_public` (`Ca.cluster`): an agent that
+/// holds the CA's public key works it out the same way to check its node certificate.
+pub fn cluster_of(ca_public: [32]u8, buffer: *[cluster_bytes]u8) []const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&ca_public, &digest, .{});
+    @memcpy(buffer[0..cluster_prefix.len], cluster_prefix);
+    const hex = std.fmt.bytesToHex(digest[0..8], .lower);
+    @memcpy(buffer[cluster_prefix.len..], &hex);
+    assert(!x509_identity.dns_problem(buffer, constants.x509_cluster_bytes_max));
+    return buffer;
+}
+
+comptime {
+    assert(cluster_bytes <= constants.x509_cluster_bytes_max);
+}
 
 comptime {
     // The CA key signs credentials and X.509 TBS bytes (docs/decisions/2026-11-05-ca-key-shared-
@@ -190,6 +284,24 @@ pub const WorkloadArgs = struct {
     ttl_ms: u64,
 };
 
+/// A node or client certificate's refusals: a revoked name, or a certificate refusal.
+pub const IssueCertificateError = CertificateError || error{Removed};
+
+pub const NodeArgs = struct {
+    node: []const u8,
+    /// The node's peer key: the agent holds the private half.
+    subject_key: [32]u8,
+    /// No longer than `x509_leaf_ttl_ms_max` (`IssueLifetime` otherwise).
+    lifetime: x509.Lifetime,
+};
+
+pub const ClientArgs = struct {
+    client: []const u8,
+    scope: x509.Scope,
+    subject_key: [32]u8,
+    ttl_ms: u64,
+};
+
 pub const ServerArgs = struct {
     dns_name: []const u8,
     subject_key: [32]u8,
@@ -213,15 +325,33 @@ test "the revoked list: names, comments, blanks, and refusals" {
     var revoked: Revoked = .{};
     try revoked.parse("# removed\nnode3\n\n  node4  # moved\r\n");
     try std.testing.expectEqual(@as(u32, 2), revoked.count);
-    try std.testing.expect(revoked.contains("node3"));
-    try std.testing.expect(revoked.contains("node4"));
-    try std.testing.expect(!revoked.contains("node"));
-    try std.testing.expect(!revoked.contains("node5"));
+    try std.testing.expect(revoked.contains(.node, "node3"));
+    try std.testing.expect(revoked.contains(.client, "node4"));
+    try std.testing.expect(!revoked.contains(.node, "node"));
+    try std.testing.expect(!revoked.contains(.node, "node5"));
     try std.testing.expectError(error.BadName, revoked.parse("node3\nBad Name\n"));
     try std.testing.expectEqual(@as(u32, 2), revoked.bad_line);
     try std.testing.expectEqual(@as(u32, 0), revoked.count);
     try revoked.parse("");
     try std.testing.expectEqual(@as(u32, 0), revoked.count);
+}
+
+test "the revoked list: a kind prefix revokes that kind only, a bare name every kind" {
+    // Goal: a node and a client of one name are told apart (decisions/2026-11-14-revoked-names-
+    // by-kind.md). Method: parse each form and ask for both kinds.
+    var revoked: Revoked = .{};
+    try revoked.parse("client/ops-1\nnode/node7\nboth\n");
+    try std.testing.expectEqual(@as(u32, 3), revoked.count);
+    try std.testing.expect(revoked.contains(.client, "ops-1"));
+    try std.testing.expect(!revoked.contains(.node, "ops-1"));
+    try std.testing.expect(revoked.contains(.node, "node7"));
+    try std.testing.expect(!revoked.contains(.client, "node7"));
+    try std.testing.expect(revoked.contains(.node, "both"));
+    try std.testing.expect(revoked.contains(.client, "both"));
+    // The prefix is the whole kind: anything else stays a name, and a name has no slash.
+    try std.testing.expectError(error.BadName, revoked.parse("workload/x\n"));
+    try std.testing.expectError(error.BadName, revoked.parse("client/\n"));
+    try std.testing.expectError(error.BadName, revoked.parse("client/node/x\n"));
 }
 
 test "the revoked list holds peer_revoked_max names and refuses one more" {
@@ -510,4 +640,73 @@ test "a credential's signed message and a certificate's are disjoint, and signat
             .name = null,
         }));
     }
+}
+
+test "the CA issues node and client certificates in its own cluster and refuses revoked names" {
+    // Goal: the B7 issuers name the CA's cluster, carry the client's scope, and refuse a name in
+    // the `revoked` file (nodes and clients alike), a bad key and a bad name. Method: issue each
+    // at a fixed clock, verify with the expected kind and SPIFFE ID, then revoke and re-issue.
+    var clock: TestClock = .{ .ms = 1_800_000_000_000 };
+    var ca = try test_ca(&clock);
+    var cluster_buffer: [cluster_bytes]u8 = undefined;
+    const cluster = ca.cluster(&cluster_buffer);
+    try std.testing.expect(std.mem.startsWith(u8, cluster, "zc-"));
+    var other_clock: TestClock = .{ .ms = 0 };
+    var other: Ca = try test_ca(&other_clock);
+    other.key = try Ed25519.KeyPair.generateDeterministic(@splat(8));
+    var other_buffer: [cluster_bytes]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(u8, cluster, other.cluster(&other_buffer)));
+
+    var uri_buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
+    var out: x509.Der = .{};
+    var node_args: NodeArgs = .{
+        .node = "node-1",
+        .subject_key = try test_key(9),
+        .lifetime = try ca.window(constants.peer_credential_ttl_ms),
+    };
+    try ca.issue_node_certificate(&out, &node_args);
+    const node_uri = try x509_identity.spiffe_write(&uri_buffer, .node, cluster, "node-1");
+    const parsed_node = try x509.verify(out.slice(), ca.public(), clock.ms, .{
+        .kind = .node,
+        .name = node_uri,
+    });
+    try std.testing.expectEqual(
+        clock.ms + constants.peer_credential_ttl_ms,
+        parsed_node.not_after_ms,
+    );
+    for ([_]x509.Scope{ .jobs, .admin }) |scope| {
+        try ca.issue_client_certificate(&out, &.{
+            .client = "ops-1",
+            .scope = scope,
+            .subject_key = try test_key(10),
+            .ttl_ms = 60_000,
+        });
+        const client_uri =
+            try x509_identity.spiffe_write(&uri_buffer, .client, cluster, "ops-1");
+        const parsed = try x509.verify(out.slice(), ca.public(), clock.ms, .{
+            .kind = .client,
+            .name = client_uri,
+        });
+        try std.testing.expectEqual(scope, parsed.scope(out.slice()));
+    }
+
+    node_args.subject_key = ca.public();
+    try std.testing.expectError(error.BadKey, ca.issue_node_certificate(&out, &node_args));
+    node_args.subject_key = try test_key(9);
+    node_args.node = "Node 1";
+    try std.testing.expectError(error.BadNodeName, ca.issue_node_certificate(&out, &node_args));
+    node_args.node = "node-1";
+    node_args.lifetime = try ca.window(constants.x509_leaf_ttl_ms_max + 1000);
+    try std.testing.expectError(error.IssueLifetime, ca.issue_node_certificate(&out, &node_args));
+    try std.testing.expectError(error.IssueLifetime, ca.window(std.math.maxInt(u64)));
+    node_args.lifetime = try ca.window(constants.peer_credential_ttl_ms);
+
+    try ca.revoked.parse("node-1\nops-1\n");
+    try std.testing.expectError(error.Removed, ca.issue_node_certificate(&out, &node_args));
+    try std.testing.expectError(error.Removed, ca.issue_client_certificate(&out, &.{
+        .client = "ops-1",
+        .scope = .jobs,
+        .subject_key = try test_key(10),
+        .ttl_ms = 60_000,
+    }));
 }

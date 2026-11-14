@@ -46,6 +46,10 @@ const Rig = struct {
     }
 
     fn setup_server(rig: *Rig, kind: x509.Kind) !void {
+        try rig.setup_server_kinds(.initOne(kind));
+    }
+
+    fn setup_server_kinds(rig: *Rig, kinds: x509.Kinds) !void {
         rig.diag.reset();
         rig.ca = try x509_test.ca_pair();
         rig.server_key = try Ed25519.KeyPair.generateDeterministic(@splat(0x21));
@@ -65,7 +69,7 @@ const Rig = struct {
                 .certificates = &rig.chain,
                 .signer = tls_server.key_pair_signer(&rig.server_key),
             },
-            .client_kind = kind,
+            .client_kinds = kinds,
         });
         rig.sent_length = 0;
         rig.data_events = 0;
@@ -626,6 +630,77 @@ test "a client certificate of the configured kind only is taken" {
     try std.testing.expect(event == .connected);
     try std.testing.expectEqual(x509.Kind.server, rig.server.peer().?.kind);
     try std.testing.expectEqualStrings("client.botpike.com", rig.server.peer().?.name);
+}
+
+test "client_kind: a server takes a client certificate of its configured kind and no other" {
+    // Goal: the four leaf kinds a client can present (B7 adds node and client) are told apart.
+    // Method: every pair of configured and presented kind; equal pairs connect and name the peer,
+    // the others are refused with ZC-E0819 and unsupported_certificate.
+    const kinds = [_]x509.Kind{ .workload, .server, .node, .client };
+    const chains = [_]testclient.Chain{ .good, .server_kind, .node_kind, .client_kind };
+    const names = [_][]const u8{
+        x509_test.workload_uri,
+        "client.botpike.com",
+        x509_test.node_uri,
+        x509_test.client_uri,
+    };
+    var failures: u32 = 0;
+    for (kinds) |configured| {
+        for (kinds, chains, names) |presented, chain, name| {
+            var rig: Rig = undefined;
+            try rig.setup_server(configured);
+            try rig.client.init(.{ .ca = rig.ca, .faults = .{ .chain = chain } });
+            const result = rig.handshake(4096);
+            if (configured == presented) {
+                const event = try result;
+                try std.testing.expect(event == .connected);
+                try std.testing.expectEqual(presented, rig.server.peer().?.kind);
+                try std.testing.expectEqualStrings(name, rig.server.peer().?.name);
+                continue;
+            }
+            try std.testing.expectError(error.Refused, result);
+            if (rig.diag.code != Code.E0819 or rig.sent_alert() !=
+                @backingInt(wire.Alert.unsupported_certificate))
+            {
+                std.debug.print("client_kind {t} took {t}\n", .{ configured, presented });
+                failures += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), failures);
+}
+
+test "client_kinds: the API's server takes a node's and a client's, with the scope" {
+    // Goal: one listener takes the set of kinds B7's API serves, and only those. Method: a server
+    // for {node, client}; each of the four kinds presented; the two connect (the client's scope
+    // read back, a node's null), the others are refused with ZC-E0819 naming both kinds taken.
+    const kinds = [_]x509.Kind{ .workload, .server, .node, .client };
+    const chains = [_]testclient.Chain{ .good, .server_kind, .node_kind, .client_kind };
+    for (kinds, chains) |presented, chain| {
+        var rig: Rig = undefined;
+        try rig.setup_server_kinds(.initMany(&.{ .node, .client }));
+        try rig.client.init(.{ .ca = rig.ca, .faults = .{ .chain = chain } });
+        const result = rig.handshake(4096);
+        switch (presented) {
+            .node, .client => {
+                try std.testing.expect(try result == .connected);
+                const peer = rig.server.peer().?;
+                try std.testing.expectEqual(presented, peer.kind);
+                if (presented == .client) {
+                    try std.testing.expectEqual(x509.Scope.jobs, peer.scope.?);
+                } else {
+                    try std.testing.expect(peer.scope == null);
+                }
+            },
+            else => {
+                try std.testing.expectError(error.Refused, result);
+                try rig.expect_code(.E0819);
+                const cause = rig.diag.last_cause().?;
+                const both = "this use needs a node certificate or a client certificate";
+                try std.testing.expect(std.mem.indexOf(u8, cause, both) != null);
+            },
+        }
+    }
 }
 
 test "a fatal alert from the client is named, plain before its keys and sealed after" {

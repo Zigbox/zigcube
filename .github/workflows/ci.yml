@@ -11,7 +11,7 @@
 #     job: they report as skipped, which required checks count as passing.
 #   - Any other change runs format, build, test, wasm and the simulations, and of the rest only
 #     what its paths can affect on a pull request: the Postgres store suites, demo-c0, demo-c1,
-#     demo-b1 (as two jobs, one per database) and the Zigbox smoke. A path no rule names runs everything.
+#     demo-b1 (as two jobs, one per database), demo-b7 (SQLite) and the Zigbox smoke. A path no rule names runs everything.
 #   - A push to main, a pull request from a claude/release-* branch and a pull request labelled
 #     full-ci run everything, so a break the filter missed shows on main.
 #   - The jobs whose time is compiling restore the Zig build cache (.github/actions/zig-cache);
@@ -57,6 +57,7 @@ jobs:
       demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
       mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
       demo_b3: ${{ steps.pick.outputs.demo_b3 || 'true' }}
+      demo_b7: ${{ steps.pick.outputs.demo_b7 || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -239,12 +240,13 @@ jobs:
   # everything it started. One job per backend builds once (the demos share the build cache of
   # the job) and runs the demos in sequence, each its own step, so a failure names its demo; a
   # failed demo does not stop the next from running, and the job still fails. Each demo still
-  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1); the job runs when any is
-  # picked. Before this they were six jobs, each downloading Zig and building the same binaries.
+  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1, and demo_b7 on SQLite only);
+  # the job runs when any is picked. Before this they were six jobs, each downloading Zig and
+  # building the same binaries.
   demos-sqlite:
     name: demos (sqlite)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_b7 == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -265,6 +267,9 @@ jobs:
       - name: demo-b1 on SQLite
         if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
         run: zig build demo-b1 -Dbackend=sqlite -Dtranscript=demo-b1-sqlite.txt --summary all
+      - name: demo-b7 (the API over mTLS)
+        if: ${{ !cancelled() && needs.changes.outputs.demo_b7 == 'true' }}
+        run: zig build demo-b7 -Dtranscript=demo-b7-sqlite.txt --summary all
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -592,10 +597,15 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.mtls_interop == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
+      # Its server rows build zcube-server, which links both client libraries.
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
       - name: mtls-interop
         shell: bash
         run: |

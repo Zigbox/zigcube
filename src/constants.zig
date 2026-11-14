@@ -221,6 +221,11 @@ pub const why_text_bytes_max: u32 = 480;
 
 /// Connections the HTTP server serves at once; the next one is answered 503 and closed.
 pub const http_connections_max: u32 = 96;
+/// Of those, kept for `--insecure-listen` when both listeners run: TLS clients take at most
+/// `http_connections_max - http_loopback_reserved`, so a flood of them (or of slow handshakes)
+/// never locks out the loopback listener the harnesses and `zcube local` use (supervisor,
+/// 2026-11-14, docs/decisions/2026-11-14-loopback-slot-reserve.md).
+pub const http_loopback_reserved: u32 = 8;
 /// Long-poll watches held open at once. Each holds one store watch (and, on Postgres, one
 /// connection), so this stays well under `store_postgres_watches_max`. 50 agents hold one each
 /// (owner, 2026-11-02); Postgres then needs `max_connections` of at least 80.
@@ -652,6 +657,9 @@ comptime {
     assert(x509_labels_bytes_max < x509_cert_bytes_max / 2);
     assert(x509_leaf_ttl_ms_max < x509_ca_ttl_ms_max);
     assert(x509_leaf_ttl_ms_max % 1000 == 0);
+    // A node certificate (B7) lives exactly as long as the credential it is issued beside, so
+    // every credential life a verifier accepts is a life the x509 profile admits.
+    assert(peer_credential_ttl_ms_max <= x509_leaf_ttl_ms_max);
     assert(x509_ca_ttl_ms_max % 1000 == 0);
     assert(x509_cn_bytes_max >= node_name_bytes_max);
     assert(x509_cn_bytes_max >= 9 + 16);
@@ -827,6 +835,7 @@ comptime {
     // The controller's watch, and one spare, besides the held watches.
     assert(http_holds_max + 2 < store_postgres_watches_max);
     assert(http_holds_max <= http_connections_max);
+    assert(http_holds_max <= http_connections_max - http_loopback_reserved);
     assert(http_head_bytes_max < http_body_bytes_max);
     assert(http_watchdog_ms < http_idle_timeout_ms);
     assert(http_hold_slice_ms <= api_watch_timeout_ms_max);

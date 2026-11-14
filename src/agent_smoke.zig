@@ -122,10 +122,10 @@ const Smoke = struct {
             ),
         });
         const args = [_][]const u8{
-            "--config",       config,
-            "--listen",       listen,
-            "--store",        store,
-            "--create-store", "--quiet",
+            "--config",          config,
+            "--insecure-listen", listen,
+            "--store",           store,
+            "--create-store",    "--quiet",
         };
         smoke.server = try smoke.spawn(smoke.server_exe, &args, log);
         const ready = struct {
