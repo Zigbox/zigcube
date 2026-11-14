@@ -647,7 +647,8 @@ test "a reload a busy API delays is applied within the bound, under both locks (
     rig.watch.tick(); // Seen.
     try testing.expect(rig.api_mutex.tryLock()); // A busy client.
     var ticks: u32 = 0;
-    while (ticks < 1 + busy_ticks_max) : (ticks += 1) rig.watch.tick(); // Read, then busy.
+    // The first tick reads the file and finds the lock busy; each tick after it is busy too.
+    while (ticks < busy_ticks_max) : (ticks += 1) rig.watch.tick();
     try testing.expect(rig.watch.pending);
     try testing.expectEqual(busy_ticks_max, rig.watch.busy_ticks);
     try testing.expectEqual(@as(u32, 0), rig.ca.revoked.count);
