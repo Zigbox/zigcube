@@ -294,8 +294,8 @@ fn print_replay(
     options: sim_cluster.Options,
     heal_at: ?u32,
 ) !void {
-    // The burst world and each tooth are comptime flags of their own runners, so the replay names
-    // that runner (`sim-c1-burst` builds the first, #202; `sim-c1-teeth-exe` the others).
+    // A world or a tooth is a comptime flag of its own runner, so its replay names that runner
+    // (`sim-c1-burst` builds the burst world's, #202; `sim-c1-teeth-exe` the teeth's).
     const runner = c1_teeth.runner;
     try out.print("  replay: zig-out/bin/{s} {d} {d} {d}", .{
         runner, seed, operations, options.nodes orelse 0,

@@ -165,6 +165,12 @@ pub const placement_exclusive = declared("c1_teeth_placement_exclusive");
 /// slice 2 fix). Needs the tenant world.
 pub const relabel_kept = declared("c1_teeth_relabel_kept");
 
+/// The agent's job pass ends at the first failure that is not the runtime's (a server call that
+/// failed, such as a committed write whose answer was lost), and a replica stage's such failure
+/// skips the job pass, as before #247: a stop committed for a run later in the pass waits for a
+/// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
+pub const job_pass_break = declared("c1_teeth_job_pass_break");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
@@ -187,12 +193,14 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
-    job_untrusted or placement_exclusive or relabel_kept;
+    job_untrusted or placement_exclusive or relabel_kept or job_pass_break;
 
-/// The runner a replay line names: the fault-on runner whose root switched a tooth on
-/// (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe` installs it), the burst world's own runner, or
-/// `sim_cluster`. Without it a failing tooth's replay ran the shipped code and passed.
+/// The runner a replay line names: the runner a root names itself (`sim_runner`), else the
+/// fault-on runner whose root switched a tooth on (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe`
+/// installs it), the burst world's own runner, or `sim_cluster`. Without it a failing tooth's
+/// replay ran the shipped code and passed.
 pub const runner: []const u8 = blk: {
+    if (@hasDecl(root, "sim_runner")) break :blk root.sim_runner;
     // A tooth's root names its runner before a world's: `job_evicted` runs in the burst world.
     for (runners) |pair| {
         if (declared(pair[0])) break :blk pair[1];
@@ -236,4 +244,5 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_job_untrusted", "sim_c1_teeth_job_untrusted" },
     .{ "c1_teeth_placement_exclusive", "sim_c1_teeth_placement_exclusive" },
     .{ "c1_teeth_relabel_kept", "sim_c1_teeth_relabel_kept" },
+    .{ "c1_teeth_job_pass_break", "sim_c1_teeth_job_pass_break" },
 };
