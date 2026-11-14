@@ -467,7 +467,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "the runtime failed an operation",
-    "explanation": "The runtime could not carry out a request that is not about one workload's\nimage or command: listing its containers, stopping one, reading its state\ndirectory, or running out of the slots it provisions at startup.\n\nThe cause line names the operation and what the host reported. A failure\nto start one workload is not this code: it is reported on that workload,\nwith the runtime's own diagnostic."
+    "explanation": "The runtime could not carry out a request that is not about one workload's\nimage or command: listing its containers, stopping one, reading its state\ndirectory, or running out of the slots it provisions at startup. A health\ncheck is refused with it when its worker (the `zcube-agent probe` process\nthat runs the check in the container) could not start, ended without a\nresult, or did not end in time.\n\nThe cause line names the operation and what the host reported. A failure\nto start one workload is not this code: it is reported on that workload,\nwith the runtime's own diagnostic."
   },
   {
     "code": "ZC-E0503",

@@ -333,16 +333,30 @@ monotonic clock from the step and never block.
   the word stays until the container ends); SimRuntime from `set_health`; ZigboxRuntime runs it
   in the container (below).
 - **ZigboxRuntime (C3 slice 10).** `probe_begin` starts a worker, `zcube-agent probe <replica>
-  <timeout_ms> <command...>` (internal, `src/probe_worker.zig`), in a process group of its own
-  with its stdout on a pipe. The worker runs the command in the container with Zigbox's
-  `exec_start` and `exec_wait` (no terminal; the command's own output goes to `/dev/null`), kills
-  it with SIGKILL through a pidfd at `timeout_ms`, and writes one line, `exited N`, `timed_out` or
-  `refused <diagnostic JSON>`, then exits. `probe_poll` reaps it with `WNOHANG` and reads the line
-  (`src/zigbox_probes.zig`); a worker that ends without a line is refused (ZC-E0502), and one
-  still running 5 s past its timeout is killed with its group and refused. A new check of the
-  same replica, a full table (the oldest goes) or the agent's exit kills the worker's group (the
-  command in the container is in it); a check never polled again (its replica went away) holds
-  its slot until then, as a zombie at most. A container that ends during the check makes it refused.
+  <timeout_ms> <command...>` (internal, `src/probe_worker.zig`), as the leader of a process
+  group of its own, with its stdout on a pipe. The worker runs the command in the container
+  with Zigbox's `exec_start` and `exec_wait` (no terminal; the command's own output goes to
+  `/dev/null`), kills it with SIGKILL through a pidfd at `timeout_ms` (counted from when the
+  command has started, after `exec_start`), and writes one line, `exited N`, `timed_out` or
+  `refused <diagnostic JSON>`, then exits. The command, and anything it starts, stays in the
+  worker's group. Every end of a check kills that whole group, so a child the command left
+  running (`sleep 30 &`) dies with the check whether it passed, failed or timed out:
+  `probe_poll` sees the worker end with `waitid(WNOWAIT)`, which keeps its pid (the group's
+  id) from being reused, sends SIGKILL to the group, then reaps the worker and reads its line
+  (`src/zigbox_probes.zig`). A command that calls `setsid` or `setpgid` leaves the group, and
+  what it starts then is not killed. A worker that ends without a line is refused (ZC-E0502),
+  and one still running 5 s past its check's timeout is killed with its group and refused.
+  Nothing waits: every wait is `WNOHANG`.
+- **The table of workers.** A new check of the same replica, a `stop` of the container, a
+  container that is gone (`probe_begin` or `probe_poll` answers `NotFound`) or the agent's exit
+  abandons the check in flight: SIGKILL to its group, and the worker stays in the table, marked
+  killed, until a later `probe_begin` or `probe_poll` reaps it. Those calls also sweep checks
+  nobody polls any more (the health check was removed): one 5 s past its timeout is collected
+  if its worker ended and abandoned if not, so no check holds its slot or its pipe longer. The
+  table holds as many live checks as the runtime has containers (512) and as many killed
+  workers again; when the live checks fill their share, a worker that ended is dropped first,
+  else the check begun first is abandoned, and when workers that did not die of SIGKILL fill
+  the table, `probe_begin` is refused (ZC-E0502) rather than waiting for them.
 - **When.** The first check begins the step the agent first sees the container running; the next
   is due `interval_ms` after the last one began (or at once, if it ran longer). At most
   `probes_concurrent_max` (8) are in flight per node; the due ones go in order of due time, then

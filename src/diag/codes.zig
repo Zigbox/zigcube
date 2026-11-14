@@ -1244,7 +1244,10 @@ pub const registry = [_]Entry{
         .explanation =
         \\The runtime could not carry out a request that is not about one workload's
         \\image or command: listing its containers, stopping one, reading its state
-        \\directory, or running out of the slots it provisions at startup.
+        \\directory, or running out of the slots it provisions at startup. A health
+        \\check is refused with it when its worker (the `zcube-agent probe` process
+        \\that runs the check in the container) could not start, ended without a
+        \\result, or did not end in time.
         \\
         \\The cause line names the operation and what the host reported. A failure
         \\to start one workload is not this code: it is reported on that workload,

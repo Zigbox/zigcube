@@ -337,14 +337,28 @@ stage_health() {
     [ "$(box_pids flip)" = "$flip_pid" ] || fail "flip's container changed while it was checked"
     ok "the check flips: observed unhealthy, last probe exit 1: $(health_line flip)"
 
-    # A check that outlives its timeout: killed by the worker, a failure with ZC-W0502.
-    apply "$(health_service slow "$(loop_json slow)" "$(health_json '["sleep","30"]' 500)")"
+    # A check that outlives its timeout: killed by the worker, a failure with ZC-W0502. The
+    # command leaves a second `sleep` in the background; the agent kills the worker's whole
+    # group, so at most the current check's two are alive at any time.
+    apply "$(health_service slow "$(loop_json slow)" \
+        "$(health_json '["sh","-c","sleep 30 & sleep 30"]' 500)")"
     slow_timed_out() { observed_health slow | grep -q " running unhealthy .* ZC-W0502\$"; }
     until_ok 90 "slow's check to time out" slow_timed_out
     sleep 5
-    left=$(pgrep -fc '^sleep 30$' || true)
-    [ "$left" -le 1 ] || fail "$left timed-out checks are still running (at most the current one)"
-    ok "a check past its timeout is killed and observed unhealthy, ZC-W0502: $(health_line slow)"
+    few_sleeps() { [ "$(pgrep -fc '^sleep 30$' || true)" -le 2 ]; }
+    until_ok 5 "at most the current check's two sleeps ($(pgrep -fc '^sleep 30$' || true) now)" \
+        few_sleeps
+    ok "a check past its timeout is killed with its group, unhealthy, ZC-W0502: $(health_line slow)"
+
+    # A check that passes but leaves a child running: the child dies with the check.
+    apply "$(health_service lefty "$(loop_json lefty)" \
+        "$(health_json '["sh","-c","sleep 31 & exit 0"]' 1000)")"
+    until_ok 90 "lefty to be observed healthy" health_is lefty healthy
+    sleep 3
+    few_left() { [ "$(pgrep -fc '^sleep 31$' || true)" -le 1 ]; }
+    until_ok 5 "at most the current check's sleep ($(pgrep -fc '^sleep 31$' || true) now)" \
+        few_left
+    ok "a check that passes leaves nothing behind: $(health_line lefty)"
 
     # An agent restart: the replicas are adopted and checked again by the new agent, which
     # starts from `unknown` (the counts are memory only). /tmp/ok is made again while no agent
@@ -363,11 +377,13 @@ stage_health() {
     [ "$(box_pids flip)" = "$fpid" ] || fail "flip's container changed over the agent restart"
     [ "$(pgrep -fc 'zcube-agent supervise-zigbox')" -eq "$supervisors" ] || fail "supervisors changed"
     ok "after an agent restart, the adopted replica is checked again: $(health_line flip)"
-    for s in flip slow; do
+    for s in flip slow lefty; do
         curl -sf -X DELETE "$API/v1/services/$s" >/dev/null || fail "delete $s"
     done
-    no_health() { [ "$(count flip)" -eq 0 ] && [ "$(count slow)" -eq 0 ]; }
-    until_ok 60 "flip and slow to stop" no_health
+    no_health() {
+        [ "$(count flip)" -eq 0 ] && [ "$(count slow)" -eq 0 ] && [ "$(count lefty)" -eq 0 ]
+    }
+    until_ok 60 "flip, slow and lefty to stop" no_health
     two_boxes || fail "box was disturbed by the health checks: $(observed box | tr '\n' ';')"
 }
 

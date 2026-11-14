@@ -13,8 +13,9 @@
 //!     result line, and the command holds no end of the agent's pipe;
 //!   - starts the command with `keep_history = false` (a check every few seconds would fill the
 //!     container's exec history);
-//!   - opens a pidfd on the command, then starts one timer thread, which, at `TIMEOUT_MS`, sends
-//!     SIGKILL through that pidfd. Not `exec_signal`: that reads `handle.pid.?` and asserts the
+//!   - opens a pidfd on the command, then starts one timer thread, which, `TIMEOUT_MS` after
+//!     `exec_start` returned (the command has started), sends SIGKILL through that pidfd. Not
+//!     `exec_signal`: that reads `handle.pid.?` and asserts the
 //!     handle is running, and `exec_wait` clears both when the command ends, so a timer that
 //!     fires as the command ends would read them as they change. A pidfd names this one process
 //!     until it is reaped and fails with ESRCH after, so a late timer kills nothing else. (A
@@ -25,9 +26,11 @@
 //!       `refused JSON`   the check could not run: the diagnostic, as `zigbox.diagnostic`
 //!                        writes it (Zigbox's code when exec refused, else a ZC-E0502).
 //!
-//! The agent kills the worker's process group (it starts the worker as a group leader, and the
-//! command stays in that group) when it abandons a check or the worker outlives its timeout and
-//! grace. Not in `zcube-agent --help`: it is the agent's, not an operator's.
+//! The timer kills the command alone; whatever the command started in the background is left to
+//! the agent, which kills the worker's whole process group at every end of a check (it starts the
+//! worker as a group leader, and the command and its children stay in that group unless one calls
+//! `setsid`): `zigbox_probes.zig`. Not in `zcube-agent --help`: it is the agent's, not an
+//! operator's.
 
 const std = @import("std");
 const assert = std.debug.assert;
