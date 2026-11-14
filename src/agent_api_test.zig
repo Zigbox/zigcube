@@ -214,6 +214,27 @@ test "a lease that has ended is ZC-E0205, for a keepalive and for a registration
     try rig.refused(rig.call("POST", keepalive, "", ""), 503, "ZC-E0205");
 }
 
+test "a node may not renew or register on the lease of another node's registration (B7)" {
+    // Goal: a node certificate keeps its own node alive and no other. Method: node1 registers on
+    // its lease; node2 renews that lease (ZC-E0205: node2 is not registered on it) and registers
+    // on it (ZC-E0104); node1 renews it and registers on it again.
+    var rig = try Rig.start(3);
+    defer rig.stop();
+    const lease = try rig.grant("node1");
+    var buffer: [512]u8 = undefined;
+    const body = try register_text(&buffer, lease);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node1", "", body);
+    var path: [96]u8 = undefined;
+    const theirs = try keepalive_path(&path, lease); // Node2's path.
+    try rig.refused(rig.call("POST", theirs, "", ""), 503, "ZC-E0205");
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", body), 400, "ZC-E0104");
+    const own = try std.fmt.bufPrint(&path, "/v1/agent/nodes/node1/lease/{d}/keepalive", .{lease});
+    _ = try rig.ok("POST", own, "", "");
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node1", "", body);
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/", "");
+    try testing.expectEqual(@as(usize, 1), field(listed, "kvs").array.items.len);
+}
+
 test "a request the endpoints cannot understand is ZC-E0104 or ZC-E0101 and writes nothing" {
     // Goal: the negative space of the routes and bodies. Method: one malformed request per rule,
     // and check that the store's revision did not move.

@@ -711,8 +711,21 @@ fn open_tls(
     }
     const cert = tls.cert orelse
         return api_tls_client.refuse_no_identity(diag, peer.where, stored_problem);
-    try credentials.load_identity(io, cert, tls.key.?, diag);
-    try credentials.require_node(cert, config.node, now_ms, diag);
+    credentials.load_identity(io, cert, tls.key.?, diag) catch |err| {
+        diag.cause("the stored node.crt was not used either: {s}", .{stored_problem});
+        return err;
+    };
+    credentials.require_node(cert, config.node, now_ms, diag) catch |err| {
+        diag.cause("the stored node.crt was not used either: {s}", .{stored_problem});
+        return err;
+    };
+    if (peer.node_certificate != null) {
+        var buffer: [256]u8 = undefined;
+        const note = std.fmt.bufPrint(&buffer, "zcube-agent: the stored node.crt is not " ++
+            "presented ({s}); presenting --cert until the next renewal\n", .{stored_problem}) catch
+            "zcube-agent: the stored node.crt is not presented; presenting --cert\n";
+        std.Io.File.stderr().writeStreamingAll(io, note) catch {}; // Only a note.
+    }
     return credentials;
 }
 
