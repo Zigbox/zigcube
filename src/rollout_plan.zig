@@ -855,6 +855,22 @@ test "rollout plan: every edge of pause, resume and begin" {
     try testing.expectEqual(Phase.rolling_back, begin(&short, .rollback, true, now).phase);
 }
 
+test "rollout plan: a resume saturates a deadline at the end of time" {
+    // Goal: a deadline read from the store may be any u64, and a resume after a user's pause
+    // moves it later: it stops at the largest one instead of overflowing. Method: a paused
+    // rollout whose deadline is near the end, resumed after a pause longer than what is left.
+    const policy: Policy = .{};
+    const max = std.math.maxInt(u64);
+    var held = state_in(.paused);
+    held.deadline_at_ms = max - 10;
+    const now = held.paused_at_ms.? + 1_000;
+    const resumed_state = try resume_rollout(&policy, &held, now);
+    try testing.expectEqual(max, resumed_state.deadline_at_ms);
+    held.paused_by = .failure;
+    const late = try resume_rollout(&policy, &held, max - 5);
+    try testing.expectEqual(max, late.deadline_at_ms);
+}
+
 test "rollout plan: a resumed failure is judged on new evidence only" {
     // Goal: a rollout paused for a failure (on_failure pause) and resumed goes on, and is not
     // failed again on the evidence it was paused for: a held replica, a passed restart bound, a
