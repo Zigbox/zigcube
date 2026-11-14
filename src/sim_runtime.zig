@@ -106,6 +106,14 @@ const Container = struct {
     cert: ?Cert = null,
     /// The clock reading (simulation ms) before which the supervisor does not ask again.
     cert_ask_ms: u64 = 0,
+    /// C4 slice 3: a service replica's mesh key (0: none made yet) and the certificate its
+    /// supervisor holds for it (sim_mesh_certs.zig); both live in the supervisor's memory, so they
+    /// go with the container. A renewal makes a new key.
+    mesh_key: u64 = 0,
+    mesh_cert: ?MeshCert = null,
+    mesh_ask_ms: u64 = 0,
+    /// The certificate expired unrenewed: the replica is off the mesh (ZC-W0703) until a renewal.
+    mesh_down: bool = false,
     /// Relayed connections open now through the relay, each on the run's certificate. Every
     /// ending closes them with the listener (`end`).
     conns: u32 = 0,
@@ -125,6 +133,9 @@ pub const relay_cancel_ms_max: u64 = 2 * constants.relay_poll_ms;
 
 /// A run's certificate as its supervisor keeps it: the placement epoch it names and its end.
 pub const Cert = struct { epoch: u64, not_after_ms: u64 };
+
+/// A replica's mesh certificate as its supervisor keeps it.
+pub const MeshCert = struct { epoch: u64, key: u64, not_before_ms: u64, not_after_ms: u64 };
 
 const Change = struct {
     handle: runtime.Handle,

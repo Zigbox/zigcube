@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0706 · Zigcube</title>
-<meta name="description" content="the server refused a relayed run's certificate">
+<meta name="description" content="the server refused a workload certificate">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0706.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,11 +73,11 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0706</h1>
-<p class="summary">the server refused a relayed run's certificate</p>
+<p class="summary">the server refused a workload certificate</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
-<p>A relayed job's supervisor made a key for the run, and the agent asked the server to sign it. The server signs only for the node that holds the job's current claim, at the claim's placement epoch, for an image that matches the job's, while the run has not ended. It refused: the cause says which check failed (not this node's claim, a stale epoch, the run has ended, a different image).</p>
-<p>The relay stays closed: the job's connections to it are closed without reaching the upstream, and the line is in the job's `relay.log`. This is what a run that lost its claim (the node was cut off, the job was placed elsewhere, or it was cancelled) should see, and needs no action. If it repeats for a run that is still this node's, check `zcube job status` for the claim and compare the agent's and the server's versions.</p>
+<p>A relayed job's or a service replica's supervisor made a key, and the agent asked the server to sign it. For a relayed run the server signs only for the node that holds the job's current claim, at the claim's placement epoch, for an image that matches the job's, while the run has not ended. For a service replica (`/service/&lt;name&gt;`) it signs only for the node the replica is assigned to, at the assignment's epoch, for the digest the replica runs. It refused: the cause names the run, or the replica and its service, and which check failed (not this node's, a stale epoch, the run has ended or the replica is gone, a different image).</p>
+<p>A relay stays closed: the job's connections to it are closed without reaching the upstream, and the line is in the job's `relay.log`. A replica gets no new mesh certificate; it keeps running, and when the one it holds expires it is off the mesh (ZC-W0703). This is what a run or replica that moved (the node was cut off, it was placed elsewhere, cancelled or replaced) should see, and needs no action. If it repeats for one that is still this node's, check `zcube job status` or `zcube why replica`, and compare the agent's and the server's versions.</p>
 <p>Two causes are not final: no node has claimed the run yet, or the claim has not started it. The server then answers 503, not 409, and the agent asks again by itself; it marks the run refused only on a 409.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

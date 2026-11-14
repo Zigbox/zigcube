@@ -58,6 +58,7 @@ const job_api = @import("job_api.zig");
 const job_retention = @import("job_retention.zig");
 const runtime = @import("runtime.zig");
 const sim_certs = @import("sim_certs.zig");
+const sim_mesh_certs = @import("sim_mesh_certs.zig");
 const sim_jobs = @import("sim_jobs.zig");
 const sim_jobs_watch = @import("sim_jobs_watch.zig");
 const sim_runtime = @import("sim_runtime.zig");
@@ -147,7 +148,11 @@ const broken_digest = "b3:00ff" ++ repeat('0', 55).* ++ "e1";
 /// A relayed job's image is a full digest (B4: its certificate attests it).
 const relay_digest = "b3:" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++
     "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03";
-const fixtures = [_][]const u8{ hello_digest, next_digest, relay_digest };
+/// C4 slice 3: in the strong world a service's image is a full digest (its replicas'
+/// certificates attest it): `hello_digest` becomes `relay_digest` and `next_digest` this one.
+const next_full_digest = "b3:" ++ "9d20c4f1" ++ "9d20c4f1" ++ "9d20c4f1" ++ "9d20c4f1" ++
+    "9d20c4f1" ++ "9d20c4f1" ++ "9d20c4f1" ++ "9d20c4f1";
+const fixtures = [_][]const u8{ hello_digest, next_digest, relay_digest, next_full_digest };
 const images = [_][]const u8{ hello_digest, next_digest, broken_digest };
 const service_names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
 
@@ -865,6 +870,8 @@ pub const Cluster = struct {
     jobs: sim_jobs.State,
     /// B4 slice 3: relayed runs' certificates and connections (`sim_certs.zig`), strong runs.
     certs: sim_certs.State,
+    /// C4 slice 3: service replicas' certificates (`sim_mesh_certs.zig`), strong runs.
+    mesh: sim_mesh_certs.State,
     /// J4: the client that follows the job endings through the watch, and its own random stream.
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
@@ -980,6 +987,7 @@ pub const Cluster = struct {
         c.checked_dropped = 0;
         c.i6_violations = 0;
         c.i7_revision = 0;
+        c.mesh = .init(c.seed);
     }
 
     /// The state sim-c1 keeps (`Options.c1` turns the checks on).
@@ -1197,6 +1205,7 @@ pub const Cluster = struct {
             c.mend_links();
             c.settle();
             if (c.jobs_on and c.strong) c.supervise_certs();
+            if (c.strong) c.supervise_mesh();
             if (c.jobs_on) c.watch_client();
             // The wedge totals J1, J6 and J8 judge by are kept whenever jobs are on,
             // not only under c1: a plain run judges the same bounds.
@@ -1233,6 +1242,13 @@ pub const Cluster = struct {
         if (store_faulty(c)) return;
         const ctx = c.certs_context();
         sim_certs.supervise(&c.certs, &ctx, c.nodes, &c.net);
+    }
+
+    /// C4 slice 3: one tick of the service replicas' supervisors (`sim_mesh_certs.supervise`).
+    fn supervise_mesh(c: *Cluster) void {
+        if (store_faulty(c)) return;
+        const ctx = c.certs_context();
+        sim_mesh_certs.supervise(&c.mesh, &ctx, c.nodes, &c.net);
     }
 
     /// The context the certificate model reads the store through: the tap's memory store, the
@@ -1440,7 +1456,7 @@ pub const Cluster = struct {
         const ctx = c.controller_context();
         _ = apply_mod.apply(&ctx, &c.api_source, .{
             .name = name,
-            .image = image,
+            .image = if (c.strong) full_digest(image) else image,
             .replicas = replicas,
             .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
             .applied_by = "alex@laptop",
@@ -2346,6 +2362,13 @@ fn replica_has_decisions(
 }
 
 /// The store is down, or about to be: reads would fail and would use up the countdown.
+/// The full digest a strong world's service runs in place of a short one (`next_full_digest`).
+fn full_digest(image: []const u8) []const u8 {
+    if (std.mem.eql(u8, image, hello_digest)) return relay_digest;
+    if (std.mem.eql(u8, image, next_digest)) return next_full_digest;
+    return image;
+}
+
 fn store_faulty(c: *const Cluster) bool {
     if (c.switched.fail_after != null) return true;
     return c.switched.down;
@@ -2362,6 +2385,8 @@ fn safety(c: *Cluster) Failure!void {
     try track_excess(c);
     try track_fencing(c);
     try track_jobs(c);
+    // C4 slice 3: M3 and M6, judged at each issue (`sim_mesh_certs.zig`).
+    try check(c, c.mesh.violation == null, c.mesh.violation orelse "");
 }
 
 /// I3 (docs/authority.md §3): no container runs on a node the server has given up on for longer
@@ -3492,7 +3517,23 @@ fn print_summary(c: *Cluster) void {
         });
     }
     if (c.jobs_on) print_jobs(c);
+    if (c.strong) print_mesh(c);
     report.print("world hash: {x:0>16}\n", .{world_hash(c)});
+}
+
+/// C4 slice 3's line: service certificates asked, issued, renewed and expired (ZC-W0703).
+fn print_mesh(c: *Cluster) void {
+    const mesh = &c.mesh;
+    c.report.print("mesh: asks={d} issued={d} renewed={d} refused={d} unread={d} " ++
+        "expired={d} recovered={d} forged={d} forged issued={d}\n", .{
+        mesh.asks,    mesh.issued,    mesh.renewed, mesh.refused,       mesh.unread,
+        mesh.expired, mesh.recovered, mesh.forged,  mesh.forged_issued,
+    });
+    c.report.print("mesh: refused by", .{});
+    for (mesh.by_reason, 0..) |count, index| {
+        c.report.print(" {s}={d}", .{ sim_mesh_certs.reason_name(index), count });
+    }
+    c.report.print("\n", .{});
 }
 
 fn print_jobs(c: *Cluster) void {

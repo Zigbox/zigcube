@@ -1,4 +1,4 @@
-error[ZC-E0706]: the server refused a relayed run's certificate
+error[ZC-E0706]: the server refused a workload certificate
   cause  the server refused a certificate for job ingest-7: a stale epoch
   fix    none needed if the run lost its claim
   more   zcube explain E0706 · rerun with --verbose for the full cause chain

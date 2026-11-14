@@ -1771,21 +1771,26 @@ pub const registry = [_]Entry{
         .code = .E0706,
         .severity = .@"error",
         .blame = .environment,
-        .summary = "the server refused a relayed run's certificate",
+        .summary = "the server refused a workload certificate",
         .explanation =
-        \\A relayed job's supervisor made a key for the run, and the agent asked the
-        \\server to sign it. The server signs only for the node that holds the job's
-        \\current claim, at the claim's placement epoch, for an image that matches
-        \\the job's, while the run has not ended. It refused: the cause says which
-        \\check failed (not this node's claim, a stale epoch, the run has ended, a
-        \\different image).
+        \\A relayed job's or a service replica's supervisor made a key, and the agent
+        \\asked the server to sign it. For a relayed run the server signs only for
+        \\the node that holds the job's current claim, at the claim's placement
+        \\epoch, for an image that matches the job's, while the run has not ended.
+        \\For a service replica (`/service/<name>`) it signs only for the node the
+        \\replica is assigned to, at the assignment's epoch, for the digest the
+        \\replica runs. It refused: the cause names the run, or the replica and its
+        \\service, and which check failed (not this node's, a stale epoch, the run
+        \\has ended or the replica is gone, a different image).
         \\
-        \\The relay stays closed: the job's connections to it are closed without
-        \\reaching the upstream, and the line is in the job's `relay.log`. This is
-        \\what a run that lost its claim (the node was cut off, the job was placed
-        \\elsewhere, or it was cancelled) should see, and needs no action. If it
-        \\repeats for a run that is still this node's, check `zcube job status` for
-        \\the claim and compare the agent's and the server's versions.
+        \\A relay stays closed: the job's connections to it are closed without
+        \\reaching the upstream, and the line is in the job's `relay.log`. A replica
+        \\gets no new mesh certificate; it keeps running, and when the one it holds
+        \\expires it is off the mesh (ZC-W0703). This is what a run or replica that
+        \\moved (the node was cut off, it was placed elsewhere, cancelled or
+        \\replaced) should see, and needs no action. If it repeats for one that is
+        \\still this node's, check `zcube job status` or `zcube why replica`, and
+        \\compare the agent's and the server's versions.
         \\
         \\Two causes are not final: no node has claimed the run yet, or the claim has
         \\not started it. The server then answers 503, not 409, and the agent asks

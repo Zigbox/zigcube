@@ -57,6 +57,7 @@ const Context = controller.Context;
 const peer = @import("peer.zig");
 const peer_ca = @import("peer_ca.zig");
 const job_cert = @import("job_cert.zig");
+const service_cert = @import("service_cert.zig");
 const x509 = @import("x509.zig");
 
 /// The route failed and `ctx.diag` says why. Same set as `api.zig`'s, so `try` passes it up.
@@ -359,6 +360,11 @@ const Call = struct {
 
     fn replicas(call: Call) Failure!Reply {
         const ctx = call.ctx;
+        if (std.mem.eql(u8, call.method, "POST")) {
+            try call.only_known();
+            const id = call.parts.next() orelse return no_such(ctx, "that path");
+            return call.replica_certificate(id);
+        }
         try call.require_method("GET");
         try call.only_known();
         try call.no_more();
@@ -519,16 +525,64 @@ const Call = struct {
     /// check until B7 (docs/mtls.md, threat list).
     fn run_certificate(call: Call, name: []const u8) Failure!Reply {
         const ctx = call.ctx;
-        const tail = call.parts.next() orelse return no_such(ctx, "that path");
-        if (!std.mem.eql(u8, tail, "certificate")) return no_such(ctx, "that path");
-        try call.no_more();
+        try call.certificate_path("a run's certificate");
         if (records.name_problem(name, constants.service_name_bytes_max) != null) {
             return bad_request(ctx, "name", "is not a valid job name");
         }
-        const ca = call.ca orelse return no_such(ctx, "a run's certificate: this server has no CA");
-        if (call.cluster.len == 0) {
-            return no_such(ctx, "a run's certificate: this server names no cluster");
+        const ca = call.ca.?;
+        const asked = try call.certificate_ask(ca);
+        const subject = try call.certificate_subject(name, asked.ask);
+        return call.certificate_reply(ca, &.{
+            .cluster = call.cluster,
+            .path = .job,
+            .name = subject.name,
+            .subject_key = asked.subject_key,
+            .identity = subject.identity_of(),
+            .lifetime = subject.lifetime,
+        });
+    }
+
+    // ---- POST /v1/agent/nodes/{node}/replicas/{id}/certificate ----
+
+    /// Signs a service replica's key (C4 slice 3): `spiffe://<cluster>/service/<service>`, the
+    /// replica's digest and placement epoch, valid `workload_cert_ttl_ms`. `service_cert.decide`
+    /// says whether this node may have it; a refusal is ZC-E0706 with a cause that names the
+    /// service. Not authenticated beyond the assignment check until B7 (docs/mtls.md, T5).
+    fn replica_certificate(call: Call, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        try call.certificate_path("a replica's certificate");
+        if (records.name_problem(id, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "id", "is not a valid replica id");
         }
+        const ca = call.ca.?;
+        const asked = try call.certificate_ask(ca);
+        const subject = try call.replica_subject(id, asked.ask);
+        return call.certificate_reply(ca, &.{
+            .cluster = call.cluster,
+            .path = .service,
+            .name = subject.service,
+            .subject_key = asked.subject_key,
+            .identity = subject.identity_of(),
+            .lifetime = subject.lifetime,
+        });
+    }
+
+    /// The rest of a certificate's path is `certificate`, and this server can sign: it has a CA
+    /// and names its cluster.
+    fn certificate_path(call: Call, comptime what: []const u8) Failure!void {
+        const ctx = call.ctx;
+        const tail = call.parts.next() orelse return no_such(ctx, "that path");
+        if (!std.mem.eql(u8, tail, "certificate")) return no_such(ctx, "that path");
+        try call.no_more();
+        if (call.ca == null) return no_such(ctx, what ++ ": this server has no CA");
+        if (call.cluster.len == 0) return no_such(ctx, what ++ ": this server names no cluster");
+    }
+
+    const Asked = struct { ask: job_cert.Ask, subject_key: [32]u8 };
+
+    /// The body of a certificate request, `{public_key, epoch, image_digest}`, and the CA's time.
+    fn certificate_ask(call: Call, ca: *const peer_ca.Ca) Failure!Asked {
+        const ctx = call.ctx;
         const limits: BodyLimits = .{
             .bytes_max = constants.peer_join_request_bytes_max,
             .ignore_unknown_fields = false,
@@ -537,26 +591,31 @@ const Call = struct {
         const subject_key = try hex32(ctx, "public_key", input.public_key);
         const digest = try hex32(ctx, "image_digest", input.image_digest);
         if (input.epoch == 0) return bad_request(ctx, "epoch", "must not be 0");
-        const now_ms = ca.wall.now_ms();
-        const subject = try call.certificate_subject(name, .{
-            .node = call.node,
-            .epoch = input.epoch,
-            .image_digest = digest,
-            .now_ms = now_ms,
-        });
-        var der: x509.Der = undefined;
-        ca.issue_job_certificate(&der, &.{
-            .cluster = call.cluster,
-            .name = subject.name,
+        return .{
+            .ask = .{
+                .node = call.node,
+                .epoch = input.epoch,
+                .image_digest = digest,
+                .now_ms = ca.wall.now_ms(),
+            },
             .subject_key = subject_key,
-            .identity = subject.identity_of(),
-            .lifetime = subject.lifetime,
-        }) catch |err| switch (err) {
+        };
+    }
+
+    /// Signs what the rule decided and replies `{certificate, not_before_ms, not_after_ms}`.
+    fn certificate_reply(
+        call: Call,
+        ca: *const peer_ca.Ca,
+        args: *const peer_ca.DecidedArgs,
+    ) Failure!Reply {
+        const ctx = call.ctx;
+        var der: x509.Der = undefined;
+        ca.issue_decided_certificate(&der, args) catch |err| switch (err) {
             error.BadKey => return bad_request(ctx, "public_key", "is not an Ed25519 public key"),
             else => {
                 ctx.diag.raise(peer_ca.code_of(err));
-                ctx.diag.cause("the certificate for job {s} could not be made: {s}", .{
-                    name, peer_ca.reason(err),
+                ctx.diag.cause("the certificate for {s} {s} could not be made: {s}", .{
+                    @tagName(args.path), args.name, peer_ca.reason(err),
                 });
                 return error.Failed;
             },
@@ -564,9 +623,47 @@ const Call = struct {
         return reply(ctx, .{
             .certificate = std.fmt.allocPrint(ctx.arena, "{x}", .{der.slice()}) catch
                 return no_memory(ctx),
-            .not_before_ms = subject.lifetime.not_before_ms,
-            .not_after_ms = subject.lifetime.not_after_ms,
+            .not_before_ms = args.lifetime.not_before_ms,
+            .not_after_ms = args.lifetime.not_after_ms,
         });
+    }
+
+    /// The replica's assignment on this node, then its `/replicas` record, both at one revision,
+    /// and `service_cert.decide` over them. The assignment names the service, so a replica that
+    /// is not assigned here is refused without reading `/replicas`.
+    fn replica_subject(
+        call: Call,
+        id: []const u8,
+        ask: job_cert.Ask,
+    ) Failure!service_cert.Subject {
+        const ctx = call.ctx;
+        const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
+        const assigned_key = records.assigned_key(call.node, id);
+        const found = ctx.store.get(ctx.arena, assigned_key.slice(), head.revision, ctx.diag) catch
+            return propagate(ctx);
+        const kv = found.kv orelse
+            return refused_replica_certificate(ctx, id, "", error.wrong_node);
+        const placed = records.read(records.Assigned, ctx.arena, kv, ctx.diag) catch
+            return propagate(ctx);
+        if (placed.job != null or placed.service.len == 0) {
+            return refused_replica_certificate(ctx, id, "", error.wrong_node);
+        }
+        const replica_key = records.replica_key(placed.service, id);
+        const held = ctx.store.get(ctx.arena, replica_key.slice(), head.revision, ctx.diag) catch
+            return propagate(ctx);
+        const replica: ?records.Replica = if (held.kv) |replica_kv|
+            records.read(records.Replica, ctx.arena, replica_kv, ctx.diag) catch
+                return propagate(ctx)
+        else
+            null;
+        const assignment: service_cert.Assignment = .{
+            .node = call.node,
+            .service = placed.service,
+            .epoch = kv.mod_revision,
+        };
+        const ttl_ms = constants.workload_cert_ttl_ms;
+        return service_cert.decide(replica, assignment, ask, ttl_ms) catch |refusal|
+            refused_replica_certificate(ctx, id, placed.service, refusal);
     }
 
     /// The job, its status, this node's claim and the run's assignment, read at one revision,
@@ -1316,6 +1413,30 @@ fn refused_certificate(ctx: *const Context, name: []const u8, refusal: job_cert.
     // No claim yet, or a claim not yet reported running: the run may still get there, so the
     // agent asks again (503) rather than marking it refused (docs/api.md).
     ctx.diag.settling = refusal == error.no_claim or refusal == error.not_started;
+    return error.Failed;
+}
+
+/// ZC-E0706 for a service replica: the cause names the service when the assignment does, and
+/// is `service_cert.reason`. A refusal is final for that ask: the agent asks again only with a
+/// newer epoch or digest (docs/api.md).
+fn refused_replica_certificate(
+    ctx: *const Context,
+    id: []const u8,
+    service: []const u8,
+    refusal: service_cert.Refusal,
+) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0706);
+    if (service.len > 0) {
+        ctx.diag.cause("the server refused a certificate for replica {s} of service {s}: {s}", .{
+            id, service, service_cert.reason(refusal),
+        });
+    } else {
+        ctx.diag.cause("the server refused a certificate for replica {s}: {s}", .{
+            id, service_cert.reason(refusal),
+        });
+    }
+    ctx.diag.fix(.{ .sentence = "none needed if the replica moved or was replaced" });
     return error.Failed;
 }
 

@@ -561,4 +561,20 @@ imply `strong`, run with or without `--c1`, and are in the fleet's canary list. 
 replay line names its own runner and `--strong`.
 `docs/decisions/2026-11-13-b4-slice3-sim-certs.md`, `docs/decisions/2026-11-13-b4-slice3-fixes.md`.
 
+C4 slice 3 adds service certificates to the strong world (`src/sim_mesh_certs.zig`). Every
+running service replica's supervisor makes a key and asks for its certificate
+(`service_cert.decide`, with a 20 s ttl in place of the server's hour so runs reach renewal),
+renews at half-life with a new key, and counts a certificate that expires unrenewed as ZC-W0703
+(the replica keeps running). Forged asks (an earlier epoch, another node, another image) must be
+refused. Two checks, judged at each issue against records the checker reads itself: M3 (the
+certificate names the service, digest and epoch of a replica current and assigned to the asking
+node at the issue revision) and M6 (its digest is the replica's, and no key is certified for two
+replicas or digests). In the strong world a service's image is a full digest
+(`sim_cluster.full_digest`; the draws are unchanged). The report's `mesh:` lines count asks,
+issues, renewals, expiries and refusals by reason. The teeth are `sim-c1-teeth-mesh_issue_stale`
+(the issuer skips the epoch compare; M3, "a certificate was issued for a stale epoch") and
+`mesh_reuse_key` (a new replica takes the key last made for its service on its node; M6, "a key
+was certified for two"); both imply `strong` and are in the canary list until slice 5 brings
+sim-c4. `docs/decisions/2026-11-14-c4-service-certs.md`.
+
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.

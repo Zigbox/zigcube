@@ -145,6 +145,10 @@ pub const mesh_ports_default_first: u16 = 30_000;
 pub const mesh_ports_default_last: u16 = 30_999;
 /// A replica's endpoint in `/observed`: `<node address>:<port>`.
 pub const mesh_endpoint_bytes_max: u32 = 256 + ":65535".len;
+/// The lifetime of a service replica's certificate (C4 slice 3, owner answer O8): the supervisor
+/// renews at half of it with a fresh key; one not renewed by its `not_after` takes the replica
+/// off the mesh (ZC-W0703) but does not stop it.
+pub const workload_cert_ttl_ms: u64 = 60 * 60 * 1000;
 
 comptime {
     assert(mesh_address_min > 0);
@@ -155,6 +159,9 @@ comptime {
     assert(service_allow_max <= services_max);
     // Every replica a node may hold gets a port of the default range (the brief, O9).
     assert(mesh_ports_default_last - mesh_ports_default_first + 1 >= agent_node_replicas_max);
+    assert(workload_cert_ttl_ms <= x509_leaf_ttl_ms_max);
+    // X.509 times are whole seconds, and half of the lifetime is a whole second too.
+    assert(workload_cert_ttl_ms % 2000 == 0);
 }
 
 /// Generations of a service `/history` keeps (owner,

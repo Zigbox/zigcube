@@ -1503,6 +1503,23 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "R7",
     },
     .{
+        .name = "mesh_issue_stale",
+        .root = "src/sim_c1_teeth_mesh_issue_stale_main.zig",
+        // M3 (C4 slice 3): the issuer does not compare the ask's epoch, and a forged ask for an
+        // earlier epoch of a service replica gets a certificate. Strong world, plain runs too.
+        .symptom = "M3: a certificate was issued for a stale epoch",
+        .canary_seeds = 20,
+        .plain_symptom = "M3: a certificate was issued for a stale epoch",
+    },
+    .{
+        .name = "mesh_reuse_key",
+        .root = "src/sim_c1_teeth_mesh_reuse_key_main.zig",
+        // M6: a new replica takes the key last made for its service on its node.
+        .symptom = "M6: a key was certified for two",
+        .canary_seeds = 20,
+        .plain_symptom = "M6: a key was certified for two",
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         // J11 (a run that exited without a node starting it); the reuse world

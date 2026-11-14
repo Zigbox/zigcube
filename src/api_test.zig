@@ -1429,3 +1429,95 @@ test "a relayed run's certificate: issued to its claim, refused (ZC-E0706) to an
     try rig.refused(post_job(&rig, path, late), 409, "ZC-E0706");
     try rig.refused(post_job(&rig, path, "{\"epoch\":1}"), 400, "ZC-E0104");
 }
+
+/// Writes replica `web-1` of service web (image `relay_image`) and its assignment to `node`;
+/// returns the assignment's revision, the placement epoch.
+fn place_replica(rig: *Rig, node: []const u8) !u64 {
+    const arena = rig.parsed.allocator();
+    const replica = try std.json.Stringify.valueAlloc(arena, records.Replica{
+        .id = "web-1",
+        .service = "web",
+        .generation = 1,
+        .image = relay_image,
+        .command = &.{"serve"},
+    }, .{});
+    const assigned = try std.json.Stringify.valueAlloc(arena, records.assigned_replica(
+        "web-1",
+        "web",
+        .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        "test",
+    ), .{});
+    const replica_key = records.replica_key("web", "web-1");
+    const assigned_key = records.assigned_key(node, "web-1");
+    const writes = [_]store.Op{
+        .{ .put = .{ .key = replica_key.slice(), .value = replica } },
+        .{ .put = .{ .key = assigned_key.slice(), .value = assigned } },
+    };
+    rig.world.diag.reset();
+    const placed = try rig.world.store_handle().txn(.{ .on_success = &writes }, &rig.world.diag);
+    return @intCast(placed.revision);
+}
+
+fn refused_replica(rig: *Rig, path: []const u8, body: []const u8) !void {
+    const response = post_job(rig, path, body);
+    try rig.refused(response, 409, "ZC-E0706");
+    try testing.expect(std.mem.indexOf(u8, response.body, "replica web-") != null);
+}
+
+test "a service replica's certificate: issued to its assignment, refused (ZC-E0706) otherwise" {
+    // Goal: C4 slice 3's issuance over the agent API. Method: write a replica and its
+    // assignment, ask as node1 under the assignment's revision and parse a /service/ workload
+    // certificate valid workload_cert_ttl_ms; then ask under an older epoch, with another digest,
+    // as node2, for a replica that does not exist and after the replica is deleted: each is 409
+    // ZC-E0706 and the cause names the replica.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    var clock = rig.world.manual.clock();
+    const ca: peer_ca.Ca = .{
+        .key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7)),
+        .revoked = .{},
+        .wall = clock,
+    };
+    _ = &clock;
+    rig.api.ca = &ca;
+    rig.api.cluster = "test.cluster";
+    const digest = relay_image["b3:".len..];
+    const key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9)))
+        .public_key.toBytes();
+    const path = "/v1/agent/nodes/node1/replicas/web-1/certificate";
+    const epoch = try place_replica(&rig, "node1");
+    const ok = post_job(&rig, path, try certificate_body(&rig, epoch, digest, key));
+    if (ok.status != 200) std.debug.print("{s}\n", .{ok.body});
+    try testing.expectEqual(@as(u16, 200), ok.status);
+    const answer = try rig.json(ok);
+    var der: [constants.x509_cert_bytes_max]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&der, field(answer, "certificate").string);
+    var detail: x509.Detail = .{};
+    const cert = try x509.parse_profile(bytes, .cluster, &detail);
+    try testing.expectEqualSlices(u8, &key, cert.public_key.of(bytes));
+    try testing.expect(std.mem.indexOf(u8, bytes, "spiffe://test.cluster/service/web") != null);
+    const lifetime = field(answer, "not_after_ms").integer - field(answer, "not_before_ms").integer;
+    try testing.expectEqual(@as(i64, constants.workload_cert_ttl_ms), lifetime);
+
+    // An epoch the assignment never had (ahead: the first write is revision 1, so behind is 0).
+    const stale = try certificate_body(&rig, epoch + 1, digest, key);
+    const refused = post_job(&rig, path, stale);
+    try rig.refused(refused, 409, "ZC-E0706");
+    try testing.expect(std.mem.indexOf(u8, refused.body, "of service web") != null);
+    const zeros: [64]u8 = @splat('0');
+    try refused_replica(&rig, path, try certificate_body(&rig, epoch, &zeros, key));
+    const node2 = "/v1/agent/nodes/node2/replicas/web-1/certificate";
+    try refused_replica(&rig, node2, try certificate_body(&rig, epoch, digest, key));
+    const nope = "/v1/agent/nodes/node1/replicas/web-9/certificate";
+    try refused_replica(&rig, nope, try certificate_body(&rig, epoch, digest, key));
+    // Moved: the same replica assigned again at a later revision; the old epoch is stale.
+    const moved = try place_replica(&rig, "node1");
+    try testing.expect(moved > epoch);
+    try refused_replica(&rig, path, try certificate_body(&rig, epoch, digest, key));
+    const replica_key = records.replica_key("web", "web-1");
+    const gone = [_]store.Op{.{ .delete = replica_key.slice() }};
+    rig.world.diag.reset();
+    _ = try rig.world.store_handle().txn(.{ .on_success = &gone }, &rig.world.diag);
+    try refused_replica(&rig, path, try certificate_body(&rig, moved, digest, key));
+    try rig.refused(post_job(&rig, path, "{\"epoch\":1}"), 400, "ZC-E0104");
+}

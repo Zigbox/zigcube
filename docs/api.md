@@ -671,6 +671,7 @@ runs unchanged on the far side of HTTP:
 | `list(/job-runs/)`, filtered to the node's assignments (B1 slice 4) | `GET /v1/agent/nodes/{node}/runs` |
 | `get(/job-input/<name>)` | `GET /v1/agent/nodes/{node}/runs/{name}/input` |
 | (no store write: the CA signs a relayed run's key, B4) | `POST /v1/agent/nodes/{node}/runs/{name}/certificate` |
+| (no store write: the CA signs a service replica's key, C4 slice 3) | `POST /v1/agent/nodes/{node}/replicas/{id}/certificate` |
 | `list(/job-observed/<node>/)`; `txn` with one put there | `GET` / `POST /v1/agent/nodes/{node}/job-observed` |
 | (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
 
@@ -895,6 +896,26 @@ run yet (also what a node without a claim of its own sees), and the claim has no
 marks the run refused for a 503; it asks only for runs it knows the server holds as `running`, so
 a 503 is a narrow race. The call writes no store key. Like every agent endpoint it is unauthenticated
 until B7 (docs/mtls.md, "Issuance").
+
+### `POST /v1/agent/nodes/{node}/replicas/{id}/certificate` (C4 slice 3)
+
+A service replica's workload certificate, B4's issuance applied to services. The body is the
+run certificate's, `{"public_key": "<64 hex>", "epoch": N, "image_digest": "<64 hex>"}` (the key
+the replica's supervisor made, the placement epoch the agent runs the replica under and the
+digest it started). The server reads `/assigned/{node}/{id}` and then `/replicas/<service>/{id}`
+(the assignment names the service) at one revision, and `service_cert.decide` checks that the
+replica exists, is assigned to `{node}` at exactly that epoch (the assignment's `mod_revision`),
+and that the digest is the full `b3:` digest the replica runs. Then the cluster CA signs
+`spiffe://<cluster>/service/<service>` with the digest and epoch (no labels: services have none),
+valid for `workload_cert_ttl_ms` (1 hour) from the server's clock, and answers as the run
+certificate does. The supervisor asks again at half-life with a new key; a certificate that
+expires unrenewed takes the replica off the mesh (ZC-W0703), not out of service.
+
+Refusals: `404` and `400` as for a run's certificate (`id` is checked as a name); **`409`
+ZC-E0706** for every other refusal, final for that ask: the cause names the replica, its service
+when the assignment names one, and the check that failed (not assigned here, a stale epoch, a
+deleted replica, another digest). A newer assignment or digest is a new ask. The call writes no
+store key, and is unauthenticated until B7 (docs/mtls.md, T5).
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 

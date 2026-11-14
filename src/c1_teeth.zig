@@ -154,17 +154,28 @@ pub const job_reuse = declared("c1_teeth_job_reuse");
 /// container of the earlier job meets the new one. Not in `any`.
 pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 
+/// C4 slice 3's M3 tooth: service certificate issuance (`service_cert.decide`) does not compare
+/// the ask's placement epoch with the replica's current assignment, so a node certifies a replica
+/// under an epoch the store has moved past (must break M3).
+pub const mesh_issue_stale = declared("c1_teeth_mesh_issue_stale");
+
+/// C4 slice 3's M6 tooth: a node that starts a replica of a new digest keeps the key of the
+/// replica it replaces, as a supervisor that did not make a new key would (must break M6).
+pub const mesh_reuse_key = declared("c1_teeth_mesh_reuse_key");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
-    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak;
+    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
+    mesh_issue_stale or mesh_reuse_key;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
-    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak;
+    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
+    mesh_issue_stale or mesh_reuse_key;
 
 /// The runner a replay line names: the fault-on runner whose root switched a tooth on
 /// (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe` installs it), the burst world's own runner, or
@@ -210,4 +221,6 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_relay_conn_leak", "sim_c1_teeth_relay_conn_leak" },
     .{ "c1_teeth_job_cert_image", "sim_c1_teeth_job_cert_image" },
     .{ "c1_teeth_relay_stop_leak", "sim_c1_teeth_relay_stop_leak" },
+    .{ "c1_teeth_mesh_issue_stale", "sim_c1_teeth_mesh_issue_stale" },
+    .{ "c1_teeth_mesh_reuse_key", "sim_c1_teeth_mesh_reuse_key" },
 };
