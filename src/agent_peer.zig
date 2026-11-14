@@ -209,7 +209,7 @@ pub const Peer = struct {
         if (std.mem.endsWith(u8, code, "E0807")) {
             diag.raise(.E0807);
             diag.cause("zcube-server will not issue node {s} a peer credential", .{self.node});
-            diag.cause("the name is on the server's list of removed nodes", .{});
+            diag.cause("the name is on the server's list of removed names (revoked)", .{});
             const sentence = "if the node belongs here, take it off the server's revoked file, " ++
                 "then restart the server";
             diag.fix(.{ .sentence = sentence });

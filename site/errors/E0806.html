@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0806 · Zigcube</title>
-<meta name="description" content="a peer key or trust file can't be used">
+<meta name="description" content="a peer key, certificate or trust file can't be used">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0806.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,11 +73,12 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0806</h1>
-<p class="summary">a peer key or trust file can't be used</p>
+<p class="summary">a peer key, certificate or trust file can't be used</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>The server's CA key (ca*.key in its state directory), the list of removed nodes (revoked), or an agent's node key (peer.key), credential (peer.cred) or trusted CA key (ca.pub) could not be read, created, written or parsed, or its file or directory has permissions that let other users read a secret or write a trust file. Key files must be owned by the process, mode 0600, and hold one line of 64 hex digits; the state directory must not be writable by group or others. A revoked line must be a node name.</p>
-<p>The secret is never printed. If the file is damaged and there is a backup, put it back. An agent's files are caches: it ignores a damaged peer.cred or ca.pub and joins again by itself; delete peer.key to get a new node key. A server whose CA key is missing although its store has run refuses to start: put the key back, or start once with --new-ca to make a new CA on purpose (every agent then joins again by itself).</p>
+<p>The server's CA key (ca*.key in its state directory), the list of removed names (revoked), an agent's node key (peer.key), credential (peer.cred), node certificate (node.crt) or trusted CA key (ca.pub), or a file that zcube-server ca issue-client or issue-node writes (NAME.key, NAME.crt) could not be read, created, written or parsed, or its file or directory has permissions that let other users read a secret or write a trust file. Key files must be owned by the process, mode 0600; the state directory must not be writable by group or others. A revoked line must be a node or client name.</p>
+<p>The secret is never printed. If the file is damaged and there is a backup, put it back. An agent's files are caches: it ignores a damaged peer.cred, node.crt or ca.pub and joins or renews again by itself; delete peer.key to get a new node key. A server whose CA key is missing although its store has run refuses to start: put the key back, or start once with --new-ca to make a new CA on purpose (every agent then joins again by itself).</p>
+<p>ca issue-client and ca issue-node never make a CA: if the store has none, give the --store and --state-dir the server runs with, or start the server with this --store first. They never replace an existing NAME.key or NAME.crt unless run with --replace, which is how a certificate is re-issued.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0806</pre>

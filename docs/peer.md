@@ -187,8 +187,8 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
 | E0803 | the server's credential names another node than the one asked for |
 | E0804 | the handshake failed: malformed or tampered message, wrong version, bad transcript signature, weak key, or a cut stream |
 | E0805 | a record failed authentication, or a direction reached its record counter limit |
-| E0806 | (environment) the CA key or the node key could not be read, written or parsed |
-| E0807 | (user) a node was refused a credential because it was removed from the cluster |
+| E0806 | (user) a peer key, certificate or trust file (the CA key, the node key, `peer.cred`, `node.crt`, `ca.pub`, or a file `ca issue-client` or `ca issue-node` writes) could not be read, written or parsed |
+| E0807 | (user) a name on the removed list (`revoked`, node and client names alike) was refused a certificate |
 | E0808 | (user) a peer's handshake was refused: its address already has as many unfinished as one may, started too many in a window, or the table of addresses is full |
 
 ## Lifetime, renewal and removal

@@ -1,6 +1,6 @@
 request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
-error[ZC-E0807]: a node was refused a credential: it was removed
-  cause  node node3 is on the server's list of removed nodes
+error[ZC-E0807]: a name on the removed list was refused a certificate
+  cause  node node3 is on the server's list of removed names (revoked)
   reqid  r-0000001
   fix    remove its name from the revoked file, then restart zcube-server
   more   zcube explain E0807

@@ -44,16 +44,37 @@ The decision is in decisions/2026-11-04-x509-two-profiles.md.
   - It refuses an extension that appears twice and an unknown critical extension.
   - It requires serverAuth, a leaf (not a CA), and exactly one DNS name or SPIFFE ID.
 
-### Client certificates
+### Client and node certificates
 
-`zcube-server ca issue-client NAME --scope jobs|admin [--out DIR]`, given the `--store` (and
-`--state-dir`, or `--config`) the server runs with, signs a `client` certificate with that
-store's CA and writes `NAME.key` (Ed25519, PKCS#8 PEM, which openssl and the JDK read) and
-`NAME.crt` (PEM), both mode 0600, in `DIR` (default the working directory). The server need not
-run. It lives `x509_leaf_ttl_ms_max` (7 days). It never makes a CA: a store with no CA key yet
-is `ZC-E0806`, as is an existing `NAME.key` or `NAME.crt`, which it does not replace. A name in
-the server's `revoked` file is `ZC-E0807`: the file holds node and client names alike
-(decisions/2026-11-13-revoked-names-shared.md), and a revoked name stops being issued at once.
+`zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]` does the following:
+
+- **What it needs.** Give it the `--store` (and `--state-dir`, or `--config`) that the server runs
+  with. The server need not be running.
+- **What it writes.** It signs a `client` certificate with that store's CA and writes two files
+  in `DIR` (default: the working directory), both mode 0600:
+  - `NAME.key`: Ed25519, PKCS#8 PEM, which openssl and the JDK read.
+  - `NAME.crt`: PEM.
+
+`zcube-server ca issue-node NAME [--out DIR] [--replace]` writes a node's first `node`
+certificate and key the same way. The operator copies the two files to the node
+(decisions/2026-11-13-node-cert-bootstrap.md); the agent presents them as `--cert`/`--key`.
+
+Both commands follow the same rules:
+
+- **Lifetime.** Each certificate lives `x509_leaf_ttl_ms_max` (7 days), and there is no flag to
+  change it.
+- **Weekly re-issue.** A client, such as Botpike's app, must be re-issued weekly: run the command
+  again with `--replace`, by hand or from cron on the server host.
+- **Never a CA.** Neither command makes a CA. A store with no CA key yet is `ZC-E0806`: start the
+  server with that `--store` first.
+- **No overwrite without `--replace`.** Without it, an existing `NAME.key` or `NAME.crt` is
+  `ZC-E0806`. Both files are written under temporary names and renamed without overwriting, so a
+  failure leaves neither file. A run killed between the two renames leaves a lone `NAME.key`,
+  which a rerun with `--replace` replaces.
+- **Removed names.** A name in the server's `revoked` file is `ZC-E0807`. The file holds node and
+  client names alike (decisions/2026-11-13-revoked-names-shared.md), and a revoked name stops
+  being issued at once.
+
 A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`), so a
 certificate already issued stops working once its name is in `revoked`.
 

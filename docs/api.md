@@ -636,8 +636,19 @@ answers
 ```
 
 `node_certificate` (B7) is the node's X.509 certificate of kind `node` (docs/mtls.md) over the
-same key, valid as long as the credential. The agent requires it: a reply without it, or with
-one for another node, key, kind or CA, is a bad reply and nothing is stored.
+same key, valid as long as the credential. The agent requires it: a reply with one for another
+node, key, kind or CA is a bad reply and nothing is stored. A reply without it comes from a
+server older than the agent (`ZC-E0504`, "the answer has no node_certificate: the server is
+older than the agent; upgrade the server first"); the agent keeps the credential it holds.
+**Upgrade the server first,** then the agents.
+
+Until B7 slice 3 the endpoint is unauthenticated, and nothing accepts a node certificate yet.
+**Slice 3 acceptance item** (decisions/2026-11-13-node-cert-bootstrap.md): over `--listen` the
+endpoint issues a credential and node certificate for `{node}` only to a caller whose client
+certificate is of kind `node` and names `{node}`. It refuses no certificate, a client certificate
+of any scope, a workload or server certificate, and a node certificate for another node, each
+in a table test. A node's first certificate comes from `zcube-server ca issue-node NAME` on the
+server host. Over `--insecure-listen` (loopback only) the join stays as it is.
 
 The agent calls it again at half the credential's life. Refusals: `400` for a key that is not 64
 hex digits or not a point on the curve, or a node name that is not a node name; `ZC-E0807` for a
@@ -886,8 +897,8 @@ rest are about the agent's own host.
 | `ZC-E0508` | user | the container's command can't be run | the supervisor, as `start_failed` |
 | `ZC-E0509` | environment | the container's supervisor is gone | `FakeRuntime`, as `lost` |
 | `ZC-W0501` | environment | the agent's lease ended and it registered again | the agent, a warning |
-| `ZC-E0806` | user | a peer key or trust file can't be used | `zcube-server` and the agent at start |
-| `ZC-E0807` | user | the node was removed from the cluster and is refused a credential | the credential endpoint |
+| `ZC-E0806` | user | a peer key, certificate or trust file can't be used | `zcube-server` and the agent at start, `ca issue-client`, `ca issue-node` |
+| `ZC-E0807` | user | a name on the removed list was refused a certificate | the credential endpoint, `ca issue-client`, `ca issue-node` |
 | `ZC-E0809` | external | a certificate is malformed or outside the bounds (the field named) | the X.509 parser, for a peer's certificate |
 | `ZC-E0810` | external | a certificate is not signed by the pinned anchor | certificate verification |
 | `ZC-E0811` | external | a certificate is expired or not yet valid (both times shown) | certificate verification |

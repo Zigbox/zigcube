@@ -43,10 +43,11 @@ These arrive with the scaffold; keep this list current as they land.
   `--insecure-listen` serves plain HTTP on loopback only, as the caller `local`, which may call
   everything (B7 slice 3, docs/mtls.md "The API over TLS"; the harnesses and `zcube local` use it).
   `zcube` and `zcube-agent` take `--ca`, `--cert`, `--key` and `--tls-name` for TLS.
-  `zcube-server ca issue-client NAME --scope jobs|admin [--out DIR]` with the server's `--store`
-  (and `--state-dir`) writes a client certificate and key (0600) signed by that store's CA
-  (B7, docs/mtls.md); it never makes a CA. `zcube-server ca issue-node NAME [--out DIR]` writes a
-  node certificate for a new agent's `--cert`/`--key` (B7 slice 3; it may join and act as NAME only).
+  `zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]` with the server's
+  `--store` (and `--state-dir`) writes a client certificate and key (0600) signed by that store's
+  CA (B7, docs/mtls.md); `ca issue-node NAME` writes a node certificate for a new agent's
+  `--cert`/`--key` (it may join and act as NAME only). Each lives 7 days; re-issue with `--replace`
+  (without it an existing file is refused). Neither makes a CA.
 - `zig build test` runs unit and snapshot tests (tidy's own tests included). `-Dtest-filter=NAME` runs only tests whose name contains NAME (the run is cached: to repeat one, run the binary under `.zig-cache/o/*/test` directly). It installs `zcube-agent` first: the `FakeRuntime` tests start real processes, each container under `zcube-agent supervise`, and skip if `zig-out/bin/zcube-agent` (or `ZCUBE_AGENT_EXE`) is not there. A test that dies can leave processes behind; `pkill -9 -f '[z]cube-agent supervise'` removes them.
 - `zig build tidy` checks formatting and the mechanical style rules: 100 columns, 70-line functions, banned patterns, `catch unreachable` comments, no `and`/`or` inside `assert(...)`. Run it before every commit; CI does.
 - `zig build test-store -Dbackend=memory|sqlite|postgres [-Dseed=N]` runs the store conformance suite. It always re-runs with a fresh seed (Zig's per-run test seed), prints nothing when it passes, and a failing test prints `seed=N`; replay with `-Dseed=N`. SQLite needs `libsqlite3-dev`, Postgres `libpq-dev` (the session-start hook installs it).
