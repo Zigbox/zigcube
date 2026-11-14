@@ -103,7 +103,7 @@ pub fn open(
         return;
     };
     const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, path) catch |err| {
+    files.make_dir(io, path) catch |err| {
         const verb = "create the directory for";
         return files.unusable(diag, path, options.key_name, verb, @errorName(err));
     };
@@ -245,6 +245,10 @@ const TestDir = struct {
 
     fn make(io: std.Io) !TestDir {
         var dir: TestDir = .{ .tmp = std.testing.tmpDir(.{}) };
+        // `tmpDir` makes the directory under the runner's umask: under 002 (a user's login
+        // umask with a private group) it is group-writable, which `check_dir` refuses. Set the
+        // mode a state directory is meant to have, so no test depends on the umask.
+        try dir.tmp.dir.setFilePermissions(io, ".", .fromMode(0o700), .{});
         dir.path_length = @intCast(try dir.tmp.dir.realPath(io, &dir.path_buffer));
         return dir;
     }
@@ -275,7 +279,13 @@ test "the CA key is made once, kept across a restart, and a bad revoked file is 
     try std.testing.expectEqualSlices(u8, &first.public(), &second.public());
     try std.testing.expectEqual(@as(u32, 0), second.revoked.count);
 
-    try dir.tmp.dir.writeFile(io, .{ .sub_path = revoked_file, .data = "# out\nnode3\n" });
+    // Made 0600 whatever the umask: `read` refuses a revoked file other users can write.
+    const secret: std.Io.Dir.CreateFileOptions = .{ .permissions = .fromMode(0o600) };
+    try dir.tmp.dir.writeFile(io, .{
+        .sub_path = revoked_file,
+        .data = "# out\nnode3\n",
+        .flags = secret,
+    });
     try open_test(&dir, &second, .{ .quiet = true }, &diag);
     try std.testing.expect(second.revoked.contains(.node, "node3"));
 
@@ -563,6 +573,49 @@ const FixedClock = struct {
         return 1_000_000;
     }
 };
+
+test "the CA tests hold under a umask of 002" {
+    // Goal: no test here depends on the runner's umask; under 002 every one of them once failed
+    // in `check_dir`. Method: set the umask to 002 (process-wide, restored on exit), make a test
+    // directory and open a CA in it.
+    const linux = std.os.linux;
+    const umask_old = linux.syscall1(.umask, 0o002);
+    defer _ = linux.syscall1(.umask, umask_old);
+    const io = std.testing.io;
+    var dir = try TestDir.make(io);
+    defer dir.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    var ca: peer_ca.Ca = undefined;
+    try open_test(&dir, &ca, .{ .quiet = true }, &diag);
+    try std.testing.expect(diag.code == null);
+}
+
+test "a state directory the server creates is 0700 whatever the umask" {
+    // Goal: under a umask of 002 the server once created its state directory 0775 and then
+    // refused it (ZC-E0806). Method: under 002, open a CA in a directory two levels below the test
+    // directory that does not exist yet; it must start, and both new directories must be 0700.
+    const linux = std.os.linux;
+    const umask_old = linux.syscall1(.umask, 0o002);
+    defer _ = linux.syscall1(.umask, umask_old);
+    const io = std.testing.io;
+    var dir = try TestDir.make(io);
+    defer dir.tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state = try std.fmt.bufPrint(&path_buffer, "{s}/data/state", .{dir.path()});
+    var diag: Diag = undefined;
+    diag.reset();
+    var ca: peer_ca.Ca = undefined;
+    var clock = FixedClock{};
+    const gpa = std.testing.allocator;
+    try open(&ca, gpa, io, state, clock.clock(), .{ .quiet = true }, &diag);
+    try std.testing.expect(diag.code == null);
+    for ([_][]const u8{ "data", "data/state" }) |sub_path| {
+        const stat = try dir.tmp.dir.statFile(io, sub_path, .{});
+        const mode = stat.permissions.toMode() & 0o777;
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), mode);
+    }
+}
 
 test "a ca.crt one byte over the longest PEM is replaced, not fatal" {
     // Goal: a file too long to be ours does not stop the server. Method: open once to make the

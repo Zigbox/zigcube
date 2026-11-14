@@ -51,6 +51,13 @@ pub fn unusable_fix(
     return error.Failed;
 }
 
+/// Creates `path` and any missing parents with mode 0700, so the umask cannot leave a directory
+/// that `check_dir` refuses (docs/decisions/2026-11-13-state-dir-0700.md). A directory that
+/// already exists keeps its mode: `check_dir` still judges it.
+pub fn make_dir(io: std.Io, path: []const u8) Dir.CreateDirPathError!void {
+    _ = try Dir.cwd().createDirPathStatus(io, path, .fromMode(0o700));
+}
+
 /// Refuses a directory that group or others can write into: they could replace a trust anchor or
 /// a secret's temporary file. ZC-E0806.
 pub fn check_dir(
@@ -65,7 +72,8 @@ pub fn check_dir(
     };
     if (stat.permissions.toMode() & 0o022 != 0) {
         const why = "other users can write into the directory";
-        return unusable(diag, where, name, "use the directory of", why);
+        const fix = "remove group and other write from the directory (chmod 0700)";
+        return unusable_fix(diag, where, name, "use the directory of", why, fix);
     }
 }
 

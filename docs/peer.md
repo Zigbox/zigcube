@@ -209,7 +209,9 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
   on revocation**, and a shorter ttl is the dial.
 - **The CA key file is per store.** `ca-<16 hex of a hash of the store's identity>.key`, so two
   clusters sharing a state directory get two CAs. The directory and the file must not be
-  writable by group or others (ZC-E0806). The key is never written to the store.
+  writable by group or others (ZC-E0806); a directory the server or agent creates is made 0700,
+  whatever the umask, and one that already exists is judged as it is. The key is never written
+  to the store.
 - **A lost key is refused, not remade.** A new CA is made silently only at a store's first
   start. If the key is missing for a store that has history, the server stops with ZC-E0806;
   `zcube-server --new-ca` accepts a new CA, and every node then joins again.

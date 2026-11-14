@@ -118,6 +118,9 @@ const World = struct {
         world.job_rounds_max = null;
         world.io = world.test_io.start();
         world.tmp = testing.tmpDir(.{});
+        // The server's state directory (the database's) must not be group-writable (ZC-E0806);
+        // `tmpDir` follows the runner's umask, which may be 002.
+        try world.tmp.dir.setFilePermissions(world.io, ".", .fromMode(0o700), .{});
         world.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         const arena = world.arena_state.allocator();
         world.dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{world.tmp.sub_path});

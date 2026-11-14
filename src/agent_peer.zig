@@ -69,7 +69,7 @@ pub const Peer = struct {
     pub fn open(io: std.Io, state_dir: []const u8, node: []const u8, diag: *Diag) Error!Peer {
         assert(diag.code == null);
         const cwd = std.Io.Dir.cwd();
-        cwd.createDirPath(io, state_dir) catch |err| {
+        files.make_dir(io, state_dir) catch |err| {
             const verb = "create the directory for";
             return files.unusable(diag, state_dir, key_file, verb, @errorName(err));
         };

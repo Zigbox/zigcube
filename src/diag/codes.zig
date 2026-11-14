@@ -1688,9 +1688,10 @@ pub const registry = [_]Entry{
         \\zcube-server ca issue-client or issue-node writes (NAME.key, NAME.crt)
         \\could not be read, created, written or parsed, or its file or directory has
         \\permissions that let other users read a secret or write a trust file. Key
-        \\files must be owned by the process, mode 0600; the state directory must not
-        \\be writable by group or others. A revoked line must be a node or client
-        \\name.
+        \\files must be owned by the process, mode 0600; the CA key and peer.key hold
+        \\one line of 64 hex digits. The state directory must not be writable by
+        \\group or others (the server and the agent create it with mode 0700). A
+        \\revoked line must be a node or client name.
         \\
         \\The secret is never printed. If the file is damaged and there is a backup,
         \\put it back. An agent's files are caches: it ignores a damaged peer.cred,
