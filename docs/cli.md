@@ -42,9 +42,12 @@ zcube help | version | --help | --version
 | `--confirm` | `repair allocations`, `store accept-rollback`: do it (without it, say what it would do) |
 
 Options may come before or after the command. `--` ends them. `--help` and `--version` are the
-commands `help` and `version` spelled as flags, as `zbx` and the other two executables take them
-(no `-h`): they print the help text or one line, `zcube <version>`, exit 0, and need no server,
-store or environment. Anything else that starts with `-` is `ZC-E0111`.
+commands `help` and `version` spelled as flags, as `zbx` and the other two executables take them:
+they print the help text or one line, `zcube <version>`, exit 0, and need no server, store or
+environment. They are commands only as the first word (options aside): anywhere else, or after
+`--`, they are `ZC-E0111` (`zcube apply --help` is refused, not read as a file). `zcube` takes no
+`-h`, though `zcube-server` and `zcube-agent` do. Anything else that starts with `-` is
+`ZC-E0111`.
 
 ## apply and delete
 

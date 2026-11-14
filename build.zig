@@ -186,7 +186,7 @@ fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
     test_step.dependOn(&check_run.step);
 }
 
-/// `zig build test` runs each installed executable as a user would, with an empty environment and
+/// `zig build test` runs each built executable as a user would, with an empty environment and
 /// no store or server: `--version` prints `<name> <version>` and `--help` the text checked in under
 /// `src/testdata/help/` (src/help_golden_test.zig compares the same files with the source).
 fn add_help_checks(b: *std.Build, built: Built, version: []const u8) void {

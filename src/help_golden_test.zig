@@ -2,7 +2,7 @@
 //! help texts are compared byte for byte with `src/testdata/help/`, which was captured from the
 //! built executables (`env -i zig-out/bin/<name> --help`); change a file there deliberately when
 //! the help changes. The version line is `<name> <version>`, the version being build.zig.zon's,
-//! as `zbx --version` prints it. `zig build test` also runs the three installed executables with
+//! as `zbx --version` prints it. `zig build test` also runs the three built executables with
 //! an empty environment (`build.zig`, `add_help_checks`), so what a user runs is checked too.
 
 const std = @import("std");
@@ -97,8 +97,9 @@ test "zcube --version and version print one line, exit 0, with no server" {
 }
 
 test "zcube-server and zcube-agent --help print the checked-in text" {
-    // Goal: the servers' help is a golden too. Method: their usage text against the captured
-    // files, and each flag parser maps `--help` and `--version` to its flag.
+    // Goal: the servers' help is a golden too. Method: their usage constants against the captured
+    // files. That each flag parser maps `--help` and `--version` to the usage and the version
+    // line is checked by running the built executables (`build.zig`, `add_help_checks`).
     try testing.expectEqualStrings(
         @embedFile("testdata/help/zcube-server.help.txt"),
         server_config.usage,

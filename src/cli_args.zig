@@ -173,28 +173,38 @@ pub fn parse(args: []const []const u8, parsed: *Parsed, diag: *Diag) Error!void 
     var positional: [constants.cli_args_max][]const u8 = undefined;
     var count: usize = 0;
     parsed.options = scan(args);
-    try split(args, &parsed.options, &positional, &count, diag);
-    parsed.command = try command_of(positional[0..count], diag);
+    const flag_command = try split(args, &parsed.options, &positional, &count, diag);
+    parsed.command = try command_of(positional[0..count], flag_command, diag);
     try check_options(&parsed.options, parsed.command, diag);
 }
 
-/// Separates the options from the positional words.
+/// Separates the options from the positional words. Returns whether the first word is `--help`
+/// or `--version` given as a flag (not after `--`).
 fn split(
     args: []const []const u8,
     options: *Options,
     positional: *[constants.cli_args_max][]const u8,
     count: *usize,
     diag: *Diag,
-) Error!void {
+) Error!bool {
     var index: usize = 0;
     var only_words = false;
+    var flag_command = false;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (arg.len > constants.cli_arg_bytes_max) {
             return refuse(diag, "an argument is over {d} bytes", .{constants.cli_arg_bytes_max});
         }
-        // `--help` and `--version` are commands that look like flags, as in `zbx`.
-        const is_flag = !only_words and arg.len > 1 and arg[0] == '-' and !is_command_flag(arg);
+        // `--help` and `--version` are commands that look like flags, as in `zbx`, and only as
+        // the first word: anywhere else they would be read as a name, a file or a code.
+        if (!only_words and is_command_flag(arg)) {
+            if (count.* > 0) return refuse(diag, "{s} goes alone: zcube {s}", .{ arg, arg });
+            positional[0] = arg;
+            count.* = 1;
+            flag_command = true;
+            continue;
+        }
+        const is_flag = !only_words and arg.len > 1 and arg[0] == '-';
         if (!is_flag or job_flag(positional[0..count.*], arg)) {
             positional[count.*] = arg;
             count.* += 1;
@@ -227,6 +237,7 @@ fn split(
             count.* += 1;
         }
     }
+    return flag_command;
 }
 
 /// In a job line the flags `zcube` does not have are the job command's, kept as words in order
@@ -265,14 +276,16 @@ fn output_value(args: []const []const u8, index: usize, diag: *Diag) Error!Outpu
     });
 }
 
-fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
+fn command_of(words: []const []const u8, flag_command: bool, diag: *Diag) Error!Command {
     if (words.len == 0) return refuse(diag, "no command was given", .{});
     const name = words[0];
     const rest = words[1..];
     if (std.mem.eql(u8, name, "help")) return no_arguments(diag, name, rest, .help);
-    if (std.mem.eql(u8, name, "--help")) return no_arguments(diag, name, rest, .help);
     if (std.mem.eql(u8, name, "version")) return no_arguments(diag, name, rest, .version);
-    if (std.mem.eql(u8, name, "--version")) return no_arguments(diag, name, rest, .version);
+    if (flag_command) {
+        const command: Command = if (std.mem.eql(u8, name, "--help")) .help else .version;
+        return no_arguments(diag, name, rest, command);
+    }
     if (std.mem.eql(u8, name, "apply")) return .{
         .apply = try one_argument(diag, name, rest, "a file"),
     };
@@ -535,7 +548,17 @@ test "the refusals: each names the part at fault" {
         .{ .line = &.{ "help", "me" }, .cause = "help takes no arguments" },
         .{ .line = &.{ "--help", "me" }, .cause = "--help takes no arguments" },
         .{ .line = &.{ "--version", "get" }, .cause = "--version takes no arguments" },
-        .{ .line = &.{ "get", "--help" }, .cause = "--help is not something get lists" },
+        .{ .line = &.{ "get", "--help" }, .cause = "--help goes alone: zcube --help" },
+        .{ .line = &.{ "apply", "--help" }, .cause = "--help goes alone: zcube --help" },
+        .{ .line = &.{ "explain", "--version" }, .cause = "--version goes alone" },
+        .{ .line = &.{ "delete", "service", "--help" }, .cause = "--help goes alone" },
+        .{ .line = &.{ "delete", "service", "x", "--help", "-y" }, .cause = "--help goes alone" },
+        .{ .line = &.{ "job", "cancel", "--help" }, .cause = "--help goes alone" },
+        .{ .line = &.{ "why", "service", "--help" }, .cause = "--help goes alone" },
+        .{ .line = &.{ "--help", "--help" }, .cause = "--help goes alone" },
+        // After `--` they are words, not flags: not the commands `help` and `version`.
+        .{ .line = &.{ "--", "--help" }, .cause = "--help is not a zcube command" },
+        .{ .line = &.{ "--", "--version" }, .cause = "--version is not a zcube command" },
         .{ .line = &.{"-help"}, .cause = "-help is not a flag zcube has" },
         .{ .line = &.{"--Version"}, .cause = "--Version is not a flag zcube has" },
         .{ .line = &.{"-V"}, .cause = "-V is not a flag zcube has" },

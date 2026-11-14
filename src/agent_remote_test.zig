@@ -789,6 +789,8 @@ test "a memory-store server that restarts has a new CA, and the agent joins it w
     try testing.expect(!identity.observe_ca(remote_store.ca_key_id.?));
 
     server.?.stop();
+    // Defensive symmetry with `Rig`, not a tested path: if the restart below fails, the deferred
+    // stop must not stop the old server a second time.
     server = null;
     server = try start_server_on(io, .memory, true);
     http_transport.client.address = server.?.address();
