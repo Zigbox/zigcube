@@ -966,7 +966,7 @@ fn package_tool(b: *std.Build) *std.Build.Step.Compile {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/package_main.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .ReleaseSafe,
         }),
     });
 }

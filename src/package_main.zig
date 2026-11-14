@@ -86,7 +86,7 @@ pub fn main(init: std.process.Init) !u8 {
     _ = iterator.next();
     const arguments = parse_arguments(&iterator) orelse {
         log.writeAll(usage_text) catch {}; // Same.
-        return constants.tool_exit_usage;
+        return constants.exit_user;
     };
     const memory = init.arena.allocator();
     const done = if (arguments.check)
@@ -97,9 +97,9 @@ pub fn main(init: std.process.Init) !u8 {
         if (err != error.Refused) {
             log.print("packages: {s}\n", .{@errorName(err)}) catch {}; // Same.
         }
-        return constants.tool_exit_failed;
+        return constants.exit_environment;
     };
-    return constants.tool_exit_ok;
+    return constants.exit_ok;
 }
 
 const Refused = error{Refused};
