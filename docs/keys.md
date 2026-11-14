@@ -215,7 +215,18 @@ the count that keeps `max_unavailable`) and how many old ones that are not ready
 (`retire_unready`, optional, 0 when absent; a replica that is ready when the controller acts is
 never retired on it); the replica controller stays the only writer of `/replicas/`. `next_at_ms`
 is when the controller looks again without a store change (`min_ready_ms`). Deleted a retention
-period after `complete`.
+period after `complete` (not built in slice 7: a finished rollout stays until the next apply of
+its service replaces it).
+
+The rest is the controller's own state, so another server's controller, or this one after a
+restart, goes on where it stopped (C3 slice 7; every field optional, with the default named):
+`reason` (`apply` or `rollback`, default `apply`), `evidence_from_ms` (failures before it no
+longer count: a resume moves it; null means `started_at_ms`), `paused_at_ms` and `paused_by`
+(`user` or `failure`; null unless paused), and what `budget` was computed on: `budget_revision`
+(the store revision the controller read), `budget_next` (the `/replica-numbers/<service>`
+counter then, null when there was none) and `budget_old` (the old replicas then). The replica
+controller counts the starts spent as the counter's advance since, and the retirements as the
+old replicas gone since, so it never spends a budget twice.
 
 **Whose rollout it is.** `service_created` is the `create_revision` of the `/services/<service>`
 key the rollout was started for. Deleting a service does not delete its rollout: the API is not
