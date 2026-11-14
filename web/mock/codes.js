@@ -397,7 +397,7 @@ export const ZC_CODES = [
     "severity": "warning",
     "blame": "user",
     "summary": "a rollout paused itself after a failure",
-    "explanation": "The service's rollout policy says `on_failure: pause`, and the rollout\nfailed (ZC-E0304, ZC-E0305 or ZC-E0306). It stopped where it was:\nreplicas of both generations keep running, and nothing is started or\nretired until you act.\n\n`zcube rollout status <service>` shows both generations. Resume with\n`zcube rollout resume <service>`, roll back with `zcube rollback\n<service>`, or apply a fixed release."
+    "explanation": "The service's rollout policy says `on_failure: pause`, and the rollout\nfailed (ZC-E0304, ZC-E0305 or ZC-E0306). It stopped where it was:\nreplicas of both generations keep running, and nothing is started or\nretired until you act.\n\n`zcube rollout status <service>` shows both generations. Resume with\n`zcube rollout resume <service>`, roll back with `zcube rollback\n<service>` (if it ran an earlier generation), or apply a fixed release."
   },
   {
     "code": "ZC-W0305",

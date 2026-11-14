@@ -1091,7 +1091,7 @@ pub const registry = [_]Entry{
         \\
         \\`zcube rollout status <service>` shows both generations. Resume with
         \\`zcube rollout resume <service>`, roll back with `zcube rollback
-        \\<service>`, or apply a fixed release.
+        \\<service>` (if it ran an earlier generation), or apply a fixed release.
         ,
     },
     .{

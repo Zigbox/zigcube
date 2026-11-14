@@ -451,9 +451,9 @@ pub const Refusal = error{
 };
 
 /// A user's pause: the rollout starts and retires nothing until `resume_rollout`. Pausing a paused
-/// rollout changes nothing. A `failed` rollout may be paused: that stops a rollback it owes, and
-/// is the one way to hold a failed rollout that has no generation to roll back to (a service's
-/// first). Its pause counts as a failure's.
+/// rollout changes nothing. A `failed` rollout may be paused: that stops a rollback it owes (a
+/// failed first generation owes none: it has ended), and a resume gives it a fresh deadline. Its
+/// pause counts as a failure's.
 pub fn pause_rollout(state: *const State, now_ms: u64) Refusal!State {
     state.assert_valid();
     const next = switch (state.phase) {
@@ -940,4 +940,58 @@ test "rollout plan: a failed first generation under on_failure rollback ends" {
         .new_held_at_ms = t0,
     };
     try testing.expect(pass(&policy, &later_state, &facts).rollback);
+}
+
+test "rollout plan: a first generation keeps owing nothing across pause and resume" {
+    // Goal: `earlier` survives a user's pause, a resume, a failure, a pause of the failed rollout
+    // and its resume, so the rollout still ends `failed` owing no rollback (the mutation "`resumed`
+    // sets `.earlier = true`" fails here); and an apply over it takes `from` from the last
+    // generation that ran to completion (docs/decisions/2026-11-14-c3-rollout-from-rule.md).
+    // Method: walk one first generation through each step; then two later applies.
+    const policy: Policy = .{};
+    assert(policy.on_failure == .rollback);
+    const state = begin(&policy, .apply, false, t0);
+    const stopped_by_user = try pause_rollout(&state, t0 + 1_000);
+    try testing.expectEqual(@as(?PauseCause, .user), stopped_by_user.paused_by);
+    const resume_at = t0 + 6_000;
+    const running = try resume_rollout(&policy, &stopped_by_user, resume_at);
+    try testing.expect(!running.earlier);
+    const held: Facts = .{
+        .desired = 3,
+        .mix = .{ .new_live = 3 },
+        .now_ms = resume_at + 1,
+        .new_held_at_ms = resume_at + 1,
+    };
+    const failed = pass(&policy, &running, &held);
+    try testing.expectEqual(Phase.failed, failed.state.phase);
+    try testing.expectEqual(@as(?Failure, .held), failed.failure);
+    try testing.expect(!failed.rollback);
+    // Paused once failed, then resumed: a fresh deadline, and the held replica no longer counts.
+    const stopped = try pause_rollout(&failed.state, resume_at + 2_000);
+    try testing.expectEqual(@as(?PauseCause, .failure), stopped.paused_by);
+    const again_at = resume_at + 5_000;
+    const again = try resume_rollout(&policy, &stopped, again_at);
+    try testing.expectEqual(again_at + policy.progress_deadline_ms, again.deadline_at_ms);
+    var late = held;
+    late.now_ms = again.deadline_at_ms;
+    const timed_out = pass(&policy, &again, &late);
+    try testing.expectEqual(Phase.failed, timed_out.state.phase);
+    try testing.expectEqual(@as(?Failure, .deadline), timed_out.failure);
+    try testing.expect(!timed_out.rollback);
+    late.now_ms += 10 * policy.progress_deadline_ms;
+    const ended = pass(&policy, &timed_out.state, &late);
+    try testing.expect(!ended.rollback);
+    try testing.expectEqualDeep(timed_out.state, ended.state);
+    // An apply over it: no generation ran to completion, so `from` is 0 and its failure ends it.
+    const t1 = late.now_ms + 1;
+    const next = begin(&policy, .apply, false, t1);
+    var next_held = held;
+    next_held.now_ms = t1;
+    next_held.new_held_at_ms = t1;
+    const next_failed = pass(&policy, &next, &next_held);
+    try testing.expectEqual(Phase.failed, next_failed.state.phase);
+    try testing.expect(!next_failed.rollback);
+    // Had an earlier generation run to completion, `from` would name it and a rollback is owed.
+    const over_done = begin(&policy, .apply, true, t1);
+    try testing.expect(pass(&policy, &over_done, &next_held).rollback);
 }
