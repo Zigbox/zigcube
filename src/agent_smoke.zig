@@ -25,6 +25,7 @@ const assert = std.debug.assert;
 const net = std.Io.net;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const harness_tls = @import("harness_tls.zig");
 const host_procs = @import("host_procs.zig");
 const http = @import("agent_http.zig");
 
@@ -59,6 +60,10 @@ const Smoke = struct {
     server_starts: u32 = 0,
     agent_starts: u32 = 0,
     failed: bool = false,
+    /// The API over TLS (`--listen`, B7 slice 6): the CA, the certificates and the smoke's own
+    /// `admin` credentials, loaded once the server has written its CA.
+    pki: ?harness_tls.Pki = null,
+    credentials: ?*harness_tls.Credentials = null,
 
     fn work_file(smoke: *Smoke, name: []const u8) ![]const u8 {
         return std.fmt.allocPrint(smoke.arena.allocator(), "{s}/{s}", .{ smoke.work, name });
@@ -121,15 +126,26 @@ const Smoke = struct {
                 .{smoke.upstream_port},
             ),
         });
+        const state_dir = try smoke.work_file("server-state");
         const args = [_][]const u8{
-            "--config",          config,
-            "--insecure-listen", listen,
-            "--store",           store,
-            "--create-store",    "--quiet",
+            "--config",       config,
+            "--listen",       listen,
+            "--store",        store,
+            "--state-dir",    state_dir,
+            "--create-store", "--quiet",
+        };
+        if (smoke.pki == null) smoke.pki = .{
+            .io = smoke.io,
+            .arena = arena,
+            .server_exe = smoke.server_exe,
+            .store = store,
+            .state_dir = state_dir,
+            .certs = try smoke.work_file("certs"),
         };
         smoke.server = try smoke.spawn(smoke.server_exe, &args, log);
         const ready = struct {
             fn check(s: *Smoke) !bool {
+                if (!try s.tls_ready()) return false;
                 const reply = s.call("GET", "/v1/status", "") catch return false;
                 return reply.status == 200;
             }
@@ -149,8 +165,32 @@ const Smoke = struct {
             "--cpu-millis",   "4000",
             "--memory-bytes", "8589934592",
             "--images",       smoke.images,
-        };
+        } ++ try smoke.agent_tls();
         smoke.agent = try smoke.spawn(smoke.agent_exe, &args, log);
+    }
+
+    /// Whether the smoke holds its `admin` credentials: once the server wrote its CA, issues
+    /// them (the first time) and loads them.
+    fn tls_ready(smoke: *Smoke) !bool {
+        if (smoke.credentials != null) return true;
+        const pki = &smoke.pki.?;
+        if (try pki.find_ca() == null) return false;
+        _ = pki.issue("smoke", "admin") catch {
+            smoke.say("ca issue-client: {s}", .{pki.said});
+            return false;
+        };
+        smoke.credentials = try pki.load("smoke");
+        return true;
+    }
+
+    /// The agent's `--ca`, `--cert` and `--key`: a node certificate issued for it.
+    fn agent_tls(smoke: *Smoke) ![6][]const u8 {
+        const pki = &smoke.pki.?;
+        _ = pki.issue(node, null) catch |err| {
+            smoke.say("ca issue-node: {s}", .{pki.said});
+            return err;
+        };
+        return pki.flags(node);
     }
 
     /// SIGTERM, then wait: a clean stop is exit 0.
@@ -170,7 +210,8 @@ const Smoke = struct {
 
     fn call(smoke: *Smoke, method: []const u8, path: []const u8, body: []const u8) !http.Reply {
         const address = try net.IpAddress.parse("127.0.0.1", smoke.port);
-        const client: http.Client = .{ .io = smoke.io, .address = address };
+        const credentials = smoke.credentials orelse return error.ApiUnreachable;
+        const client: http.Client = .{ .io = smoke.io, .address = address, .tls = credentials };
         var diag: Diag = undefined;
         diag.reset();
         return client.call(smoke.arena.allocator(), .{
