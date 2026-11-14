@@ -76,8 +76,8 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a mesh port could not be bound on this node</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
-<p>The agent gives each replica a port from the node's mesh port range for the connections other replicas make to it. No port of the range could be bound: other programs on the node hold them. The replica runs but takes no mesh connections until a port is free.</p>
-<p>Find what holds the ports (ss -ltn) and stop it, or give the agent another range. The agent retries on its own.</p>
+<p>The agent gives each replica a port from the node's mesh port range for the connections other replicas make to it. No port of the range could be bound: other programs on the node hold them. The replica does not start: an unbindable port is a start failure, never a replica without a mesh.</p>
+<p>Find what holds the ports (ss -ltn) and stop it, or give the agent another range. The agent retries the start on its own.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0710</pre>

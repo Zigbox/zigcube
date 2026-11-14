@@ -326,7 +326,12 @@ The answer is the decision id and the one-line summary (api.md item 5), whether 
 - **`?dry_run=1`** computes the same answer and writes nothing: `dry_run` is `true`, and `revision`
   and `decision` are absent. A dry run needs the store to read the current service.
 - A write whose compare fails (someone else changed the service during the request) is read and
-  planned again up to three times, then refused with `409` and the new **`ZC-E0105`**.
+  planned again up to three times, then refused with `409` and the new **`ZC-E0105`**. Since C4
+  every create (and the first apply of a service written before C4) also compares the mesh address
+  counter, `/mesh-address-next` (docs/keys.md, "Mesh addresses"), so creates of *different*
+  services that run at the same moment can conflict too, and under enough of them one gets `409`
+  ZC-E0105 although nobody touched its service. Nothing was written: a client retries the same
+  apply.
 - Invalid input (a bad name, no command, too many replicas, container `limits` outside the
   runtime's bounds, a body that is not a service) is `400` and `ZC-E0104`. The bounds are a job's:
   `cpu_millis` 10 to 1,024,000 and `memory_bytes` 4 MiB to 2^40, and the cause names
@@ -346,7 +351,8 @@ The answer is the decision id and the one-line summary (api.md item 5), whether 
   body with `mesh_address` is `ZC-E0104`, an unknown field). It appears with `allow` on
   `/services/<name>` in the read endpoints. When every address is held (by services, or by deleted
   ones whose replicas remain or that were deleted within a day), a create is `503` and
-  `ZC-E0207`.
+  `ZC-E0207`; the service is not written, but the address counter moves on, so a retry probes
+  other numbers.
 
 ### `DELETE /v1/services/{name}[?applied_by=<name>]`
 

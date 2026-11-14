@@ -18,6 +18,30 @@ const MOCK_IMAGE_BYTES = 48 * 1048576; // the mock's stand-in for a held image t
 
 export class StoreDown extends Error {}
 
+const SERVICE_NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+
+/** The cause sentence of ZC-E0135, or null: the rules of src/records.zig `allow_problem`. */
+export function allowProblem(service, allow) {
+  if (allow.length > 64) return `it holds ${allow.length} grants; a service holds at most 64`;
+  for (const [index, grant] of allow.entries()) {
+    const number = index + 1;
+    const from = grant?.from;
+    if (typeof from !== "string" || !from || from.length > 48 || !SERVICE_NAME_RE.test(from)) {
+      return `grant ${number}: from is not a valid service name`;
+    }
+    if (!Number.isInteger(grant.port) || grant.port < 1 || grant.port > 65535) {
+      return `grant ${number}: port ${grant.port} is not a port from 1 to 65535`;
+    }
+    if (from === service) {
+      return `grant ${number}: ${service} names itself; a service does not reach itself through the mesh`;
+    }
+    if (allow.slice(0, index).some(g => g.from === from && g.port === grant.port)) {
+      return `grant ${number}: ${from} on port ${grant.port} is listed twice`;
+    }
+  }
+  return null;
+}
+
 export class Engine {
   constructor({ backend = "postgres" } = {}) {
     this.backend = backend;
@@ -203,11 +227,12 @@ export class Engine {
   // ---- Decisions ---------------------------------------------------------------------------
 
   /** Builds a decision plus the index op that must be committed with it. */
-  decision({ actor, action, subject, reason, cause, causeDiagnostic, evidence, locality }) {
+  decision({ actor, action, subject, reason, change, cause, causeDiagnostic, evidence, locality }) {
     const at = this.now();
     const id = `${String(at).padStart(13, "0")}-rc01-${String(++this.decisionCounter).padStart(4, "0")}`;
     const value = { v: locality ? 3 : 1, id, at_ms: at, actor, action, subject, reason, cause };
     if (locality) { value.locality_bytes = locality.bytes; value.node_store_revision = locality.revision; }
+    if (change) value.change = change;
     if (causeDiagnostic) value.cause_diagnostic = causeDiagnostic;
     if (evidence) value.cause_evidence = { text: evidence };
     return {
@@ -223,6 +248,14 @@ export class Engine {
 
   apply(spec, { actor = "alex@laptop", requestId = this.newRequestId() } = {}) {
     this.requireUp();
+    const problem = allowProblem(spec.name, spec.allow || []);
+    if (problem) {
+      const diagnostic = {
+        code: "ZC-E0135", severity: "error", blame: "user",
+        summary: "a service's allow list has a bad entry", causes: [problem], while: [], context: {},
+      };
+      throw Object.assign(new Error("ZC-E0135"), { status: 400, diagnostic });
+    }
     const key = `/services/${spec.name}`;
     const existing = this.getKv(key);
     const same = existing && ["image", "command", "env", "limits", "source"].every(k => JSON.stringify(existing.value[k]) === JSON.stringify(spec[k] ?? (k === "env" ? [] : k === "limits" ? {} : k === "source" ? "" : undefined)));
@@ -245,6 +278,21 @@ export class Engine {
       mesh_address, allow: spec.allow || [],
     };
     ops.unshift({ put: [key, value] });
+    // The `grant` decision (docs/keys.md): written when the grants change as a set; a reorder
+    // alone writes none, as src/apply.zig `put_grant_decision`.
+    const before = existing?.value.allow || [];
+    const has = (list, g) => list.some(h => h.from === g.from && h.port === g.port);
+    const change = [
+      ...value.allow.filter(g => !has(before, g)).map(g => `${g.from} → ${g.port} added`),
+      ...before.filter(g => !has(value.allow, g)).map(g => `${g.from} → ${g.port} removed`),
+    ].join(", ");
+    if (change) {
+      ops.push(...this.decision({
+        actor: "api", action: "grant", subject: { kind: "service", name: spec.name },
+        reason: `${actor} changed who may connect to ${spec.name} (request ${requestId})`,
+        change, cause: { kind: "desired", key },
+      }).ops);
+    }
     // docs/keys.md `/history/<service>/<generation>`: one record per new generation, written with
     // the service; at most 16 per service, the lowest generation dropped in the same commit.
     if (!existing || value.generation !== existing.value.generation) {

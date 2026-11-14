@@ -292,7 +292,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "the store has no free capacity for this",
-    "explanation": "The store is full in a dimension it bounds on purpose: all watch slots\nare in use, all lease slots are in use, the memory set aside for the\nrequest was not enough for the result, or a record would take more\nbytes than the store keeps in one value (the cause gives both sizes).\n\nClose watches that are no longer needed, or ask for smaller pages. For\nan oversized record, shorten its largest field. If the limit is too low\nfor the fleet, raise it in the server's configuration."
+    "explanation": "The store is full in a dimension it bounds on purpose: all watch slots\nare in use, all lease slots are in use, the memory set aside for the\nrequest was not enough for the result, a record would take more bytes\nthan the store keeps in one value (the cause gives both sizes), or no\nmesh address is free for a new service (127.77.0.0/16: every address a\ncreate tried is held, by a service or by one deleted within a day or\nwhose replicas remain).\n\nClose watches that are no longer needed, or ask for smaller pages. For\nan oversized record, shorten its largest field. For mesh addresses,\ndelete services that are no longer used, or wait a day for deleted ones\nto be released. These bounds are fixed in this release; none is a\nsetting."
   },
   {
     "code": "ZC-E0208",
@@ -726,7 +726,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "a mesh port could not be bound on this node",
-    "explanation": "The agent gives each replica a port from the node's mesh port range for the\nconnections other replicas make to it. No port of the range could be bound:\nother programs on the node hold them. The replica runs but takes no mesh\nconnections until a port is free.\n\nFind what holds the ports (ss -ltn) and stop it, or give the agent another\nrange. The agent retries on its own."
+    "explanation": "The agent gives each replica a port from the node's mesh port range for the\nconnections other replicas make to it. No port of the range could be bound:\nother programs on the node hold them. The replica does not start: an\nunbindable port is a start failure, never a replica without a mesh.\n\nFind what holds the ports (ss -ltn) and stop it, or give the agent another\nrange. The agent retries the start on its own."
   },
   {
     "code": "ZC-E0711",

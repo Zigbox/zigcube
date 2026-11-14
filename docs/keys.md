@@ -182,7 +182,8 @@ Until C3 slice 11 the API's apply body takes neither member: slice 5 defines and
   a source service `from` and a destination `port` (1 to 65535). At most 64 grants
   (`service_allow_max`); no grant names the service itself; no grant appears twice. `from` must be
   a valid service name but need not exist (ZC-W0704 is a warning, so services may be applied in
-  any order). Otherwise ZC-E0135, before anything is written. A change of `allow` does not bump
+  any order; the API raises it from C4 slice 9, so until then such an apply is accepted without
+  a warning). Otherwise ZC-E0135, before anything is written. A change of `allow` does not bump
   `generation` (it does not change what a replica runs): the summary says `grants changed`, and
   the apply writes a `grant` decision (below, "Apply decisions").
 - A version 3 or 4 record reads as "no address, no grants". **Downgrade:** every service a C4
@@ -198,23 +199,36 @@ Until C3 slice 11 the API's apply body takes neither member: slice 5 defines and
 ```json
 /mesh-address-next   { "v": 1, "next": 4 }
 /mesh-addresses/00003 { "v": 1, "service": "db" }
-/mesh-addresses/00001 { "v": 1, "service": "old", "released_at_ms": 1761350000123 }
+/mesh-addresses/00001 { "v": 1, "service": "old", "released_at_ms": 1761350000123,
+                        "replicas_below": 3 }
 ```
 
 - `/mesh-address-next` is the counter: the number the next create tries first. Absent means 1.
   `/mesh-addresses/<n>` (`n` the address number, five digits, zero-padded) is the hold: which
-  service has the address, and, once that service is deleted, when it was released.
+  service has the address, and, once that service is deleted, when it was released and which of
+  its replicas were that service's: those numbered below `replicas_below`, the service's replica
+  counter (`/replica-numbers/<service>`, never reset) at the delete. A hold released without it
+  counts every replica of the name.
 - **Assigned in the apply's transaction.** The apply that creates a service reads the counter,
   takes the first number from it on that is free, and writes the counter (one past it) and the
   hold with the service, each compared at the revision read. Two applies that race for a number
-  conflict; one is retried. Past 65,534 the counter starts again at 1.
+  conflict; one is retried. Creates therefore serialize on the counter: creates of different
+  services at the same moment can conflict, and one may end in `409` ZC-E0105 (docs/api.md).
+  Past 65,534 the counter starts again at 1.
 - **Free** means no hold, or a released hold that is at least a day old
-  (`mesh_address_quarantine_ms`, the decision-retention window) and whose service has no replica
-  left anywhere: no `/replicas/<service>/` record and no `/observed/<node>/<service>-<n>` (one
-  that does not read counts as left). A create probes at most 500 numbers
-  (`mesh_address_probes_max`); if none is free it is refused with ZC-E0207. With at most 256
-  services (`services_max`) that happens only if well over 500 services were deleted within a day
-  or still have replicas.
+  (`mesh_address_quarantine_ms`, the decision-retention window) and whose deleted service has no
+  replica left anywhere: no `/replicas/<service>/<service>-<n>` record and no
+  `/observed/<node>/<service>-<n>` key with `n` below `replicas_below` (the key names the replica,
+  so one whose value does not read still counts, for its own service only). Replicas of the same
+  name applied again are numbered from the counter on, so they do not keep the old address held
+  (TLA+ finding 9).
+  A hold that does not read counts as held. A create probes at most 500 numbers
+  (`mesh_address_probes_max`): the first 250 in order from the counter, the other 250 spread over
+  the whole block, one every 261 (`mesh_address.probe_number`), so a long run of held numbers
+  after the counter does not refuse creates while most of the block is free. If none is free the
+  create is refused with ZC-E0207, and the counter moves past the 250 numbers tried in order, so
+  the next create probes others. With at most 256 services (`services_max`) that happens only if
+  well over 500 services were deleted within a day or still have replicas.
 - **Released by the delete**, in its own transaction: the hold keeps the service name and gains
   `released_at_ms`. A hold is never deleted, so these keys number at most 65,534. A service
   deleted and applied again takes a new address; its old one may come back to another service

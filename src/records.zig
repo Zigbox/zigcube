@@ -642,10 +642,14 @@ pub const Grant = struct {
     }
 };
 
+/// Whether two grant lists hold the same grants, in any order: `allow` is a set, and the `grant`
+/// decision names what was added and removed, so a reorder alone is no change.
 pub fn grants_equal(first: []const Grant, second: []const Grant) bool {
-    if (first.len != second.len) return false;
-    for (first, second) |left, right| {
-        if (!left.equal(right)) return false;
+    for (first) |grant| {
+        if (!grants_contain(second, grant)) return false;
+    }
+    for (second) |grant| {
+        if (!grants_contain(first, grant)) return false;
     }
     return true;
 }
@@ -756,12 +760,19 @@ pub const MeshAddressNext = struct {
 
 /// `/mesh-addresses/<n>`: who holds address `n`. Written by the API with the service that takes
 /// it; marked released when that service is deleted, and replaced only by the allocation that
-/// reuses it, once the quarantine has passed and no replica of `service` remains.
+/// reuses it, once the quarantine has passed and no replica of that incarnation of `service`
+/// remains.
 pub const MeshAddressHold = struct {
     v: u32 = 1,
     service: []const u8,
     /// When the service was deleted; absent while it exists.
     released_at_ms: ?u64 = null,
+    /// Written with `released_at_ms`: the service's replica counter (`/replica-numbers/`) when
+    /// it was deleted. A replica counter is never reset, so the deleted incarnation's replicas
+    /// are exactly `<service>-<n>` with `n` below it, and a service applied again under the
+    /// same name numbers its replicas from it on (TLA+ finding 9). Absent on a release that did
+    /// not record it: every replica of the name then counts.
+    replicas_below: ?u64 = null,
 };
 
 pub const key_mesh_address_next = "/mesh-address-next";
@@ -1143,18 +1154,29 @@ pub fn endpoint_valid(endpoint: ?[]const u8) bool {
     const text = endpoint orelse return true;
     if (text.len > constants.mesh_endpoint_bytes_max) return false;
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return false;
-    if (colon == 0) return false;
-    for (text[0..colon]) |byte| {
-        // A host name, IPv4, or bracketed IPv6 (whose colons are inside the brackets).
-        const host_byte = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or
-            byte == ':' or byte == '[' or byte == ']';
-        if (!host_byte) return false;
-    }
+    if (!endpoint_host_valid(text[0..colon])) return false;
     const digits = text[colon + 1 ..];
     if (digits.len == 0 or digits.len > 5) return false;
     for (digits) |byte| if (!std.ascii.isDigit(byte)) return false;
     const port = std.fmt.parseInt(u32, digits, 10) catch unreachable; // At most five digits.
     return port > 0 and port <= std.math.maxInt(u16);
+}
+
+/// A host name or IPv4 address (no colon, no bracket), or an IPv6 address in brackets (hex digits,
+/// colons and dots between `[` and `]`, nothing after).
+fn endpoint_host_valid(host: []const u8) bool {
+    if (host.len == 0) return false;
+    if (host[0] == '[') {
+        if (host.len < 3 or host[host.len - 1] != ']') return false;
+        for (host[1 .. host.len - 1]) |byte| {
+            if (!(std.ascii.isHex(byte) or byte == ':' or byte == '.')) return false;
+        }
+        return true;
+    }
+    for (host) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-')) return false;
+    }
+    return true;
 }
 
 /// The health verdict an observation carries: `unknown` for one without a check, and for every
@@ -1439,6 +1461,13 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         if (!job_valid(record)) return malformed(diag, kv.key, @typeName(T));
     }
     if (T == Assigned and !assigned_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    // `release` and the reuse check use the name as a service name.
+    if (T == MeshAddressHold) {
+        const name_bytes_max = constants.service_name_bytes_max;
+        if (name_problem(record.service, name_bytes_max) != null) {
+            return malformed(diag, kv.key, @typeName(T));
+        }
+    }
     if (T == Service and !service_mesh_valid(record)) return malformed(diag, kv.key, @typeName(T));
     if (T == Observed and !endpoint_valid(record.endpoint)) {
         return malformed(diag, kv.key, @typeName(T));
@@ -1922,6 +1951,7 @@ test "records a C1 build wrote still read" {
         } else if (std.mem.startsWith(u8, kv.key, prefix_observed)) {
             const record = try read(Observed, arena, kv, &diag);
             try testing.expectEqual(@as(u32, 2), record.v);
+            try testing.expectEqual(@as(?[]const u8, null), record.endpoint);
             seen[2] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_decisions)) {
             const record = try read(Decision, arena, kv, &diag);
@@ -2111,7 +2141,9 @@ test "records a build before C3 wrote still read" {
     // Goal: a stored value is read by the next release. Method: read every record of a store the
     // last release before C3 produced (services with env, limits and a source, a generation bump,
     // a held replica) as the type its key says: services and replicas at version 3, with no health
-    // and the default rollout; observed and decisions at version 2.
+    // and the default rollout; observed and decisions at version 2. C4 reads them with no mesh
+    // address, no grants and no endpoint: these are the only service and observed versions a
+    // build's API or agent has written before C4 (src/testdata/README.md).
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2128,6 +2160,8 @@ test "records a build before C3 wrote still read" {
             try testing.expectEqual(service_version_plain, record.v);
             try testing.expect(record.health == null);
             try testing.expect(record.rollout_policy().equal(.{}));
+            try testing.expectEqual(@as(?[]const u8, null), record.mesh_address);
+            try testing.expectEqual(@as(usize, 0), record.allow.len);
             seen[0] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
             const record = try read(Replica, arena, kv, &diag);
@@ -2321,9 +2355,13 @@ test "source round-trips at version 3 and a version 6 service is refused" {
 
 test "services and observations written before C4 still read, with no mesh members" {
     // Goal: the slice's test "old records still read". Method: a version 3 and a version 4
-    // service, and a version 3 observation, as C2 and C3 wrote them, read back without an
-    // address, grants or endpoint; a v5 service with a bad address or grant, or a v4 observation
-    // with a bad endpoint, is malformed (ZC-E0301), not taken in.
+    // service, and a version 3 observation, read back without an address, grants or endpoint.
+    // Version 3 is also read from a real capture (the test above); version 4 and observed
+    // version 3 are written by hand, because no build before C4 writes them through its API or
+    // agent (C3 slice 5, 3c5df94, has no `health` in an apply and no agent health check). A
+    // capture replaces them once a C3 build that writes them exists (src/testdata/README.md).
+    // A v5 service with a bad address or grant, or a v4 observation with a bad endpoint, is
+    // malformed (ZC-E0301), not taken in.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2411,6 +2449,8 @@ test "the version a record is written in is the version the reader accepts" {
         if (T == Service) value.mesh_address = "127.77.0.1";
         // `read` checks a v5 service's grants against its name, so it needs a valid one.
         if (T == Service) value.name = "s";
+        // `read` refuses a hold that names no valid service (it is held, never reused).
+        if (T == MeshAddressHold) value.service = "s";
         if (T == Observed) value.health = .healthy;
         if (T == Observed) value.endpoint = "node1:30000";
         const bytes = try encode(arena, value, &diag);
