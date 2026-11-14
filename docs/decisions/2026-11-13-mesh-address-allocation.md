@@ -48,6 +48,13 @@
   held until it is gone, which is correct. Separately, ZC-E0207 now moves the counter past the
   250 numbers it tried in order (its own compared write), so creates are not refused at one place
   forever.
+- **Known limitation: the quarantine trusts the wall clock** (TLA+ finding 10, zigcube-tla PR #3).
+  It ends when `ctx.clock.now_ms()` minus the hold's `released_at_ms` reaches 24 hours, two
+  readings of the wall clock, possibly by different servers. Skew of seconds between servers, or
+  a small step, is harmless next to a day. A large forward step (a clock set far ahead, then
+  corrected) shortens the quarantine or ends it at once, so an address could be given to another
+  service while an old replica's peers still remember it. The replica check above still applies
+  then; only the time bound is lost. Not changed in slice 1 (supervisor, 2026-11-14).
 - **The reuse check takes no compare on `/replicas/` or `/observed/`** (review SHOULD 9). The
   store compares single keys, not the absence of every key under a prefix, so the apply cannot
   guard "no replica record appeared since I looked". Nor does it need to: the hold is released by
