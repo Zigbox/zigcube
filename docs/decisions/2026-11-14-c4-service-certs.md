@@ -5,7 +5,9 @@
 **Stacking.** The branch `claude/c4-slice3` starts from `claude/c4-slice2` (28de5de) and merges
 `claude/b4-slice2` (4adcba5) and `claude/b4-slice3` (cc81cd9), merge commits only. The merges were
 built and tested (`zig build test`) before any slice 3 code. Review fixes on those branches are
-merged in, never rebased.
+merged in, never rebased: `claude/c4-slice1`'s fixes (82f92a9) came in as d921b55, with one
+test line added on this branch (b3803a8: the version test gives its zeroed address hold a valid
+service name, which slice 1's new hold guard requires; slice 1's fix session adds the same line).
 
 **Issuance.** `src/service_cert.zig` (core) is B4's rule (`job_cert.zig`) for `/service/<name>`:
 the asking node must hold `/assigned/<node>/<id>` with the replica's service, the ask's epoch must
