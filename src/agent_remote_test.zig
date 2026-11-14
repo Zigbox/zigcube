@@ -213,6 +213,9 @@ test "a server that is not there is ZC-E0503, and the same store works when it r
     var diag: Diag = undefined;
     diag.reset();
     const lease = try remote.lease_grant(10_000, &diag);
+    // A node keeps alive only the lease of its registration (B7 slice 3).
+    const done = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
+    try testing.expect(done.succeeded);
 
     rig.server.stop();
     try testing.expectError(error.BackendFailed, remote.lease_grant(10_000, &diag));
