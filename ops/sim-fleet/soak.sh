@@ -1,5 +1,5 @@
 #!/bin/sh
-# The long soak (ops/sim-fleet/README.md, item 7; docs/briefs/c3.md, item 6): one seed of
+# The long soak (ops/sim-fleet/README.md, item 8; docs/briefs/c3.md, item 6): one seed of
 # `sim_cluster` for hours, judged at every epoch (src/sim_soak.zig) for leaks, counters near
 # their range and a world that stopped moving, then handed to `sim_fleet ingest --kind sim-soak`.
 # It runs beside run.sh, not inside it: it takes the binaries run.sh last built
