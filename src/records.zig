@@ -2415,6 +2415,7 @@ test "the version a record is written in is the version the reader accepts" {
         value.v = version_current(T);
         // A replica's assignment: `read` refuses one with neither a service nor a job.
         if (T == Assigned) value.service = "s";
+        if (T == MeshAddressHold) value.service = "s";
         // A service or replica is written at version 4 only with a health check (`encode`).
         if (T == Service or T == Replica) value.health = test_health;
         // A service is written at version 5 only with a mesh member, an observation at version 4
