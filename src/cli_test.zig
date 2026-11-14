@@ -853,3 +853,44 @@ test "job run, get --wait, cancel, list and watch against a live server, and no 
     try expect_contains(world.err(), "ZC-E0131");
     try testing.expect(std.mem.indexOf(u8, world.err(), "env-secret-value") == null);
 }
+
+test "history and rollout status, pause and resume against a live server, on its real answers" {
+    // Goal: C3 slice 11's commands read what the server really sends (REVIEW.md: a fixture is
+    // checked against real output). Method: apply hello, then a new image; `history` lists both
+    // generations; with no rollout controller in this build (slice 7), `rollout status` says
+    // "no rollout" and pause and resume are ZC-E0129.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+
+    const arena = world.arena_state.allocator();
+    const path = try std.fmt.allocPrint(arena, "{s}/hello.zon", .{world.dir});
+    try apply_hello(&world, path, 2);
+    const first = try hello_zon(2);
+    defer testing.allocator.free(first);
+    const second = try std.mem.replaceOwned(u8, arena, first, "b3:51aa9c03", "b3:9d20c4f1");
+    _ = try world.file("hello.zon", second);
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "apply", path, "--yes" }));
+
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "history", "hello" }));
+    try expect_contains(world.out(), "GEN  IMAGE        REASON  APPLIED BY");
+    try expect_contains(world.out(), "2*   b3:9d20c4f1  apply");
+    try expect_contains(world.out(), "1    b3:51aa9c03  apply");
+    try testing.expectEqualStrings("", world.err());
+
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "status", "hello" }));
+    try testing.expectEqualStrings(
+        "hello: generation 2, 2 replicas\nno rollout\npolicy: rolling, surge 1, " ++
+            "unavailable 0, min ready 5s, deadline 600s, on failure rollback\n",
+        world.out(),
+    );
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "rollout", "pause", "hello" }));
+    try expect_contains(world.err(), "ZC-E0129");
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "rollout", "resume", "hello" }));
+    try expect_contains(world.err(), "ZC-E0129");
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "history", "nosuch" }));
+    try expect_contains(world.err(), "ZC-E0101");
+    const json_args: []const []const u8 = &.{ "rollout", "status", "hello", "-o", "json" };
+    try testing.expectEqual(@as(u8, 0), world.run(json_args));
+    try expect_contains(world.out(), "\"rollout\":null");
+}
