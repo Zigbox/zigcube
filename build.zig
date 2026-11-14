@@ -328,6 +328,21 @@ fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Buil
             },
         }),
     });
+    // The Jepsen lease test's negative control (`zcube_agent_fence_teeth.zig`). Installed, so
+    // that the Jepsen harness can copy it to a node; it is never part of a release.
+    const fence_teeth_agent = b.addExecutable(.{
+        .name = "zcube-agent-fence-teeth",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zcube_agent_fence_teeth.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.options.createModule() },
+                .{ .name = "zigbox", .module = options.zigbox },
+            },
+        }),
+    });
+    b.installArtifact(fence_teeth_agent);
     // Both are built by plain `zig build`, so neither smoke can stop compiling unnoticed.
     b.installArtifact(exe);
     b.getInstallStep().dependOn(&teeth_agent.step);

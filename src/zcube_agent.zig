@@ -29,6 +29,8 @@ comptime {
     assert(!c1_teeth.any);
     // `zcube_agent_teeth.zig` is the one root that switches the fetch plan's fault on.
     if (@import("root") == @This()) assert(!fetch_plan.fault_skip_verify);
+    // `zcube_agent_fence_teeth.zig` is the one root that switches the late kill on.
+    if (@import("root") == @This()) assert(!c1_teeth.fence_stop_teeth);
 }
 
 /// A panic is a `bug` diagnostic. The internal message is shown only with `--verbose`

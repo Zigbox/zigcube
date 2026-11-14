@@ -97,6 +97,7 @@ pub fn fence_at_ms(sent_ms: u64, ttl_ms: u32) u64 {
 
 /// When it kills what has not stopped.
 pub fn kill_at_ms(fence_at: u64) u64 {
+    if (c1_teeth.fence_stop_teeth) return fence_at + c1_teeth.fence_stop_teeth_ms;
     return fence_at + constants.fence_stop_ms;
 }
 
