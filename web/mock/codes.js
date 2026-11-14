@@ -376,7 +376,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "a rollout failed: a new replica did not become ready",
-    "explanation": "A rollout starts replicas of the new generation a few at a time and\nretires old ones only once new ones are ready. A new replica did not\nbecome ready within `ready_timeout_ms`: it exited, was held, or its\nhealth check kept failing. The new version is at fault, not the cluster.\n\nThe cause line names the replica and what it did. With `on_failure`\nrollback (the default) the service is rolled back to the generation it\nran before; with `pause` the rollout stops where it is. Fix the release,\nthen apply it again; `zcube why replica <id>` shows its last failure."
+    "explanation": "A rollout starts replicas of the new generation a few at a time and\nretires old ones only once new ones are ready. A new replica did not\nbecome ready within `ready_timeout_ms`: it exited, was held, or its\nhealth check kept failing. The new version is at fault, not the cluster.\n\nThe cause line names the replica and what it did. With `on_failure`\nrollback (the default) the service is rolled back to the generation it\nran before, if it ran one: a failed first generation stays failed. With\n`pause` the rollout stops where it is. Fix the release, then apply it\nagain; `zcube why replica <id>` shows its last failure."
   },
   {
     "code": "ZC-E0305",
@@ -390,7 +390,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "a rollout passed its progress deadline",
-    "explanation": "A rollout must finish within `progress_deadline_ms` of its start. This\none did not: new replicas became ready too slowly, or not at all, though\nnone failed outright. (A rollout stalled for room when its deadline\npassed fails with ZC-E0305 instead.)\n\nWith `on_failure` rollback (the default) the service is rolled back to\nthe generation it ran before; with `pause` the rollout stops where it is.\nIf the new version is right but slow to start, raise the deadline in the\nservice file and apply it again."
+    "explanation": "A rollout must finish within `progress_deadline_ms` of its start. This\none did not: new replicas became ready too slowly, or not at all, though\nnone failed outright. (A rollout stalled for room when its deadline\npassed fails with ZC-E0305 instead.)\n\nWith `on_failure` rollback (the default) the service is rolled back to\nthe generation it ran before, if it ran one: a failed first generation\nstays failed. With `pause` the rollout stops where it is.\nIf the new version is right but slow to start, raise the deadline in the\nservice file and apply it again."
   },
   {
     "code": "ZC-W0304",

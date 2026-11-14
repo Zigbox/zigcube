@@ -25,12 +25,15 @@ differ from it:
    nothing (`rollback_owed` is false), so a version pair that both fail cannot swap forever and the
    rollout still ends (R7) instead of waiting in `paused` for an operator. Under `on_failure pause`
    it pauses, as any rollout does. `Pass.rollback` is set exactly when `rollback_owed` holds: the
-   rollout failed, the policy says `rollback`, and its reason is `apply`.
+   rollout failed, the policy says `rollback`, its reason is `apply`, and the service ran an
+   earlier generation (`State.earlier`; a failed first generation ends `failed` the same way:
+   `2026-11-14-c3-first-generation-failure.md`).
 4. **Pause and resume.** Pause is allowed from `progressing`, `rolling_back` and `failed`;
    pausing a paused rollout changes nothing; pausing a `complete` rollout is refused
-   (`error.NoRollout`, ZC-E0129). Pausing a `failed` rollout stops a rollback it owes; it is also
-   the way to hold a failed first generation, which has no generation to roll back to (slice 7's
-   rollback handler refuses it, so without the pause it would stay `failed` calling it). Resume is
+   (`error.NoRollout`, ZC-E0129). Pausing a `failed` rollout stops a rollback it owes. (This item
+   once relied on that pause to hold a failed first generation, which would otherwise stay `failed`
+   calling a rollback handler that refuses it; the TLA+ model showed R7 failing there, and such a
+   rollout now owes nothing: `2026-11-14-c3-first-generation-failure.md`.) Resume is
    allowed from `paused`, changes nothing on a running rollout, and is refused on `complete` and
    `failed`. ZC-E0129's explanation now says exactly this: the idempotent cases succeed.
    - **A resumed rollout returns to its own phase.** `State.reason` (apply or rollback) names it,

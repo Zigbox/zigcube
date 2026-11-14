@@ -209,7 +209,9 @@ known). So after an upgrade the first new generation can always be rolled back t
 ```
 
 Written only by the rollout controller (role `rollout_controller`), one per service. `phase` is
-`progressing`, `paused`, `rolling_back`, `complete` or `failed`. `budget` is how many new
+`progressing`, `paused`, `rolling_back`, `complete` or `failed`. `from` is 0 for a service's
+first generation: such a rollout that fails has nothing to roll back to and stays `failed`, owing
+no rollback, as a failed rollback does. `budget` is how many new
 replicas the replica controller may start now, how many ready old ones it may retire (`retire`,
 the count that keeps `max_unavailable`) and how many old ones that are not ready it may retire
 (`retire_unready`, optional, 0 when absent; a replica that is ready when the controller acts is
