@@ -58,6 +58,7 @@ jobs:
       mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
       demo_b3: ${{ steps.pick.outputs.demo_b3 || 'true' }}
       packages: ${{ steps.pick.outputs.packages || 'true' }}
+      mac_test: ${{ steps.pick.outputs.mac_test || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -618,6 +619,127 @@ jobs:
         run: .github/packages-install.sh
       - name: The release signing path with a generated throwaway gpg key
         run: .github/release-sign-test-container.sh
+
+  # The macOS zcube (docs/briefs/packaging.md, slice 2), ported from Zigbox's release `mac-test`:
+  # `zig build mac-release` over both slices, signed with a throwaway self-signed identity in a
+  # temporary keychain (hardened runtime, no entitlement, no notarization, no upload), the zip
+  # checked as a user gets it, `zcube version` and `zcube help`, `zcube local` refused with
+  # ZC-E0122, and the unit tests that build on macOS. No secret is used: the keychain's and the
+  # wrapping password are random, made here and gone with the runner.
+  mac-test:
+    name: mac-test (universal zcube, throwaway identity)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.mac_test == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+    steps:
+      # The runner context is not available in a job's `env:`, so the paths are set here.
+      - name: Paths of the temporary keychain and its work directory
+        run: |
+          echo "KEYCHAIN=$RUNNER_TEMP/zcube-mac-test.keychain-db" >> "$GITHUB_ENV"
+          echo "SECRETS_DIR=$RUNNER_TEMP/zcube-mac-test-secrets" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-zig-macos
+      - name: The unit tests that build on macOS
+        run: zig build test-macos --summary all
+      - name: Temporary keychain with a throwaway self-signed identity
+        run: |
+          umask 077
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          mkdir "$SECRETS_DIR"
+          KEYCHAIN_PASSWORD=$(/usr/bin/openssl rand -hex 24)
+          WRAP_PASSWORD=$(/usr/bin/openssl rand -hex 24)
+          export WRAP_PASSWORD
+          cat > "$SECRETS_DIR/openssl.cnf" <<'CNF'
+          [req]
+          distinguished_name = dn
+          prompt = no
+          x509_extensions = ext
+          [dn]
+          CN = zcube-mac-test
+          [ext]
+          basicConstraints = critical,CA:false
+          keyUsage = critical,digitalSignature
+          extendedKeyUsage = critical,codeSigning
+          CNF
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$SECRETS_DIR/openssl.cnf" \
+            -keyout "$SECRETS_DIR/key.pem" -out "$SECRETS_DIR/cert.pem"
+          /usr/bin/openssl pkcs12 -export -inkey "$SECRETS_DIR/key.pem" -in "$SECRETS_DIR/cert.pem" \
+            -passout env:WRAP_PASSWORD -out "$SECRETS_DIR/wrapped.p12"
+          # `security` takes these two throwaway passwords on its command line only (as in
+          # Zigbox's mac-test); they lock a keychain that lives for this job and holds nothing else.
+          /usr/bin/security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          /usr/bin/security set-keychain-settings -t 3600 "$KEYCHAIN"
+          /usr/bin/security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          /usr/bin/security import "$SECRETS_DIR/wrapped.p12" -k "$KEYCHAIN" -P "$WRAP_PASSWORD" -x -T /usr/bin/codesign
+          /usr/bin/security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # codesign refuses an identity whose certificate is not trusted for code signing, so the
+          # throwaway certificate is trusted in the admin domain (the user domain would wait for a
+          # password prompt); a prompt fails the step after a minute instead of hanging it.
+          /usr/bin/perl -e 'alarm 60; exec @ARGV' /usr/bin/sudo -n /usr/bin/security \
+            add-trusted-cert -d -r trustRoot -p codeSign -k "$KEYCHAIN" "$SECRETS_DIR/cert.pem"
+          /usr/bin/security find-identity -p codesigning "$KEYCHAIN"
+          # codesign finds an untrusted self-signed identity by its certificate hash (public data).
+          fingerprint=$(/usr/bin/openssl x509 -in "$SECRETS_DIR/cert.pem" -noout -fingerprint -sha1)
+          echo "TEST_IDENTITY=$(echo "${fingerprint#*=}" | /usr/bin/tr -d ':')" >> "$GITHUB_ENV"
+          /bin/rm -rf "$SECRETS_DIR"
+      - name: Build the universal zip and sign it (no notarization, no upload)
+        run: |
+          # codesign finds the identity only when its keychain is on the search list. Saved to a
+          # temp file and moved into place, so the cleanup never restores an empty list.
+          /usr/bin/security list-keychains -d user | /usr/bin/sed 's/^ *"\(.*\)"$/\1/' > "$RUNNER_TEMP/keychain-list.tmp"
+          /bin/mv "$RUNNER_TEMP/keychain-list.tmp" "$RUNNER_TEMP/keychain-list"
+          existing=()
+          while IFS= read -r line; do existing+=("$line"); done < "$RUNNER_TEMP/keychain-list"
+          /usr/bin/security list-keychains -d user -s "$KEYCHAIN" ${existing[@]+"${existing[@]}"}
+          zig build mac-release -Dsign-identity="$TEST_IDENTITY" -Dkeychain="$KEYCHAIN"
+      - name: The zip is the one that was hashed, and the formula names it
+        id: zip
+        run: |
+          cd zig-out/mac-release
+          /usr/bin/shasum -a 256 -c zcube-*-macos-universal.zip.sha256
+          version=$(sed -n 's/^ *\.version = "\([^"]*\)",.*/\1/p' ../../build.zig.zon | head -n 1)
+          sum=$(cut -d ' ' -f 1 "zcube-$version-macos-universal.zip.sha256")
+          grep -q "sha256 \"$sum\"" zigcube.rb
+          grep -q "version \"$version\"" zigcube.rb
+          if grep -q '@[A-Z0-9]*@' zigcube.rb; then echo "mac-test: zigcube.rb keeps a placeholder" >&2; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/mac-check-zip
+        with:
+          zip: zig-out/mac-release/zcube-${{ steps.zip.outputs.version }}-macos-universal.zip
+          version: ${{ steps.zip.outputs.version }}
+          gatekeeper: 'false'
+      - name: zcube version, zcube help, and zcube local refused with ZC-E0122
+        run: |
+          dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/zcube-run.XXXXXX")
+          /usr/bin/ditto -x -k zig-out/mac-release/zcube-${{ steps.zip.outputs.version }}-macos-universal.zip "$dir"
+          "$dir/zcube" version
+          "$dir/zcube" help | tee "$dir/help.txt"
+          grep -q "local up" "$dir/help.txt"
+          status=0
+          ZCUBE_LOCAL_DIR="$dir/local" "$dir/zcube" local up 2> "$dir/local.txt" || status=$?
+          cat "$dir/local.txt"
+          if [ "$status" -ne 2 ]; then echo "mac-test: zcube local up exited $status, not 2" >&2; exit 1; fi
+          grep -q "ZC-E0122" "$dir/local.txt"
+          grep -q "zcube local needs Linux" "$dir/local.txt"
+          if [ -e "$dir/local" ]; then echo "mac-test: zcube local up made its directory" >&2; exit 1; fi
+          /bin/rm -rf "$dir"
+      - name: Delete the keychain and everything this job wrote under the runner's temp
+        if: ${{ always() }}
+        run: |
+          # Puts back the search list the build step found (nothing to do if it never got that far).
+          if [ -f "$RUNNER_TEMP/keychain-list" ]; then
+            saved=()
+            while IFS= read -r line; do saved+=("$line"); done < "$RUNNER_TEMP/keychain-list"
+            /usr/bin/security list-keychains -d user -s ${saved[@]+"${saved[@]}"} || true
+          fi
+          /usr/bin/security delete-keychain "$KEYCHAIN" || true
+          /bin/rm -rf "$KEYCHAIN" "$RUNNER_TEMP/keychain-list" "$RUNNER_TEMP/keychain-list.tmp" "$SECRETS_DIR" "$RUNNER_TEMP"/zig-aarch64-macos-* "$RUNNER_TEMP"/zcube-run.*
 
   # Stock servers (openssl s_server, a JDK 21 SSLServerSocket) against the mTLS client. Test-only
   # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md.

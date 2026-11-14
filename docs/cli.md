@@ -379,7 +379,8 @@ repair's `ZC-E0401` to `E0403` ([api.md](api.md)).
 something to talk to. This is the one command that is not an HTTP client: it lives in
 `src/cli_local.zig`, outside the wasm core, and starts `zcube-server` (SQLite) and `zcube-agent`
 (`FakeRuntime`, node `local`), which it finds beside the `zcube` executable (E0122 if they are not
-there). It waits for `GET /v1/status` and for the node to be registered (E0123 if either does not
+there; on any system but Linux, E0122 before it touches anything, since the two run only on
+Linux). It waits for `GET /v1/status` and for the node to be registered (E0123 if either does not
 happen within 20 s; the fix names the log), then prints the address, `export ZCUBE_SERVER=...` and
 `zcube apply hello.zon`.
 

@@ -13,6 +13,7 @@
 #   mtls_interop  mtls-interop (stock openssl and JDK servers)
 #   demo_b3       demo-b3 (one VM, KVM, a GHCR image)
 #   packages      the packages job (build the .deb and .rpm files, install them in containers)
+#   mac_test      mac-test (the universal macOS zcube signed with a throwaway identity, on macOS)
 #
 # Environment: EVENT (github.event_name), HEAD_REF (the PR's head branch), LABELS (the PR's labels,
 # space separated). See docs/decisions/2026-11-04-ci-affected-demos.md.
@@ -23,7 +24,7 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 packages)
+jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 packages mac_test)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -67,6 +68,10 @@ classify() {
     # The package tool, what it packs and the release-assets tool: the packages job only (the
     # release scripts, the install test and the workflows are under .github/, which runs
     # everything).
+    # The macOS release tool, the macOS test root and the Homebrew formula: mac-test (the formula
+    # is under packaging/, which the packages job reads too).
+    src/mac_release.zig | src/tests_macos.zig) want_one mac_test; return ;;
+    packaging/homebrew/*) want_one mac_test; want_one packages; return ;;
     packaging/* | src/package*.zig | src/package/* | src/release_assets*.zig)
       want_one packages; return ;;
     # The mTLS interop harness and its Java server.

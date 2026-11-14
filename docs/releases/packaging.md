@@ -26,7 +26,10 @@ on PATH, docker, and `zig-pkg/` holding the pinned Zigbox package.
 ## The packages
 
 - `zig build packages [-Dbin=DIR]` reads `zig-out/release-bin` (or `DIR`). `-Dpackage-arch=x86_64`
-  (or `aarch64`) builds one architecture: for CI, which builds one; a release has both.
+  (or `aarch64`) builds one architecture: for CI, which builds one; a release has both. Each
+  executable must be a 64-bit little-endian ELF file whose machine is its name's architecture
+  (`e_machine` 62 or 183); anything else (an x86_64 file under an aarch64 name, a Mach-O file) is
+  refused in one line naming the file.
 - `-Dzigbox-version` defaults to the Zigbox tag `build.zig.zon` pins: `zigbox-dev` depends on
   `zigbox (>= that version)`.
 - `-Dsigned-at=<unix seconds>` sets the apt `Release`'s `Date` and a `Valid-Until` 21 days later,
@@ -54,7 +57,37 @@ the signing time: `Valid-Until` is 21 days out, and the 7 days after that are th
 renew. A refused run names which key to renew.
 
 `.github/release-sign-test-container.sh` runs the real path (`release-sign-test.sh`, a throwaway
-gpg key it generates) in a Fedora container, including the refusals above.
+gpg key it generates) in a Fedora container, including the refusals above. The runner builds only
+its own architecture, so the other one gets a stand-in under the four names: a minimal static Zig
+executable built for that machine, which the ELF check accepts. It tests the signing, not the
+executables.
+
+## macOS
+
+The Mac release is `zcube` alone, one universal binary (the server and the agent need Linux;
+`zcube local` on macOS refuses with ZC-E0122 before it touches anything). Ported from Zigbox's
+`mac-release` (`src/mac_release.zig`):
+
+- `zig build mac-bin` cross-builds `zig-out/mac-bin/zcube-aarch64` and `zcube-x86_64` (ReleaseSafe)
+  and compiles the macOS unit tests (`src/tests_macos.zig`) for both, on any host.
+- `zig build test-macos` runs those tests on the host (the `mac-test` job runs it on macOS).
+- `zig build mac-release [-Dsign-identity=ID] [-Dkeychain=FILE] [-Dnotarize=true]
+  [-Dnotary-profile=NAME]` needs macOS: `lipo` into one binary, `codesign` with the hardened runtime
+  and no entitlement (a secure timestamp unless ad hoc), `codesign --verify --strict`, `ditto` into
+  `zcube-<version>-macos-universal.zip`, the zip's CDHash compared with the signed binary's, then
+  (with `-Dnotarize=true`) `notarytool submit --wait` with the keychain profile, then the zip's
+  `.sha256` and `zigcube.rb` from `packaging/homebrew/zigcube.rb`, all under `zig-out/mac-release`.
+  The identity defaults to Developer ID and the profile to `zbx-notary` (the same Apple account as
+  Zigbox's); neither is ever an argument a session sees.
+- `.github/actions/mac-check-zip` checks a zip as a user gets it: `zcube` alone, a strict
+  signature, the hardened runtime, no entitlements, both slices, Gatekeeper when notarized, and
+  `zcube version` saying the version.
+
+CI's `mac-test` job (`macos-15`) signs with a throwaway self-signed identity in a temporary
+keychain, without notarization, and runs the zip check, `zcube version`, `zcube help`, `zcube local
+up` (exit 2, ZC-E0122) and `zig build test-macos`. The formula's own `brew test` runs
+`zcube version` and `zcube help`: the command has no `--help` flag (`zcube --help` is refused with
+ZC-E0111), as it has no `--version`.
 
 ## Release assets
 

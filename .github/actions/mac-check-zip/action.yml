@@ -1,0 +1,86 @@
+# Ported from Zigbox main 5d1b0ba (.github/actions/mac-check-zip): zcube instead of zbx, `zcube
+# version` instead of `--version`, and two checks Zigbox does not make (zcube has no entitlement):
+# the hardened runtime flag is set and the signature carries no entitlements.
+name: Check the macOS release zip
+description: >
+  Unpacks a zcube release zip and checks what a user gets: the signature is valid and strict, it
+  has the hardened runtime and no entitlement, the binary holds both slices (arm64 and x86_64),
+  Gatekeeper accepts it (unless the zip is a test build), and `zcube version` says the version.
+  The system tools are called by absolute path. Runs on the runner's own architecture, so the
+  slice it can execute is the one that is run.
+inputs:
+  zip:
+    description: Path of the zip.
+    required: true
+  version:
+    description: The version the binary must report, such as 0.0.1.
+    required: true
+  gatekeeper:
+    description: '"true" to require spctl to accept the binary (notarized builds), else "false".'
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Check the zip
+      shell: /bin/bash --noprofile --norc -euo pipefail {0}
+      env:
+        ZIP: ${{ inputs.zip }}
+        VERSION: ${{ inputs.version }}
+        GATEKEEPER: ${{ inputs.gatekeeper }}
+      run: |
+        dir=$(/usr/bin/mktemp -d "${RUNNER_TEMP}/zcube-check.XXXXXX")
+        /usr/bin/ditto -x -k "$ZIP" "$dir"
+        listing=$(/bin/ls -A "$dir")
+        if [ "$listing" != "zcube" ]; then
+          echo "release: the zip holds '$listing', not zcube alone" >&2
+          exit 1
+        fi
+        binary="$dir/zcube"
+        /usr/bin/codesign --verify --strict --verbose=2 "$binary"
+        # `codesign -d` writes its description to stderr; the flags line names the runtime.
+        details=$(/usr/bin/codesign -d --verbose=2 "$binary" 2>&1)
+        case "$details" in
+          *"flags=0x10000(runtime)"*) ;;
+          *) echo "release: zcube is not signed with the hardened runtime alone" >&2
+             echo "$details" >&2; exit 1 ;;
+        esac
+        # The entitlements go to stdout as XML; a signature without any writes nothing there.
+        entitlements=$(/usr/bin/codesign -d --entitlements - --xml "$binary" 2> /dev/null)
+        if [ -n "$entitlements" ]; then
+          echo "release: zcube carries entitlements, and it must have none: $entitlements" >&2
+          exit 1
+        fi
+        archs=$(/usr/bin/lipo -archs "$binary")
+        echo "archs: $archs"
+        case " $archs " in
+          *" arm64 "*) ;;
+          *) echo "release: zcube holds '$archs', not both arm64 and x86_64" >&2; exit 1 ;;
+        esac
+        case " $archs " in
+          *" x86_64 "*) ;;
+          *) echo "release: zcube holds '$archs', not both arm64 and x86_64" >&2; exit 1 ;;
+        esac
+        if [ "$(printf '%s\n' "$archs" | /usr/bin/wc -w | /usr/bin/tr -d ' ')" != "2" ]; then
+          echo "release: zcube holds more than arm64 and x86_64: $archs" >&2
+          exit 1
+        fi
+        if [ "$GATEKEEPER" = "true" ]; then
+          # A bare Mach-O is judged as an executable; some macOS versions only judge it as an
+          # open document with its primary signature. Either acceptance is Gatekeeper's.
+          if /usr/sbin/spctl --assess --type execute --verbose=2 "$binary"; then
+            :
+          elif /usr/sbin/spctl --assess --type open --context context:primary-signature \
+            --verbose=2 "$binary"; then
+            :
+          else
+            echo "release: Gatekeeper (spctl) does not accept zcube" >&2
+            exit 1
+          fi
+        fi
+        out=$("$binary" version)
+        echo "$out"
+        case "$out" in
+          *"zcube $VERSION"*) ;;
+          *) echo "release: zcube version does not say $VERSION" >&2; exit 1 ;;
+        esac
+        /bin/rm -rf "$dir"
