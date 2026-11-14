@@ -247,6 +247,39 @@ test "a pause starts nothing more until a resume, and a second pause changes not
     try testing.expectEqual(@as(u32, 2), try fixture.count_of(2));
 }
 
+test "an old replica that dies during a pause is replaced at its own generation" {
+    // Goal: R4 allows a same-generation replacement only (TLA+ review): an old replica lost while
+    // paused comes back old, not as a start of the new generation. Method: pause after the first
+    // new replica starts, report one old replica stopped, and count the generations.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    const old = (try fixture.replicas())[0];
+    try testing.expectEqual(@as(u64, 1), old.rec.generation);
+    const observed: records.Observed = .{
+        .replica = old.rec.id,
+        .node = "node1",
+        .generation = 1,
+        .status = .stopped,
+        .reported_at_ms = fixture.manual.ms,
+    };
+    const key = records.observed_key("node1", old.rec.id);
+    try fixture.put(.{ .agent = "node1" }, key.slice(), observed);
+    try fixture.settle();
+    var found_old = false;
+    for (try fixture.replicas()) |replica| {
+        try testing.expect(!std.mem.eql(u8, replica.rec.id, old.rec.id));
+        if (replica.rec.generation == 1) found_old = true;
+    }
+    try testing.expect(found_old);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+}
+
 test "a held new replica fails the rollout with ZC-E0304 and nothing more starts" {
     // Goal: `hold_failed_replica` feeds the rollout's failure. Method: the first new replica's
     // start fails by the user's fault; the rollout fails, its old replicas stay, and a resume is

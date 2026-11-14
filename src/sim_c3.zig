@@ -137,26 +137,38 @@ fn running(snap: *const Snapshot, replica: *const records.Replica) bool {
 /// What one transaction does to one service's replicas.
 const Step = struct {
     created: u32 = 0,
+    /// Of `created`, those that run the service's current spec (`rollout_controller.is_new`).
+    created_new: u32 = 0,
     /// Deleted replicas that had stopped or whose node is lost: replaced, not retired.
     dead: u32 = 0,
+    /// Of `dead`, those that ran the service's current spec.
+    dead_new: u32 = 0,
     /// Deleted replicas of another generation that had not stopped: a rollout's retirements.
     retired: u32 = 0,
     /// Of `retired`, those reported running.
     retired_running: u32 = 0,
 };
 
-fn step_of(snap: *const Snapshot, service: *const ServiceEntry, request: store.TxnRequest) Step {
+fn step_of(
+    ctx: *const Context,
+    snap: *const Snapshot,
+    service: *const ServiceEntry,
+    request: store.TxnRequest,
+) Step {
     var step: Step = .{};
     for (request.on_success) |op| switch (op) {
         .put => |put| {
             const id = replica_id(put.key, service.rec.name) orelse continue;
-            if (find_replica(snap, id) == null) step.created += 1;
+            if (find_replica(snap, id) != null) continue;
+            step.created += 1;
+            if (created_new(ctx, put, service)) step.created_new += 1;
         },
         .delete => |key| {
             const id = replica_id(key, service.rec.name) orelse continue;
             const replica = find_replica(snap, id) orelse continue;
             if (stopped(snap, &replica.rec) or on_lost_node(snap, &replica.rec)) {
                 step.dead += 1;
+                if (rollout_controller.is_new(&replica.rec, &service.rec)) step.dead_new += 1;
             } else if (!rollout_controller.is_new(&replica.rec, &service.rec)) {
                 step.retired += 1;
                 if (running(snap, &replica.rec)) step.retired_running += 1;
@@ -164,6 +176,22 @@ fn step_of(snap: *const Snapshot, service: *const ServiceEntry, request: store.T
         },
     };
     return step;
+}
+
+/// Whether the replica `put` creates runs `service`'s current spec. One that does not decode is
+/// counted as new, the stricter reading.
+fn created_new(ctx: *const Context, put: store.Put, service: *const ServiceEntry) bool {
+    const kv: store.KeyValue = .{
+        .key = put.key,
+        .value = put.value,
+        .create_revision = 1,
+        .mod_revision = 1,
+    };
+    const replica = records.read(records.Replica, ctx.arena, kv, ctx.diag) catch {
+        ctx.diag.reset();
+        return true;
+    };
+    return rollout_controller.is_new(&replica, &service.rec);
 }
 
 /// R4: a paused rollout starts and retires nothing; a replica that failed on its own is still
@@ -178,7 +206,7 @@ fn step_problem(
     request: store.TxnRequest,
     tally: *Tally,
 ) Found {
-    var step = step_of(snap, service, request);
+    var step = step_of(ctx, snap, service, request);
     scaled_down(ctx, snap, service, request, &step);
     if (step.created + step.retired == 0) return null;
     const rollout = rollout_of(ctx, service) orelse return null;
@@ -186,6 +214,11 @@ fn step_problem(
         tally.paused_judged += 1;
         if (step.retired > 0) return "R4: a paused rollout retired a replica";
         if (step.created > step.dead) return "R4: a paused rollout started a replica";
+        // A replacement runs the generation of the replica it replaces: an old replica replaced
+        // at the new spec is a start (TLA+ review, C3 slice 7).
+        if (step.created_new > step.dead_new) {
+            return "R4: a paused rollout started a replica of the new generation";
+        }
         return null;
     }
     if (!rollout_plan.active(rollout.phase)) return null;

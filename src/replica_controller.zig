@@ -433,6 +433,16 @@ const Run = struct {
         // missing are the rollout's to start, and a paused rollout starts nothing more (R4).
         if (plan.stale > 0 or roll.paused) creations = @min(creations, removed_count);
         creations = @min(creations, roll.room);
+        // While the rollout starts nothing (paused, failed, or not begun), a replacement runs the
+        // generation the dead replica ran: replacing an old one at the new generation would be a
+        // start the rollout did not allow (R4). Otherwise it runs the service's.
+        var templates: [batch_replicas_max]?*const records.Replica = @splat(null);
+        if (!roll.starts) {
+            for (removed[0..@min(creations, removed_count)], 0..) |item, index| {
+                const replica = &item.replica.rec;
+                if (replica.generation < service.rec.generation) templates[index] = replica;
+            }
+        }
         if (!run.budget()) return;
 
         var batch: Batch = .{};
@@ -459,7 +469,7 @@ const Run = struct {
             else
                 null,
         }, &batch);
-        try run.create_replicas(&batch, service, &decision, creations);
+        try run.create_replicas_from(&batch, service, &decision, templates[0..creations]);
         _ = try run.finish(&batch);
     }
 
@@ -827,22 +837,26 @@ const Run = struct {
         because: *const DecisionId,
         count: u32,
     ) Error!void {
-        if (count == 0) return;
+        var templates: [batch_replicas_max]?*const records.Replica = @splat(null);
+        return run.create_replicas_from(batch, service, because, templates[0..count]);
+    }
+
+    /// As `create_replicas`, one replica per entry of `templates`: a null entry runs the
+    /// service's generation, a replica the generation and spec of that (older) replica.
+    fn create_replicas_from(
+        run: *Run,
+        batch: *Batch,
+        service: *const Entry(records.Service),
+        because: *const DecisionId,
+        templates: []const ?*const records.Replica,
+    ) Error!void {
+        if (templates.len == 0) return;
         const counter = try run.counter_of(service.rec.name);
         var next = if (counter) |found| found.rec.next else run.first_number(service);
-        for (0..count) |_| {
+        for (templates) |template| {
             if (next > constants.replica_number_max) return run.numbers_used_up(service);
             const id = try controller.format(run.ctx, "{s}-{d}", .{ service.rec.name, next });
-            const reason = try controller.format(run.ctx, "creating {s} (generation {d}) for " ++
-                "service {s}", .{ id, service.rec.generation, service.rec.name });
-            _ = try controller.put_decision(run.ctx, &run.rc.source, .{
-                .actor = actor,
-                .action = "create_replica",
-                .subject = .{ .kind = .replica, .name = id },
-                .reason = reason,
-                .cause = controller.cause_decision(because),
-            }, batch);
-            const replica: records.Replica = .{
+            var replica: records.Replica = .{
                 .id = id,
                 .service = service.rec.name,
                 .generation = service.rec.generation,
@@ -853,6 +867,20 @@ const Run = struct {
                 .source = service.rec.source,
                 .health = service.rec.health,
             };
+            if (template) |older| {
+                assert(older.generation < service.rec.generation);
+                replica = older.*;
+                replica.id = id;
+            }
+            const reason = try controller.format(run.ctx, "creating {s} (generation {d}) for " ++
+                "service {s}", .{ id, replica.generation, service.rec.name });
+            _ = try controller.put_decision(run.ctx, &run.rc.source, .{
+                .actor = actor,
+                .action = "create_replica",
+                .subject = .{ .kind = .replica, .name = id },
+                .reason = reason,
+                .cause = controller.cause_decision(because),
+            }, batch);
             const key = records.replica_key(service.rec.name, id);
             const value = try records.encode(run.ctx.arena, replica, run.ctx.diag);
             batch.put(try controller.key_copy(run.ctx, &key), value);
