@@ -195,6 +195,7 @@ pub fn start(demo: *Demo) !void {
     host.section("0. Start: zcube-server on the host, three guests' agents");
     _ = try host.zcube(&.{"version"});
     try host.start_server(30 * 1000);
+    try host.check_tls_only();
     host.say("  zcube-server is up on 127.0.0.1:{d} (SQLite); the guests reach it at {s}", .{
         host.port, demo.server,
     });

@@ -309,8 +309,19 @@ const Smoke = struct {
     // ---- The API ----
 
     fn call(smoke: *Smoke, method: []const u8, target: []const u8, body: []const u8) !http.Reply {
-        const address = try net.IpAddress.parse("127.0.0.1", smoke.port);
         const credentials = smoke.credentials orelse return error.ApiUnreachable;
+        return smoke.call_with(credentials, method, target, body);
+    }
+
+    /// One request, over TLS with `credentials`, or in plain HTTP when it is null.
+    fn call_with(
+        smoke: *Smoke,
+        credentials: ?*harness_tls.Credentials,
+        method: []const u8,
+        target: []const u8,
+        body: []const u8,
+    ) !http.Reply {
+        const address = try net.IpAddress.parse("127.0.0.1", smoke.port);
         const client: http.Client = .{ .io = smoke.io, .address = address, .tls = credentials };
         var diag: Diag = undefined;
         diag.reset();
@@ -447,6 +458,10 @@ const Smoke = struct {
 fn script(smoke: *Smoke) !void {
     try smoke.start_server();
     smoke.say("server up on 127.0.0.1:{d}", .{smoke.port});
+    // The server serves TLS only (B7 slice 7): plain HTTP gets no answer.
+    const plain = smoke.call_with(null, "GET", "/v1/status", "");
+    const refused = if (plain) |reply| reply.status != 200 else |_| true;
+    try smoke.expect(refused, "a plain-HTTP GET /v1/status answered 200", .{});
     smoke.proxy.black_hole(true);
     try step_first_from_registry(smoke);
     try step_second_from_peer(smoke);

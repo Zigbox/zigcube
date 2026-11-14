@@ -988,14 +988,21 @@ fn identity_or_wait(
     diag: *diag_mod.Diag,
 ) ?peer.Identity {
     assert(diag.code == null);
+    assert(wait_ms <= constants.fetch_peer_wait_ms);
     if (parsed.server == null and parsed.peer_count == 0) return identity_or_say(io, parsed, diag);
     const started = peer_stream.boot_ms(io);
-    while (true) {
+    // Bounded twice: by the clock, and by the number of reads the wait can hold.
+    const reads_max = wait_ms / constants.fetch_peer_poll_ms + 1;
+    var reads: u32 = 0;
+    while (reads < reads_max) {
+        reads += 1;
         if (identity_or_say(io, parsed, diag)) |held| return held;
         if (diag.code != null) return null; // Files that cannot be used: said by the reader.
         if (peer_stream.boot_ms(io) -| started >= wait_ms) break;
         io.sleep(.fromMilliseconds(constants.fetch_peer_poll_ms), .awake) catch break;
     }
+    assert(reads >= 1);
+    assert(reads <= reads_max);
     diag.raise(.E0806);
     diag.cause("no peer identity: node {s} has not joined the cluster CA yet ({s} or {s} " ++
         "is missing in {s}) after {d} ms", .{
@@ -2011,6 +2018,48 @@ test "a fetch with peers to ask and no peer identity yet says so (ZC-E0806), and
     const alone = parse(with_peer[0..10]).?;
     try std.testing.expect(identity_or_wait(std.testing.io, &alone, 0, &diag) == null);
     try std.testing.expect(diag.code == null);
+}
+
+test "a peer identity that appears during the wait is used, and nothing is said" {
+    // Goal: the supervisor's ruling on SHOULD b: the wait ends as soon as the join writes the
+    // identity. Method: a key and a held credential in an empty state directory; another thread
+    // stores the set after 1.5 s while the fetch waits up to 10 s: the identity is returned
+    // before the bound, and no diagnostic is raised (so no ZC-E0806 line).
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const state = path[0..try tmp.dir.realPath(io, &path)];
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    var opened = try agent_peer.Peer.open(io, state, "node1", &diag);
+    defer opened.close();
+    const ca = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const now = peer_stream.wall_ms(io);
+    try opened.hold_for_test(ca, now - 1000, now + 100_000);
+    const later = struct {
+        fn store(held: *agent_peer.Peer) void {
+            var stored: diag_mod.Diag = undefined;
+            stored.reset();
+            std.testing.io.sleep(.fromMilliseconds(1500), .awake) catch {};
+            held.store(&stored) catch {};
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, later.store, .{&opened});
+    const words = [_][]const u8{
+        "--node",       "node1",          "--state-dir", state,
+        "--images-dir", "/i",             "--digest",    "b3:00000000",
+        "--registry",   "127.0.0.1:9000", "--peer",      "node2=127.0.0.1:9001",
+    };
+    const parsed = parse(&words).?;
+    const started = peer_stream.boot_ms(io);
+    const held = identity_or_wait(io, &parsed, 10_000, &diag);
+    const waited = peer_stream.boot_ms(io) -| started;
+    writer.join();
+    try std.testing.expect(held != null);
+    try std.testing.expect(diag.code == null);
+    try std.testing.expect(waited >= 1000);
+    try std.testing.expect(waited < 10_000);
 }
 
 /// The arguments of a fetch that reads `rig`'s server over TLS as node1 with `--ca`, `--cert`

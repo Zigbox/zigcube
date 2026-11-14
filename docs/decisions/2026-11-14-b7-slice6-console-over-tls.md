@@ -84,8 +84,8 @@ so part 1 is handed to a fresh session, from this decision.
 | `demo-b7` | unchanged | it already runs both listeners and tests the insecure one |
 | `bench-watch` | no | an in-process `Server` with `insecure_listen`: it measures the watch fan-out of 50 held polls, and a TLS handshake per poll would measure TLS instead |
 | `server_test`, `cli_test`, `agent_remote_test` | no | in-process unit tests of the handlers, the CLI and the agent's client; `api_tls_test` and `tls_conn_test` test the transport |
-| `swarm-smoke` | **no: gap** | converted in slice 7; see below |
-| `demo-c2` | **no: gap** | converted in slice 7, for the same reason as `swarm-smoke` |
+| `swarm-smoke` | yes (slice 7) | the agent's fetch child speaks TLS since slice 7; see below |
+| `demo-c2` | yes (slice 7) | TLS only (`--listen`, no `--insecure-listen`), for the same reason |
 
 **Gap: the agent's `fetch` child does not speak TLS.**
 
@@ -108,7 +108,7 @@ The fix belongs to the agent:
 That is next to slice 5's agent-client work. The supervisor agreed (2026-11-14) that it becomes
 **B7 slice 7**, done by a fresh session after slice 5 lands, before 0.5.1 ships (B7 makes TLS
 the default, so 0.5.1 must not ship with C2's peer fetch silently broken). In that slice,
-`swarm-smoke` and `demo-c2` move to TLS. `swarm-smoke` stays on `--insecure-listen` until then. Converting it is the pattern of
+`swarm-smoke` and `demo-c2` move to TLS. Slice 7 did so (decisions/2026-11-14-b7-slice7-o5-over-tls.md). Converting it is the pattern of
 `agent-smoke`: the `pki` and `credentials` fields, `tls_ready` and `agent_tls`.
 
 ## CI

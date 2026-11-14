@@ -40,8 +40,12 @@ peer, and swarm-smoke flaked. When the fetch has peers or a server to ask, it no
 identity every `fetch_peer_poll_ms` (1 s) for up to `fetch_peer_wait_ms` (30 s), the existing O5
 bounds; no new bound. If it is still missing, the fetch says **ZC-E0806** (existing code, "no
 peer identity", with the node and the two file names) and goes on from the registry.
-Reusing E0806 rather than registering a warning was put to the supervisor; until they answer,
-E0806 stands. swarm-smoke's wait for the `/node-store/` summaries was removed (MUST 2): it
+The supervisor ruled to reuse E0806 with that cause rather than register a code; a dedicated
+warning (e.g. ZC-W0604: the fetch goes on, so it is not an error) is a candidate for after the b3
+tag. The wait is bounded twice and asserted: by the clock, and by `wait_ms / fetch_peer_poll_ms
++ 1` reads, with `wait_ms <= fetch_peer_wait_ms`. A test stores the identity from another thread
+1.5 s into a 10 s wait: the fetch uses it before the bound and says nothing (a mutation that ends
+the wait at once fails it). swarm-smoke's wait for the `/node-store/` summaries was removed (MUST 2): it
 passed 10 of 10 without it.
 
 ## Corrections
