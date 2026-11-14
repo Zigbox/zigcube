@@ -1368,7 +1368,7 @@ const c1_teeth_roots = [_]struct {
         // exist only in the tenant world, which the tooth switches on. Plain runs (no `--c1`)
         // do not judge P1: it needs the per-revision tap.
         .symptom = "P1",
-        .canary_seeds = 20,
+        .canary_seeds = 35,
     },
     .{
         .name = "relabel_kept",

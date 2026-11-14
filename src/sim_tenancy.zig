@@ -72,7 +72,10 @@ pub fn job_number(name: []const u8) ?u32 {
 /// retried write, not the 30 s resync. It is tight on purpose: a node that comes back under new
 /// labels comes back empty (a new tenure), and the paths that replace what a node lost also
 /// clear such holds, within seconds to tens of seconds; only a bound under those tells a missing
-/// eviction (`relabel_kept`) from them. A sim-check constant, not a product bound.
+/// eviction (`relabel_kept`) from them. Per the supervisor's ruling it is a stated multiple of the
+/// measured worst case: over seeds 1..60 (150 operations, `--c1 --strong --tenants`) every one of
+/// 31 refused holds was acted on before the next one-second scan, so 5 times that resolution.
+/// A sim-check constant, not a product bound.
 pub const acted_ms_max: u64 = 5_000;
 
 /// Refused holds tracked at once; more fails the run (the world holds far fewer).

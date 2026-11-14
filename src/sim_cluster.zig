@@ -1083,7 +1083,11 @@ pub const Cluster = struct {
             if (skewed) -skew_ppm else ppm,
             if (skewed) skew_beyond_ppm else @max(c.swarm.clock_ppm, 1),
         );
+        // `gpa.create` applies no field defaults: every field is set here.
         node.label_set = 0;
+        node.relabel_pending = false;
+        node.relabel_to = null;
+        node.wipe_pending = false;
         if (c.tenants) node.label_set = node.draw_label_set();
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
         node.sim.containers.on_start = job_started;
@@ -1607,11 +1611,13 @@ pub const Cluster = struct {
         // shared and exclusive for its own tenant (`tenant_sets` keeps the exclusive twin of set
         // `s` at `s + 2`): a shared spell lets services and other tenants land on it, and the
         // exclusive one refuses them, the case P1's eviction exists for.
-        const odd = c.nodes.len > 1 and random.boolean();
+        // u32 draws: a `usize` draw differs between native and wasm32.
+        const count: u32 = @intCast(c.nodes.len);
+        const odd = count > 1 and random.boolean();
         const index = if (odd)
-            1 + 2 * random.uintLessThan(usize, c.nodes.len / 2)
+            1 + 2 * random.uintLessThan(u32, count / 2)
         else
-            random.uintLessThan(usize, c.nodes.len);
+            random.uintLessThan(u32, count);
         const node = c.nodes[index];
         if (node.down or node.sim.crashed) return;
         c.stats.relabel_restarts += 1;
