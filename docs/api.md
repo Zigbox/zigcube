@@ -500,7 +500,7 @@ them. The apply body takes `health` and `rollout` in the shape of service v4 (`d
 
 | Endpoint | Does | Codes |
 | --- | --- | --- |
-| `GET /v1/services/{name}/history` | the service's usable generations (`history.usable`), newest first, each as stored with environment values `null` | `ZC-E0101` |
+| `GET /v1/services/{name}/history` | the service's usable generations (`history.usable`), newest first, each as stored; environment values are `null` for a read-only token (`Api.read_only`, item 8), as in every record | `ZC-E0101` |
 | `POST /v1/services/{name}/rollback[?to=<generation>]` | (slice 8, not served) applies a stored generation's spec as a new generation (`reason rollback`, `restores`); without `to`, the one before the current | `ZC-E0127` no earlier generation, `ZC-E0128` compacted, `ZC-E0105` |
 | `GET /v1/services/{name}/rollout` | the service's policy and its `/rollouts/` record, `rollout: null` when it has none | `ZC-E0101` |
 | `POST /v1/services/{name}/rollout/pause`, `.../resume` | freezes or restores the rollout's budget, as a rollout-controller transaction | `409` `ZC-E0129` no rollout, it is complete, or (resume) it failed; `ZC-E0105` it kept changing |
@@ -521,14 +521,22 @@ GET /v1/services/hello/rollout
 
 POST /v1/services/hello/rollout/pause      {"applied_by": "alex@laptop"}  (the body may be empty)
 { "request_id": "...", "action": "pause", "name": "hello", "generation": 2, "phase": "paused",
-  "change": "paused" | "none", "revision": 53, "decision": "1761350000123-api0-0007" }
+  "change": "progressing → paused", "revision": 53, "decision": "1761350000123-api0-0007" }
+
+POST /v1/services/hello/rollout/pause      (again: already paused)
+{ "request_id": "...", "action": "none", "name": "hello", "generation": 2, "phase": "paused",
+  "change": "no change" }
 ```
+
+`action` is `pause` or `resume` when the request wrote, `none` when it changed nothing. `change`
+is `"<phase before> → <phase after>"` (the decision's `change`, e.g. `progressing → paused`,
+`paused → rolling_back`) or `"no change"`. `phase` is the phase after the request.
 
 `GET .../rollout` answers `200` with `rollout: null`, not `404`, when there is no rollout: the
 service exists, and "no rollout" is a state of it (a record whose `service_created` is not the
 service's, `records.rollout_of`, reads as none). `policy` is the stored one with the defaults
-filled in. A pause of a paused rollout, or a resume of a running one, changes nothing: `change`
-is `none`, and there is no `revision` or `decision`. A pause sets the budget to zero in the same
+filled in. A pause of a paused rollout, or a resume of a running one, changes nothing: `action`
+is `none`, `change` is `no change`, and there is no `revision` or `decision`. A pause sets the budget to zero in the same
 write as the phase (R4, `docs/decisions/2026-11-14-c3-slice11-surfaces.md`); a resume restarts the
 evidence window (`evidence_from_ms`) and moves the progress deadline later by the length of the
 pause. The decision is `rollout_pause` or `rollout_resume`, actor `rollout-controller`, citing
