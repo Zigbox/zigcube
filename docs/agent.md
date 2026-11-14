@@ -49,6 +49,24 @@ digest is `start_failed` with the placeholder `ZBX-E0410` ([runtime-codes.md](ru
 unless `--registry` gives it a registry to fetch from (below).
 Capacity is declared, as HANDOFF's provisional answer says.
 
+**Node labels** (B6) are given by `--label KEY=VALUE`, once per label, or by `.labels` in the ZON
+file (`.labels = .{ "tenant=a", "exclusive=tenant" }`); at most `node_labels_max` (8), each at most
+`node_label_bytes_max` (128) bytes. `KEY=VALUE` is a label a job's `placement.require` can name;
+`exclusive=KEY` reserves the node for the jobs that require its own value of `KEY`, so `KEY` must
+be one of the node's labels. Labels are the one setting where flags do not win: if both the flags
+and the file give labels and the two sets differ, the agent refuses to start (`ZC-E0505`, "the
+node's labels are given by --label and by .labels in the file, and they differ"); the same set in
+either order is accepted. A label decides which tenants' work a node runs, so a disagreement is
+not settled by a rule nobody reads. A label without `=`, a key given twice, or an `exclusive`
+naming a key the node lacks is `ZC-E0505` too
+([decision](decisions/2026-11-14-b6-agent-labels-flag-and-file.md)).
+
+**Relabelling a node is a reinstall.** The agent sends its labels when it registers a new tenure,
+not on every keepalive, so an agent restarted with other labels while its lease lives keeps the
+labels it registered. To relabel a node, stop its agent, empty its `--state-dir` (which stops what
+it ran: a wiped node, as in B2), and start it with the new labels: it registers a new tenure with
+them, and the scheduler judges it afresh.
+
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
 the exit code of their blame. While it runs, a server that cannot be reached is `ZC-E0503`, shown
 once and again every 30 seconds, with a backoff from 250 ms to 5 s. SIGINT or SIGTERM ends the
