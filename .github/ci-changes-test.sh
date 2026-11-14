@@ -65,6 +65,7 @@ check $PR x "" "build.zig.zon" TTTTTTTTTT
 check $PR x "" ".github/workflows/ci.yml" TTTTTTTTTT
 check $PR x "" ".github/ci-changes.sh" TTTTTTTTTT
 check $PR x "" "src/demo_host.zig" TTTTTTTTTT
+check $PR x "" "src/harness_tls.zig" TTTTTTTTTT
 check $PR x "" "src/server.zig" TTTTTTTTTT
 check $PR x "" "src/agent_loop.zig" TTTTTTTTTT
 check $PR x "" "src/store_postgres.zig" TTTTTTTTTT

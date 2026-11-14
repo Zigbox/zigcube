@@ -48,7 +48,7 @@ classify() {
     # What every job is built from, or CI itself, and what a demo's start scripts run.
     build.zig | build.zig.zon | .github/* | fixtures/* | demo/*) want_all; return ;;
     # The shared driver of both demos.
-    src/demo_host.zig) want_all; return ;;
+    src/demo_host.zig | src/harness_tls.zig) want_all; return ;;
     # The files of one demo: that demo only (docs/demos/*.md is documentation).
     # demo-b1 imports demo_c1_state.zig, which imports demo_c1_fleet.zig and demo_c0_state.zig.
     # demo-b7 imports demo_b1_state.zig and demo_c1_state.zig.
