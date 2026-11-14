@@ -50,8 +50,8 @@ Choices the brief left open, or where this slice differs from it or from slice 6
     `--profile=auto` replay line written before this slice draws another profile. Replay lines
     name the concrete profile, so recorded lines are unaffected.
 14. **The fleet has no `sim-c3` kind.** The three teeth are left out of the canary manifest, and
-    neither `sim-c3-teeth` nor a `--c3` seed is in `zig build check`; the gate is the sweep
-    `sim_cluster --seeds 1..40 150 --c3` run by hand.
+    neither `sim-c3-teeth` nor a `--c3` seed is in `zig build check`. CI's `sim` job runs both
+    the gate's sweep, `sim_cluster --seeds 1..40 150 --c3` (about a minute), and `sim-c3-teeth`.
 15. **A finished rollout is not deleted after a retention period.** It stays until the next apply
     replaces it.
 16. **A replacement made during a pause keeps the old generation** (TLA+ review, gap 2). An old

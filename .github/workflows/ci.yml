@@ -403,6 +403,14 @@ jobs:
       # the old ttl / 3 renewal rule must fail it.
       - name: Fencing negative test
         run: zig build sim-fencing-teeth --summary all
+      # sim-c3 (docs/core.md, "sim-c3"): C3's rollout checks, the slice gate's sweep and the
+      # negative tests of R1, R4 and R6 (docs/decisions/2026-11-14-c3-slice7-controller.md).
+      - name: sim-c3 sweep, seeds 1 to 40
+        run: |
+          zig build -Doptimize=ReleaseSafe sim-c1-exe --summary all
+          zig-out/bin/sim_cluster --seeds 1..40 150 --c3
+      - name: sim-c3 negative tests
+        run: zig build sim-c3-teeth --summary all
 
   # The sim-c1 negative tests (about 22 minutes), apart from the other simulations so that no job
   # nears its timeout (docs/decisions/2026-11-09-sim-job-split.md).
