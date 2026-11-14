@@ -1405,18 +1405,20 @@ test "store-faults: the watch checker and a client thread fail under fingerprint
 
 // C3 fleet 7: the shape `sim_cluster --seeds A..B <ops> --shrink` prints since the trace (the
 // shrunk run's last operations), and a soak's failure (`sim_cluster <seed> soak`).
-const traced_failing =
-    \\seed 4: FAILED: J8: a run was never started (seed 4, at 61000 ms)
-    \\  step: end
+/// Seed 1 of `sim_teeth --seeds 1..3 100 --shrink` at the slice's commit (C3 slice 4), its trace
+/// cut to the last two of 11 lines, the coverage line to one counter, the summary to one seed.
+const traced_failing = "seed 1: FAILED: a container runs on a node whose lease ran out " ++
+    "longer ago than the lost grace (self-fencing failed)\n" ++
+    \\  step: faults
     \\  profile: mixed
-    \\  shape: operations=300 nodes=3 lease_ttl_ms=15000 replicas_pct=100
-    \\  replay: zig-out/bin/sim_cluster 4 300 3 --heal-at=200
-    \\  shrunk to 41 operations
-    \\  replay: zig-out/bin/sim_cluster 4 41 3 --heal-at=200
-    \\  trace: op 39 at 58100 ms: job_create
-    \\  trace: op 40 at 60900 ms: apply web
-    \\coverage: profile=mixed seeds=1 op.advance=1
-    \\sim-cluster: seeds 4..4, 300 operations: 1 of 1 failed
+    \\  shape: operations=100 nodes=0 lease_ttl_ms=10000 replicas_pct=100
+    \\  replay: zig-out/bin/sim_cluster 1 100 0 --heal-at=60
+    \\  shrunk to 11 operations
+    \\  replay: zig-out/bin/sim_cluster 1 11 0 --heal-at=60
+    \\  trace: op 9 at 7051 ms: apply gamma
+    \\  trace: op 10 at 7151 ms: suspend_node
+    \\coverage: profile=mixed seeds=1 check.I6=1
+    \\sim-cluster: seeds 1..1, 100 operations: 1 of 1 failed
 ;
 
 const soak_failing =
@@ -1425,7 +1427,7 @@ const soak_failing =
     \\seed 7: FAILED: soak: memory grew faster than the history it holds
     \\  step: soak
     \\  profile: mixed
-    \\  shape: operations=1000 nodes=0 lease_ttl_ms=15000 replicas_pct=100
+    \\  shape: operations=1000 nodes=0 lease_ttl_ms=10000 replicas_pct=100
     \\  replay: zig-out/bin/sim_cluster 7 soak 0 --soak-operations=1000 --soak-epoch=500
     \\  soak: 90 live bytes per history item, 20 after the warm-up, limit 4 times
     \\sim-cluster --soak: seeds 7..7, 1000 operations: 1 of 1 failed
@@ -1438,9 +1440,9 @@ test "an issue carries the shrunk replay and the trace of the shrunk run" {
     const batch = try parse(arena, kind_sim_cluster, traced_failing);
     try std.testing.expectEqual(@as(usize, 1), batch.failures.len);
     const failure = batch.failures[0];
-    try std.testing.expectEqual(@as(?u32, 41), failure.shrunk_operations);
+    try std.testing.expectEqual(@as(?u32, 11), failure.shrunk_operations);
     try std.testing.expectEqualStrings(
-        "trace: op 39 at 58100 ms: job_create\n  trace: op 40 at 60900 ms: apply web",
+        "trace: op 9 at 7051 ms: apply gamma\n  trace: op 10 at 7151 ms: suspend_node",
         failure.trace,
     );
     const report: Report = .{
@@ -1450,10 +1452,10 @@ test "an issue carries the shrunk replay and the trace of the shrunk run" {
         .more = &.{},
     };
     const body = try issue_body(arena, &report);
-    const replay = "zig-out/bin/sim_cluster 4 41 3 --heal-at=200\n```";
+    const replay = "zig-out/bin/sim_cluster 1 11 0 --heal-at=60\n```";
     try std.testing.expect(std.mem.indexOf(u8, body, replay) != null);
-    const trace = "```\ntrace: op 39 at 58100 ms: job_create\n" ++
-        "trace: op 40 at 60900 ms: apply web\n```";
+    const trace = "```\ntrace: op 9 at 7051 ms: apply gamma\n" ++
+        "trace: op 10 at 7151 ms: suspend_node\n```";
     try std.testing.expect(std.mem.indexOf(u8, body, trace) != null);
     try std.testing.expect(std.mem.indexOf(u8, try comment_body(arena, &report), trace) != null);
     // The trace is evidence, not identity: the same check at the same step is the same issue.
