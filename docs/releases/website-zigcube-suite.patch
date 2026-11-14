@@ -1,0 +1,387 @@
+From aac86dc37113c35a5f77fe1d267475166bc856ea Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 21:46:47 +0000
+Subject: [PATCH] Deploy Zigcube's apt suite and rpm tree beside Zigbox's
+
+A second fetch step takes zigcube-repos.tar.gz from the newest Zigcube
+release that has one and accepts only apt/dists/zigcube/**,
+apt/pool/main/z/zigcube*/**, apt/pool/main/z/zigbox-dev/** and
+rpm/zigcube/**: no keyring, dot file, .html, test key or to-sign, and no
+path Zigbox's asset also holds. Its files join the same manifest, so the
+byte-for-byte check after deploying covers both. Zigbox's step and its
+refusals are unchanged. The check is .github/check-zigcube-asset.sh,
+table-tested by check-zigcube-asset-test.sh.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RfMZXKcdWukYanC6ZupoKb
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ .github/check-zigcube-asset-test.sh | 155 ++++++++++++++++++++++++++++
+ .github/check-zigcube-asset.sh      |  89 ++++++++++++++++
+ .github/workflows/deploy.yml        |  39 +++++++
+ AGENTS.md                           |  20 ++--
+ 4 files changed, 297 insertions(+), 6 deletions(-)
+ create mode 100644 .github/check-zigcube-asset-test.sh
+ create mode 100755 .github/check-zigcube-asset.sh
+
+diff --git a/.github/check-zigcube-asset-test.sh b/.github/check-zigcube-asset-test.sh
+new file mode 100644
+index 0000000..cf5d72a
+--- /dev/null
++++ b/.github/check-zigcube-asset-test.sh
+@@ -0,0 +1,155 @@
++#!/usr/bin/env bash
++# Table test of check-zigcube-asset.sh: builds small assets and checks each is accepted or
++# refused as it should be. Needs bash, tar, gzip, coreutils. Run: bash .github/check-zigcube-asset-test.sh
++set -euo pipefail
++
++here=$(cd "$(dirname "$0")" && pwd)
++check="$here/check-zigcube-asset.sh"
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++failed=0
++
++# The files a signed Zigcube asset holds (two architectures), as release-sign.sh writes them.
++good_files=(
++  apt/dists/zigcube/Release apt/dists/zigcube/InRelease apt/dists/zigcube/Release.gpg
++  apt/dists/zigcube/main/binary-amd64/Packages apt/dists/zigcube/main/binary-amd64/Packages.gz
++  apt/pool/main/z/zigcube/zigcube_0.5.1_amd64.deb
++  apt/pool/main/z/zigcube-server-sqlite/zigcube-server-sqlite_0.5.1_amd64.deb
++  apt/pool/main/z/zigbox-dev/zigbox-dev_0.5.1_amd64.deb
++  rpm/zigcube/x86_64/repodata/repomd.xml rpm/zigcube/x86_64/repodata/repomd.xml.asc
++  rpm/zigcube/x86_64/zigcube-0.5.1-1.x86_64.rpm
++  rpm/zigcube/aarch64/repodata/repomd.xml rpm/zigcube/aarch64/repodata/repomd.xml.asc
++)
++# Zigbox's asset, as the first fetch step lists it (directories with a trailing slash).
++cat > "$work/zigbox.list" <<'EOF'
++apt/
++apt/dists/
++apt/dists/stable/
++apt/dists/stable/Release
++apt/dists/stable/InRelease
++apt/pool/
++apt/pool/main/
++apt/pool/main/z/
++apt/pool/main/z/zigbox/
++apt/pool/main/z/zigbox/zigbox_0.5.1_amd64.deb
++rpm/
++rpm/x86_64/
++rpm/x86_64/repodata/repomd.xml
++zigbox-archive-keyring.gpg
++zigbox-archive-keyring.asc
++EOF
++
++# make_asset NAME [extra command...]: a directory with the good files, then the extra command run
++# in it, then tarred like release-sign.sh does (tar -czf ... -C dir apt rpm [more]).
++make_asset() {
++  local name=$1
++  shift
++  local dir="$work/$name.d"
++  mkdir -p "$dir"
++  for f in "${good_files[@]}"; do
++    mkdir -p "$dir/$(dirname "$f")"
++    printf '%s\n' "$f" > "$dir/$f"
++  done
++  if [ "$#" -gt 0 ]; then (cd "$dir" && "$@"); fi
++  local tops
++  tops=$(cd "$dir" && ls -A)
++  # shellcheck disable=SC2086
++  tar -czf "$work/$name.tar.gz" -C "$dir" $tops
++}
++
++# expect NAME accept|refuse TEXT [ZIGBOX_LIST]: TEXT must appear in the output of a refusal.
++expect() {
++  local name=$1 want=$2 text=$3 list=${4:-$work/zigbox.list}
++  local out status=0
++  out=$(bash "$check" "$work/$name.tar.gz" "$list" "$work/$name.tree" 2>&1) || status=$?
++  if [ "$want" = accept ]; then
++    if [ "$status" != 0 ] || [ ! -s "$work/$name.tree.manifest" ]; then
++      echo "FAIL $name: refused: $out"; failed=1; return
++    fi
++    if ! (cd "$work/$name.tree" && sha256sum --quiet -c "$work/$name.tree.manifest"); then
++      echo "FAIL $name: manifest does not match the tree"; failed=1; return
++    fi
++    echo "ok   $name: accepted, $(wc -l < "$work/$name.tree.manifest") files"
++  else
++    if [ "$status" != 1 ]; then echo "FAIL $name: exit $status, want 1: $out"; failed=1; return; fi
++    if [ -e "$work/$name.tree" ]; then echo "FAIL $name: refused but unpacked"; failed=1; return; fi
++    if ! grep -qF -- "$text" <<< "$out"; then
++      echo "FAIL $name: no '$text' in: $out"; failed=1; return
++    fi
++    echo "ok   $name: refused: $(tail -n 1 <<< "$out")"
++  fi
++}
++
++make_asset good
++expect good accept ""
++
++make_asset stable_suite sh -c 'mkdir -p apt/dists/stable && echo x > apt/dists/stable/Release'
++expect stable_suite refuse "outside Zigcube's suite"
++
++make_asset zigbox_pool sh -c 'mkdir -p apt/pool/main/z/zigbox && echo x > apt/pool/main/z/zigbox/zigbox_0.5.1_amd64.deb'
++expect zigbox_pool refuse "outside Zigcube's suite"
++
++make_asset zigbox_rpm sh -c 'mkdir -p rpm/x86_64 && echo x > rpm/x86_64/zigbox-0.5.1-1.x86_64.rpm'
++expect zigbox_rpm refuse "outside Zigcube's suite"
++
++make_asset keyring sh -c 'echo x > zigbox-archive-keyring.gpg'
++expect keyring refuse "zigbox.org must not serve"
++
++make_asset keyring_in_suite sh -c 'echo x > apt/dists/zigcube/zigbox-archive-keyring.asc'
++expect keyring_in_suite refuse "zigbox.org must not serve"
++
++make_asset dotfile sh -c 'echo x > apt/dists/zigcube/.htaccess'
++expect dotfile refuse "zigbox.org must not serve"
++
++make_asset html sh -c 'echo x > rpm/zigcube/index.html'
++expect html refuse "zigbox.org must not serve"
++
++make_asset to_sign sh -c 'mkdir -p rpm/zigcube/to-sign && echo x > rpm/zigcube/to-sign/a.header'
++expect to_sign refuse "zigbox.org must not serve"
++
++make_asset test_key sh -c 'echo x > apt/dists/zigcube/zigbox-test-key.gpg'
++expect test_key refuse "zigbox.org must not serve"
++
++make_asset symlink ln -s Release apt/dists/zigcube/Link
++expect symlink refuse "other than files and directories"
++
++# zigcube* is a prefix (zigcube-agent, zigcube-server-*); zigbox-dev is one exact directory.
++make_asset zigcube_prefix sh -c 'mkdir -p apt/pool/main/z/zigcube-agent && echo x > apt/pool/main/z/zigcube-agent/a.deb'
++expect zigcube_prefix accept ""
++
++make_asset dev_prefix sh -c 'mkdir -p apt/pool/main/z/zigbox-devil && echo x > apt/pool/main/z/zigbox-devil/a.deb'
++expect dev_prefix refuse "outside Zigcube's suite"
++
++make_asset file_in_dir_path sh -c 'echo x > apt/pool/main/z/a.deb'
++expect file_in_dir_path refuse "outside Zigcube's suite"
++
++make_asset suite_prefix sh -c 'mkdir -p apt/dists/zigcubex && echo x > apt/dists/zigcubex/Release'
++expect suite_prefix refuse "outside Zigcube's suite"
++
++make_asset no_inrelease rm apt/dists/zigcube/InRelease
++expect no_inrelease refuse "apt/dists/zigcube/InRelease is missing"
++
++make_asset no_aarch64 rm -r rpm/zigcube/aarch64
++expect no_aarch64 refuse "rpm/zigcube/aarch64/repodata/repomd.xml is missing"
++
++# Zigbox's asset holding one of Zigcube's paths: refused, whichever side added it.
++cp "$work/zigbox.list" "$work/overlap.list"
++echo apt/pool/main/z/zigbox-dev/zigbox-dev_0.5.1_amd64.deb >> "$work/overlap.list"
++make_asset overlap_file
++expect overlap_file refuse "Zigbox's asset holds the paths above too" "$work/overlap.list"
++
++cp "$work/zigbox.list" "$work/overlap_dir.list"
++printf 'rpm/zigcube/\nrpm/zigcube/x86_64/other.rpm\n' >> "$work/overlap_dir.list"
++make_asset overlap_dir
++expect overlap_dir refuse "Zigbox's asset holds the paths above too" "$work/overlap_dir.list"
++
++# A tar listing with ./ prefixes (tar -C dir .) is read the same way.
++make_asset dot_prefix
++tar -czf "$work/dot_prefix.tar.gz" -C "$work/dot_prefix.d" .
++expect dot_prefix accept ""
++
++if [ "$failed" != 0 ]; then
++  echo "check-zigcube-asset-test: FAIL"
++  exit 1
++fi
++echo "check-zigcube-asset-test: PASS"
+diff --git a/.github/check-zigcube-asset.sh b/.github/check-zigcube-asset.sh
+new file mode 100755
+index 0000000..5379e32
+--- /dev/null
++++ b/.github/check-zigcube-asset.sh
+@@ -0,0 +1,89 @@
++#!/usr/bin/env bash
++# Checks Zigcube's zigcube-repos.tar.gz and unpacks it, for deploy.yml's second fetch step.
++#
++#   check-zigcube-asset.sh ASSET ZIGBOX_LIST TREE
++#
++# ASSET is the downloaded zigcube-repos.tar.gz; ZIGBOX_LIST the paths of Zigbox's asset, one per
++# line, as the first fetch step lists them (pkg/list); TREE an absent directory to unpack into.
++# On success it writes TREE.manifest ("sha256  path" per file, the format of pkg/manifest) and
++# exits 0; on a refusal it prints one line per reason and exits 1, having unpacked nothing.
++#
++# Zigcube's asset may hold only its own suite and rpm tree (Zigcube's
++# docs/decisions/2026-11-14-zigcube-packages.md): files under apt/dists/zigcube/,
++# apt/pool/main/z/zigcube*/, apt/pool/main/z/zigbox-dev/ and rpm/zigcube/, and the directories
++# leading to them. No keyring (the keyring is Zigbox's asset's), no dot file, no .html, never the
++# test key or the to-sign list, and no path Zigbox's asset also holds.
++set -euo pipefail
++
++if [ "$#" -ne 3 ]; then
++  echo "usage: check-zigcube-asset.sh ASSET ZIGBOX_LIST TREE" >&2
++  exit 2
++fi
++asset=$1
++zigbox_list=$2
++tree=$3
++name=$(basename "$asset")
++if [ -e "$tree" ]; then
++  echo "packages: $tree exists already"
++  exit 2
++fi
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++tar -tvzf "$asset" | awk '{ print substr($1, 1, 1) }' | sort -u > "$work/kinds"
++if grep -qvx -e - -e d "$work/kinds"; then
++  echo "packages: $name holds something other than files and directories"
++  exit 1
++fi
++tar -tzf "$asset" | sed 's|^\./||' | grep -v '^$' > "$work/list" || true
++if [ ! -s "$work/list" ]; then
++  echo "packages: $name is empty"
++  exit 1
++fi
++# Files under the four subtrees; the directories above them only as directories.
++ok='^(apt/dists/zigcube/|apt/pool/main/z/zigcube[^/]*/|apt/pool/main/z/zigbox-dev/|rpm/zigcube/)'
++dirs='^(apt|apt/dists|apt/pool|apt/pool/main|apt/pool/main/z|rpm)/$'
++refused=0
++if grep -vE "$ok" "$work/list" | grep -vE "$dirs"; then
++  echo "packages: $name holds the paths above, outside Zigcube's suite and rpm tree"
++  refused=1
++fi
++if grep -E '(^|/)\.|\.html?$|to-sign|zigbox-test-key|zigbox-archive-keyring' "$work/list"; then
++  echo "packages: $name holds the paths above, which zigbox.org must not serve"
++  refused=1
++fi
++# A path both assets hold would be served from one and overwrite the other. Directories are
++# shared (apt/, apt/pool/main/z/); a file or a subtree of the other's is not.
++sed 's|^\./||; s|/$||' "$zigbox_list" | grep -v '^$' | sort -u > "$work/zigbox"
++grep -v '/$' "$work/list" | sort -u > "$work/files"
++comm -12 "$work/files" "$work/zigbox" > "$work/both"
++grep -E '^(apt/dists/zigcube|apt/pool/main/z/zigcube[^/]*|apt/pool/main/z/zigbox-dev|rpm/zigcube)(/|$)' \
++  "$work/zigbox" >> "$work/both" || true
++if [ -s "$work/both" ]; then
++  sort -u "$work/both"
++  echo "packages: Zigbox's asset holds the paths above too, so neither is deployed"
++  refused=1
++fi
++if [ "$refused" != 0 ]; then
++  exit 1
++fi
++
++mkdir -p "$work/tree"
++tar -xzf "$asset" -C "$work/tree" --no-same-owner --no-same-permissions
++for f in apt/dists/zigcube/Release apt/dists/zigcube/InRelease apt/dists/zigcube/Release.gpg \
++  rpm/zigcube/x86_64/repodata/repomd.xml rpm/zigcube/x86_64/repodata/repomd.xml.asc \
++  rpm/zigcube/aarch64/repodata/repomd.xml rpm/zigcube/aarch64/repodata/repomd.xml.asc; do
++  if [ ! -s "$work/tree/$f" ]; then
++    echo "packages: $f is missing from $name"
++    exit 1
++  fi
++done
++# Workers static assets refuse a file over 25 MiB.
++big=$(find "$work/tree" -type f -size +25M)
++if [ -n "$big" ]; then
++  echo "packages: over 25 MiB, which the Worker cannot serve: $big"
++  exit 1
++fi
++(cd "$work/tree" && find . -type f | sed 's|^\./||' | sort | xargs sha256sum) > "$work/manifest"
++mv "$work/tree" "$tree"
++mv "$work/manifest" "$tree.manifest"
+diff --git a/.github/workflows/deploy.yml b/.github/workflows/deploy.yml
+index b50a546..3981ccc 100644
+--- a/.github/workflows/deploy.yml
++++ b/.github/workflows/deploy.yml
+@@ -14,6 +14,10 @@ name: Deploy zigbox.org
+ #   /apt/, /rpm/      the owner-signed apt and dnf repositories, with
+ #   /zigbox-archive-keyring.gpg and .asc: the zigbox-repos.tar.gz asset of the newest Zigbox
+ #                     release that has one, copied byte for byte (never built or signed here)
++#   /apt/dists/zigcube/, /apt/pool/main/z/zigcube*/, /apt/pool/main/z/zigbox-dev/, /rpm/zigcube/
++#                     Zigcube's suite: the zigcube-repos.tar.gz asset of the newest Zigcube
++#                     release that has one, copied byte for byte beside Zigbox's (one site, one
++#                     key, two suites; Zigcube's docs/decisions/2026-11-14-zigcube-packages.md)
+ # A pull request assembles the site and checks the Worker config; only main deploys, and then
+ # checks that zigbox.org serves every repository file with status 200 and the asset's bytes.
+ on:
+@@ -95,6 +99,34 @@ jobs:
+           if [ -n "$big" ]; then echo "packages: over 25 MiB, which the Worker cannot serve: $big"; exit 1; fi
+           (cd pkg/tree && find . -type f | sed 's|^\./||' | sort | xargs sha256sum) > pkg/manifest
+           echo "packages: $(wc -l < pkg/manifest) files from $ASSET of Zigbox $tag"
++      - name: Fetch Zigcube's signed suite
++        env:
++          GH_TOKEN: ${{ github.token }}
++          ASSET: zigcube-repos.tar.gz
++        run: |
++          set -eu
++          if [ ! -f pkg/manifest ]; then
++            echo "packages: no Zigbox repositories, so Zigcube's suite is not deployed either"
++            exit 0
++          fi
++          tag=""
++          for t in $(gh release list --repo Zigbox/zigcube --exclude-drafts --exclude-pre-releases \
++            --limit 30 --json tagName --jq '.[].tagName'); do
++            if gh release view "$t" --repo Zigbox/zigcube --json assets --jq '.assets[].name' \
++              | grep -qxF "$ASSET"; then tag=$t; break; fi
++          done
++          if [ -z "$tag" ]; then
++            echo "packages: no Zigcube release carries $ASSET yet, so its suite is not deployed"
++            exit 0
++          fi
++          mkdir pkg/cube
++          gh release download "$tag" --repo Zigbox/zigcube --pattern "$ASSET" --dir pkg/cube
++          # Only Zigcube's own paths, nothing Zigbox's asset holds, and the same refusals as above
++          # (self/.github/check-zigcube-asset.sh; its test is check-zigcube-asset-test.sh).
++          bash self/.github/check-zigcube-asset.sh "pkg/cube/$ASSET" pkg/list pkg/cube/tree \
++            || { echo "packages: $ASSET of Zigcube $tag refused"; exit 1; }
++          cat pkg/cube/tree.manifest >> pkg/manifest
++          echo "packages: $(wc -l < pkg/cube/tree.manifest) files from $ASSET of Zigcube $tag"
+       - name: Assemble the site
+         run: |
+           set -eu
+@@ -112,6 +144,13 @@ jobs:
+             done
+             cp -R pkg/tree/. "$out/"
+           fi
++          if [ -d pkg/cube/tree ]; then
++            # Neither src/ nor Zigbox's asset may hold a file of Zigcube's.
++            while read -r _ path; do
++              test ! -e "$out/$path" || { echo "not deployed: $path exists twice"; exit 1; }
++            done < pkg/cube/tree.manifest
++            cp -R pkg/cube/tree/. "$out/"
++          fi
+           echo "box:  $(ls "$out/errors/box" | wc -l) error pages and the project site, Zigbox $(git -C box rev-parse --short HEAD)"
+           echo "cube: $(ls "$out/errors/cube" | wc -l) error pages and the project site, Zigcube $(git -C cube rev-parse --short HEAD)"
+           for f in index.html errors/index.html errors/box/E0101.html errors/cube/E0101.html \
+diff --git a/AGENTS.md b/AGENTS.md
+index 4d54665..d38f07f 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -15,19 +15,27 @@ assembles the site and checks the config.
+ | `/errors/cube/<code>.html` | `site/errors/` on `Zigbox/zigcube` `main`, generated the same way there |
+ | `/zigbox/`, `/zigcube/` | `site/` on each repository's `main` (their project sites), copied at build time |
+ | `/apt/`, `/rpm/`, `/zigbox-archive-keyring.gpg`, `.asc` | the owner-signed `zigbox-repos.tar.gz` asset of the newest Zigbox release that has one, copied byte for byte |
++| `/apt/dists/zigcube/`, `/apt/pool/main/z/zigcube*/`, `/apt/pool/main/z/zigbox-dev/`, `/rpm/zigcube/` | the owner-signed `zigcube-repos.tar.gz` asset of the newest Zigcube release that has one, copied byte for byte beside Zigbox's |
+ 
+-The decisions are `docs/decisions/2026-11-04-errors-on-org-site.md` in Zigbox and Zigcube, and
+-`docs/decisions/2026-11-10-packages-on-zigbox-org.md` in Zigbox for the package repositories.
++The decisions are `docs/decisions/2026-11-04-errors-on-org-site.md` in Zigbox and Zigcube,
++`docs/decisions/2026-11-10-packages-on-zigbox-org.md` in Zigbox for the package repositories, and
++`docs/decisions/2026-11-14-zigcube-packages.md` in Zigcube for Zigcube's suite (one site, one key,
++two suites: apt suites `stable` and `zigcube`, each signed and published by its own product).
+ 
+ ## Rules
+ 
+ - Never hand-edit an error page. They are generated in their product repository and copied here
+   by `.github/workflows/deploy.yml`. Fix the generator there.
+ - Never add, build or sign anything under `/apt/` or `/rpm/`: those bytes are the owner's signed
+-  release asset (Zigbox's `docs/releases/packaging.md`). The deploy refuses an asset holding
+-  anything but files under `apt/` and `rpm/` and the two keyring files, and after deploying it
+-  fetches every file from zigbox.org and fails unless each is served with status 200 and the
+-  asset's exact bytes (no redirect, rewrite or added encoding).
++  release assets, one per product (Zigbox's and Zigcube's `docs/releases/packaging.md`). The
++  deploy refuses a Zigbox asset holding anything but files under `apt/` and `rpm/` and the two
++  keyring files, and a Zigcube asset holding anything but files under `apt/dists/zigcube/`,
++  `apt/pool/main/z/zigcube*/`, `apt/pool/main/z/zigbox-dev/` and `rpm/zigcube/` (no keyring, no
++  dot file, no `.html`, no test key, no `to-sign`), or any path Zigbox's asset also holds
++  (`.github/check-zigcube-asset.sh`; run `.github/check-zigcube-asset-test.sh` after changing it).
++  Zigcube's suite is deployed only with Zigbox's, whose asset carries the keyring. After deploying
++  it fetches every file of both from zigbox.org and fails unless each is served with status 200
++  and the asset's exact bytes (no redirect, rewrite or added encoding).
+ - Never add a path under `/zigbox/` or `/zigcube/`: those belong to the project sites, which
+   are edited in their own repositories.
+ - A URL ending in `.html` redirects (307) to the same URL without it (the assets'
+-- 
+2.43.0
+
