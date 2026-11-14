@@ -902,7 +902,9 @@ test "server names: the most that fit is exact, and a real certificate at it is 
     const fit = server_names_bytes_max(dns_name);
     try testing.expect(server_names_fit(dns_name, fit));
     try testing.expect(!server_names_fit(dns_name, fit + 1));
-    const letters: [constants.x509_dns_name_bytes_max]u8 = @splat('a');
+    // One label, so at most 63 bytes (RFC 1035); `x509_dns_name_bytes_max` is 64.
+    const letters: [63]u8 = @splat('a');
+    comptime assert(letters.len < constants.x509_dns_name_bytes_max);
     var sans: [constants.x509_cert_bytes_max / 3]San = undefined;
     var count: u32 = 0;
     var remaining = fit - server_names_bytes(dns_name, &.{});
