@@ -24,6 +24,7 @@ const server_listen = @import("server_listen.zig");
 const Remembered = @import("server_remember.zig").Remembered;
 const peer_ca = @import("peer_ca.zig");
 const server_ca = @import("server_ca.zig");
+const server_browser_ca = @import("server_browser_ca.zig");
 const server_tls = @import("server_tls.zig");
 const RealClock = @import("server_store.zig").RealClock;
 const store_verified = @import("store_verified.zig");
@@ -54,6 +55,9 @@ pub const Server = struct {
     remembered: ?Remembered,
     /// The cluster CA (docs/peer.md): `ca.key` in the state directory, or in memory.
     ca: peer_ca.Ca,
+    /// The browser CA (B7 slice 6): `<stem>-browser.key` beside the cluster key, or in memory.
+    /// It signs the P-256 certificate a browser gets, and `ca issue-client --p12` certificates.
+    browser_ca: server_browser_ca.KeyPair = undefined,
     /// The CA key's file for this store and whether the store has run here before (`guard`).
     ca_name_buffer: [server_ca.key_name_bytes_max]u8 = undefined,
     ca_name_length: u8 = 0,
@@ -237,6 +241,21 @@ pub const Server = struct {
                 return error.StartFailed;
             },
         };
+        server.browser_ca = server_browser_ca.open(
+            server.io,
+            &server.ca,
+            directory,
+            server.ca_name_buffer[0..server.ca_name_length],
+            .make,
+            diag,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled, // No diagnostic: see `Error`.
+            error.Failed => {
+                assert(diag.code != null);
+                return error.StartFailed;
+            },
+        };
         server.shared.api.ca = &server.ca;
     }
 
@@ -304,7 +323,11 @@ pub const Server = struct {
         assert(!(config.listen == null and config.insecure_listen == null));
         errdefer server.close_listeners();
         if (config.listen) |where| {
-            server.tls.init(server.io, &server.ca, config.tls_name, diag) catch
+            const browser: server_tls.Setup.Browser = .{
+                .ca_key = server.browser_ca,
+                .sans = config.tls_sans,
+            };
+            server.tls.init(server.io, &server.ca, config.tls_name, browser, diag) catch
                 return error.StartFailed;
             server.listener = listen(server.io, where, diag) catch |err| {
                 server.tls.deinit();

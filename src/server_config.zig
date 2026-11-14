@@ -30,7 +30,8 @@ pub const tls_name_default = "zcube-server";
 
 pub const usage =
     \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--insecure-listen HOST:PORT]
-    \\                    [--tls-name NAME] [--store SPEC] [--create-store] [--new-ca]
+    \\                    [--tls-name NAME] [--tls-san NAME_OR_IP]... [--store SPEC]
+    \\                    [--create-store] [--new-ca]
     \\                    [--verbose] [--quiet]
     \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]
     \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
@@ -51,6 +52,10 @@ pub const usage =
     \\                    for zcube local, the console in a browser, and tests
     \\  --tls-name NAME   the DNS name in the server's certificate, which clients check
     \\                    (default zcube-server)
+    \\  --tls-san NAME_OR_IP
+    \\                    another DNS name or IP address in the certificate a browser gets
+    \\                    (from the browser CA, ca-browser.crt in the state directory);
+    \\                    repeatable, none by default
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
     \\  --lost-grace-ms N how long a lost node's replicas stay before they are replaced under
@@ -95,6 +100,8 @@ pub const Config = struct {
     insecure_listen: ?IpAddress = null,
     /// The DNS name of the TLS listener's certificate.
     tls_name: []const u8 = tls_name_default,
+    /// More names for the browser path's certificate (`--tls-san`), after `tls_name`.
+    tls_sans: []const San = &.{},
     store: Store,
     create_store: bool,
     /// Where the remembered revision is kept; null: beside the SQLite file. A Postgres store
@@ -129,6 +136,7 @@ pub const Issue = struct {
 };
 
 pub const Scope = @import("x509.zig").Scope;
+pub const San = @import("x509_p256.zig").San;
 
 /// One relay: the name a job gives and the `host:port` the node agent connects to for it.
 pub const Relay = @import("records.zig").JobRelay;
@@ -189,7 +197,37 @@ pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag)
     if (flags.help) return .help;
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
-    return .{ .run = try merge(flags, file, diag) };
+    var config = try merge(flags, file, diag);
+    config.tls_sans = try sans_of(arena, args, diag);
+    return .{ .run = config };
+}
+
+/// Every `--tls-san` value in `args`, in order (`parse_flags` has checked each has one): an IP
+/// address (its 4 or 16 bytes) or a DNS name (ZC-E0106 otherwise). The list is in `arena`.
+fn sans_of(arena: Allocator, args: []const []const u8, diag: *Diag) Error![]const San {
+    var sans: std.ArrayList(San) = .empty;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        if (!std.mem.eql(u8, args[index], "--tls-san")) continue;
+        index += 1;
+        assert(index < args.len);
+        try sans.append(arena, try san_of(arena, args[index], diag));
+    }
+    return sans.items;
+}
+
+fn san_of(arena: Allocator, text: []const u8, diag: *Diag) Error!San {
+    if (IpAddress.parse(text, 0)) |address| {
+        return switch (address) {
+            .ip4 => |ip4| .{ .ip = try arena.dupe(u8, &ip4.bytes) },
+            .ip6 => |ip6| .{ .ip = try arena.dupe(u8, &ip6.bytes) },
+        };
+    } else |_| {}
+    if (x509_identity.dns_problem(text, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "--tls-san {s} is not a DNS name or an IP address", .{text}, "use a " ++
+            "name like console.example.com, or an address like 192.0.2.7 or 2001:db8::7");
+    }
+    return .{ .dns = text };
 }
 
 /// `ca issue-client NAME --scope S` or `ca issue-node NAME`, `[--out DIR] [--replace]`, and the
@@ -351,6 +389,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.insecure_listen = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--tls-name")) {
             flags.tls_name = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--tls-san")) {
+            _ = try value_of(args, &index, diag); // Read again, in order, by `sans_of`.
         } else if (std.mem.eql(u8, arg, "--store")) {
             flags.store = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
@@ -925,4 +965,29 @@ test "--insecure-listen is loopback only, and --tls-name is a DNS name (B7)" {
         diag.reset();
         try expect_bad(tls_name_of(input, &diag), &diag);
     }
+}
+
+test "--tls-san is repeatable, in order, a DNS name or an IP address (B7 slice 6)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const args = [_][]const u8{
+        "--tls-san", "console.example.com", "--tls-name", "api.example.com",
+        "--tls-san", "192.0.2.7",           "--tls-san",  "2001:db8::7",
+    };
+    const command = try load(arena, testing.io, &args, &diag);
+    const sans = command.run.tls_sans;
+    try testing.expectEqual(@as(usize, 3), sans.len);
+    try testing.expectEqualStrings("console.example.com", sans[0].dns);
+    try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 7 }, sans[1].ip);
+    try testing.expectEqual(@as(usize, 16), sans[2].ip.len);
+    try testing.expectEqual(@as(usize, 0), (try load(arena, testing.io, &.{}, &diag)).run.tls_sans.len);
+    for ([_][]const u8{ "has space", "-lead.example", "" }) |input| {
+        diag.reset();
+        try expect_bad(load(arena, testing.io, &.{ "--tls-san", input }, &diag), &diag);
+    }
+    diag.reset();
+    try expect_bad(load(arena, testing.io, &.{"--tls-san"}, &diag), &diag);
 }
