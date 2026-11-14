@@ -1913,6 +1913,7 @@ test "records a C1 build wrote still read" {
         } else if (std.mem.startsWith(u8, kv.key, prefix_observed)) {
             const record = try read(Observed, arena, kv, &diag);
             try testing.expectEqual(@as(u32, 2), record.v);
+            try testing.expectEqual(@as(?[]const u8, null), record.endpoint);
             seen[2] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_decisions)) {
             const record = try read(Decision, arena, kv, &diag);
@@ -2102,7 +2103,9 @@ test "records a build before C3 wrote still read" {
     // Goal: a stored value is read by the next release. Method: read every record of a store the
     // last release before C3 produced (services with env, limits and a source, a generation bump,
     // a held replica) as the type its key says: services and replicas at version 3, with no health
-    // and the default rollout; observed and decisions at version 2.
+    // and the default rollout; observed and decisions at version 2. C4 reads them with no mesh
+    // address, no grants and no endpoint: these are the only service and observed versions a
+    // build's API or agent has written before C4 (src/testdata/README.md).
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2119,6 +2122,8 @@ test "records a build before C3 wrote still read" {
             try testing.expectEqual(service_version_plain, record.v);
             try testing.expect(record.health == null);
             try testing.expect(record.rollout_policy().equal(.{}));
+            try testing.expectEqual(@as(?[]const u8, null), record.mesh_address);
+            try testing.expectEqual(@as(usize, 0), record.allow.len);
             seen[0] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
             const record = try read(Replica, arena, kv, &diag);
@@ -2312,8 +2317,11 @@ test "source round-trips at version 3 and a version 6 service is refused" {
 
 test "services and observations written before C4 still read, with no mesh members" {
     // Goal: the slice's test "old records still read". Method: a version 3 and a version 4
-    // service, and a version 3 observation, as C2 and C3 wrote them, read back without an
-    // address, grants or endpoint; a v5 service with a bad address or grant, or a v4 observation
+    // service, and a version 3 observation, read back without an address, grants or endpoint.
+    // Version 3 is also read from a real capture (the test above); version 4 and observed
+    // version 3 are written by hand, because no build before C4 writes them through its API or
+    // agent (C3 slice 5, 3c5df94, has no `health` in an apply and no agent health check). A
+    // capture replaces them once a C3 build that writes them exists (src/testdata/README.md); a v5 service with a bad address or grant, or a v4 observation
     // with a bad endpoint, is malformed (ZC-E0301), not taken in.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

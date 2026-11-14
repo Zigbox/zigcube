@@ -45,6 +45,18 @@
   has an address, so every service the API writes is version 5. A server older than C4 refuses
   them (ZC-E0303): **downgrading the server past C4 after its first create is not supported**, as
   with earlier record bumps. This belongs in the release notes.
+- **Old records are proven by a capture where one exists.** Services at version 3 and
+  observations at version 2 are the newest any build's API or agent wrote before C4, and the
+  real capture `src/testdata/b3_store.txt` reads with no mesh address, grants or endpoint. Service
+  version 4 and observed version 3 (C3 slice 5) have no capture: at `3c5df94` neither the apply
+  API nor the agent writes them, so their test is hand-written until a C3 build writes them
+  (review SHOULD 8, cut and recorded here).
+- **Rollback and history (for C3 slice 8).** A rollback rewrites `/services/<name>` from a
+  `/history/` record. `/history/` does not hold `mesh_address` or `allow`, so the rollback must
+  keep both from the current service: a rollback that drops `mesh_address` would assign a new one
+  (or leave the hold orphaned), and one that drops `allow` silently revokes grants. `allow` is not
+  part of a generation, so `/service-history` does not record it; who changed grants is in the
+  `grant` decisions.
 - **Services with no address (written before C4).** Slice 1 assigns one on the next apply of the
   service. A service that is never re-applied keeps none until the backfill, which belongs to
   slice 4. Until then slice 2's `mesh_plan` treats a service without `mesh_address` as having no
@@ -62,4 +74,4 @@ Where: `docs/keys.md` ("Mesh addresses", "Version 5"), `docs/authority.md` §2, 
 (`POST /v1/apply`), `src/mesh_address.zig`.
 
 *Amended 2026-11-14 by the slice 1 review fixes: serialization, reuse reads, probes, the reuse
-check's compares, `allow` as a set, ZC-W0704's slice.*
+check's compares, `allow` as a set, ZC-W0704's slice, the pre-C4 capture, rollback.*
