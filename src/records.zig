@@ -2411,6 +2411,8 @@ test "the version a record is written in is the version the reader accepts" {
         if (T == Service) value.mesh_address = "127.77.0.1";
         // `read` checks a v5 service's grants against its name, so it needs a valid one.
         if (T == Service) value.name = "s";
+        // `read` refuses a hold that names no valid service (it is held, never reused).
+        if (T == MeshAddressHold) value.service = "s";
         if (T == Observed) value.health = .healthy;
         if (T == Observed) value.endpoint = "node1:30000";
         const bytes = try encode(arena, value, &diag);
