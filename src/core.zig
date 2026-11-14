@@ -50,6 +50,7 @@ pub const modules = .{
     @import("peer_serve.zig"),
     @import("records.zig"),
     @import("replica_controller.zig"),
+    @import("rollout_controller.zig"),
     @import("runtime_codes.zig"),
     @import("retention.zig"),
     @import("pull_retention.zig"),

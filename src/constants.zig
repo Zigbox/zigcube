@@ -138,6 +138,12 @@ pub const health_verdict_ms_max: u64 = job_deadline_ms_max;
 /// The longest `rollout.progress_deadline_ms` (which bounds `ready_timeout_ms` and
 /// `min_ready_ms` too): a day, the longest deadline a job may have.
 pub const rollout_deadline_ms_max: u32 = @intCast(job_deadline_ms_max);
+/// How often one rollout's new replicas may die before the rollout fails (ZC-E0304): more than
+/// this many deaths of new replicas since the rollout began or was last resumed fail it. A
+/// replica is replaced under a new id, not restarted in place, so a "restart" is a new replica's
+/// container ending for any reason the release can cause: not a held start (failed at once) and
+/// not its node's loss (docs/decisions/2026-11-13-c3-rollout-restarts-max.md).
+pub const rollout_restarts_max: u32 = 3;
 /// The longest `rollout.grace_ms` an old replica gets to stop: a job's longest stop grace.
 pub const rollout_grace_ms_max: u32 = job_grace_ms_max;
 /// Writes one controller step makes at most (each is a transaction of at most

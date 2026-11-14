@@ -749,6 +749,12 @@ pub const RolloutPhase = enum { progressing, paused, rolling_back, complete, fai
 /// this many ready old ones (`retire`, the count R1 limits) and this many old ones that are not
 /// ready (`retire_unready`). A replica counted as unready that is ready when the controller acts
 /// is not retired on `retire_unready`.
+/// Why a rollout runs: a generation the user applied, or a rollback that landed as one.
+pub const RolloutReason = enum { apply, rollback };
+
+/// Who paused a rollout: the user (`zcube rollout pause`) or a failure under `on_failure: pause`.
+pub const RolloutPauseCause = enum { user, failure };
+
 pub const RolloutBudget = struct {
     start: u32 = 0,
     retire: u32 = 0,
@@ -776,6 +782,20 @@ pub const Rollout = struct {
     budget: RolloutBudget = .{},
     /// The decision that started or last moved the rollout.
     cause_decision: []const u8 = "",
+    /// C3 slice 7: the rest of the controller's state (`rollout_plan.State`), so that another
+    /// server's controller, or this one after a restart, goes on where it stopped.
+    reason: RolloutReason = .apply,
+    /// Failures seen before this moment no longer count (a resume moves it); null: `started_at_ms`.
+    evidence_from_ms: ?u64 = null,
+    paused_at_ms: ?u64 = null,
+    paused_by: ?RolloutPauseCause = null,
+    /// What `budget` was computed on, so the replica controller can tell what of it is spent: the
+    /// store revision the controller read, the `/replica-numbers/<service>` counter then (null:
+    /// no counter yet) and the old replicas (`/replicas/` records of an older spec) then. Starts
+    /// spent are the counter's advance since; retirements, the old replicas gone since.
+    budget_revision: u64 = 0,
+    budget_next: ?u64 = null,
+    budget_old: u32 = 0,
 };
 
 /// Whether `rollout` is the rollout of the service whose key was created at

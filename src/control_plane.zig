@@ -1,9 +1,9 @@
 //! The server's controllers run as one: the node controller, the scheduler, the allocation
-//! auditor and the replica controller, each a core step of its own (`controller.zig`), in that
-//! order, so one pass can mark a node ready, place the replicas that were waiting for it, audit
-//! the accounting those placements changed and create the replicas the service lacks. Every
-//! shell that runs the server's side (`server_drive.zig`, the simulations) drives this and not
-//! the four separately.
+//! auditor, the job controller, the rollout controller and the replica controller, each a core
+//! step of its own (`controller.zig`), in that order, so one pass can mark a node ready, place
+//! the replicas that were waiting for it, audit the accounting those placements changed, move
+//! the rollouts on and create the replicas the service lacks. Every shell that runs the server's
+//! side (`server_drive.zig`, the simulations) drives this and not the six separately.
 //!
 //! Core: no thread, no clock but the one in the context, no I/O.
 
@@ -15,6 +15,7 @@ const controller = @import("controller.zig");
 const job_controller = @import("job_controller.zig");
 const node_controller = @import("node_controller.zig");
 const replica_controller = @import("replica_controller.zig");
+const rollout_controller = @import("rollout_controller.zig");
 const scheduler = @import("scheduler.zig");
 
 const Context = controller.Context;
@@ -23,7 +24,8 @@ const Wakeup = controller.Wakeup;
 
 /// Every prefix any of the four watches. The auditor's are all the scheduler's too.
 pub const watch_prefixes = node_controller.watch_prefixes ++ scheduler.watch_prefixes ++
-    replica_controller.watch_prefixes ++ job_controller.watch_prefixes;
+    replica_controller.watch_prefixes ++ job_controller.watch_prefixes ++
+    rollout_controller.watch_prefixes;
 
 comptime {
     for (auditor.watch_prefixes) |prefix| {
@@ -37,6 +39,7 @@ pub const ControlPlane = struct {
     nodes: node_controller.NodeController,
     scheduler: scheduler.Scheduler,
     jobs: job_controller.JobController,
+    rollouts: rollout_controller.RolloutController,
     replicas: replica_controller.ReplicaController,
     auditor: auditor.Auditor,
     /// Run `scheduler.find_mismatch` after each scheduler pass (the simulations and tests do;
@@ -56,6 +59,7 @@ pub const ControlPlane = struct {
             .nodes = node_controller.NodeController.init(instance *% 4),
             .scheduler = scheduler.Scheduler.init(instance *% 4 +% 2),
             .jobs = job_controller.JobController.init(instance),
+            .rollouts = rollout_controller.RolloutController.init(instance),
             .replicas = replica_controller.ReplicaController.init(instance *% 4 +% 1),
             .auditor = auditor.Auditor.init(instance *% 4 +% 3),
         };
@@ -96,6 +100,9 @@ pub const ControlPlane = struct {
             job_diag = ctx.diag.*;
             ctx.diag.reset();
         }
+        // The rollout controller runs right before the replicas' controller, so the budget it
+        // stores is the one the replicas' pass spends (C3 slice 7).
+        const rolled = try plane.rollouts.reconcile(ctx);
         const third = try plane.replicas.reconcile(ctx);
         if (job_error) |err| {
             ctx.diag.* = job_diag;
@@ -104,10 +111,11 @@ pub const ControlPlane = struct {
         return .{
             .at_ms = @min(
                 @min(@min(first.at_ms, second.at_ms), @min(audited.at_ms, third.at_ms)),
-                jobs.at_ms,
+                @min(jobs.at_ms, rolled.at_ms),
             ),
             .prefixes = &watch_prefixes,
-            .acted = first.acted + second.acted + audited.acted + third.acted + jobs.acted,
+            .acted = first.acted + second.acted + audited.acted + third.acted + jobs.acted +
+                rolled.acted,
         };
     }
 };

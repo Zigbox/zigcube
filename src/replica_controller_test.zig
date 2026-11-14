@@ -463,7 +463,9 @@ test "a spec change replaces every replica; deleting the service stops them all"
     try testing.expectEqual(@as(usize, 0), gone.len);
     var chain = try fixture.decisions(.service, "hello");
     defer chain.deinit(testing.allocator);
-    const tail = "delete_service<desired;scale_down<desired;scale_down<desired;";
+    // The rollout's record goes with the service (`rollout_step`, rollout_controller.zig).
+    const tail = "delete_service<desired;scale_down<desired;rollout_step<desired;" ++
+        "scale_down<desired;";
     try testing.expect(std.mem.endsWith(u8, chain.items, tail));
 }
 
@@ -524,8 +526,10 @@ test "a service applied again with the same generation and another image loses i
     try expect_ids(&.{ "hello-3", "hello-4" }, last);
     try fixture.expect_replica_image("hello-3", second.image);
     const reason = try fixture.reason_of(.service, "hello", "replace_replica");
+    // The rollout's budget (one surge replica, none unavailable) starts one new replica and
+    // retires one old one per step (C3 slice 7).
     const expected = "service hello is at generation 1 and 2 replicas do not run what it asks " ++
-        "for; replacing hello-1; hello-2";
+        "for; replacing hello-1";
     try testing.expectEqualStrings(expected, reason);
 }
 
@@ -545,8 +549,9 @@ test "a rolled service says its replicas run an older generation" {
     try fixture.apply(second);
     _ = try fixture.settle();
     const reason = try fixture.reason_of(.service, "hello", "replace_replica");
+    // One at a time, as the rollout's budget allows (C3 slice 7).
     const expected = "service hello is at generation 2 and 2 replicas run an older one; " ++
-        "replacing hello-1; hello-2";
+        "replacing hello-1";
     try testing.expectEqualStrings(expected, reason);
 }
 
