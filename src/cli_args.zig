@@ -109,8 +109,8 @@ pub const help_text =
     \\  job watch [--from REV]       one line per ending, as they happen
     \\  local up                     start a server and an agent on this machine (SQLite)
     \\  local down                   stop them; the state and the containers are kept
-    \\  help                         show this text
-    \\  version                      print the version
+    \\  help, --help                 show this text
+    \\  version, --version           print the version
     \\
     \\options (before or after the command):
     \\  -v, --verbose                show the full cause chain of a failure and request ids
@@ -193,7 +193,8 @@ fn split(
         if (arg.len > constants.cli_arg_bytes_max) {
             return refuse(diag, "an argument is over {d} bytes", .{constants.cli_arg_bytes_max});
         }
-        const is_flag = !only_words and arg.len > 1 and arg[0] == '-';
+        // `--help` and `--version` are commands that look like flags, as in `zbx`.
+        const is_flag = !only_words and arg.len > 1 and arg[0] == '-' and !is_command_flag(arg);
         if (!is_flag or job_flag(positional[0..count.*], arg)) {
             positional[count.*] = arg;
             count.* += 1;
@@ -241,6 +242,10 @@ fn is_job_command(words: []const []const u8, arg: []const u8) bool {
         std.mem.eql(u8, arg, "--command");
 }
 
+fn is_command_flag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "--version");
+}
+
 fn is_global(arg: []const u8) bool {
     const names = [_][]const u8{
         "--",        "-v", "--verbose", "-o",        "--output",
@@ -265,7 +270,9 @@ fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
     const name = words[0];
     const rest = words[1..];
     if (std.mem.eql(u8, name, "help")) return no_arguments(diag, name, rest, .help);
+    if (std.mem.eql(u8, name, "--help")) return no_arguments(diag, name, rest, .help);
     if (std.mem.eql(u8, name, "version")) return no_arguments(diag, name, rest, .version);
+    if (std.mem.eql(u8, name, "--version")) return no_arguments(diag, name, rest, .version);
     if (std.mem.eql(u8, name, "apply")) return .{
         .apply = try one_argument(diag, name, rest, "a file"),
     };
@@ -482,6 +489,13 @@ test "the commands of the handoff parse, with options before or after" {
     const explain = try parse_text(&.{ "explain", "ZC-E0201" });
     try testing.expectEqualStrings("ZC-E0201", explain.command.explain);
     _ = try parse_text(&.{"help"});
+    // `--help` and `--version` are the commands `help` and `version`, as in `zbx`, wherever the
+    // other options are.
+    try testing.expect((try parse_text(&.{"--help"})).command == .help);
+    try testing.expect((try parse_text(&.{"--version"})).command == .version);
+    const decorated = try parse_text(&.{ "-v", "--version", "--server", "10.0.0.1:7070" });
+    try testing.expect(decorated.command == .version);
+    try testing.expect(decorated.options.verbose);
     try testing.expectEqual(LocalAction.up, (try parse_text(&.{ "local", "up" })).command.local);
     const verbose_down = try parse_text(&.{ "-v", "local", "down" });
     try testing.expectEqual(LocalAction.down, verbose_down.command.local);
@@ -519,6 +533,12 @@ test "the refusals: each names the part at fault" {
             .cause = "--output wide is for zcube get",
         },
         .{ .line = &.{ "help", "me" }, .cause = "help takes no arguments" },
+        .{ .line = &.{ "--help", "me" }, .cause = "--help takes no arguments" },
+        .{ .line = &.{ "--version", "get" }, .cause = "--version takes no arguments" },
+        .{ .line = &.{ "get", "--help" }, .cause = "--help is not something get lists" },
+        .{ .line = &.{"-help"}, .cause = "-help is not a flag zcube has" },
+        .{ .line = &.{"--Version"}, .cause = "--Version is not a flag zcube has" },
+        .{ .line = &.{"-V"}, .cause = "-V is not a flag zcube has" },
         .{ .line = &.{"local"}, .cause = "local takes up or down" },
         .{ .line = &.{ "local", "restart" }, .cause = "local takes up or down" },
         .{ .line = &.{ "local", "up", "down" }, .cause = "local takes up or down" },

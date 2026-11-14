@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) void {
     };
     const built = add_executables(b, shared_options);
     add_unit_tests(b, shared_options, built);
+    add_help_checks(b, built, manifest.version);
 
     // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
     const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
@@ -183,6 +184,52 @@ fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
     const check_run = b.addRunArtifact(check_tests);
     check_run.setCwd(b.path("."));
     test_step.dependOn(&check_run.step);
+}
+
+/// `zig build test` runs each installed executable as a user would, with an empty environment and
+/// no store or server: `--version` prints `<name> <version>` and `--help` the text checked in under
+/// `src/testdata/help/` (src/help_golden_test.zig compares the same files with the source).
+fn add_help_checks(b: *std.Build, built: Built, version: []const u8) void {
+    const test_step = &b.top_level_steps.get("test").?.step;
+    const Golden = struct {
+        exe: *std.Build.Step.Compile,
+        name: []const u8,
+        help: []const u8,
+    };
+    const goldens = [_]Golden{
+        .{
+            .exe = built.cli,
+            .name = "zcube",
+            .help = @embedFile("src/testdata/help/zcube.help.txt"),
+        },
+        .{
+            .exe = built.server,
+            .name = "zcube-server",
+            .help = @embedFile("src/testdata/help/zcube-server.help.txt"),
+        },
+        .{
+            .exe = built.agent,
+            .name = "zcube-agent",
+            .help = @embedFile("src/testdata/help/zcube-agent.help.txt"),
+        },
+    };
+    for (goldens) |golden| {
+        const version_run = b.addRunArtifact(golden.exe);
+        version_run.setName(b.fmt("{s} --version", .{golden.name}));
+        version_run.addArg("--version");
+        version_run.clearEnvironment();
+        version_run.expectStdErrEqual("");
+        version_run.expectStdOutEqual(b.fmt("{s} {s}\n", .{ golden.name, version }));
+        test_step.dependOn(&version_run.step);
+
+        const help_run = b.addRunArtifact(golden.exe);
+        help_run.setName(b.fmt("{s} --help", .{golden.name}));
+        help_run.addArg("--help");
+        help_run.clearEnvironment();
+        help_run.expectStdErrEqual("");
+        help_run.expectStdOutEqual(golden.help);
+        test_step.dependOn(&help_run.step);
+    }
 }
 
 const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };

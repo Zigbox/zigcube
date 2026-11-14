@@ -1,0 +1,20 @@
+usage: zcube-server [--config FILE] [--listen HOST:PORT] [--store SPEC] [--create-store]
+                    [--new-ca] [--verbose] [--quiet]
+       zcube-server --version | --help
+
+  --config FILE     a ZON file with .listen, .store, .create_store and .relays
+                    (the upstreams a job's relay may name)
+  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
+  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
+  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
+  --lost-grace-ms N how long a lost node's replicas stay before they are replaced under
+                    new ids (default 1000)
+  --state-dir DIR   where to remember the highest store revision seen (SQLite: default is
+                    the SQLite file's directory; Postgres: required). Keep outside the store
+  --create-store    create the store's file or schema if it is not there
+  --new-ca          make a new peer CA key although the store has run before (every agent
+                    then joins again); the key file is in the state directory
+  --verbose         show the internal message of a bug, and every request
+  --quiet           log only failures
+
+Writes to the API are unauthenticated: listen on a loopback or private address.

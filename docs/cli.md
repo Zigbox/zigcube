@@ -28,7 +28,7 @@ zcube [options] job watch [--from REV]   one line per ending, as they happen
 zcube [options] explain <code>          explain a diagnostic code, offline
 zcube [options] bundle --last           the evidence for the last failure
 zcube [options] bundle <kind> <name>    the evidence for a service, replica or node
-zcube help | version
+zcube help | version | --help | --version
 ```
 
 | Option | Meaning |
@@ -41,8 +41,10 @@ zcube help | version
 | `--no-redact` | `bundle`: keep secrets in the bundle (prints a warning) |
 | `--confirm` | `repair allocations`, `store accept-rollback`: do it (without it, say what it would do) |
 
-Options may come before or after the command. `--` ends them. Anything else that starts with `-`
-is `ZC-E0111`.
+Options may come before or after the command. `--` ends them. `--help` and `--version` are the
+commands `help` and `version` spelled as flags, as `zbx` and the other two executables take them
+(no `-h`): they print the help text or one line, `zcube <version>`, exit 0, and need no server,
+store or environment. Anything else that starts with `-` is `ZC-E0111`.
 
 ## apply and delete
 

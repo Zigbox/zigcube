@@ -195,7 +195,8 @@ fn start_server_diag(
     var parse_diag: Diag = undefined;
     parse_diag.reset();
     const config: config_mod.Config = .{
-        .listen = config_mod.parse_listen("127.0.0.1:0", &parse_diag) catch unreachable, // A literal.
+        // A literal address: it always parses.
+        .listen = config_mod.parse_listen("127.0.0.1:0", &parse_diag) catch unreachable,
         .store = store_config,
         .create_store = create,
         .verbose = false,

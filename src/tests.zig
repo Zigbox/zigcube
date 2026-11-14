@@ -72,6 +72,7 @@ test {
 }
 
 test {
+    _ = @import("help_golden_test.zig");
     _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
 }

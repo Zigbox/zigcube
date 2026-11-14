@@ -1,0 +1,30 @@
+usage: zcube-agent [--config FILE] [--node NAME] [--server HOST:PORT] [--state-dir DIR]
+                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
+                   [--images-dir DIR] [--peer-listen HOST:PORT] [--peer-advertise HOST:PORT]
+                   [--registry HOST:PORT] [--runtime fake|zigbox] [--verbose]
+       zcube-agent --version | --help
+
+  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
+                     .runtime, .images, .address, .images_dir, .peer_listen, .peer_advertise
+                     and .registry
+  --node NAME        this node's name (a lowercase hostname label)
+  --server ADDR      zcube-server's address, an IP address and a port
+  --state-dir DIR    where the agent keeps its containers (created if missing)
+  --cpu-millis N     the CPU this node offers, in millicores
+  --memory-bytes N   the memory this node offers, in bytes
+  --runtime NAME     fake (the default) or zigbox, real containers (docs/agent.md)
+  --images FILE      fake: the image digests it has (default fixtures/images.zon);
+                     zigbox (deprecated): each digest with the reference to pull it
+                     from, for a service that names no `source`
+  --address TEXT     recorded with the node for people to read; it is not used to connect
+  --images-dir DIR   the node's chunk store; an image the node lacks is fetched into it
+  --peer-listen ADDR serve the chunk store to peers (needs --images-dir, or --runtime zigbox:
+                     the Zigbox store is served)
+  --peer-advertise ADDR  the address peers connect to, published with the node; needed when
+                     --peer-listen is 0.0.0.0 or :: (default: the --peer-listen address)
+  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
+                     peer has it (needs --images-dir)
+  --verbose          show the internal message of a bug
+
+Containers run as plain host processes under supervisors of their own, so stopping the agent
+leaves them running; start it again with the same --state-dir and it adopts them.

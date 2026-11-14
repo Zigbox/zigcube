@@ -1,0 +1,43 @@
+zcube - the Zigcube command line
+
+usage: zcube [options] <command>
+
+commands:
+  apply <file.zon>             show what a service file would change, then apply it
+  delete service <name>        delete a service; its replicas are stopped
+  get service [name]           services and how many replicas run
+  get replicas [service]       replicas, where they run and how they are doing
+  get nodes [name]             nodes, their status, lease, capacity and last contact
+  why <kind> <name>            why a service, replica or node is as it is
+  explain <code>               explain a diagnostic code offline, for example E0201
+  bundle --last                collect the evidence for the last failure
+  bundle <kind> <name>         collect the evidence for a service, replica or node
+  check allocations            compare each node's accounting with its assignments
+  stats pull [node]            the recorded image pulls: bytes by source, time, struck peers
+  repair allocations <node>    show the repair of a node's accounting; --confirm writes it
+  job run <name> --image <digest> [--env K=V] [--input-file F --input-env VAR]
+      [--relay NAME] [--deadline 10m] [--submit-within 10m] [--label k=v]
+      --command <word>...
+                               run a command in an image once, to its end
+  job get <name> [--wait]      a job's state and ending; --wait waits for the ending
+  job list [--state S] [--label k=v]
+                               jobs, newest names first; S is a state or ended
+  job cancel <name>            stop a job
+  job watch [--from REV]       one line per ending, as they happen
+  local up                     start a server and an agent on this machine (SQLite)
+  local down                   stop them; the state and the containers are kept
+  help, --help                 show this text
+  version, --version           print the version
+
+options (before or after the command):
+  -v, --verbose                show the full cause chain of a failure and request ids
+  -o, --output text|wide|json  wide adds columns to get; json prints JSON (failures go to
+                               stderr, one JSON object per line)
+  --server HOST:PORT           where zcube-server listens (default: $ZCUBE_SERVER, then
+                               127.0.0.1:7070)
+  -y, --yes                    apply, delete: do not ask first (required without a terminal)
+  --dry-run                    apply: show the change and stop
+  --no-redact                  bundle: keep secrets in the bundle (prints a warning)
+
+exit codes: 0 ok, 1 your input, 2 your environment, 3 an external service, 70 a bug
+  job get --wait: 0 exited with code 0, 10 exited otherwise, 11 failed, 12 cancelled

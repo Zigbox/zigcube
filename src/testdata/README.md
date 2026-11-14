@@ -2,6 +2,10 @@
 
 `cli/` holds the golden outputs of every diagnostic (`ZCUBE_GOLDEN_UPDATE`, see `cli_golden.zig`).
 
+`help/` holds the `--help` text of `zcube`, `zcube-server` and `zcube-agent`, captured with
+`env -i zig-out/bin/<name> --help`. `help_golden_test.zig` and `zig build test` (which runs the
+three executables) compare against it; regenerate a file the same way when its help changes.
+
 `c0_store.txt` holds the live records of a store written by a C0 build (commit `2ed7b80`, before
 C1 slice 2 changed any format): `zcube-server` on SQLite and `zcube-agent` with `FakeRuntime`, as
 real processes, with `hello` at 3 replicas, every replica process killed with `kill -9` and
