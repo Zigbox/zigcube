@@ -1,7 +1,8 @@
 request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
 error[ZC-E0129]: the service has no rollout to pause or resume
-  cause  service hello has no rollout in progress (the last one is complete)
+  cause  service hello has no rollout in progress (the last one, to generation
+         7, is complete)
   reqid  r-0000001
-  fix    see what the service runs
+  fix    see what the service runs   zcube rollout status hello
   more   zcube explain E0129
   docs   https://zigbox.github.io/zigcube/errors/E0129.html

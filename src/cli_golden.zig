@@ -31,6 +31,7 @@ const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
+const rollout_steer = @import("rollout_steer.zig");
 const secure_random = @import("secure_random.zig");
 const testpeer = @import("tls_testpeer.zig");
 const tls_client = @import("tls_client.zig");
@@ -292,8 +293,8 @@ fn rollback_compacted(diag: *diag_mod.Diag) void { // C3 slice 8: the rollback h
 }
 
 fn rollout_none(diag: *diag_mod.Diag) void { // C3 slice 11: pause and resume
-    const cause = "service hello has no rollout in progress (the last one is complete)";
-    sample(diag, .E0129, &.{cause}, "see what the service runs");
+    // The server's own text (rollout_steer.zig), not a copy of it.
+    rollout_steer.raise_refused(diag, "hello", 7, .complete);
 }
 
 fn rollout_failed(diag: *diag_mod.Diag) void { // C3 slice 7: the rollout controller

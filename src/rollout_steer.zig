@@ -17,6 +17,7 @@ const evidence = @import("evidence.zig");
 const records = @import("records.zig");
 const rollout_plan = @import("rollout_plan.zig");
 const store = @import("store.zig");
+const Diag = @import("diag.zig").Diag;
 
 const Context = controller.Context;
 
@@ -264,16 +265,22 @@ fn no_rollout(ctx: *const Context, name: []const u8) error{NoRollout} {
 
 /// The plan refused: the rollout is complete, or a resume found it failed.
 fn refused(ctx: *const Context, input: Input, rollout: *const records.Rollout) error{NoRollout} {
-    assert(ctx.diag.code == null);
-    ctx.diag.raise(.E0129);
-    switch (rollout.phase) {
-        .failed => ctx.diag.cause("the rollout of service {s} to generation {d} failed; " ++
-            "a failed rollout is resumed only once paused", .{ input.name, rollout.to }),
-        else => ctx.diag.cause("service {s} has no rollout in progress (the last one, to " ++
-            "generation {d}, is {s})", .{ input.name, rollout.to, @tagName(rollout.phase) }),
-    }
-    ctx.diag.fix_with("see what the service runs", "zcube rollout status {s}", .{input.name});
+    raise_refused(ctx.diag, input.name, rollout.to, rollout.phase);
     return error.NoRollout;
+}
+
+/// ZC-E0129 for a rollout the plan refused to pause or resume. Public so the CLI's golden
+/// (`cli_golden.zig`) shows the server's own text.
+pub fn raise_refused(diag: *Diag, name: []const u8, to: u64, phase: records.RolloutPhase) void {
+    assert(diag.code == null);
+    diag.raise(.E0129);
+    switch (phase) {
+        .failed => diag.cause("the rollout of service {s} to generation {d} failed; " ++
+            "a failed rollout is resumed only once paused", .{ name, to }),
+        else => diag.cause("service {s} has no rollout in progress (the last one, to " ++
+            "generation {d}, is {s})", .{ name, to, @tagName(phase) }),
+    }
+    diag.fix_with("see what the service runs", "zcube rollout status {s}", .{name});
 }
 
 // ---- Tests -----------------------------------------------------------------------------------
@@ -281,7 +288,6 @@ fn refused(ctx: *const Context, input: Input, rollout: *const records.Rollout) e
 const testing = std.testing;
 const ManualClock = @import("clock.zig").ManualClock;
 const MemoryStore = @import("store_memory.zig").MemoryStore;
-const Diag = @import("diag.zig").Diag;
 const writers = @import("writers.zig");
 
 const Fixture = struct {

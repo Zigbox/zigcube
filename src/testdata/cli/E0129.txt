@@ -1,5 +1,6 @@
 error[ZC-E0129]: the service has no rollout to pause or resume
-  cause  service hello has no rollout in progress (the last one is complete)
-  fix    see what the service runs
+  cause  service hello has no rollout in progress (the last one, to generation
+         7, is complete)
+  fix    see what the service runs   zcube rollout status hello
   more   zcube explain E0129 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0129.html
