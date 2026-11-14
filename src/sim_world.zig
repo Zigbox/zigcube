@@ -64,6 +64,12 @@ pub const SwitchedStore = struct {
     /// null in every simulation. `lost_answers` counts them.
     lost_answer_prefix: ?[]const u8 = null,
     lost_answers: u32 = 0,
+    /// The calls, and the transactions among them, made since the last `mark` (a lost answer
+    /// marks; so may a test); both 0 until the first. Test-only, to assert what follows a
+    /// failure.
+    marked: bool = false,
+    calls_since_mark: u32 = 0,
+    txns_since_mark: u32 = 0,
     /// A transaction that puts a key under this prefix is answered as a server answers a write
     /// under a tenure that has ended (ZC-E0510); test-only, null in every simulation.
     tenure_ended_put_prefix: ?[]const u8 = null,
@@ -131,6 +137,13 @@ pub const SwitchedStore = struct {
         return @ptrCast(@alignCast(context));
     }
 
+    /// Starts `calls_since_mark` and `txns_since_mark` again from 0.
+    pub fn mark(self: *SwitchedStore) void {
+        self.marked = true;
+        self.calls_since_mark = 0;
+        self.txns_since_mark = 0;
+    }
+
     /// Counts the call and fails it if the store is down.
     fn gate(self: *SwitchedStore, diag: *Diag) store.Error!void {
         if (self.fail_after) |left| {
@@ -142,6 +155,7 @@ pub const SwitchedStore = struct {
             }
         }
         self.calls += 1;
+        if (self.marked) self.calls_since_mark += 1;
         if (self.before_fn) |before| before(self.before_context.?);
         if (self.call_cost) |*cost| if (self.in_agent_step) {
             if (cost.clock.ms + cost.cost_ms > cost.cap_ms.*) {
@@ -206,6 +220,7 @@ pub const SwitchedStore = struct {
     ) store.Error!store.TxnResult {
         const self = from(context);
         try self.gate(diag);
+        if (self.marked) self.txns_since_mark += 1;
         if (self.refuse_put_prefix) |prefix| {
             for (request.on_success) |op| {
                 if (op != .put) continue;
@@ -255,6 +270,7 @@ pub const SwitchedStore = struct {
                 };
                 if (!std.mem.startsWith(u8, key, prefix)) continue;
                 self.lost_answers += 1;
+                self.mark();
                 diag.raise(.E0201);
                 diag.cause("the store committed the write and the connection dropped", .{});
                 diag.fix(.{ .sentence = "none: the next read shows the write" });
@@ -377,6 +393,9 @@ pub const World = struct {
     /// A runtime the agent uses instead of `sim` (a test's wrapper that watches the specs it is
     /// given and passes them on to `sim.interface()`); null in every simulation.
     runtime_override: ?runtime_mod.Runtime = null,
+    /// The agent's step arena as a test's wrapper of the world's own (one that fails an
+    /// allocation on cue); null in every simulation.
+    arena_override: ?Allocator = null,
     /// The agent's files as a wrapper of `files` that injects failures; null in every simulation.
     state_override: ?agent_state.AgentState = null,
     /// The agent's image store, for the summary it writes; null in every simulation but a test's.
@@ -441,6 +460,7 @@ pub const World = struct {
         world.boot_id = "";
         world.call_cap_ms = std.math.maxInt(u64);
         world.runtime_override = null;
+        world.arena_override = null;
         world.state_override = null;
         world.images = null;
         return world;
@@ -486,6 +506,11 @@ pub const World = struct {
         return world.arena_state.allocator();
     }
 
+    fn agent_arena(world: *World) Allocator {
+        const arena = world.fresh_arena();
+        return world.arena_override orelse arena;
+    }
+
     pub fn controller_context(world: *World) controller.Context {
         world.diag.reset();
         return .{
@@ -514,7 +539,7 @@ pub const World = struct {
             .store = world.store_handle(),
             .runtime = world.runtime_override orelse world.sim.interface(),
             .clock = world.manual.clock(),
-            .arena = world.fresh_arena(),
+            .arena = world.agent_arena(),
             .diag = &world.diag,
             .images = world.images,
             .state = world.state_override orelse world.files.interface(),

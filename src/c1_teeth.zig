@@ -78,6 +78,15 @@ pub const evict_world = declared("c1_evict_world") or job_evicted;
 /// `any`.
 pub const burst_world = declared("c1_burst_world") or evict_world;
 
+/// The runner a replay line names: a root may name its own installed runner (`sim_runner`),
+/// since a world or a tooth is a comptime flag of that runner and `sim_cluster` has neither.
+pub const runner: []const u8 = if (@hasDecl(root, "sim_runner"))
+    root.sim_runner
+else if (burst_world)
+    "sim_c1_burst"
+else
+    "sim_cluster";
+
 /// The jobs watch drops the events of some endings (must break J4: a client that follows the watch
 /// misses an ending it never hears of).
 pub const job_gap = declared("c1_teeth_job_gap");

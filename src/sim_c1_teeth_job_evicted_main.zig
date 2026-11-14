@@ -4,5 +4,6 @@
 //! runner as `sim_c1_teeth_job_evicted` for replay.
 
 pub const c1_teeth_job_evicted = true;
+pub const sim_runner = "sim_c1_teeth_job_evicted";
 
 pub const main = @import("sim_cluster_main.zig").main;

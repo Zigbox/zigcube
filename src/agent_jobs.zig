@@ -255,9 +255,15 @@ pub fn pass(
     }
     // One run's failing step must not starve the runs after it (#205): like a replica's, it is
     // kept and the next run is looked at. After a failure that is not the runtime's (the server:
-    // a lost answer to a committed write is one), no other store call is made in this pass, but
-    // each run whose stop needs none, this one included, is still stopped (#247, #248): a stop
-    // committed for a run later in name order is not held back a step by an earlier run's report.
+    // a lost answer to a committed write is one), each run whose stop needs no store call, this
+    // one included, is still stopped (#247, #248): a stop committed for a run later in name
+    // order is not held back a step by an earlier run's report. A failure in this loop ends the
+    // pass's store calls at once (`stop_only` makes none); one in an earlier stage (agent.zig
+    // `stages`) leaves the pass the one read of the runs above, and no write.
+    // `stop_only` follows a failed `one` on the same subject, which may already have stopped a
+    // stale container: the repeated grace-0 stop is harmless on a real host (`pending_stop`
+    // keeps one). In the simulation a state-directory crash in mid-step is folded into
+    // `node.sim.crashed` only after the step, so such a stop can still reach the runtime there.
     for (subjects) |subject| {
         // Test-only: the pass ends at the first failure that is not the runtime's (J6).
         if (c1_teeth.job_pass_break and kept.stopped) break;

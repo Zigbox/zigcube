@@ -1116,6 +1116,11 @@ fn canary_manifest(b: *std.Build) []const u8 {
         text = b.fmt("{s}sim_c1_teeth_{s} sim-c1 {s} {s}\n", .{
             text, entry.name, seeds, entry.symptom,
         });
+        for (entry.also_seeds) |seed| {
+            text = b.fmt("{s}sim_c1_teeth_{s} sim-c1 {d}+1@{d} {s}\n", .{
+                text, entry.name, seed, entry.ops, entry.symptom,
+            });
+        }
     }
     return b.fmt("{s}sim_swarm_teeth sim-swarm {d} {s}\n", .{
         text, canary_seeds_swarm_teeth, canary_symptom_swarm_teeth,
@@ -1177,6 +1182,10 @@ const c1_teeth_roots = [_]struct {
     /// the runner's default profile (manifest `FIRST+COUNT@OPS`), not fresh seeds at drawn
     /// operations: ops/sim-fleet/README.md.
     canary_first: ?u32 = null,
+    /// More known hits of a sparse tooth, each pinned on its own: `sim-c1-teeth-NAME` also runs
+    /// each alone and it must fail with `symptom`, and the manifest gets a line `SEED+1@OPS` of
+    /// its own for each, so the canary rests on more than one seed (PR #250 review).
+    also_seeds: []const u32 = &.{},
     /// The first seed `sim-c1-teeth-NAME` runs. The test stops at the first failing seed and
     /// that one must show `symptom`, unless `any_symptom`: then seeds that fail otherwise (the
     /// skew world fails on convergence at some seeds since #177) are skipped, and some seed in
@@ -1393,8 +1402,12 @@ const c1_teeth_roots = [_]struct {
         .name = "job_pass_break",
         .root = "src/sim_c1_teeth_job_pass_break_main.zig",
         .symptom = "J6",
+        // Sparse: seeds 225 and 44 of the evict world are its known hits (J6 at 21,596 and
+        // 23,406 ms on the loop's `break`); seeds 1..40 have none. The unit tests in
+        // `agent_jobs_test.zig` (#247) are the real guard of both halves of the fix.
         .canary_seeds = 1,
         .canary_first = 225,
+        .also_seeds = &.{44},
         .first_seed = 225,
         .seeds = 225,
         .ops = 300,
@@ -1472,9 +1485,10 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
         teeth.dependOn(&teeth_run.step);
-        add_plain_tooth(b, teeth, teeth_exe, entry);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
+        add_also_seeds(b, &.{ teeth, own }, teeth_exe, entry);
+        add_plain_tooth(b, teeth, teeth_exe, entry);
         const own_install = b.addInstallArtifact(teeth_exe, .{});
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
@@ -1486,6 +1500,25 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// Each more known hit of a sparse tooth (`also_seeds`), run alone with `--c1`: it must fail
+/// with the tooth's symptom.
+fn add_also_seeds(
+    b: *std.Build,
+    steps: []const *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    entry: anytype,
+) void {
+    for (entry.also_seeds) |seed| {
+        const run = b.addRunArtifact(exe);
+        run.addArgs(&.{
+            "--seeds",                  b.fmt("{d}..{d}", .{ seed, seed }),
+            b.fmt("{d}", .{entry.ops}), "--c1",
+            "--expect-fail",            b.fmt("--expect-symptom={s}", .{entry.symptom}),
+        });
+        for (steps) |step| step.dependOn(&run.step);
+    }
 }
 
 /// The same fault in a plain run (no `--c1`): the job checks need no per-revision tap.
@@ -1829,9 +1862,10 @@ const c1_regressions = [_][]const []const u8{
         "--replicas-pct=300", "--heal-at=58",
     },
     // #247: a lost answer (ZC-E0201) to a run's write ended the job pass, and a run whose
-    // cancel had committed kept running past J6's bound (137,767 ms) on f49041a. fb385b2 passes
-    // it by luck of timing; the pass now stops decided runs after a server failure
-    // (docs/decisions/2026-11-14-b3-soak-after-247.md).
+    // cancel had committed kept running past J6's bound (137,767 ms) on f49041a. It records the
+    // issue and guards nothing: fb385b2 passes it by luck of timing, and so does the loop's
+    // `break` put back. The guards are the #247 unit tests (`agent_jobs_test.zig`) and the
+    // `job_pass_break` tooth (docs/decisions/2026-11-14-b3-soak-after-247.md).
     &.{
         "870682998",          "80",                   "3",
         "--strong",           "--profile=slow_store", "--lease-ttl-ms=8488",

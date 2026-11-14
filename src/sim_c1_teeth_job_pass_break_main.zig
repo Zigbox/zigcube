@@ -6,5 +6,6 @@
 
 pub const c1_evict_world = true;
 pub const c1_teeth_job_pass_break = true;
+pub const sim_runner = "sim_c1_teeth_job_pass_break";
 
 pub const main = @import("sim_cluster_main.zig").main;

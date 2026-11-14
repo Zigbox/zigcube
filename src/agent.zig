@@ -453,8 +453,9 @@ pub const Agent = struct {
     ) u32 {
         var acted: u32 = 0;
         pass.replicas(kept);
-        // The job pass runs even after a replica's server failure: it then makes one read (the
-        // runs) and no write, and stops the runs whose stop is decided (#247).
+        // The job pass runs even after a replica stage's failure that is not the runtime's (that
+        // stage makes no store call: the arena or an encode): it then makes one read (the runs)
+        // and no write, and stops the runs whose stop is decided (#247).
         if (kept.stopped and c1_teeth.job_pass_break) return acted;
         acted += kept.run(agent, ctx, "run the job pass", agent_jobs.pass(
             agent,
