@@ -1304,7 +1304,8 @@ test "GET /v1/services/{name}/history lists the generations newest first, env re
     var rig = try Rig.start(31);
     defer rig.stop();
     _ = try rig.json(post(&rig, "", hello_json));
-    const changed = try std.mem.replaceOwned(u8, rig.parsed.allocator(), hello_json, "9c03", "9c04");
+    const arena = rig.parsed.allocator();
+    const changed = try std.mem.replaceOwned(u8, arena, hello_json, "9c03", "9c04");
     _ = try rig.json(post(&rig, "", changed));
     const body = try rig.ok("/v1/services/hello/history", "");
     try testing.expectEqual(@as(i64, 2), field(body, "generation").integer);
