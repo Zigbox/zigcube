@@ -170,17 +170,11 @@ pub fn run(demo: *Demo) !void {
     try summary(demo);
 }
 
-/// `zcube job run NAME --image TREE --relay botpike <extra> --command python -c SOURCE NAME`:
-/// the trailing name marks the job's process for the node's tools (`guest.sh`).
+/// demo-b3's `run_job` with a 10-minute deadline: `zcube job run NAME --image TREE --relay
+/// botpike --deadline 10m <extra> --command python -c SOURCE NAME`.
 fn run_job(demo: *Demo, name: []const u8, extra: []const []const u8, source: []const u8) !void {
-    var args: std.ArrayList([]const u8) = .empty;
-    try args.appendSlice(demo.arena(), &.{
-        "job", "run", name, "--image", demo.v1_tree, "--relay", "botpike", "--deadline", "10m",
-    });
-    try args.appendSlice(demo.arena(), extra);
-    try args.appendSlice(demo.arena(), &.{ "--command", "python", "-c", source, name });
-    const started = try demo.host.zcube(args.items);
-    try demo.host.check(started.code == 0, "zcube job run {s} --relay botpike", .{name});
+    const args = try std.mem.concat(demo.arena(), []const u8, &.{ &.{ "--deadline", "10m" }, extra });
+    try b3.run_job(demo, name, args, source);
 }
 
 fn running(demo: *Demo, name: []const u8) !void {
@@ -434,10 +428,10 @@ fn orphan_row(demo: *Demo) !void {
     demo.expect(view.end_kind != null and std.mem.eql(u8, view.end_kind.?, "exited") and
         view.code == null, "the job was killed by a signal, not left to sleep (end {s}, code " ++
         "{?d})", .{ view.end_kind orelse "?", view.code });
-    const logs = try demo.guest(0, "relay-logs", .{});
+    const logs = try demo.guest(0, "relay-logs {s}", .{job_orphan});
     demo.expect(std.mem.indexOf(u8, logs, "ZC-E0702") != null and
-        std.mem.indexOf(u8, logs, "the job's command was killed") != null, "the relay's log " ++
-        "says why: ZC-E0702, the relay's listener stopped and the command was killed", .{});
+        std.mem.indexOf(u8, logs, "the job's command was killed") != null, "the orphan's own " ++
+        "relay.log says why: ZC-E0702, the relay's listener stopped and the command was killed", .{});
 }
 
 fn summary(demo: *Demo) !void {

@@ -130,14 +130,15 @@ pub fn has_ended(want: Want, demo: *Demo) !bool {
     return view.end_kind != null;
 }
 
-/// `zcube job run NAME --image TREE --relay botpike <extra> --command python -c <source>`.
+/// `zcube job run NAME --image TREE --relay botpike <extra> --command python -c <source> NAME`:
+/// the trailing name (Python's `sys.argv[1]`, unused) lets the node's tools find the job's process.
 pub fn run_job(demo: *Demo, name: []const u8, extra: []const []const u8, source: []const u8) !void {
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(demo.arena(), &.{
         "job", "run", name, "--image", demo.v1_tree, "--relay", "botpike",
     });
     try args.appendSlice(demo.arena(), extra);
-    try args.appendSlice(demo.arena(), &.{ "--command", "python", "-c", source });
+    try args.appendSlice(demo.arena(), &.{ "--command", "python", "-c", source, name });
     const started = try demo.host.zcube(args.items);
     try demo.host.check(started.code == 0, "zcube job run {s} --relay botpike", .{name});
 }
