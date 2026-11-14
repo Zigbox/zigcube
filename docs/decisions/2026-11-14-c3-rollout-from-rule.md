@@ -17,11 +17,11 @@ what the record holds today: `records.read(Rollout, ...)` refuses `to` 0, `from`
 `deadline_at_ms` before `started_at_ms`, and `rolling_back` with `from` 0 (`rollout_valid`, test
 "C3: a rollout record that contradicts itself is refused when read"). Slice 7 adds `reason`,
 `paused_at_ms`, `paused_by` and `evidence_from_ms` to the record (slice 6 decision, item 5) and
-must extend `rollout_valid` to everything else `State.assert_valid` and `begin` assert: `reason` rollback with `from` 0,
-`paused_at_ms`/`paused_by` set exactly while `paused`, `evidence_from_ms` not before the start, a
-pause not before the evidence, an active phase that is not the reason's. It does this before it
-calls `begin` or `pass`; the controller then changes nothing for that service until the key is
-fixed (ZC-E0301's own fix line).
+must extend `rollout_valid` to everything else `State.assert_valid` and `begin` assert: `reason`
+rollback with `from` 0, `paused_at_ms`/`paused_by` set exactly while `paused`, `evidence_from_ms`
+not before the start, a pause not before the evidence, an active phase that is not the reason's.
+It does this before it calls `begin` or `pass`; the controller then changes nothing for that
+service until the key is fixed (ZC-E0301's own fix line).
 
 **3. An automatic rollback that the rollback handler refuses (ZC-E0127, ZC-E0128) ends the
 rollout `failed`, owing nothing, with the refusal recorded** as the decision's code. With rule 1
