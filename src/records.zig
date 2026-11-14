@@ -642,10 +642,14 @@ pub const Grant = struct {
     }
 };
 
+/// Whether two grant lists hold the same grants, in any order: `allow` is a set, and the `grant`
+/// decision names what was added and removed, so a reorder alone is no change.
 pub fn grants_equal(first: []const Grant, second: []const Grant) bool {
-    if (first.len != second.len) return false;
-    for (first, second) |left, right| {
-        if (!left.equal(right)) return false;
+    for (first) |grant| {
+        if (!grants_contain(second, grant)) return false;
+    }
+    for (second) |grant| {
+        if (!grants_contain(first, grant)) return false;
     }
     return true;
 }
@@ -1112,18 +1116,29 @@ pub fn endpoint_valid(endpoint: ?[]const u8) bool {
     const text = endpoint orelse return true;
     if (text.len > constants.mesh_endpoint_bytes_max) return false;
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return false;
-    if (colon == 0) return false;
-    for (text[0..colon]) |byte| {
-        // A host name, IPv4, or bracketed IPv6 (whose colons are inside the brackets).
-        const host_byte = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or
-            byte == ':' or byte == '[' or byte == ']';
-        if (!host_byte) return false;
-    }
+    if (!endpoint_host_valid(text[0..colon])) return false;
     const digits = text[colon + 1 ..];
     if (digits.len == 0 or digits.len > 5) return false;
     for (digits) |byte| if (!std.ascii.isDigit(byte)) return false;
     const port = std.fmt.parseInt(u32, digits, 10) catch unreachable; // At most five digits.
     return port > 0 and port <= std.math.maxInt(u16);
+}
+
+/// A host name or IPv4 address (no colon, no bracket), or an IPv6 address in brackets (hex digits,
+/// colons and dots between `[` and `]`, nothing after).
+fn endpoint_host_valid(host: []const u8) bool {
+    if (host.len == 0) return false;
+    if (host[0] == '[') {
+        if (host.len < 3 or host[host.len - 1] != ']') return false;
+        for (host[1 .. host.len - 1]) |byte| {
+            if (!(std.ascii.isHex(byte) or byte == ':' or byte == '.')) return false;
+        }
+        return true;
+    }
+    for (host) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-')) return false;
+    }
+    return true;
 }
 
 /// The health verdict an observation carries: `unknown` for one without a check, and for every
@@ -1408,6 +1423,13 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         if (!job_valid(record)) return malformed(diag, kv.key, @typeName(T));
     }
     if (T == Assigned and !assigned_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    // `release` and the reuse check use the name as a service name.
+    if (T == MeshAddressHold) {
+        const name_bytes_max = constants.service_name_bytes_max;
+        if (name_problem(record.service, name_bytes_max) != null) {
+            return malformed(diag, kv.key, @typeName(T));
+        }
+    }
     if (T == Service and !service_mesh_valid(record)) return malformed(diag, kv.key, @typeName(T));
     if (T == Observed and !endpoint_valid(record.endpoint)) {
         return malformed(diag, kv.key, @typeName(T));
