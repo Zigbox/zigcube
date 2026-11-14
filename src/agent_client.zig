@@ -581,6 +581,7 @@ pub const RemoteStore = struct {
             .agent_version = node.agent_version,
             .address = node.address,
             .labels = node.labels,
+            .trust_policy = node.trust_policy,
         }, diag);
         const target = try remote.path(arena, "", diag);
         return .{ .method = "PUT", .target = target, .body = body };

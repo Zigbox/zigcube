@@ -351,6 +351,7 @@ const Call = struct {
         if (capacity.memory_bytes == 0) return bad_request(ctx, "capacity", "needs memory_bytes");
         try check_text(ctx, "agent_version", input.agent_version, node_text_bytes_max);
         try check_text(ctx, "address", input.address, node_text_bytes_max);
+        try check_text(ctx, "trust_policy", input.trust_policy, constants.config_path_bytes_max);
         if (input.labels.len > node_labels_max) return bad_request(ctx, "labels", "has too many");
         for (input.labels) |label| try check_text(ctx, "labels", label, node_text_bytes_max);
         const node: records.Node = .{
@@ -359,6 +360,7 @@ const Call = struct {
             .address = input.address,
             .capacity = capacity,
             .labels = input.labels,
+            .trust_policy = input.trust_policy,
         };
         const key = records.node_key(call.node);
         const value = records.encode(ctx.arena, node, ctx.diag) catch return propagate(ctx);
@@ -991,6 +993,9 @@ const Call = struct {
         if (rec.tenure != tenure) {
             return bad_request(ctx, "puts", "a record does not name the tenure of the request");
         }
+        if (!records.observed_valid(rec)) {
+            return bad_request(ctx, "puts", "a replica record has the job-only exit kind refused");
+        }
         const wanted = records.observed_key(call.node, rec.replica);
         if (!std.mem.eql(u8, put.key, wanted.slice())) {
             return bad_request(ctx, "puts", "a key is not the observed key of its record");
@@ -1090,6 +1095,7 @@ const RegisterBody = struct {
     agent_version: []const u8 = "",
     address: []const u8 = "",
     labels: []const []const u8 = &.{},
+    trust_policy: []const u8 = "",
 };
 
 const CredentialBody = struct { node_key: []const u8, lease: u64 };

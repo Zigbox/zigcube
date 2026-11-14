@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
         .sqlite = sqlite,
         .libpq = libpq_module,
     });
-    add_agent_smoke_step(b, built, zigbox_module);
+    add_agent_smoke_step(b, built, shared_options);
     add_swarm_smoke_steps(b, shared_options, built);
     add_relay_teeth_step(b, shared_options);
     add_mtls_interop_step(b, shared_options, built);
@@ -299,14 +299,20 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
 /// `zig build agent-smoke`: the server and the agent as real processes, with real containers
 /// (src/agent_smoke.zig). It runs the executables the build made, whatever `-Doptimize` says, and
 /// is not `demo-c0`. It never caches: it exists to be run.
-fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.Module) void {
+/// Step 9 writes jobs straight into the stopped server's SQLite store (src/demo_b5_inject.zig),
+/// so it links the store backends.
+fn add_agent_smoke_step(b: *std.Build, built: Built, options: ExecutablesOptions) void {
     const exe = b.addExecutable(.{
         .name = "agent_smoke",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/agent_smoke.zig"),
             .target = b.graph.host,
             .optimize = .Debug,
-            .imports = &.{.{ .name = "zigbox", .module = zigbox_module }},
+            .imports = &.{
+                .{ .name = "zigbox", .module = options.zigbox },
+                .{ .name = "sqlite_c", .module = options.sqlite },
+                .{ .name = "libpq_c", .module = options.libpq },
+            },
         }),
     });
     const run = b.addRunArtifact(exe);
@@ -667,6 +673,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     add_demo_b7_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
+    add_demo_b5_step(b, step_options, transcript);
 }
 
 /// `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: HANDOFF's C1 demo, run for
@@ -882,6 +889,62 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run B3's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
     b.step("demo-b3", help).dependOn(&run.step);
+}
+
+/// `zig build demo-b5 [-Dtranscript=FILE]`: B5's demo, run for real (src/demo_b5.zig): the server
+/// on the host with a trust policy, one QEMU guest with `zcube-agent --runtime zigbox
+/// --trust-policy` where jobs are signed with `zbx sign`; unsigned, untrusted and other-tree jobs
+/// refused at the server and again at the agent. Skips unless `ZCUBE_REAL_HOST=1`.
+fn add_demo_b5_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
+    const exe = b.addExecutable(.{
+        .name = "demo_b5",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b5.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    // demo-b5 runs only on KVM hosts, so `check` compiles it (no run) and runs the tests of its
+    // script: what a comptime assert or a type error would otherwise show only in CI's demo-b5 job.
+    const script_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b5_script.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const build_step = b.step("demo-b5-build", "Compile demo-b5 and test its script, no run");
+    build_step.dependOn(&exe.step);
+    build_step.dependOn(&b.addRunArtifact(script_tests).step);
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addFileArg(stripped(b, built.agent));
+    run.addArg("--zbx");
+    run.addFileArg(stripped(b, zigbox.artifact("zbx")));
+    run.addArg("--guest-script");
+    run.addFileArg(b.path("ops/demo-b5/guest.sh"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run B5's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
+    b.step("demo-b5", help).dependOn(&run.step);
 }
 
 /// The settings of the Postgres the demo runs against, and the commands that stop and start it.
@@ -1550,6 +1613,17 @@ const c1_teeth_roots = [_]struct {
         .ops = 300,
     },
     .{
+        .name = "job_untrusted",
+        .root = "src/sim_c1_teeth_job_untrusted_main.zig",
+        // J12 (a run started that its node's trust policy refuses); signed jobs and node
+        // policies exist only in the signed world, which the tooth switches on. Plain runs (no
+        // `--c1`) judge J12 too. Caught by 23 of 30 seeds (drawn operations, `--profile=auto`,
+        // `--c1`, 2026-11-13): 30 seeds at a design rate of 0.6 miss with 1.2e-12.
+        .symptom = "J12",
+        .canary_seeds = 30,
+        .plain_symptom = "J12",
+    },
+    .{
         .name = "job_evicted",
         .root = "src/sim_c1_teeth_job_evicted_main.zig",
         // With #202 fixed (agents arm a run's deadline when it starts), the second clause is hit
@@ -1586,7 +1660,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 28 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the 29 negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1601,27 +1675,13 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     b.step("sim-c1-exe", "Install the native sim-c1 runner (sim_cluster --c1)")
         .dependOn(&install.step);
     const nodes = b.option(u32, "c1-nodes", "Nodes of sim-c1 (default: the seed picks)") orelse 0;
-    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
-    const ops_text = ops_argument(b, sim);
     const nodes_text = b.fmt("{d}", .{if (sim.auto_shape) 0 else nodes});
-    const run = b.addRunArtifact(exe);
-    // The strong world (wipes, relayed jobs, certificates) costs no measurable time here (B4
-    // slice 3 fixes); `tools/wasm_check.mjs --sim-c1` sets it on the WASM side too.
-    run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1", "--strong" });
-    run.addArg(b.fmt("--profile={s}", .{sim.profile}));
-    const native_report = run.captureStdOut(.{});
     const step = b.step("sim-c1", "Run sim-c1 natively and as WASM, and compare (-Dseed=N)");
-    for (v8_modes) |mode| {
-        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
-        node.addFileArg(b.path("tools/wasm_check.mjs"));
-        node.addArg("--sim-c1");
-        node.addFileArg(sim.library.getEmittedBin());
-        node.addArgs(&.{ seed_text, ops_text, nodes_text, "true", sim.profile });
-        node.addFileArg(native_report);
-        step.dependOn(&node.step);
-    }
+    // The seed twice: as it always ran, and in B5's trust world (`--signed`, J12).
+    add_c1_comparison(b, sim, exe, step, nodes_text, false);
+    add_c1_comparison(b, sim, exe, step, nodes_text, true);
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 28 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 29 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1653,9 +1713,41 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_burst_step(b, sim);
     add_worlds_step(b, sim);
     add_reuse_step(b, sim);
+    add_signed_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// One sim-c1 seed run natively and under both V8 compilers as WASM, the reports compared byte
+/// for byte; `signed` adds `--signed` to both.
+fn add_c1_comparison(
+    b: *std.Build,
+    sim: SimStepOptions,
+    exe: *std.Build.Step.Compile,
+    step: *std.Build.Step,
+    nodes_text: []const u8,
+    signed: bool,
+) void {
+    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
+    const ops_text = ops_argument(b, sim);
+    const run = b.addRunArtifact(exe);
+    // The strong world (wipes, relayed jobs, certificates) costs no measurable time here (B4
+    // slice 3 fixes); `tools/wasm_check.mjs --sim-c1` sets it on the WASM side too.
+    run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1", "--strong" });
+    run.addArg(b.fmt("--profile={s}", .{sim.profile}));
+    if (signed) run.addArg("--signed");
+    const native_report = run.captureStdOut(.{});
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim-c1");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, ops_text, nodes_text, "true", sim.profile });
+        node.addFileArg(native_report);
+        if (signed) node.addArg("--signed");
+        step.dependOn(&node.step);
+    }
 }
 
 /// The same fault in a plain run (no `--c1`): the job checks need no per-revision tap.
@@ -1938,6 +2030,29 @@ fn add_reuse_step(b: *std.Build, sim: SimStepOptions) void {
         .dependOn(&run.step);
 }
 
+/// The seeds of `sim-c1-signed` (B5 slice 3).
+const signed_seeds_max = 20;
+
+/// `zig build sim-c1-signed`: B5's trust world (`--signed`: signed jobs, node policies, J12) at
+/// shapes and profiles drawn from the seed; no seed of 1 to `signed_seeds_max` may fail.
+fn add_signed_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_signed",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "--seeds", b.fmt("1..{d}", .{signed_seeds_max}), "auto", "--c1" });
+    run.addArgs(&.{ "--signed", "--profile=auto" });
+    run.expectExitCode(0);
+    b.step("sim-c1-signed", "Run sim-c1 in the signed-jobs world, 20 seeds (J12 holds)")
+        .dependOn(&run.step);
+}
+
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long
 /// cuts, short deadlines) with the fix on. It passes only if no seed fails (J8 and the rest).
 fn add_offline_step(b: *std.Build, sim: SimStepOptions) void {
@@ -2139,6 +2254,13 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     guest.addFileInput(b.path("ops/demo-b3/guest.sh"));
     guest.expectExitCode(0);
     test_step.dependOn(&guest.step);
+    // demo-b5's guest script prints what the host parses (keys, envelopes, containers) and lists
+    // containers only in the Zigbox runtime's layout.
+    const guest_b5 = b.addSystemCommand(&.{"sh"});
+    guest_b5.addFileArg(b.path("ops/demo-b5/test-guest.sh"));
+    guest_b5.addFileInput(b.path("ops/demo-b5/guest.sh"));
+    guest_b5.expectExitCode(0);
+    test_step.dependOn(&guest_b5.step);
 }
 
 /// The seeds the teeth test runs and the most the simulator may need to catch the agent's
@@ -2296,7 +2418,7 @@ fn add_check_step(b: *std.Build) void {
     const gates = [_][]const u8{
         "install",            "test",       "tidy",          "errors-site-check",
         "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
-        "check-store-sqlite", "mtls-teeth", "demo-b3-build",
+        "check-store-sqlite", "mtls-teeth", "demo-b3-build", "demo-b5-build",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);

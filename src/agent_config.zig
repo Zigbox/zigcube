@@ -24,6 +24,8 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const x509_identity = @import("x509_identity.zig");
+const text_util = @import("text.zig");
+const trust_file = @import("trust_file.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -35,13 +37,13 @@ pub const usage =
     \\usage: zcube-agent [--config FILE] [--node NAME] [--server HOST:PORT] [--state-dir DIR]
     \\                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
     \\                   [--images-dir DIR] [--peer-listen HOST:PORT] [--peer-advertise HOST:PORT]
-    \\                   [--registry HOST:PORT] [--runtime fake|zigbox] [--verbose]
-    \\                   [--ca FILE [--cert FILE --key FILE] [--tls-name NAME]]
+    \\                   [--registry HOST:PORT] [--runtime fake|zigbox] [--trust-policy FILE]
+    \\                   [--verbose] [--ca FILE [--cert FILE --key FILE] [--tls-name NAME]]
     \\       zcube-agent --version | --help
     \\
     \\  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
     \\                     .runtime, .images, .address, .images_dir, .peer_listen, .peer_advertise
-    \\                     .registry, .ca, .cert, .key and .tls_name
+    \\                     .registry, .trust_policy, .ca, .cert, .key and .tls_name
     \\  --node NAME        this node's name (a lowercase hostname label)
     \\  --server ADDR      zcube-server's address, an IP address and a port
     \\  --state-dir DIR    where the agent keeps its containers (created if missing)
@@ -64,6 +66,10 @@ pub const usage =
     \\  --cert FILE, --key FILE  the certificate and key to present until the node has its
     \\                     own (node.crt in the state directory, issued at join)
     \\  --tls-name NAME    the DNS name in the server's certificate (default zcube-server)
+    \\  --trust-policy FILE  this node's Zigbox trust policy: a job whose signatures it refuses is
+    \\                     never started here (ends refused, ZBX-E0905); service replicas are not
+    \\                     checked. An absolute path, owned by root or the agent's user, writable
+    \\                     by no one else. Without it the node checks nothing
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -99,6 +105,9 @@ pub const Config = struct {
     peer_advertise: ?IpAddress = null,
     /// The registry an image the node lacks is fetched from (`zcube-agent fetch`), as typed.
     registry: ?[]const u8 = null,
+    /// The node's own trust policy (`--trust-policy`, B5), read once at start; null: the agent
+    /// checks no job's signatures. The API cannot name, change or switch it off.
+    trust: ?trust_file.Loaded = null,
     /// The API over TLS; null: plain HTTP.
     tls: ?Tls = null,
 };
@@ -144,6 +153,7 @@ const File = struct {
     cert: ?[]const u8 = null,
     key: ?[]const u8 = null,
     tls_name: ?[]const u8 = null,
+    trust_policy: ?[]const u8 = null,
 };
 
 /// The fixtures file: the digests the fake runtime has.
@@ -170,6 +180,7 @@ const Flags = struct {
     cert: ?[]const u8 = null,
     key: ?[]const u8 = null,
     tls_name: ?[]const u8 = null,
+    trust_policy: ?[]const u8 = null,
     verbose: bool = false,
     version: bool = false,
     help: bool = false,
@@ -200,8 +211,22 @@ pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag)
     if (flags.help) return .help;
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
-    return .{ .run = try merge(arena, io, flags, file, diag) };
+    var config = try merge(arena, io, flags, file, diag);
+    if (flags.trust_policy orelse file.trust_policy) |path| {
+        try check_trust_path(path, diag);
+        config.trust = try trust_file.read(arena, io, path, trust_options, diag);
+    }
+    return .{ .run = config };
 }
+
+const trust_options: trust_file.Options = .{
+    .code = .E0505,
+    .setting = "--trust-policy",
+    .user = "the agent's user",
+    .fix = "give --trust-policy FILE naming a readable Zigbox policy file",
+    .owner_fix = "chown it to root (or the agent's user) and chmod go-w it: a policy that" ++
+        " others can rewrite gates nothing",
+};
 
 fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Error!Config {
     const node = flags.node orelse file.node orelse
@@ -374,6 +399,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.registry = try value_of(args, &index, diag);
         } else if (tls_flag(&flags, arg)) |field| {
             field.* = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--trust-policy")) {
+            flags.trust_policy = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--cpu-millis")) {
             flags.cpu_millis = try number_of(u32, args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--memory-bytes")) {
@@ -633,6 +660,19 @@ fn absolute_state_dir(
     return arena.dupe(u8, buffer[0..length]) catch error.OutOfMemory;
 }
 
+/// The path is published with the node (`/nodes/<node>.trust_policy`) as typed, so it must name
+/// the file wherever it is read: absolute, and printable ASCII (the record's text rule).
+fn check_trust_path(path: []const u8, diag: *Diag) Error!void {
+    for (path) |byte| if (!text_util.is_printable(byte)) {
+        const fix = "move the policy to a path of printable ASCII";
+        return bad(diag, "the --trust-policy path is not printable ASCII", .{}, fix);
+    };
+    if (path.len == 0 or path[0] != '/') {
+        const fix = "give the policy's absolute path: the node publishes it as typed";
+        return bad(diag, "the --trust-policy path {s} is not absolute", .{path}, fix);
+    }
+}
+
 fn bad(diag: *Diag, comptime cause: []const u8, args: anytype, fix: []const u8) Error {
     assert(diag.code == null);
     diag.raise(.E0505);
@@ -646,6 +686,19 @@ const testing = std.testing;
 fn expect_bad(result: anytype, diag: *const Diag) !void {
     try testing.expectError(error.BadConfig, result);
     try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0505), diag.code);
+}
+
+test "a --trust-policy path is absolute and printable, or it is refused" {
+    // Goal: the published path names the file on any reader's terms (review B5 slice 2). Method:
+    // an absolute path passes; a relative one, an empty one and one with a control byte are E0505.
+    var diag: Diag = undefined;
+    diag.reset();
+    try check_trust_path("/etc/zcube/trust.zon", &diag);
+    const inputs = [_][]const u8{ "trust.zon", "./trust.zon", "", "/etc/zcube/\x07.zon" };
+    for (inputs) |input| {
+        diag.reset();
+        try expect_bad(check_trust_path(input, &diag), &diag);
+    }
 }
 
 test "the server address is an IP address and a port, and nothing else" {

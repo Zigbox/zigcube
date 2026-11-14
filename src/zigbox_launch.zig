@@ -69,6 +69,10 @@ pub const Spec = struct {
     relay_server_name: []const u8 = "",
     /// A Debug build's test-only plain upstream (`relay_tls.plain_allowed`).
     relay_plain: bool = false,
+    /// The job's DSSE envelopes that counted under the node's policy (B5), one line each: the
+    /// supervisor keeps them in the node's Zigbox store before the start when the node's `zbx`
+    /// policy asks (`import_signatures`). Empty: nothing to keep.
+    signatures: []const []const u8 = &.{},
     /// `host.time_now()` (seconds) when the agent decided to start it: a Zigbox record older than
     /// this belongs to an earlier container of the same name.
     launched: u64,

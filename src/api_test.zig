@@ -1527,3 +1527,138 @@ test "a relayed run's certificate: issued to its claim, refused (ZC-E0706) to an
     try rig.refused(post_job(&rig, path, late), 409, "ZC-E0706");
     try rig.refused(post_job(&rig, path, "{\"epoch\":1}"), 400, "ZC-E0104");
 }
+
+// ---- B5: signatures at admission ------------------------------------------------------------
+
+const job_trust = @import("job_trust.zig");
+const trust_fixture = @import("job_trust_fixture.zig");
+
+/// A job of `tree(tree_byte)`, pinned to the manifest of `source(9)`, with `signatures`.
+fn signed_body(
+    rig: *Rig,
+    name: []const u8,
+    tree_byte: u8,
+    signatures: []const []const u8,
+) ![]const u8 {
+    const arena = rig.parsed.allocator();
+    var image_buffer: [67]u8 = undefined;
+    var source_buffer: [128]u8 = undefined;
+    const image = trust_fixture.image(&image_buffer, tree_byte);
+    const source = trust_fixture.source(&source_buffer, 9);
+    var list: std.Io.Writer.Allocating = .init(arena);
+    for (signatures, 0..) |line, index| {
+        if (index > 0) try list.writer.writeAll(",");
+        try list.writer.print("{f}", .{std.json.fmt(line, .{})});
+    }
+    return std.fmt.allocPrint(arena,
+        \\{{"name":"{s}","image":"{s}","source":"{s}","command":["true"],"deadline_ms":60000,
+    ++
+        \\"submit_by_ms":{d},"signatures":[{s}]}}
+    , .{ name, image, source, rig.world.now_ms() + 30_000, list.written() });
+}
+
+test "without a trust policy every job is admitted, and its signatures are kept and shown" {
+    // Goal: B5's "with no trust entry, everything is accepted as before". Method: an unsigned
+    // job and a job with a line no key would count are both created; the second's GET shows
+    // its signature as submitted.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    var fixture = try trust_fixture.Fixture.init(testing.allocator);
+    defer fixture.deinit(testing.allocator);
+    const arena = rig.parsed.allocator();
+    const unsigned = try signed_body(&rig, "plain", 1, &.{});
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", unsigned).status);
+    const line = try fixture.sign_tree(arena, 5, 2); // Another key, another tree.
+    const body = try signed_body(&rig, "kept", 1, &.{line});
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", body).status);
+    const got = try rig.ok("/v1/jobs/kept", "");
+    const shown = field(field(got, "job"), "signatures").array.items;
+    try testing.expectEqual(@as(usize, 1), shown.len);
+    try testing.expectEqualStrings(line, shown[0].string);
+}
+
+test "under a policy, POST /v1/jobs answers 403 ZBX-E0905 for an uncovered job and writes nothing" {
+    // Goal: B5 slice 1's refusal. Method: under a policy trusting key 7, an unsigned job, one
+    // signed by key 5, one over another tree and one bound to another manifest are each 403
+    // with ZBX-E0905 and leave no job behind; a malformed line is 400 ZC-E0130; the good
+    // signature is 201.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    var fixture = try trust_fixture.Fixture.init(testing.allocator);
+    defer fixture.deinit(testing.allocator);
+    try fixture.trust_keys(&.{7}, true);
+    const config = fixture.config();
+    rig.api.trust = &config;
+    const arena = rig.parsed.allocator();
+    const status_before = try rig.ok("/v1/status", "");
+    const revision = field(field(status_before, "store"), "revision").integer;
+
+    const untrusted = try fixture.sign_tree(arena, 5, 1);
+    const other_tree = try fixture.sign_tree(arena, 7, 2);
+    const other_manifest = try fixture.sign_manifest(arena, 7, 1, 8);
+    const refused = [_][]const []const u8{
+        &.{}, &.{untrusted}, &.{other_tree}, &.{other_manifest},
+    };
+    for (refused) |signatures| {
+        const body = try signed_body(&rig, "guarded", 1, signatures);
+        const response = post_job(&rig, "/v1/jobs", body);
+        try rig.refused(response, 403, "ZBX-E0905");
+        try testing.expect(std.mem.indexOf(u8, response.body, "/etc/zcube/trust.zon") != null);
+        try testing.expectEqual(@as(u16, 404), rig.get("/v1/jobs/guarded", "").status);
+    }
+    const after = try rig.ok("/v1/status", "");
+    try testing.expectEqual(revision, field(field(after, "store"), "revision").integer);
+
+    const malformed = try signed_body(&rig, "guarded", 1, &.{"not an envelope"});
+    try rig.refused(post_job(&rig, "/v1/jobs", malformed), 400, "ZC-E0130");
+
+    const good = try fixture.sign_manifest(arena, 7, 1, 9);
+    const body = try signed_body(&rig, "guarded", 1, &.{ untrusted, good });
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", body).status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", body).status);
+}
+
+test "the signatures' bounds hold with or without a policy" {
+    // Goal: B5's bounds, ZC-E0130 naming the field. Method: five envelopes, an empty one and one
+    // with a control character are refused without a policy.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const five = [_][]const u8{ "a", "b", "c", "d", "e" };
+    const cases = [_][]const []const u8{ &five, &.{""}, &.{"tab\there"} };
+    for (cases) |signatures| {
+        const body = try signed_body(&rig, "bounded", 1, signatures);
+        const response = post_job(&rig, "/v1/jobs", body);
+        try rig.refused(response, 400, "ZC-E0130");
+        try testing.expect(std.mem.indexOf(u8, response.body, "signatures") != null);
+    }
+}
+
+test "a signatures array filling the whole body is refused by name within the request arena" {
+    // Goal: `signatures` is built as slices before its count is checked; even a body of empty
+    // strings stays within the production request arena and the answer is ZC-E0130 naming it.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const head = "{\"name\":\"big\",\"image\":\"b3:51aa9c03\",\"command\":[\"true\"]," ++
+        "\"deadline_ms\":1000,\"submit_by_ms\":9999999999999,\"signatures\":[";
+    const tail = "\"\"]}";
+    const body = try rig.parsed.allocator().alloc(u8, constants.job_request_bytes_max);
+    @memcpy(body[0..head.len], head);
+    var at: usize = head.len;
+    while (at + 3 < body.len - tail.len) : (at += 3) @memcpy(body[at..][0..3], "\"\",");
+    const rest = body.len - tail.len;
+    @memset(body[at..rest], ' ');
+    @memcpy(body[rest..], tail);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = rig.world.controller_context();
+    ctx.arena = arena.allocator();
+    const response = rig.api.handle(&ctx, .{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/jobs",
+        .body = body,
+    });
+    try rig.refused(response, 400, "ZC-E0130");
+    try testing.expect(std.mem.indexOf(u8, response.body, "signatures") != null);
+    try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
+}

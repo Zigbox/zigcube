@@ -225,6 +225,7 @@ pub const ZigboxRuntime = struct {
             .relay = spec.relay,
             .relay_server_name = spec.relay_server_name,
             .relay_plain = spec.relay_plain,
+            .signatures = spec.signatures,
             .launched = self.host.time_now(),
         };
     }

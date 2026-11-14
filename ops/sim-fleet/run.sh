@@ -191,8 +191,12 @@ kind_flags() {
         echo "--c1"
         return 0
     fi
+    # The sim-c1 workers run B5's trust world (`--signed`, J12); a canary keeps the world its
+    # tooth was measured in.
     case "$(kind_sim "$1")" in
-    sim-c1) echo "--c1 --profile=$profile" ;;
+    sim-c1) if [ "$1" = sim-c1 ]; then
+        echo "--c1 --signed --profile=$profile"
+    else echo "--c1 --profile=$profile"; fi ;;
     *) echo "--profile=$profile" ;;
     esac
 }

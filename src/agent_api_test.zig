@@ -394,6 +394,17 @@ test "a report that is not this node's own, or not one transaction, is refused" 
         .{mine},
     );
     try rig.refused(rig.call("POST", path, "", elsewhere), 400, "ZC-E0104");
+    // `refused` is a job's exit kind only (B5); a replica never ends refused.
+    var refused_buffer: [384]u8 = undefined;
+    const refused = try std.fmt.bufPrint(&refused_buffer, "{{\"v\":2,\"replica\":\"hello-1\"," ++
+        "\"node\":\"node2\",\"generation\":1,\"tenure\":{d},\"status\":\"stopped\"," ++
+        "\"exit\":{{\"kind\":\"refused\"}},\"reported_at_ms\":2}}", .{rig.tenure});
+    const refused_put = try std.fmt.bufPrint(
+        &body,
+        "{{\"puts\":[{{\"key\":\"/observed/node2/hello-1\",\"value\":{s}}}]}}",
+        .{refused},
+    );
+    try rig.refused(rig.call("POST", path, "", refused_put), 400, "ZC-E0104");
     const twice = "{\"deletes\":[\"/observed/node2/a\",\"/observed/node2/a\"]}";
     try rig.refused(rig.call("POST", path, "", twice), 400, "ZC-E0104");
     const other_node = "{\"deletes\":[\"/observed/node3/a\"]}";

@@ -31,6 +31,7 @@ const agent_mod = @import("agent.zig");
 const build_options = @import("build_options");
 const clock_mod = @import("agent_clock.zig");
 const config_mod = @import("agent_config.zig");
+const job_trust = @import("job_trust.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const fake_runtime = @import("fake_runtime.zig");
@@ -418,6 +419,42 @@ fn peer_address(buffer: *[64]u8, advertise: ?std.Io.net.IpAddress) []const u8 {
     return std.fmt.bufPrint(buffer, "{f}", .{address}) catch unreachable;
 }
 
+/// The agent, with the node's own trust policy and its scratch (a few MiB, so on the heap) when
+/// it has `--trust-policy`. `destroy_agent` frees both.
+fn new_agent(
+    gpa: std.mem.Allocator,
+    config: config_mod.Config,
+    peer_buffer: *[64]u8,
+) error{OutOfMemory}!*agent_mod.Agent {
+    const agent = try gpa.create(agent_mod.Agent);
+    errdefer gpa.destroy(agent);
+    var trust: ?*const job_trust.Trust = null;
+    if (config.trust) |loaded| {
+        const held = try gpa.create(NodeTrust);
+        held.trust = .{ .policy = loaded.policy, .path = loaded.path, .scratch = &held.scratch };
+        trust = &held.trust;
+    }
+    agent.init(.{
+        .node = config.node,
+        .capacity = config.capacity,
+        .address = config.address,
+        .peer = peer_address(peer_buffer, config.peer_advertise),
+        .agent_version = build_options.version,
+        .trust = trust,
+    });
+    return agent;
+}
+
+const NodeTrust = struct { trust: job_trust.Trust, scratch: job_trust.Scratch };
+
+fn destroy_agent(gpa: std.mem.Allocator, agent: *agent_mod.Agent) void {
+    if (agent.config.trust) |trust| {
+        const held: *const NodeTrust = @alignCast(@fieldParentPtr("trust", trust));
+        gpa.destroy(held);
+    }
+    gpa.destroy(agent);
+}
+
 /// Runs the agent until it is told to stop. Returns the process's exit code.
 pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const io = init.io;
@@ -452,10 +489,9 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         return fail(io, &diag, config.verbose);
     http_transport.client.tls = tls;
     defer if (config.tls != null) credentials.deinit();
-    const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
-    defer gpa.destroy(agent);
     var peer_buffer: [64]u8 = undefined;
-    init_agent(agent, config, &peer_buffer);
+    const agent = new_agent(gpa, config, &peer_buffer) catch return constants.exit_environment;
+    defer destroy_agent(gpa, agent);
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
     var swarm: Swarm = .{};
     defer swarm.stop(gpa); // Also after a start that failed with the store open.
@@ -484,16 +520,6 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     defer shell.arena.deinit();
     announce(io, config);
     return serve(&shell, &diag, peer_identity.stored_problem);
-}
-
-fn init_agent(agent: *agent_mod.Agent, config: config_mod.Config, peer_buffer: *[64]u8) void {
-    agent.init(.{
-        .node = config.node,
-        .capacity = config.capacity,
-        .address = config.address,
-        .peer = peer_address(peer_buffer, config.peer_advertise),
-        .agent_version = build_options.version,
-    });
 }
 
 /// Runs the agent's loop until it is told to stop, then saves the pair.

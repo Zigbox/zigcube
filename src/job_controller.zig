@@ -534,6 +534,7 @@ pub fn map_ending(observed: *const records.JobObserved) ?Ending {
         .pid_limit => failed(.pid_limit, null),
         .start_failed => failed(.start_failed, null),
         .lost => failed(.unknown, null),
+        .refused => failed(.refused, null),
     };
 }
 
@@ -622,6 +623,7 @@ const Pass = struct {
             .input_digest = spec.input_digest,
             .input_bytes = spec.input_bytes,
             .relay = spec.relay,
+            .signatures = spec.signatures,
             .start_by_ms = spec.created_at_ms +| spec.deadline_ms,
             .created_at_ms = now,
         };

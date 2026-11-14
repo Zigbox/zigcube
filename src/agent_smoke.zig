@@ -12,7 +12,15 @@
 //!      carries the `ZBX-E0410` diagnostic;
 //!   6. a job, claimed, adopted after `kill -9` of the agent, ended with its exit code;
 //!   7. a relayed job (B3 slice 2): its command reaches an upstream of this program through
-//!      `ZCUBE_RELAY`, and the relay's port refuses connections once the job has ended.
+//!      `ZCUBE_RELAY`, and the relay's port refuses connections once the job has ended;
+//!   8. the agent restarted with `--trust-policy` (B5 slice 2): an unsigned job is refused before
+//!      its command starts (`failed`, cause `refused`), and a job signed by the trusted key runs.
+//!   9. demo-b5's step 4, rehearsed on FakeRuntime (B5 slice 4): the server restarted with the
+//!      same policy refuses three jobs (unsigned, signed by an untrusted key, signed for another
+//!      tree) with 403 and ZBX-E0905 saying why; then, the server stopped, they are written
+//!      straight into its SQLite store (src/demo_b5_inject.zig), the server is started on the same
+//!      store, and the agent refuses each (`failed`, cause `refused`, ZBX-E0905 saying why) with
+//!      nothing started.
 //!
 //! Every process it starts is killed at the end, whatever happened (`Smoke.cleanup`). It prints
 //! to stdout only, one line per step, because the build runner counts any stderr as a failure; a
@@ -60,6 +68,10 @@ const Smoke = struct {
     agent: ?std.process.Child = null,
     server_starts: u32 = 0,
     agent_starts: u32 = 0,
+    /// The agent's `--trust-policy`, once the trust step sets one.
+    trust_policy: ?[]const u8 = null,
+    /// The server's trust policy, once step 9 sets one.
+    server_policy: ?[]const u8 = null,
     failed: bool = false,
 
     fn work_file(smoke: *Smoke, name: []const u8) ![]const u8 {
@@ -115,16 +127,21 @@ const Smoke = struct {
         const store = try std.fmt.allocPrint(arena, "sqlite:{s}/store.db", .{smoke.work});
         const log = try std.fmt.allocPrint(arena, "server-{d}.log", .{smoke.server_starts});
         const config = try smoke.work_file("server.zon");
+        const trust = if (smoke.server_policy) |policy|
+            try std.fmt.allocPrint(arena, ", .trust = .{{ .policy = \"{s}\" }}", .{policy})
+        else
+            "";
         try std.Io.Dir.cwd().writeFile(smoke.io, .{
             .sub_path = config,
             .data = try std.fmt.allocPrint(
                 arena,
                 ".{{ .cluster = \"{s}\", .relays = .{{ .echo = .{{ " ++
                     ".address = \"127.0.0.1:{d}\", .server_name = \"{s}\", " ++
-                    ".server_ca = \"{s}/upstream-ca.pem\" }} }} }}\n",
+                    ".server_ca = \"{s}/upstream-ca.pem\" }} }}{s} }}\n",
                 .{
                     tls_upstream.cluster,     smoke.upstream_port,
                     tls_upstream.server_name, smoke.work,
+                    trust,
                 },
             ),
         });
@@ -156,8 +173,10 @@ const Smoke = struct {
             "--cpu-millis",   "4000",
             "--memory-bytes", "8589934592",
             "--images",       smoke.images,
+            "--trust-policy", smoke.trust_policy orelse "",
         };
-        smoke.agent = try smoke.spawn(smoke.agent_exe, &args, log);
+        const used = if (smoke.trust_policy == null) args.len - 2 else args.len;
+        smoke.agent = try smoke.spawn(smoke.agent_exe, args[0..used], log);
     }
 
     /// SIGTERM, then wait: a clean stop is exit 0.
@@ -354,6 +373,8 @@ fn script(smoke: *Smoke) !void {
     try step_unknown_digest(smoke);
     try step_job(smoke);
     try step_relay_job(smoke);
+    try step_trust_jobs(smoke);
+    try step_trust_bypass(smoke);
 }
 
 const three_run = struct {
@@ -832,6 +853,269 @@ fn check_relay_identity(smoke: *Smoke) !void {
     );
     const epoch = seen.placement_epoch;
     try smoke.expect(epoch > 0, "the certificate's placement epoch is {d}", .{epoch});
+}
+
+// ---- The node's trust policy (B5 slice 2) -------------------------------------------------------
+
+const trust_fixture = @import("job_trust_fixture.zig");
+
+/// The tree the signed job runs: `b3:` and 64 hex digits, which a signature can name.
+const signed_tree: u8 = 0x5a;
+
+fn job_ended(smoke: *Smoke, name: []const u8) !bool {
+    const state = (try job_now(smoke, name)).state;
+    return std.mem.eql(u8, state, "exited") or std.mem.eql(u8, state, "failed");
+}
+
+const unsigned_ended = struct {
+    fn check(s: *Smoke) !bool {
+        return job_ended(s, "unsigned");
+    }
+};
+
+const signed_ended = struct {
+    fn check(s: *Smoke) !bool {
+        return job_ended(s, "signed");
+    }
+};
+
+/// The cause of a failed job's ending, or "" when it has none.
+fn job_cause(smoke: *Smoke, name: []const u8) ![]const u8 {
+    const arena = smoke.arena.allocator();
+    const path = try std.fmt.allocPrint(arena, "/v1/jobs/{s}", .{name});
+    const reply = try smoke.call("GET", path, "");
+    const value = try std.json.parseFromSliceLeaky(Json, arena, reply.body, .{});
+    const status = value.object.get("status") orelse return "";
+    if (status != .object) return "";
+    const end = status.object.get("end") orelse return "";
+    if (end != .object) return "";
+    const cause = end.object.get("cause") orelse return "";
+    return if (cause == .string) cause.string else "";
+}
+
+/// Writes the agent's images (the fixture's two and the signed tree) and a policy that trusts
+/// key 1 and asks for a signature, then restarts the agent with `--trust-policy`.
+fn restart_with_policy(smoke: *Smoke, signed_image: []const u8) !void {
+    const arena = smoke.arena.allocator();
+    const images = try smoke.work_file("images.zon");
+    try std.Io.Dir.cwd().writeFile(smoke.io, .{
+        .sub_path = images,
+        .data = try std.fmt.allocPrint(
+            arena,
+            ".{{ .images = .{{ \"b3:51aa9c03\", \"b3:9d20c4f1\", \"{s}\" }} }}\n",
+            .{signed_image},
+        ),
+    });
+    const policy = try smoke.work_file("trust.zon");
+    const public = trust_fixture.public_text(1);
+    try std.Io.Dir.cwd().writeFile(smoke.io, .{
+        .sub_path = policy,
+        .data = try std.fmt.allocPrint(
+            arena,
+            ".{{ .version = 1, .keys = .{{ .{{ .name = \"smoke\", .public = \"{s}\" }} }}, " ++
+                ".require_signature = true }}\n",
+            .{&public},
+        ),
+    });
+    smoke.images = images;
+    smoke.trust_policy = policy;
+    try smoke.stop(&smoke.agent, "the agent");
+    // The restarted agent keeps its remembered lease, so the node record still holds the first
+    // registration's `trust_policy` (docs/agent.md, "Known limits"); the jobs below show the check.
+    try smoke.start_agent();
+}
+
+fn post_trust_job(
+    smoke: *Smoke,
+    name: []const u8,
+    image: []const u8,
+    signatures: []const u8,
+) !void {
+    const arena = smoke.arena.allocator();
+    const stamp: u64 = @intCast(std.Io.Clock.real.now(smoke.io).toMilliseconds());
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"name\":\"{0s}\",\"image\":\"{1s}\",\"deadline_ms\":60000," ++
+            "\"submit_by_ms\":{2d},\"signatures\":[{3s}],\"command\":[\"sh\",\"-c\"," ++
+            "\"echo {0s} >> {4s}/trust-starts\"]}}",
+        .{ name, image, stamp + 60_000, signatures, smoke.work },
+    );
+    const reply = try smoke.call("POST", "/v1/jobs", body);
+    try smoke.expect(reply.status == 201, "POST /v1/jobs ({s}) answered {d}: {s}", .{
+        name, reply.status, reply.body,
+    });
+}
+
+/// The agent restarted with a policy: an unsigned job is refused before anything starts, ending
+/// `failed` with cause `refused`; the same image signed by the trusted key runs and exits 0.
+fn step_trust_jobs(smoke: *Smoke) !void {
+    const arena = smoke.arena.allocator();
+    var image_buffer: [67]u8 = undefined;
+    const signed_image = trust_fixture.image(&image_buffer, signed_tree);
+    try restart_with_policy(smoke, signed_image);
+
+    try post_trust_job(smoke, "unsigned", signed_image, "");
+    try smoke.wait_until("the unsigned job to end", unsigned_ended.check, wait_ms_default);
+    const refused = try job_now(smoke, "unsigned");
+    const cause = try job_cause(smoke, "unsigned");
+    try smoke.expect(
+        std.mem.eql(u8, refused.state, "failed") and std.mem.eql(u8, cause, "refused"),
+        "the unsigned job ended {s} ({s}), expected failed (refused)",
+        .{ refused.state, cause },
+    );
+
+    var fixture = try trust_fixture.Fixture.init(smoke.gpa);
+    defer fixture.deinit(smoke.gpa);
+    const line = try fixture.sign_tree(arena, 1, signed_tree);
+    const quoted = try std.json.Stringify.valueAlloc(arena, line, .{});
+    try post_trust_job(smoke, "signed", signed_image, quoted);
+    try smoke.wait_until("the signed job to end", signed_ended.check, wait_ms_default);
+    const signed = try job_now(smoke, "signed");
+    try smoke.expect(
+        std.mem.eql(u8, signed.state, "exited") and signed.code == 0,
+        "the signed job ended {s} with {any}, expected exited with 0",
+        .{ signed.state, signed.code },
+    );
+    const starts = std.Io.Dir.cwd().readFileAlloc(
+        smoke.io,
+        try smoke.work_file("trust-starts"),
+        arena,
+        .limited(256),
+    ) catch "";
+    try smoke.expect(
+        std.mem.eql(u8, starts, "signed\n"),
+        "the trust jobs' commands wrote \"{s}\", expected only the signed job's",
+        .{starts},
+    );
+    smoke.say("trust policy: an unsigned job refused (nothing started), a signed job exit 0", .{});
+}
+
+// ---- demo-b5's step 4, on FakeRuntime (B5 slice 4) ---------------------------------------------
+
+const inject = @import("demo_b5_inject.zig");
+
+/// The three jobs both checks refuse, as demo-b5 names its cases.
+const bypass_names = [_][]const u8{ "b5-unsigned", "b5-stranger", "b5-elsewhere" };
+
+const bypass_ended = struct {
+    fn check(s: *Smoke) !bool {
+        for (bypass_names) |name| if (!try job_ended(s, name)) return false;
+        return true;
+    }
+};
+
+/// `status.diagnostic` of a job, or null when it has none.
+fn job_diagnostic(smoke: *Smoke, name: []const u8) !?Json {
+    const arena = smoke.arena.allocator();
+    const path = try std.fmt.allocPrint(arena, "/v1/jobs/{s}", .{name});
+    const reply = try smoke.call("GET", path, "");
+    const value = try std.json.parseFromSliceLeaky(Json, arena, reply.body, .{});
+    const status = value.object.get("status") orelse return null;
+    if (status != .object) return null;
+    return status.object.get("diagnostic");
+}
+
+/// The signatures of each case: none, one by key 2 (no policy lists it), and one by the trusted
+/// key 1 over another tree than the job's.
+fn bypass_jobs(smoke: *Smoke, image: []const u8) ![bypass_names.len]inject.Job {
+    const arena = smoke.arena.allocator();
+    var fixture = try trust_fixture.Fixture.init(smoke.gpa);
+    defer fixture.deinit(smoke.gpa);
+    const stranger = try arena.alloc([]const u8, 1);
+    stranger[0] = try fixture.sign_tree(arena, 2, signed_tree);
+    const elsewhere = try arena.alloc([]const u8, 1);
+    elsewhere[0] = try fixture.sign_tree(arena, 1, signed_tree + 1);
+    const signatures = [bypass_names.len][]const []const u8{ &.{}, stranger, elsewhere };
+    var jobs: [bypass_names.len]inject.Job = undefined;
+    for (&jobs, bypass_names, signatures) |*job, name, lines| {
+        const line = try std.fmt.allocPrint(arena, "echo {s} >> {s}/trust-starts", .{
+            name, smoke.work,
+        });
+        const command = try arena.dupe([]const u8, &.{ "sh", "-c", line });
+        job.* = .{
+            .name = name,
+            .image = image,
+            .signatures = lines,
+            .command = command,
+            .deadline_ms = 60_000,
+        };
+    }
+    return jobs;
+}
+
+/// The server, restarted with the node's policy, refuses each job: 403, ZBX-E0905 with the case's
+/// own cause, and no job stored.
+fn bypass_at_server(smoke: *Smoke, jobs: []const inject.Job) !void {
+    const arena = smoke.arena.allocator();
+    smoke.server_policy = smoke.trust_policy.?;
+    try smoke.stop(&smoke.server, "the server");
+    try smoke.start_server();
+    for (jobs, std.enums.values(inject.Refused)) |job, case| {
+        const stamp: u64 = @intCast(std.Io.Clock.real.now(smoke.io).toMilliseconds());
+        const body = try std.json.Stringify.valueAlloc(arena, .{
+            .name = job.name,
+            .image = job.image,
+            .deadline_ms = job.deadline_ms,
+            .submit_by_ms = stamp + 60_000,
+            .signatures = job.signatures,
+            .command = job.command,
+        }, .{});
+        const reply = try smoke.call("POST", "/v1/jobs", body);
+        try smoke.expect(
+            reply.status == 403 and inject.body_refuses(arena, reply.body, case.words()),
+            "POST /v1/jobs {s} answered {d}, expected 403 with ZBX-E0905 saying \"{s}\": {s}",
+            .{ job.name, reply.status, case.words(), reply.body[0..@min(reply.body.len, 300)] },
+        );
+        const after = try job_now(smoke, job.name);
+        try smoke.expect(after.state.len == 0, "the refused {s} was stored", .{job.name});
+    }
+}
+
+/// demo-b5's step 4: the server stopped, the jobs written into its store with no trust check,
+/// the server started on the same store; the agent refuses each before anything starts.
+fn step_trust_bypass(smoke: *Smoke) !void {
+    const arena = smoke.arena.allocator();
+    var image_buffer: [67]u8 = undefined;
+    const image = trust_fixture.image(&image_buffer, signed_tree);
+    const jobs = try bypass_jobs(smoke, image);
+    try bypass_at_server(smoke, &jobs);
+
+    try smoke.stop(&smoke.server, "the server");
+    const store_path = try smoke.work_file("store.db");
+    var out: std.Io.Writer.Allocating = .init(arena);
+    inject.inject(smoke.gpa, smoke.io, store_path, &jobs, &out.writer) catch |err| {
+        try smoke.expect(false, "writing the jobs into {s}: {s}: {s}", .{
+            store_path, @errorName(err), out.written(),
+        });
+    };
+    try smoke.start_server();
+    try smoke.wait_until("the jobs written into the store to end", bypass_ended.check, 30_000);
+    for (jobs, std.enums.values(inject.Refused)) |job, case| {
+        const now = try job_now(smoke, job.name);
+        const cause = try job_cause(smoke, job.name);
+        const diagnostic = try job_diagnostic(smoke, job.name);
+        const said = if (diagnostic) |value| inject.refusal_says(value, case.words()) else false;
+        const got = if (diagnostic == null) "none" else if (said) "as wanted" else "another";
+        try smoke.expect(
+            std.mem.eql(u8, now.state, "failed") and std.mem.eql(u8, cause, "refused") and said,
+            "{s} ended {s} ({s}, diagnostic {s}), expected failed (refused) with ZBX-E0905 " ++
+                "saying \"{s}\"",
+            .{ job.name, now.state, cause, got, case.words() },
+        );
+    }
+    const starts = std.Io.Dir.cwd().readFileAlloc(
+        smoke.io,
+        try smoke.work_file("trust-starts"),
+        arena,
+        .limited(256),
+    ) catch "";
+    try smoke.expect(
+        std.mem.eql(u8, starts, "signed\n"),
+        "after the store write the trust jobs' commands wrote \"{s}\", expected only signed's",
+        .{starts},
+    );
+    smoke.say("trust bypass: 3 jobs refused at the server (403), then written into the store " ++
+        "and refused by the agent, nothing started", .{});
 }
 
 /// A port the system is not using now: bind port 0, read it, let go.

@@ -121,6 +121,12 @@ pub const Spec = struct {
     /// way out (`docs/decisions/2026-11-12-openshell-fence-comparison.md`, row 2), and a spec that
     /// names a relay and asks for more is refused.
     network: Network = .host,
+    /// The job's DSSE envelopes that counted under the node's `--trust-policy`, one JSON line
+    /// each (B5; `job_trust.counted_lines`), none without a policy. The Zigbox runtime keeps them
+    /// in the node's Zigbox store when the node's own `zbx` policy asks for signatures, for `zbx`
+    /// there; it never fails a start over them. A runtime with no store (the fake and the
+    /// simulated one) ignores them.
+    signatures: []const []const u8 = &.{},
     /// Must include `label_replica`.
     labels: []const Label,
 };

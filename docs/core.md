@@ -561,4 +561,29 @@ imply `strong`, run with or without `--c1`, and are in the fleet's canary list. 
 replay line names its own runner and `--strong`.
 `docs/decisions/2026-11-13-b4-slice3-sim-certs.md`, `docs/decisions/2026-11-13-b4-slice3-fixes.md`.
 
+**Signed jobs (B5 slice 3).** `--signed` (`Options.signed`; `src/sim_trust.zig`) opens B5's
+trust world. Five Ed25519 keys come from the seed; the first four can be trusted, the fifth never
+is. Each node draws a Zigbox trust policy: one in eight has none (no `--trust-policy`), one in
+eight an open policy (`require_signature = false`), the rest require a signature from a subset of
+the four (the first key in seven of eight). Every job names one tree image (`sim_trust.image`) and
+carries up to three `zbx trust export` lines drawn from fifteen envelopes signed ahead of the run:
+tree-only statements of that tree, statements of another tree, and statements bound to a manifest
+(which count for no job: a sim job has no pinned `source`). The lines are a function of the seed
+and the job's number, so a name made again carries the same ones. The agent judges a run with the
+real `job_trust.judge_run` against its node's policy; the simulator keeps its own oracle (a
+`require` node admits a run only if some line is a tree-only statement of the job's tree by a key
+it trusts; a unit test holds it to the real verdict). **J12**: no run of a job that its node's
+policy refuses ever starts (judged at each start), and every refused run ends `refused` exactly
+once: judged on each terminal `/job-status/` put the tap sees (a run that ended refused never ends
+again; it was placed on a node whose policy refuses it) and at rest (a terminal run on a refusing
+node, not ended by a stop cause, ended `refused`). The report adds `jobs: trust nodes none=..
+open=.. require=.. starts=.. checked=.. refused endings=.. judged at rest=..`; without `--signed`
+nothing is drawn and every world is unchanged bit for bit. `sim-c1` runs its seed twice, without
+and with `--signed`, each natively and as WASM. `sim-c1-signed` runs seeds 1..20 at drawn shapes
+and profiles (CI's `sim-worlds` job). The tooth, `sim-c1-teeth-job_untrusted`
+(`c1_teeth.job_untrusted`, which opens the world on its own), has the agent skip the check and must
+fail J12, with or without `--c1`. The fleet's sim-c1 workers pass `--signed`; the canaries do not
+(the tooth's runner opens the world itself, and every other canary keeps the world it was measured
+in). `docs/decisions/2026-11-13-b5-slice3-handoff.md`.
+
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.

@@ -13,6 +13,7 @@
 #   mtls_interop  mtls-interop (stock openssl and JDK servers)
 #   demo_b3       demo-b3 (one VM, KVM, a GHCR image)
 #   demo_b7       demo-b7 (the API over mTLS, FakeRuntime, SQLite)
+#   demo_b5       demo-b5 (one VM, KVM, a GHCR image, signed jobs)
 #
 # Environment: EVENT (github.event_name), HEAD_REF (the PR's head branch), LABELS (the PR's labels,
 # space separated). See docs/decisions/2026-11-04-ci-affected-demos.md.
@@ -23,7 +24,7 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 demo_b7)
+jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 demo_b7 demo_b5)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -52,20 +53,21 @@ classify() {
     # The files of one demo: that demo only (docs/demos/*.md is documentation).
     # demo-b1 imports demo_c1_state.zig, which imports demo_c1_fleet.zig and demo_c0_state.zig.
     # demo-b7 imports demo_b1_state.zig and demo_c1_state.zig.
-    src/demo_c0_state.zig) want_one demo_c0; want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; return ;;
-    src/demo_c1_state.zig | src/demo_c1_fleet.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; return ;;
+    src/demo_c0_state.zig) want_one demo_c0; want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; return ;;
+    src/demo_c1_state.zig | src/demo_c1_fleet.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; return ;;
     src/demo_c0*.zig) want_one demo_c0; return ;;
     src/demo_c1*.zig) want_one demo_c1; return ;;
-    # demo-b3 imports demo_b1_state.zig (so demo_b1_fleet.zig, demo_c1_state.zig and what they import), and demo_c2_steps.zig and demo_c2_vms.zig (its rig).
-    src/demo_b1_state.zig | src/demo_b1_fleet.zig) want_one demo_b1; want_one demo_b3; want_one demo_b7; return ;;
+    # demo-b3 and demo-b5 import demo_b1_state.zig (so demo_b1_fleet.zig, demo_c1_state.zig and what they import), and demo_c2_steps.zig, demo_c2_vms.zig and demo_c2_check.zig (their rig; demo_c2_steps.zig imports demo_c2_check.zig).
+    src/demo_b1_state.zig | src/demo_b1_fleet.zig) want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; return ;;
     src/demo_b1*.zig) want_one demo_b1; return ;;
-    src/demo_c2_steps.zig | src/demo_c2_vms.zig) want_one demo_c2; want_one demo_b3; return ;;
+    src/demo_c2_steps.zig | src/demo_c2_vms.zig | src/demo_c2_check.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
     src/demo_c2*.zig | ops/demo-c2/*) want_one demo_c2; return ;;
     src/demo_b3*.zig | ops/demo-b3/*) want_one demo_b3; return ;;
     src/demo_b7*.zig) want_one demo_b7; return ;;
+    src/demo_b5*.zig | ops/demo-b5/*) want_one demo_b5; return ;;
     # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
-    src/zigbox_* | src/relay*.zig) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; return ;;
+    src/zigbox_* | src/relay*.zig) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
     # The mTLS interop harness and its Java server.
     src/mtls_interop*.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
     # The smoke's own files.

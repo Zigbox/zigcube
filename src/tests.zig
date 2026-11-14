@@ -112,9 +112,12 @@ comptime {
     _ = @import("demo_c2_check.zig");
     _ = @import("job_api.zig");
     _ = @import("job_cert.zig");
+    _ = @import("job_trust.zig");
+    _ = @import("job_trust_fixture.zig");
 }
 
 test {
     _ = @import("zigbox_limits_test.zig");
     _ = @import("api_tls_test.zig");
+    _ = @import("trust_file.zig");
 }

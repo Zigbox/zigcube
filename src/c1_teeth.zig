@@ -159,12 +159,21 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak;
 
+/// The agent starts every run its node's trust policy refuses: `trust_refusal` judges
+/// nothing (must break J12: no run its node's policy refuses ever starts; B5 slice 3). Needs the
+/// signed world (`Options.signed`).
+pub const job_untrusted = declared("c1_teeth_job_untrusted");
+
+/// The teeth whose fault needs the signed world.
+pub const signed_world = job_untrusted;
+
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
-    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak;
+    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
+    job_untrusted;
 
 /// The runner a replay line names: the fault-on runner whose root switched a tooth on
 /// (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe` installs it), the burst world's own runner, or
@@ -210,4 +219,5 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_relay_conn_leak", "sim_c1_teeth_relay_conn_leak" },
     .{ "c1_teeth_job_cert_image", "sim_c1_teeth_job_cert_image" },
     .{ "c1_teeth_relay_stop_leak", "sim_c1_teeth_relay_stop_leak" },
+    .{ "c1_teeth_job_untrusted", "sim_c1_teeth_job_untrusted" },
 };

@@ -159,8 +159,17 @@ and then removes the observed record.
 
 ```json
 { "v": 1, "name": "node1", "agent_version": "0.0.0", "address": "10.0.0.5:7070",
-  "capacity": {"cpu_millis": 4000, "memory_bytes": 8589934592}, "labels": [] }
+  "capacity": {"cpu_millis": 4000, "memory_bytes": 8589934592}, "labels": [],
+  "trust_policy": "/etc/zcube/trust.zon" }
 ```
+
+`trust_policy` (B5 slice 2, optional, empty when absent) is the path of the policy the agent judges
+every run against before it starts it (`--trust-policy`, an absolute path); empty means the
+node registered no policy, or one that asks for no signature and no provenance: it checks nothing.
+It is for people (`zcube why node`); no one acts on it. Like every member here it is the
+registration's: an agent restarted under a live lease does not register again (docs/agent.md,
+"Known limits"), so a node restarted without its policy can still show the old path while it
+checks nothing.
 
 Written by the agent with `lease` set to the lease it keeps alive. When the lease ends the key
 is deleted by the store, and that delete event is how lost nodes are detected (C1). The key's
@@ -249,7 +258,10 @@ and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) a
 - `status` is `starting`, `running` or `stopped`.
 - `exit` is present when `stopped`: `{"kind": "exited", "code": 0}`, `{"kind": "signaled",
   "signal": 9}`, `{"kind": "oom"}`, `{"kind": "pid_limit"}`, `{"kind": "start_failed"}`,
-  `{"kind": "lost"}`: the runtime's `ExitReason`.
+  `{"kind": "lost"}`: the runtime's `ExitReason`; and `{"kind": "refused"}` (B5 slice 2, jobs only):
+  the node's trust policy refused the run, nothing was started, and `diagnostic` is the
+  `ZBX-E0905` (or `ZBX-E0906`). In a replica's `/observed` record it is never valid: the agent
+  endpoint refuses such a report (ZC-E0104) and a reader takes the row as malformed (ZC-E0301).
 - **`diagnostic` is where an observed-state diagnostic lives.** It is a complete diagnostic in
   the JSON shape of DIAGNOSTICS.md (the `Diagnostic` of `src/diagnostic.zig`), embedded in the
   record that it explains. Present for `start_failed` (the runtime's own, possibly `ZBX-`),
@@ -487,9 +499,30 @@ name rule (48 bytes).
 The spec is immutable. `cancel_requested` is the one member that changes (set once). The input is
 never here, only its digest and size. `retries` is 0 (a larger value is `ZC-E0130`).
 `relay` (B3, optional, additive at the same version) is `{"name":"botpike","address":"HOST:PORT"}`:
-the name the job asked for and the address the server's configuration gave it at admission. At most
+the name the job asked for and the address the server's configuration gave it at admission.
+`signatures` (B5, optional, additive at the same version) is an array of at most
+`job_signatures_max` (4) DSSE envelopes, each 1 to `job_signature_bytes_max` (2048) bytes of
+printable ASCII (one line of `zbx trust export`), as submitted; absent when the job has none. At most
 `job_labels_max` (6) labels, `job_command_words_max` (64) command words, `env` of at most
 `job_env_bytes_max` (8 KiB). Written with its `/job-input/` and `/job-admission` in one transaction.
+
+**Upgrade note (B5 `signatures`).** Every reader of `/jobs/` and `/job-runs/` decodes with unknown
+members ignored, so an older build reads these records, but it drops what it ignores:
+
+- A pre-B5 server serving `POST /v1/jobs/{name}/cancel` decodes the job, sets `cancel_requested` and
+  writes it back without `signatures`. After the next upgrade, resubmitting the same signed body
+  answers `409` ZC-E0131 for a job the client never changed.
+- A run made by a pre-B5 job controller has no `signatures`. Once the node's check of B5 slice 2
+  exists, an agent with a trust policy refuses such a run although its job was signed.
+- A pre-B5 server answers a body with `signatures` `400` ZC-E0104 (unknown member).
+- A pre-B5 agent ignores the run's `signatures` and runs the job unchecked, which is safe in slice 1.
+- A slice-1 server does not know the slice-2 agent's exit kind `refused` (`/observed`) and refuses
+  that report, so a refused run is never ended; it also ignores `trust_policy` in a registration.
+
+Order: upgrade every server first, and finish the rollout before submitting signed jobs; never serve
+cancels from a server rolled back past B5; agents may be upgraded in any order until slice 2, and
+after it, before any agent is given a trust policy. For slice 2: every server first, then the agents
+(B5 slice 2, docs/decisions/2026-11-13-b5-slice2-agent-check.md).
 
 ### `/job-input/<name>`: the input (API)
 
@@ -511,7 +544,7 @@ status, which compares it. Neither is deleted.
 
 `{"v":1,"id":"train-7-job","job":"train-7",` the spec's `image`, `source`, `command`, `env`,
 `limits`, `deadline_ms`, `grace_ms`, `labels`, `input_env`, `input_digest`, `input_bytes`, `relay`
-(B3, as in the job),
+(B3, as in the job), `signatures` (B5, as in the job),
 `"start_by_ms":…,"created_at_ms":…,"stop":{"cause":"cancel","at_ms":…}}`. At most
 `job_run_bytes_max` (16 KiB). Created once, with its status. `stop` is set at most once and never
 removed; its `cause` is `cancel`, `unreachable` or `not_started`. From the revision of the `stop`,
@@ -527,7 +560,8 @@ nothing places or claims the run. `start_by_ms` is creation plus `deadline_ms` o
   `cancelled`. A terminal status is written once and never changes (I8a).
 - `end` is present exactly when the state is terminal, with `ended_at_ms`. `exited` carries exactly
   one of `code` and `signal`; `failed` carries `cause`, one of `oom`, `pid_limit`, `start_failed`,
-  `deadline`, `fenced`, `unreachable`, `not_started`, `unknown`; `cancelled` carries nothing. A
+  `deadline`, `fenced`, `unreachable`, `not_started`, `refused` (B5 slice 2: the node's trust policy
+  refused the run; never retried or placed again), `unknown`; `cancelled` carries nothing. A
   record that breaks this is `ZC-E0301` on read.
 - `stop_cause` (`cancel`, `deadline`, `fence`, `not_started`, `unreachable`): why the agent stopped
   the run, when it did. The ending follows it, never the exit alone.

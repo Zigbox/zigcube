@@ -577,6 +577,12 @@ test "SPIFFE IDs and DNS names have exactly one shape" {
         "spiffe://10.0.0.1/service/a", "spiffe://prod.2024/service/a",
     };
     for (bad) |text| try testing.expect(std.meta.isError(spiffe_parse(text)));
+}
+
+test "SPIFFE IDs of jobs have exactly one shape" {
+    // Goal: B4's `/job/` path refuses the near misses the others do.
+    // Method: a table of near misses, and the write side's name checks.
+    var buffer: [constants.x509_spiffe_bytes_max]u8 = @splat(0xAA);
     const bad_jobs = [_][]const u8{
         "spiffe://prod/job/",          "spiffe://prod/job",
         "spiffe://prod/job/a/b",       "spiffe://prod/job/a?x=1",

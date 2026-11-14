@@ -84,6 +84,7 @@ if (simSwarm) {
 if (simCluster) {
   // Same contract as --sim: the native report arrives as a file; the two must be equal byte for byte.
   const [wasmPath, seedText, operationsText, nodesText, livenessText, profileText, nativePath] = process.argv.slice(3);
+  const signed = process.argv[10] === "--signed";
   const exports = await instantiate(readFileSync(wasmPath));
   const started = Date.now();
   const failed = exports.zcube_sim_cluster_shaped(
@@ -97,8 +98,9 @@ if (simCluster) {
     0,
     // sim-c1 runs the strong world (B4 slice 3 fixes), as build.zig's native run does.
     simC1 ? 1 : 0,
+    signed ? 1 : 0,
   );
-  const label = simC1 ? "sim-c1" : "sim-cluster";
+  const label = simC1 ? (signed ? "sim-c1 --signed" : "sim-c1") : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_cluster_report_ptr(), exports.zcube_cluster_report_len());
   const wasmText = new TextDecoder().decode(rendered);

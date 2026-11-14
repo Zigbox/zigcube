@@ -35,6 +35,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const job_trust = @import("job_trust.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
@@ -139,6 +140,9 @@ pub const Config = struct {
     /// `HOST:PORT` of the node's peer server, as other nodes' fetches reach it; borrowed.
     peer: []const u8 = "",
     agent_version: []const u8 = "0.0.0",
+    /// The node's own trust policy (`--trust-policy`, B5): every run is judged against it before
+    /// it starts, and a refused one never starts. Null checks nothing. Borrowed.
+    trust: ?*const job_trust.Trust = null,
 };
 
 /// The state file that holds the lease, in the agent's state directory.
@@ -776,6 +780,7 @@ pub const Agent = struct {
             .agent_version = agent.config.agent_version,
             .address = agent.config.address,
             .capacity = agent.config.capacity,
+            .trust_policy = published_policy(agent.config.trust),
         };
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);
@@ -1432,6 +1437,13 @@ const Pass = struct {
 
 // ---- Pure helpers ------------------------------------------------------------------------------
 
+/// The path the node registers as `trust_policy`: only a policy that asks for a signature or a
+/// provenance checks anything, so one that asks for neither is published as none (records.Node).
+fn published_policy(trust: ?*const job_trust.Trust) []const u8 {
+    const loaded = trust orelse return "";
+    return if (loaded.policy.checks()) loaded.path else "";
+}
+
 fn state_failed(ctx: *const Context, err: agent_state.Error, operation: []const u8) Error {
     // `Crashed` is the simulator's, which looks for its own flag before it reads a result.
     const mapped: agent_state.Error = if (err == error.Crashed) error.Io else err;
@@ -1558,4 +1570,20 @@ test "a kept failure keeps its diagnostic whatever the arena holds (RB-S9)" {
     try std.testing.expect(diag.code == null);
     kept.restore(&ctx);
     try std.testing.expectEqual(@import("diag/codes.zig").Code.E0502, diag.code.?);
+}
+
+test "a node publishes its policy path only when the policy checks something" {
+    // Goal: `why node` never claims checks a policy does not make (review B5 slice 2). Method: a
+    // policy that asks for nothing, one that asks for a signature, and no policy.
+    var policy: std.meta.Child(@FieldType(job_trust.Trust, "policy")) = undefined;
+    policy.clear();
+    const path = "/etc/zcube/trust.zon";
+    const trust: job_trust.Trust = .{ .policy = &policy, .path = path, .scratch = undefined };
+    try std.testing.expectEqualStrings("", published_policy(&trust));
+    policy.require_signature = true;
+    try std.testing.expectEqualStrings(path, published_policy(&trust));
+    policy.require_signature = false;
+    policy.require_provenance = true;
+    try std.testing.expectEqualStrings(path, published_policy(&trust));
+    try std.testing.expectEqualStrings("", published_policy(null));
 }

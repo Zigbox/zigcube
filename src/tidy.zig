@@ -69,6 +69,11 @@ const shell_allowlist = [_][]const u8{
     // demo-b3's guest half (docs/demos/b3.md), for the same reason: it starts the agent and a test
     // upstream as root and reads logs and listeners.
     "ops/demo-b3/guest.sh",
+    // demo-b5's guest half (docs/demos/b5.md), for the same reason: it signs with `zbx`, writes
+    // the node's trust policy, starts the agent as root and lists the runtime's containers. Its
+    // test runs it against a fake `zbx` in `zig build test`.
+    "ops/demo-b5/guest.sh",
+    "ops/demo-b5/test-guest.sh",
     // The owner's one-off recipe for demo-c2's two GHCR images (ops/demo-c2-images): it runs on
     // the owner's machine with docker and a registry login, never in a build or test, and is a
     // list of `docker buildx` calls; the build has no docker to drive from Zig.
@@ -706,9 +711,14 @@ fn print_violations(out: *std.Io.Writer, path: []const u8, report: *const Report
 /// runs in that gate, so the gate would pass without it.
 const teeth_root = "src/mtls_teeth.zig";
 
-/// Files with `teeth:` tests that belong to another gate (the store history checker's, run by
-/// `zig build test`), so `teeth_root` does not import them.
-const teeth_other_gates = [_][]const u8{"src/testing/history.zig"};
+/// Files with `teeth:` tests that belong to another gate (the store history checker's, B5's
+/// admission check's and the node's check of B5, run by `zig build test`), so `teeth_root` does
+/// not import them.
+const teeth_other_gates = [_][]const u8{
+    "src/testing/history.zig",
+    "src/job_trust.zig",
+    "src/agent_jobs_test.zig",
+};
 
 /// True when `source` (the file at `path`) has a `teeth:` test that `root_source` does not
 /// import and no other gate owns.
