@@ -116,16 +116,15 @@ const Storage = struct {
 
 const bad_args = "the arguments of zcube-agent probe are not valid";
 
+const standard_streams = [3]linux.fd_t{ 0, 1, 2 };
+
 pub fn run(init: std.process.Init, args: []const []const u8) u8 {
-    // The result channel: a copy of standard output that the command does not inherit.
-    const out_rc = linux.fcntl(1, linux.F.DUPFD_CLOEXEC, 3);
-    if (linux.errno(out_rc) != .SUCCESS) return constants.exit_environment;
-    const out: linux.fd_t = @intCast(out_rc);
+    const out = result_channel(1) orelse return constants.exit_environment;
     const storage = std.heap.page_allocator.create(Storage) catch {
         return constants.exit_environment;
     };
     defer std.heap.page_allocator.destroy(storage);
-    if (!quiet_streams()) {
+    if (!quiet_streams(standard_streams)) {
         storage.result = .{ .refused = failure("its streams could not be set to /dev/null") };
     } else if (parse_args(args)) |parsed| {
         check(init, &parsed, storage);
@@ -138,13 +137,24 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     return constants.exit_ok;
 }
 
-/// Points standard input, output and error at /dev/null: they are the command's.
-fn quiet_streams() bool {
+/// The result channel: a copy of `fd` (standard output) above 2 that the command does not
+/// inherit.
+fn result_channel(fd: linux.fd_t) ?linux.fd_t {
+    const rc = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 3);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return @intCast(rc);
+}
+
+/// Points `targets` (standard input, output and error) at /dev/null: they are the command's.
+fn quiet_streams(targets: [3]linux.fd_t) bool {
     const rc = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
     if (linux.errno(rc) != .SUCCESS) return false;
     const null_fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(null_fd);
-    for ([_]linux.fd_t{ 0, 1, 2 }) |target| {
+    // With a stream closed, /dev/null opens as that stream: then it stays open.
+    defer if (std.mem.indexOfScalar(linux.fd_t, &targets, null_fd) == null) {
+        _ = linux.close(null_fd);
+    };
+    for (targets) |target| {
         if (linux.errno(linux.dup2(null_fd, target)) != .SUCCESS) return false;
     }
     return true;
@@ -343,6 +353,8 @@ test "probe_worker: a line that is not exactly one result is refused" {
         "refused not json\n",
         "running\n",
         "hello\n",
+        "refused {\"code\":\"ZC-E0502\"\n}\n",
+        "exited 0\n\n",
     };
     for (bad) |line| try testing.expect(!parse_line(&out, line));
 }
@@ -362,4 +374,111 @@ test "probe_worker: arguments" {
     too_many[1] = "10";
     try testing.expect(parse_args(&too_many) == null);
     try testing.expect(parse_args(too_many[0 .. too_many.len - 1]) != null);
+}
+
+test "probe_worker: verdict" {
+    // Goal: each way a command ends maps to its result. Method: a table over exit, timer and
+    // container, on a handle set by hand (it is large, so on the heap).
+    const handle = try testing.allocator.create(zigbox.ExecHandle);
+    defer testing.allocator.destroy(handle);
+    handle.container_ended = false;
+    handle.lost_diag.reset();
+    handle.lost_diag.raise(.E0402);
+    handle.lost_diag.cause("lost for the test", .{});
+    const Case = struct {
+        exit: zigbox.ExecExit,
+        fired: bool,
+        timed: bool = true,
+        ended: bool = false,
+        want: union(enum) { exited: u8, timed_out, refused: []const u8 },
+    };
+    const cases = [_]Case{
+        // Killed by the kernel (OOM), not the timer: the code it died with.
+        .{ .exit = .{ .signaled = 9 }, .fired = false, .want = .{ .exited = 137 } },
+        // The timer fired as the command ended by itself: its own code.
+        .{ .exit = .{ .exited = 0 }, .fired = true, .want = .{ .exited = 0 } },
+        .{ .exit = .{ .exited = 4 }, .fired = true, .want = .{ .exited = 4 } },
+        .{ .exit = .{ .signaled = 9 }, .fired = true, .want = .timed_out },
+        .{ .exit = .{ .signaled = 15 }, .fired = true, .want = .{ .exited = 143 } },
+        .{
+            .exit = .{ .signaled = 9 },
+            .fired = false,
+            .ended = true,
+            .want = .{ .refused = "ZC-E0502" },
+        },
+        .{ .exit = .lost, .fired = false, .want = .{ .refused = "ZBX-E0402" } },
+        .{ .exit = .{ .exited = 0 }, .fired = false, .timed = false, .want = .{
+            .refused = "ZC-E0502",
+        } },
+    };
+    for (&cases) |*case| {
+        handle.container_ended = case.ended;
+        const got = verdict(case.exit, handle, case.fired, case.timed);
+        switch (case.want) {
+            .exited => |code| try testing.expectEqual(code, got.exited),
+            .timed_out => try testing.expect(got == .timed_out),
+            .refused => |code| try testing.expectEqualStrings(code, got.refused.code.slice()),
+        }
+    }
+}
+
+test "probe_worker: the command's streams are /dev/null and the result channel is not inherited" {
+    var pipes: [3][2]linux.fd_t = undefined;
+    for (&pipes) |*pipe| {
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(pipe, .{})));
+    }
+    defer for (&pipes) |*pipe| {
+        _ = linux.close(pipe[0]);
+        _ = linux.close(pipe[1]);
+    };
+    const targets = [3]linux.fd_t{ pipes[0][0], pipes[1][1], pipes[2][1] };
+    const out = result_channel(targets[1]).?;
+    defer _ = linux.close(out);
+    try testing.expect(out > 2);
+    const flags = linux.fcntl(out, linux.F.GETFD, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(flags));
+    try testing.expect(flags & linux.FD_CLOEXEC != 0);
+    try testing.expect(quiet_streams(targets));
+    for (targets) |fd| try expect_dev_null(fd);
+    try expect_pipe(out); // The copy is still the pipe.
+}
+
+fn fd_target(fd: linux.fd_t, buffer: []u8) ![]const u8 {
+    var path: [32]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&path, "/proc/self/fd/{d}", .{fd}, 0);
+    const rc = linux.readlink(name, buffer.ptr, buffer.len);
+    if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
+    return buffer[0..rc];
+}
+
+fn expect_dev_null(fd: linux.fd_t) !void {
+    var buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings("/dev/null", try fd_target(fd, &buffer));
+}
+
+fn expect_pipe(fd: linux.fd_t) !void {
+    var buffer: [64]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, try fd_target(fd, &buffer), "pipe:"));
+}
+
+test "probe_worker: zcube-agent probe of a container that does not exist is refused by Zigbox" {
+    // Goal: run's whole path in the built agent: arguments, streams, exec_start's refusal and
+    // the one line. Skipped without the executable, as the FakeRuntime tests are.
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const given = testing.environ.getPosix("ZCUBE_AGENT_EXE");
+    const relative = given orelse "zig-out/bin/zcube-agent";
+    const length = std.Io.Dir.cwd().realPathFile(testing.io, relative, &path_buffer) catch
+        return error.SkipZigTest;
+    const exe = path_buffer[0..length];
+    const name = "zcube-probe-test-nosuch";
+    const ran = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ exe, "probe", name, "1000", "true" },
+    });
+    defer testing.allocator.free(ran.stdout);
+    defer testing.allocator.free(ran.stderr);
+    try testing.expectEqual(@as(u8, constants.exit_ok), ran.term.exited);
+    try testing.expectEqualStrings("", ran.stderr);
+    var result: ProbeResult = undefined;
+    try testing.expect(parse_line(&result, ran.stdout)); // Exactly one line.
+    try testing.expectEqualStrings("ZBX-E0402", result.refused.code.slice());
 }
