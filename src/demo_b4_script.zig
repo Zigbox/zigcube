@@ -44,67 +44,86 @@ const identity_python =
 ;
 
 /// `keys`: waits (bounded by its deadline) for the node's root to publish the candidate keys (the
-/// upstream serves them), then looks for each, raw, hex and base64, in its environment and every
+/// upstream serves them), then looks for each (`keys_search_python`) in its environment and every
 /// regular file under every mount it sees but /proc, /sys and /dev, and reports the count through
 /// the relay.
 const keys_python =
-    \\import base64 as B, os, time, urllib.request as u
-    \\R = os.environ["ZCUBE_RELAY"]
-    \\o = os.path
-    \\g = lambda p: u.urlopen(R + p, timeout=15).read()
+    \\import os,time,urllib.request as u
+    \\o=os.path
+    \\g=lambda p:u.urlopen(os.environ["ZCUBE_RELAY"]+p,timeout=15).read()
     \\g("/whoami")
-    \\c = b""
-    \\while not c:
-    \\ time.sleep(1)
-    \\ c = g("/candidates")
-    \\P = []
-    \\for k in [bytes.fromhex(x) for x in c.split()]:
-    \\ h = k.hex().encode()
-    \\ P += [k, h, h.upper(), B.b64encode(k)[:42], B.urlsafe_b64encode(k)[:42]]
-    \\H = []
-    \\def s(n, d):
-    \\ H.extend(n for p in P if p in d)
-    \\s("env", repr(os.environ).encode())
-    \\s("environ", open("/proc/self/environ", "rb").read())
-    \\n = 0
-    \\X = ("/proc", "/sys", "/dev")
-    \\for m in {l.split()[4] for l in open("/proc/self/mountinfo")}:
-    \\ if m.startswith(X): continue
-    \\ for d, D, F in os.walk(m):
-    \\  D[:] = [x for x in D if not o.join(d, x).startswith(X)]
-    \\  for f in F:
-    \\   p = o.join(d, f)
-    \\   try:
-    \\    if o.isfile(p) and not o.islink(p) and o.getsize(p) < 1 << 26:
-    \\     s(p, open(p, "rb").read()); n += 1
-    \\   except OSError: pass
-    \\q = "candidates=%d&files=%d&found=%d&first=" % (len(P) // 5, n, len(H))
-    \\g("/keys?" + q + u.quote(str(H[:1])))
+    \\while not(c:=g("/candidates")):time.sleep(1)
+    \\K=[bytes.fromhex(x)for x in c.split()]
+    \\
+++ keys_search_python ++
+    \\s("environ",open("/proc/self/environ","rb").read())
+    \\n=0
+    \\X=("/proc","/sys","/dev")
+    \\for d,D,F in os.walk("/"):
+    \\ D[:]=[x for x in D if not o.join(d,x).startswith(X)]
+    \\ for f in F:
+    \\  p=o.join(d,f)
+    \\  try:
+    \\   if o.isfile(p)and not o.islink(p)and o.getsize(p)<1<<26:s(p,open(p,"rb").read());n+=1
+    \\  except OSError:pass
+    \\g("/keys?candidates=%d&files=%d&found=%d&first=%s"%(len(K),n,len(H),u.quote(str(H[:1]))))
 ;
 
-/// `fence`: every count must be 0 and every route `failed`.
+/// The search of `keys`, given the candidate seeds `K`: `s(name, data)` adds `name` to `H` once
+/// per pattern found in `data`. For each seed and its expanded scalar (SHA-512's first half,
+/// clamped): the raw bytes; hex in lower or upper case, bare or with `:`, `-` or ` ` between bytes; and
+/// base64 in both alphabets at each of the three alignments a 3-byte group allows (a PKCS#8 PEM
+/// puts an Ed25519 seed at DER offset 16), keeping only the 42 characters that depend on the
+/// key alone, searched in the data with line breaks removed (a PEM wraps at 64) and the
+/// URL-safe alphabet mapped to the standard one. Terse: `keys` must fit one
+/// command-line argument (`cli_arg_bytes_max`).
+const keys_search_python =
+    \\import base64 as B,hashlib
+    \\P=[];H=[]
+    \\for k in K:
+    \\ a=bytearray(hashlib.sha512(k).digest()[:32]);a[0]&=248;a[31]=a[31]&63|64
+    \\ for v in k,bytes(a):
+    \\  P+=[v]
+    \\  for h in[v.hex()]+[v.hex(x)for x in":- "]:P+=[h.encode(),h.upper().encode()]
+    \\  P+=[B.b64encode(bytes(i)+v)[j:j+42]for i,j in((0,0),(1,2),(2,3))]
+    \\T=bytes.maketrans(b"-_",b"+/")
+    \\def s(n,d):
+    \\ w=d.translate(T,b"\r\n")
+    \\ H.extend(n for p in P if p in d or p in w)
+    \\
+;
+
+/// `fence`: every count must be 0 and every route `failed`. The positive control: a child the
+/// job forks, which it may ptrace and whose memory it may open (same user, its own descendant),
+/// so `kid_mem` and `kid_ptrace` must be 1, and `others` (every process it sees but itself) at
+/// least 1. `/proc/<pid>/mem` is only opened: its permission check is at open, and a read at
+/// offset 0 fails on any process (nothing is mapped there).
 const fence_python =
-    \\import ctypes, os, urllib.request as u
-    \\L = ctypes.CDLL(None, use_errno=True)
-    \\V = [int(p) for p in os.listdir("/proc") if p.isdigit()]
-    \\O = [p for p in V if p != os.getpid()]
+    \\import ctypes,os,time,urllib.request as u
+    \\L=ctypes.CDLL(None,use_errno=True)
+    \\k=os.fork()
+    \\if k==0:time.sleep(600);os._exit(0)
+    \\V=[int(p)for p in os.listdir("/proc")if p.isdigit()]
+    \\O=[p for p in V if p!=os.getpid()]
+    \\N=[p for p in O if p!=k]
     \\def rd(p):
-    \\ try: return open("/proc/%d/cmdline" % p, "rb").read()
-    \\ except OSError: return b""
-    \\see = sum(1 for p in O if b"zcube" in rd(p) or b"zbx" in rd(p))
+    \\ try:return open("/proc/%d/cmdline"%p,"rb").read()
+    \\ except OSError:return b""
+    \\see=sum(1 for p in N if b"zcube"in rd(p)or b"zbx"in rd(p))
     \\def alive(p):
-    \\ try: os.kill(p, 0); return 1
-    \\ except ProcessLookupError: return 0
-    \\ except OSError: return 1
-    \\top = int(open("/proc/sys/kernel/pid_max").read())
-    \\out = sum(alive(p) for p in range(1, top) if p not in V)
-    \\tr = sum(1 for p in O if L.ptrace(16, p, 0, 0) == 0)
+    \\ try:os.kill(p,0);return 1
+    \\ except ProcessLookupError:return 0
+    \\ except OSError:return 1
+    \\top=int(open("/proc/sys/kernel/pid_max").read())
+    \\out=sum(alive(p)for p in range(1,top)if p not in V)
     \\def mem(p):
-    \\ try: open("/proc/%d/mem" % p, "rb").read(1); return 1
-    \\ except OSError: return 0
-    \\mm = sum(mem(p) for p in O)
-    \\q = "see=%d&outside=%d&ptrace=%d&mem=%d&others=%d" % (see, out, tr, mm, len(O))
-    \\u.urlopen(os.environ["ZCUBE_RELAY"] + "/fence?" + q, timeout=15).read()
+    \\ try:open("/proc/%d/mem"%p,"rb").close();return 1
+    \\ except OSError:return 0
+    \\tr=lambda p:int(L.ptrace(16,p,0,0)==0)
+    \\c=(see,out,sum(map(tr,N)),sum(map(mem,N)),len(O),mem(k),tr(k))
+    \\os.kill(k,9)
+    \\q="see=%d&outside=%d&ptrace=%d&mem=%d&others=%d&kid_mem=%d&kid_ptrace=%d"%c
+    \\u.urlopen(os.environ["ZCUBE_RELAY"]+"/fence?"+q,timeout=15).read()
 ;
 
 /// `net`: IPv6 to the internet, UDP to the internet and UDP to the node; each must fail.
@@ -426,4 +445,54 @@ test "each job's script fits one command-line argument" {
     }) |source| {
         try std.testing.expect(source.len <= constants.cli_arg_bytes_max);
     }
+}
+
+/// Drives `keys_search_python` over encodings of a test seed; exits 0 only if each is found and
+/// a file without the key is not.
+const keys_search_check_python =
+    \\import base64
+    \\k = bytes(range(1, 33))
+    \\K = [k]
+    \\
+++ keys_search_python ++
+    \\der = bytes.fromhex("302e020100300506032b657004220420") + k
+    \\pem = b"-----BEGIN PRIVATE KEY-----\n" + base64.b64encode(der) + b"\n-----END PRIVATE KEY-----\n"
+    \\assert base64.b64encode(k)[:42] not in pem, "the seed sits off the 3-byte grid in a PEM"
+    \\a = bytearray(hashlib.sha512(k).digest()[:32]); a[0] &= 248; a[31] = a[31] & 63 | 64
+    \\b64 = base64.b64encode(b"x" * 99 + k + b"y" * 7)
+    \\cases = {
+    \\ "pkcs8 pem": pem,
+    \\ "raw": b"..." + k + b"...",
+    \\ "hex upper": b"key=" + k.hex().upper().encode(),
+    \\ "hex colons": k.hex(":").encode(),
+    \\ "hex spaces upper": k.hex(" ").upper().encode(),
+    \\ "hex dashes": k.hex("-").encode(),
+    \\ "url-safe, offset 2": base64.urlsafe_b64encode(b"zz" + k),
+    \\ "wrapped at 64": b"\n".join(b64[i:i + 64] for i in range(0, len(b64), 64)),
+    \\ "scalar raw": bytes(a),
+    \\ "scalar hex": bytes(a).hex().encode(),
+    \\ "scalar base64, offset 1": base64.b64encode(b"q" + bytes(a)),
+    \\}
+    \\for name, data in cases.items():
+    \\ s(name, data)
+    \\ assert name in H, "not found: " + name
+    \\H.clear()
+    \\s("clean", base64.b64encode(hashlib.sha512(b"clean").digest() * 4) + bytes(range(40, 256)))
+    \\assert not H, "found in a file without the key: %r" % H
+    \\print("ok")
+;
+
+test "the key search finds a seed in a PKCS#8 PEM and its other encodings" {
+    // Goal: `keys` cannot miss a leaked seed because of how it was encoded (review of B4 slice
+    // 4: base64 was matched only at offsets that are a multiple of 3, and a PKCS#8 Ed25519 PEM
+    // puts the seed at DER offset 16). Method: run the job's own search code in python3 over a
+    // real PKCS#8 PEM of a test seed and the other encodings, and over a file without it.
+    const result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "python3", "-c", keys_search_check_python },
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    if (!result.term.success()) std.debug.print("{s}\n", .{result.stderr});
+    try std.testing.expect(result.term.success());
+    try std.testing.expectEqualStrings("ok\n", result.stdout);
 }
