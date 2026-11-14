@@ -233,6 +233,10 @@ pub const State = struct {
     paused_at_ms: ?u64 = null,
     /// Why: set exactly while `phase` is `paused`.
     paused_by: ?PauseCause = null,
+    /// The automatic rollback this failed rollout owed was refused (ZC-E0127, ZC-E0128): it has
+    /// ended `failed`, owing nothing, and is never retried
+    /// (docs/decisions/2026-11-14-c3-rollout-from-rule.md, rule 3). Set only while `failed`.
+    rollback_refused: bool = false,
 
     pub fn assert_valid(state: *const State) void {
         assert(state.deadline_at_ms >= state.started_at_ms);
@@ -247,6 +251,8 @@ pub const State = struct {
         if (active(state.phase)) assert(state.phase == state.reason.active_phase());
         if (state.reason == .rollback) assert(state.earlier);
         if (state.paused_at_ms) |paused_at| assert(paused_at >= state.evidence_from_ms);
+        if (state.rollback_refused) assert(state.phase == .failed);
+        if (state.rollback_refused) assert(state.reason == .apply);
     }
 };
 
@@ -341,7 +347,19 @@ pub fn rollback_owed(policy: *const Policy, state: *const State) bool {
     if (state.phase != .failed) return false;
     if (policy.on_failure != .rollback) return false;
     if (!state.earlier) return false;
+    if (state.rollback_refused) return false;
     return state.reason == .apply;
+}
+
+/// The rollback `state` owed was refused (ZC-E0127, ZC-E0128): the rollout stays `failed`,
+/// owing nothing from now on, so the controller records the refusal once and never retries it.
+pub fn rollback_refused(policy: *const Policy, state: *const State) State {
+    assert(rollback_owed(policy, state));
+    var next = state.*;
+    next.rollback_refused = true;
+    next.assert_valid();
+    assert(!rollback_owed(policy, &next));
+    return next;
 }
 
 /// One pass: the phase that follows `state` on what `facts` shows, and the budget in it.
@@ -444,6 +462,7 @@ fn paused(state: *const State, now_ms: u64, cause: PauseCause) State {
     next.phase = .paused;
     next.paused_at_ms = @max(now_ms, state.evidence_from_ms);
     next.paused_by = cause;
+    next.rollback_refused = false;
     return next;
 }
 
@@ -1010,4 +1029,36 @@ test "rollout plan: a first generation keeps owing nothing across pause and resu
     // Had an earlier generation run to completion, `from` would name it and a rollback is owed.
     const over_done = begin(&policy, .apply, true, t1);
     try testing.expect(pass(&policy, &over_done, &next_held).rollback);
+}
+
+test "rollout plan: a refused automatic rollback ends the rollout, owing nothing" {
+    // Goal: a rollback the API refused is an end: the rollout stays `failed`, every later pass
+    // owes nothing and changes nothing, and a pause clears the mark
+    // (docs/decisions/2026-11-14-c3-rollout-from-rule.md, rule 3). Method: fail a rollout that
+    // ran an earlier generation, refuse its rollback, pass it again much later.
+    const policy: Policy = .{};
+    assert(policy.on_failure == .rollback);
+    const state = begin(&policy, .apply, true, t0);
+    const held: Facts = .{
+        .desired = 3,
+        .mix = .{ .new_live = 3 },
+        .now_ms = t0 + 1,
+        .new_held_at_ms = t0 + 1,
+    };
+    const failed = pass(&policy, &state, &held);
+    try testing.expectEqual(Phase.failed, failed.state.phase);
+    try testing.expect(failed.rollback);
+    const refused = rollback_refused(&policy, &failed.state);
+    try testing.expect(refused.rollback_refused);
+    var later = held;
+    later.now_ms += 10 * policy.progress_deadline_ms;
+    const ended = pass(&policy, &refused, &later);
+    try testing.expect(!ended.rollback);
+    try testing.expectEqualDeep(refused, ended.state);
+    try testing.expect(ended.plan.zero());
+    // A pause of the ended rollout clears the mark; a resume runs it again under a fresh deadline.
+    const stopped = try pause_rollout(&refused, later.now_ms);
+    try testing.expect(!stopped.rollback_refused);
+    const again = try resume_rollout(&policy, &stopped, later.now_ms + 1);
+    try testing.expect(!again.rollback_refused);
 }

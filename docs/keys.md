@@ -218,7 +218,8 @@ one. A service's first generation has no rollout of its own, so with no rollout 
 deleted incarnation at that generation or above count for none). With `from` 0 (a service's
 first generation, or an apply over one that failed), a rollout that fails under `on_failure:
 rollback` has nothing to roll back to and stays `failed`, owing no rollback, as a failed rollback
-does; so does one whose automatic rollback the API refused (ZC-E0127, ZC-E0128; slice 8). A record that
+does; so does one whose automatic rollback the API refused (ZC-E0127, ZC-E0128; `rollback_refused`: `true`, absent otherwise, and only on a
+`failed` rollout of reason `apply`; slice 8 sets it). A record that
 contradicts itself is refused by every reader (ZC-E0301): `to` 0, `from` not below `to`, a
 deadline or `evidence_from_ms` before `started_at_ms`, `reason` `rollback` or phase
 `rolling_back` with `from` 0, `progressing` with reason `rollback` or `rolling_back` with `apply`,

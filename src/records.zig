@@ -789,6 +789,9 @@ pub const Rollout = struct {
     evidence_from_ms: ?u64 = null,
     paused_at_ms: ?u64 = null,
     paused_by: ?RolloutPauseCause = null,
+    /// `true`: the automatic rollback this failed rollout owed was refused (ZC-E0127, ZC-E0128),
+    /// so it has ended owing nothing; null otherwise (`false` is never written).
+    rollback_refused: ?bool = null,
     /// What `budget` was computed on, so the replica controller can tell what of it is spent: the
     /// store revision the controller read, the `/replica-numbers/<service>` counter then (null:
     /// no counter yet) and the old replicas (`/replicas/` records of an older spec) then. Starts
@@ -1275,6 +1278,11 @@ fn rollout_valid(record: *const Rollout) bool {
     if (paused != (record.paused_by != null)) return false;
     if (record.paused_at_ms) |at| {
         if (at < evidence_from) return false;
+    }
+    if (record.rollback_refused) |refused| {
+        if (!refused) return false;
+        if (record.phase != .failed) return false;
+        if (record.reason != .apply) return false;
     }
     return switch (record.phase) {
         .progressing => record.reason == .apply,

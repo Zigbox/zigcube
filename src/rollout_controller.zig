@@ -542,6 +542,7 @@ const Run = struct {
             .user => .user,
             .failure => .failure,
         } else null;
+        rollout.rollback_refused = if (state.rollback_refused) true else null;
         rollout.next_at_ms = result.next_at_ms;
         rollout.ready_new = seen.mix.new_ready;
         rollout.budget = result.plan.stored();
@@ -728,6 +729,8 @@ pub fn state_of(rollout: *const records.Rollout) ?plan_mod.State {
     if (rollout.paused_at_ms) |at| {
         if (at < evidence_from) return null;
     }
+    const refused = rollout.rollback_refused orelse false;
+    if (refused and (rollout.phase != .failed or reason != .apply)) return null;
     const state: plan_mod.State = .{
         .phase = rollout.phase,
         .reason = reason,
@@ -740,6 +743,7 @@ pub fn state_of(rollout: *const records.Rollout) ?plan_mod.State {
             .user => .user,
             .failure => .failure,
         } else null,
+        .rollback_refused = refused,
     };
     state.assert_valid();
     return state;
@@ -839,6 +843,7 @@ fn write_state(rollout: *records.Rollout, state: *const plan_mod.State) void {
         .user => .user,
         .failure => .failure,
     } else null;
+    rollout.rollback_refused = if (state.rollback_refused) true else null;
 }
 
 fn refuse(ctx: *const Context, service: []const u8, why: []const u8) Outcome {

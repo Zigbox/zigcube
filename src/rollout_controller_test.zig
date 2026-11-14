@@ -367,7 +367,8 @@ test "an apply over a rollout still progressing starts from the generation that 
 
 test "a stored rollout that contradicts itself is refused at decode with ZC-E0301" {
     // Goal: a record that would trip the plan's assertions (from not below to, an active phase
-    // of the other reason, a rollback from generation 0) is malformed, never asserted on.
+    // of the other reason, a refused rollback on a rollout that has not failed, a rollback from
+    // generation 0) is malformed, never asserted on.
     // Method: real record text the controller wrote, edited, then read back and handed to a
     // controller pass.
     var fixture: Fixture = undefined;
@@ -381,6 +382,8 @@ test "a stored rollout that contradicts itself is refused at decode with ZC-E030
     const edits = [_][2][]const u8{
         .{ "\"from\":1,", "\"from\":2," },
         .{ "\"phase\":\"progressing\"", "\"phase\":\"rolling_back\"" },
+        // A refused rollback marks only a failed rollout.
+        .{ "\"phase\":\"progressing\"", "\"phase\":\"progressing\",\"rollback_refused\":true" },
     };
     for (edits) |edit| {
         try testing.expect(std.mem.indexOf(u8, text, edit[0]) != null);

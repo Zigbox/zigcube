@@ -315,7 +315,8 @@ fn rollout_deadline(diag: *diag_mod.Diag) void { // C3 slice 7: the rollout cont
 
 fn rollout_paused(diag: *diag_mod.Diag) void { // C3 slice 8: on_failure pause
     const cause = "the rollout of hello to generation 7 failed (ZC-E0304) and paused itself";
-    sample(diag, .W0304, &.{cause}, "resume it, roll back, or apply a fixed release");
+    const fix = "resume it, roll back (if it ran an earlier generation), or apply a fixed release";
+    sample(diag, .W0304, &.{cause}, fix);
 }
 
 fn rolled_back(diag: *diag_mod.Diag) void { // C3 slice 8: on_failure rollback

@@ -84,7 +84,14 @@ Choices the brief left open, or where this slice differs from it or from slice 6
     members slice 7 added (a rollback from 0, `paused_at_ms`/`paused_by` set exactly while
     `paused`, `evidence_from_ms` before the start, a pause before the evidence, an active phase
     that is not the reason's), tested with record text the controller wrote. No new code.
-21. **Rule 3 (a refused auto-rollback ends the rollout `failed`) is left to slice 8.** The rule's
-    file names it slice 7's obligation; the supervisor's ruling to this slice says slice 8's.
-    Slice 7 calls no rollback handler (item 8), so there is nothing yet to refuse; the record
-    member, the `State` field and the `pass` test go with slice 8's handler call.
+21. **Rule 3: a refused auto-rollback is an end** (the supervisor's later message assigns it to
+    slice 7). `/rollouts` gains the optional member `rollback_refused` (`true` or absent),
+    `rollout_plan.State.rollback_refused` mirrors it, `rollback_owed` owes nothing once it is set,
+    and `rollout_plan.rollback_refused` sets it on a rollout that owed one; a pause clears it.
+    Test "a refused automatic rollback ends the rollout, owing nothing". The record refuses the
+    mark on anything but a failed `apply` (ZC-E0301). Slice 7 calls no rollback handler (item 8):
+    slice 8 calls `rollback_refused` when the handler answers E0127 or E0128, records the code in
+    the decision and writes the state once.
+22. **W0304's fix line** says "roll back (if it ran an earlier generation)", like its
+    explanation (`cli_golden.zig` and its three golden files; the controller's `rollout_pause`
+    decision has no fix line of its own).
