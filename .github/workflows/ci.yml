@@ -59,6 +59,7 @@ jobs:
       demo_b3: ${{ steps.pick.outputs.demo_b3 || 'true' }}
       demo_b7: ${{ steps.pick.outputs.demo_b7 || 'true' }}
       demo_b5: ${{ steps.pick.outputs.demo_b5 || 'true' }}
+      demo_b6: ${{ steps.pick.outputs.demo_b6 || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -245,13 +246,13 @@ jobs:
   # everything it started. One job per backend builds once (the demos share the build cache of
   # the job) and runs the demos in sequence, each its own step, so a failure names its demo; a
   # failed demo does not stop the next from running, and the job still fails. Each demo still
-  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1, and demo_b7 on SQLite only);
+  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1, demo_b6, and demo_b7 on SQLite only);
   # the job runs when any is picked. Before this they were six jobs, each downloading Zig and
   # building the same binaries.
   demos-sqlite:
     name: demos (sqlite)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_b7 == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_b7 == 'true' || needs.changes.outputs.demo_b6 == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -275,6 +276,9 @@ jobs:
       - name: demo-b7 (the API over mTLS)
         if: ${{ !cancelled() && needs.changes.outputs.demo_b7 == 'true' }}
         run: zig build demo-b7 -Dtranscript=demo-b7-sqlite.txt --summary all
+      - name: demo-b6 on SQLite
+        if: ${{ !cancelled() && needs.changes.outputs.demo_b6 == 'true' }}
+        run: zig build demo-b6 -Dbackend=sqlite -Dtranscript=demo-b6-sqlite.txt --summary all
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -285,13 +289,13 @@ jobs:
 
   # The same image, by digest, as store-postgres. demo-c0 stops the database mid-run: the service
   # container is stopped with `docker stop` and started again with `docker start`, which keeps its
-  # data and its published port. The container is named once, before the demos run. demo-c1 and
-  # demo-b1 do not stop it; each demo owns the database's `zcube` schema and drops it around its
+  # data and its published port. The container is named once, before the demos run. demo-c1,
+  # demo-b1 and demo-b6 do not stop it; each demo owns the database's `zcube` schema and drops it around its
   # run, so running them in turn on one database is what each already assumes.
   demos-postgres:
     name: demos (postgres)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_b6 == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -335,6 +339,9 @@ jobs:
       - name: demo-b1 on Postgres
         if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
         run: zig build demo-b1 -Dbackend=postgres -Dtranscript=demo-b1-postgres.txt --summary all
+      - name: demo-b6 on Postgres
+        if: ${{ !cancelled() && needs.changes.outputs.demo_b6 == 'true' }}
+        run: zig build demo-b6 -Dbackend=postgres -Dtranscript=demo-b6-postgres.txt --summary all
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

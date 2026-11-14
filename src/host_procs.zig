@@ -8,6 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const process_session = @import("process_session.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -119,24 +120,110 @@ pub const Procs = struct {
         return !info.zombie;
     }
 
-    /// Kills the process group of every supervisor under the state directory (the supervisor,
-    /// its command, what that started). Returns how many it signalled.
+    /// Kills every process of every container's session: that of each supervisor running under
+    /// the state directory, that of each supervisor a container's directory records, live or
+    /// dead, and that of each process that runs in the state directory (`in_state`), which
+    /// finds what a container left after the agent removed its directory. A command has a
+    /// process group of its own inside its supervisor's session, and what it started may
+    /// outlive both, so a kill of the supervisor's group is not enough. Agents, which run in our
+    /// own session, are the caller's to kill. Returns how many sessions it signalled.
     pub fn kill_supervisor_groups(procs: Procs) u32 {
+        var killed: u32 = 0;
+        const recorded = procs.containers() catch &.{};
+        const ours = own_session(procs.io);
         var proc_dir = std.Io.Dir.cwd().openDir(procs.io, "/proc", .{ .iterate = true }) catch {
-            return 0;
+            return killed;
         };
         defer proc_dir.close(procs.io);
-        var killed: u32 = 0;
         var iterator = proc_dir.iterate();
         while (iterator.next(procs.io) catch null) |entry| {
             const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
-            if (!procs.is_supervisor(pid)) continue;
-            std.posix.kill(-pid, .KILL) catch continue; // The group may be gone already.
+            const info = procs.proc(pid) orelse continue;
+            if (info.zombie) continue;
+            if (info.session <= 1) continue;
+            if (info.session == ours) continue;
+            if (!procs.is_ours(pid, info, recorded)) continue;
+            // A session is ours to kill while a process of it lives: Linux keeps its id out of
+            // use until then, so it cannot be a stranger's.
+            process_session.kill_all(procs.io, info.session);
             killed += 1;
         }
         return killed;
     }
+
+    /// The processes that live in the session of a container whose supervisor is gone: what a
+    /// container left behind when it ended (a pid namespace would have taken it along). Zero
+    /// while the run is healthy; a demo checks it before its cleanup kills everything. It finds
+    /// them by `is_ours`, so it sees what a removed container left only when the agent runs in
+    /// the state directory.
+    pub fn orphans(procs: Procs) !u32 {
+        const recorded = try procs.containers();
+        const ours = own_session(procs.io);
+        var left: u32 = 0;
+        var proc_dir = try std.Io.Dir.cwd().openDir(procs.io, "/proc", .{ .iterate = true });
+        defer proc_dir.close(procs.io);
+        var iterator = proc_dir.iterate();
+        while (try iterator.next(procs.io)) |entry| {
+            const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+            const info = procs.proc(pid) orelse continue;
+            if (info.zombie) continue;
+            if (info.session == ours) continue;
+            if (procs.alive(info.session)) continue; // Its supervisor still runs.
+            if (procs.is_ours(pid, info, recorded)) left += 1;
+        }
+        return left;
+    }
+
+    /// What still runs after `kill_supervisor_groups`: every process `is_ours`, each counted
+    /// once. The caller settles first: a killed process disappears a moment later.
+    pub fn survivors(procs: Procs) !u32 {
+        const recorded = try procs.containers();
+        var left: u32 = 0;
+        var proc_dir = try std.Io.Dir.cwd().openDir(procs.io, "/proc", .{ .iterate = true });
+        defer proc_dir.close(procs.io);
+        var iterator = proc_dir.iterate();
+        while (try iterator.next(procs.io)) |entry| {
+            const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+            const info = procs.proc(pid) orelse continue;
+            if (info.zombie) continue;
+            if (procs.is_ours(pid, info, recorded)) left += 1;
+        }
+        return left;
+    }
+
+    /// A process of this state directory's containers: a supervisor of it, a member of the
+    /// session of a supervisor a container's directory records, or a process that runs in the
+    /// state directory (`in_state`).
+    fn is_ours(procs: Procs, pid: i32, info: ProcInfo, recorded: []const Pids) bool {
+        if (procs.is_supervisor(pid)) return true;
+        if (procs.in_state(pid)) return true;
+        for (recorded) |pids| {
+            if (pids.supervisor > 1 and pids.supervisor == info.session) return true;
+        }
+        return false;
+    }
+
+    /// True if the process's working directory is the state directory or under it. A demo
+    /// starts its agents there, and supervisors, commands and what those start inherit it.
+    pub fn in_state(procs: Procs, pid: i32) bool {
+        var path: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&path, "/proc/{d}/cwd", .{pid}) catch return false;
+        var buffer: [constants.state_path_bytes_max + 64]u8 = undefined;
+        const length = std.Io.Dir.readLinkAbsolute(procs.io, name, &buffer) catch return false;
+        const cwd = buffer[0..length];
+        if (!std.mem.startsWith(u8, cwd, procs.state)) return false;
+        return cwd.len == procs.state.len or cwd[procs.state.len] == '/' or
+            cwd[procs.state.len] == ' '; // "<dir> (deleted)"
+    }
 };
+
+/// The session of this process: the demo's own, which its agents and server share.
+fn own_session(io: std.Io) i32 {
+    var buffer: [1024]u8 = undefined;
+    const bytes = std.Io.Dir.cwd().readFile(io, "/proc/self/stat", &buffer) catch return -1;
+    const info = parse_stat(bytes) orelse return -1;
+    return info.session;
+}
 
 fn read_pid(io: std.Io, dir: std.Io.Dir, name: []const u8) ?i32 {
     var buffer: [32]u8 = undefined;

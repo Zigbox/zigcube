@@ -69,7 +69,8 @@ pub const Fleet = struct {
             "--verbose",
         };
         const log = try log_name(arena, index, fleet.starts[index]);
-        fleet.agents[index] = try host.spawn(host.config.agent_exe, &args, log);
+        const cwd: std.process.Child.Cwd = .{ .path = dir };
+        fleet.agents[index] = try host.spawn_in(host.config.agent_exe, &args, log, cwd);
     }
 
     /// Power off: SIGKILL of the agent, so it cannot revoke its lease, then of every supervisor's
@@ -109,18 +110,22 @@ pub const Fleet = struct {
         fleet.proxy = null;
     }
 
-    /// What still runs after `cleanup`: supervisors and the commands of every container of every
-    /// node. Settles first: a killed process disappears a moment later.
+    /// What still runs after `cleanup`: supervisors and every process of every container's
+    /// session, on every node. Settles first: a killed process disappears a moment later.
     pub fn survivors(fleet: *Fleet) !u32 {
         try fleet.host.io.sleep(.fromMilliseconds(500), .awake);
         var left: u32 = 0;
         for (0..count) |index| {
-            const procs_now = fleet.procs(index);
-            left += try procs_now.supervisors();
-            for (try procs_now.containers()) |pids| {
-                if (procs_now.alive(pids.command)) left += 1;
-            }
+            left += try fleet.procs(index).survivors();
         }
+        return left;
+    }
+
+    /// What ended containers left running, on every node (`Procs.orphans`); before `cleanup`.
+    pub fn orphans(fleet: *Fleet) !u32 {
+        try fleet.host.io.sleep(.fromMilliseconds(500), .awake);
+        var left: u32 = 0;
+        for (0..count) |index| left += try fleet.procs(index).orphans();
         return left;
     }
 

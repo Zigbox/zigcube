@@ -174,7 +174,11 @@ checks nothing.
 `labels` are words: `key=value` is a label a job's `placement.require` can name, and
 `exclusive=K` reserves the node: it takes only a job whose `require` names `K` with the node's own
 value of `K`, and never a service's replica. At registration an `exclusive=K` must name a key `K`
-the node carries exactly once, else `ZC-E0104` (B6).
+the node carries exactly once, else `ZC-E0104` (B6). The agent takes its labels from
+`--label KEY=VALUE` or from `.labels` in its configuration file, refuses a disagreement between the
+two (`ZC-E0505`), and sends them when it registers a new tenure; a start with other labels while
+its kept lease is live is refused (`ZC-E0505`): relabelling waits one lease ttl or empties the state
+directory ([agent.md](agent.md#running-it)).
 
 Written by the agent with `lease` set to the lease it keeps alive. When the lease ends the key
 is deleted by the store, and that delete event is how lost nodes are detected (C1). The key's

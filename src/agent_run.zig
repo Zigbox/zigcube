@@ -440,6 +440,7 @@ fn new_agent(
         .address = config.address,
         .peer = peer_address(peer_buffer, config.peer_advertise),
         .agent_version = build_options.version,
+        .labels = config.labels,
         .trust = trust,
     });
     return agent;
@@ -476,6 +477,8 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     var remote = remote_mod.RemoteStore.init(gpa, http_transport.transport(), config.node);
     remote.set_deadline(boot.clock(), std.math.maxInt(u64));
     var boot_id_buffer: [64]u8 = undefined;
+    const boot_id = read_boot_id(io, &boot_id_buffer);
+    if (refuse_relabel(io, gpa, &backend, config, boot_id, boot.clock(), &diag)) |code| return code;
     load_pair(gpa, &remote, backend.pair_state, config.state_dir, config.server, &diag) catch
         return fail(io, &diag, config.verbose);
     var peer_identity = switch (open_peer(io, config, &diag)) {
@@ -511,7 +514,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .diag = undefined,
         .verbose = config.verbose,
         .policy = loop_mod.Loop.init(),
-        .boot_id = read_boot_id(io, &boot_id_buffer),
+        .boot_id = boot_id,
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
         .tls = http_transport.client.tls,
@@ -520,6 +523,33 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     defer shell.arena.deinit();
     announce(io, config);
     return serve(&shell, &diag, peer_identity.stored_problem);
+}
+
+/// Refuses to start (ZC-E0505) when the state directory holds a live lease that was taken
+/// under other labels: the agent would resume it, and the server would keep the old labels
+/// (`agent.kept_labels_allow`).
+fn refuse_relabel(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    backend: *Backend,
+    config: config_mod.Config,
+    boot_id: []const u8,
+    mono: @import("clock.zig").Clock,
+    diag: *Diag,
+) ?u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Absent is a first start; unreadable is the fence's to handle, as `Agent.restore` does.
+    const text = backend.pair_state.interface().read(arena, agent_mod.lease_file) catch return null;
+    const labels = config.labels;
+    if (agent_mod.kept_labels_allow(arena, text, labels, boot_id, mono.now_ms())) return null;
+    diag.raise(.E0505);
+    diag.cause("the node's labels differ from those it registered with, and its lease is " ++
+        "live", .{});
+    diag.fix(.{ .sentence = "to relabel the node, stop the agent for one lease ttl (the node " ++
+        "fences and registers again with the new labels) or empty --state-dir" });
+    return fail(io, diag, config.verbose);
 }
 
 /// Runs the agent's loop until it is told to stop, then saves the pair.

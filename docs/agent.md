@@ -52,6 +52,27 @@ With `--ca FILE` (and `--tls-name`) the agent speaks TLS to the server's `--list
 its own `node.crt` once it has joined, else `--cert` and `--key`
 ([mtls.md](mtls.md), "The API over TLS"); without it, plain HTTP to `--insecure-listen`.
 
+**Node labels** (B6) are given by `--label KEY=VALUE`, once per label, or by `.labels` in the ZON
+file (`.labels = .{ "tenant=a", "exclusive=tenant" }`); at most `node_labels_max` (8), each at most
+`node_label_bytes_max` (128) bytes. `KEY=VALUE` is a label a job's `placement.require` can name;
+`exclusive=KEY` reserves the node for the jobs that require its own value of `KEY`, so `KEY` must
+be one of the node's labels. Labels are the one setting where flags do not win: if both the flags
+and the file give labels and the two sets differ, the agent refuses to start (`ZC-E0505`, "the
+node's labels are given by --label and by .labels in the file, and they differ"); the same set in
+either order is accepted. A label decides which tenants' work a node runs, so a disagreement is
+not settled by a rule nobody reads. A label without `=`, a key given twice, or an `exclusive`
+naming a key the node lacks is `ZC-E0505` too
+([decision](decisions/2026-11-14-b6-agent-labels-flag-and-file.md)).
+
+**Relabelling a node.** The agent sends its labels when it registers a new tenure, not on every
+keepalive, and it records them in its lease file (`<state-dir>/lease.json`). An agent started
+with other labels while the recorded lease would still be live refuses to start (`ZC-E0505`, "the
+node's labels differ from those it registered with, and its lease is live"), since it would
+resume the old tenure under the old labels. To relabel a node, stop its agent for one lease ttl
+(the node fences, and the next start registers a new tenure with the new labels), or empty its
+`--state-dir` (which stops what it ran: a wiped node, as in B2). A lease file written before
+labels were recorded is accepted. Label keys are at most 32 bytes, at most 8 labels.
+
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
 the exit code of their blame. While it runs, a server that cannot be reached is `ZC-E0503`, shown
 once and again every 30 seconds, with a backoff from 250 ms to 5 s. SIGINT or SIGTERM ends the

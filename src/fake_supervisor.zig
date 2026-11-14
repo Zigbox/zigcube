@@ -64,7 +64,17 @@ var term_received: std.atomic.Value(bool) = .init(false);
 fn on_term(_: std.posix.SIG) callconv(.c) void {
     term_received.store(true, .seq_cst);
     const pid = child_pid.load(.seq_cst);
-    if (pid > 1) _ = std.os.linux.kill(pid, .TERM);
+    if (pid > 1) term_group(pid);
+}
+
+/// `SIGTERM` to the command's (or the fetch's) process group, so what it started is told too; to
+/// the pid alone if it leads no group (a command an older supervisor started, a test's child).
+/// Async-signal-safe: raw system calls only.
+fn term_group(pid: i32) void {
+    assert(pid > 1);
+    const rc = std.os.linux.kill(-pid, .TERM);
+    if (std.os.linux.errno(rc) == .SUCCESS) return;
+    _ = std.os.linux.kill(pid, .TERM);
 }
 
 /// Waits until the child `pid` has ended, without reaping it, then stops `on_term` from signalling
@@ -93,7 +103,7 @@ fn wait_ended_unreaped(pid: i32) void {
 fn publish_child(pid: i32) void {
     assert(pid > 1);
     child_pid.store(pid, .seq_cst);
-    if (term_received.load(.seq_cst)) _ = std.os.linux.kill(pid, .TERM);
+    if (term_received.load(.seq_cst)) term_group(pid);
 }
 
 /// Waits for `child` to end and reaps it, in the one order that is safe (issue #113). While its
@@ -107,7 +117,13 @@ fn reap(
     child: *std.process.Child,
     between: ?*const fn () void,
 ) std.process.Child.WaitError!std.process.Child.Term {
-    wait_ended_unreaped(child.id.?);
+    const pid = child.id.?;
+    wait_ended_unreaped(pid);
+    // What the child started ends with it, as in a pid namespace (B6 slice 3's review: a
+    // `sh -c 'sleep 300'` stopped by `SIGTERM` to the shell left the `sleep` running). The
+    // unreaped zombie still holds the group's id, so no stranger can own it; a child that leads
+    // no group makes this ESRCH.
+    _ = std.os.linux.kill(-pid, .KILL);
     if (dir) |own| own.deleteFile(io, files.file_child) catch {}; // Absent if it was never written.
     if (between) |hook| hook();
     return child.wait(io);
@@ -121,8 +137,9 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     const arena = arena_state.allocator();
     const dir = Dir.openDirAbsolute(io, dir_path, .{}) catch return constants.exit_environment;
     defer dir.close(io);
-    // A new session and process group: signals and a closing terminal aimed at the agent do not
-    // reach it, and one `kill(-pid)` reaches the supervisor and everything it started.
+    // A new session: signals and a closing terminal aimed at the agent do not reach it. The
+    // command gets a group of its own inside it, so killing everything the supervisor started
+    // is a kill of the session (`process_session.kill_all`), not of this group.
     _ = std.os.linux.setsid();
     const lock = dir.createFile(io, files.file_lock, .{ .truncate = false, .lock = .exclusive });
     // Not closed: the lock is released when the process ends, and that is what the agent tests.
@@ -187,6 +204,7 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
         .stdin = .ignore,
         .stdout = .{ .file = log },
         .stderr = .{ .file = log },
+        .pgid = 0, // As the command's: a stop reaches the fetch's own children too.
     }) catch return failed(.environment, "the host refused to start the fetch");
     publish_child(child.id.?);
     const term = reap(io, null, &child, null) catch return .{ .kind = .lost };
@@ -437,6 +455,9 @@ fn run_command(
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
+        // A group of its own inside this session: a stop reaches what the command started, and
+        // `SIGKILL` to the command's group does not reach this supervisor before it records.
+        .pgid = 0,
     }) catch |err| return spawn_failure(err);
     const pid: i32 = child.id.?;
     publish_child(pid);

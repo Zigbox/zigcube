@@ -1130,9 +1130,12 @@ pub const registry = [_]Entry{
         .summary = "the agent's configuration can't be used",
         .explanation =
         \\A flag or a setting in the agent's ZON file is missing, unknown or out of
-        \\range, or a file it names (the image fixtures, the --trust-policy file)
-        \\cannot be read or used. The cause line names the setting. The agent did
-        \\not start and changed nothing.
+        \\range, the node's labels are malformed or given by --label and by the
+        \\file's .labels differently, the labels differ from those the node
+        \\registered with while its lease in --state-dir is live, or a file it
+        \\names (the image fixtures, the --trust-policy file) cannot be read or
+        \\used. The cause line names the setting. The agent did not start and
+        \\changed nothing.
         \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,

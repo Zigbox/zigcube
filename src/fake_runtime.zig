@@ -44,6 +44,7 @@ const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
 const diag_mod = @import("diag.zig");
 const files = @import("fake_files.zig");
+const process_session = @import("process_session.zig");
 const runtime = @import("runtime.zig");
 const sim_runtime = @import("sim_runtime.zig");
 
@@ -419,7 +420,7 @@ pub const FakeRuntime = struct {
             return;
         };
         if (grace_ms == 0) return self.kill_and_wait(dir, child);
-        signal(child, .TERM);
+        signal_command(child, .TERM);
         const waited = @min(grace_ms, stop_wait_ms);
         if (self.wait_ended(dir, waited)) return;
         if (grace_ms <= stop_wait_ms) self.kill_and_wait(dir, child);
@@ -445,11 +446,11 @@ pub const FakeRuntime = struct {
             self.kill_group(dir);
             return;
         };
-        signal(child, if (number == runtime.signal_kill) .KILL else .TERM);
+        signal_command(child, if (number == runtime.signal_kill) .KILL else .TERM);
     }
 
     fn kill_and_wait(self: *FakeRuntime, dir: Dir, child: i32) void {
-        signal(child, .KILL);
+        signal_command(child, .KILL);
         _ = self.wait_ended(dir, constants.fake_reap_ms);
     }
 
@@ -603,19 +604,21 @@ pub const FakeRuntime = struct {
         agent_records.write_run(self.state.interface(), name, &lost) catch {};
     }
 
-    /// Kills the supervisor's process group: the supervisor, the command, what the command
-    /// started. Only what is provably ours is signalled, because the pids come from files that may
-    /// be old (after a host restart a recycled pid belongs to someone else): the supervisor must
-    /// still be a `supervise` of this state directory, or the command must still be in the
-    /// session the supervisor led, which no new process can have as its id while a member lives.
+    /// Kills the supervisor's session: the supervisor, the command (in a group of its own), what
+    /// the command started. Only what is provably ours is signalled, because the pids come from
+    /// files that may be old (after a host restart a recycled pid belongs to someone else): the
+    /// supervisor must still be a `supervise` of this state directory, or the command must still
+    /// be in the session the supervisor led, which no new process can have as its id while a
+    /// member lives.
     pub fn kill_group(self: *FakeRuntime, dir: Dir) void {
         const supervisor = files.read_pid(self.io, dir, files.file_supervisor) catch return;
+        if (supervisor <= 1) return;
         var ours = self.is_our_supervisor(supervisor);
         if (!ours) {
             const command = files.read_pid(self.io, dir, files.file_child) catch return;
             ours = self.session_of(command) == supervisor;
         }
-        if (ours) signal(-supervisor, .KILL);
+        if (ours) process_session.kill_all(self.io, supervisor);
     }
 
     /// True if `pid` is a `zcube-agent supervise` of a container under our state directory.
@@ -792,7 +795,7 @@ pub const FakeRuntime = struct {
         _ = arena;
         if (is_limit_word(word)) {
             files.write_atomic(self.io, dir, files.file_forced, word) catch return false;
-            signal(child, .KILL);
+            signal_command(child, .KILL);
             return true;
         }
         if (std.mem.eql(u8, word, "relay_stop")) {
@@ -817,6 +820,16 @@ pub const FakeRuntime = struct {
 fn is_limit_word(word: []const u8) bool {
     if (std.mem.eql(u8, word, "oom")) return true;
     return std.mem.eql(u8, word, "pid_limit");
+}
+
+/// A signal to a container's command and what it started: the command leads a process group of
+/// its own (`fake_supervisor.run_command`). A command an older supervisor started shares its
+/// supervisor's group and gets the signal alone, as before.
+fn signal_command(pid: i32, sig: std.posix.SIG) void {
+    assert(pid > 1);
+    std.posix.kill(-pid, sig) catch {
+        signal(pid, sig);
+    };
 }
 
 fn signal(pid: i32, sig: std.posix.SIG) void {

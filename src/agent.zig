@@ -165,7 +165,50 @@ const LeaseFile = struct {
     fencing: bool = false,
     /// With `fencing`: when the fence kills what is left, monotonic, in `boot_id`.
     kill_at_ms: u64 = 0,
+    /// The node's labels as this agent was configured when it kept the file (B6). Null in a
+    /// file an agent before B6 slice 3's fix wrote: unknown, and accepted.
+    labels: ?[]const []const u8 = null,
 };
+
+/// Whether an agent configured with `labels` may start on the state directory whose lease file
+/// is `text`: false if the file holds a lease this agent would resume, under other labels. A
+/// node's labels reach the server only when it registers, so resuming would keep the old ones
+/// in force (docs/decisions/2026-11-14-b6-agent-labels-flag-and-file.md). Any file the agent
+/// would not resume (unreadable, another boot, a fence begun, past its fence time, labels not
+/// recorded) is fine: the agent fences and registers again with `labels`. Order does not count.
+pub fn kept_labels_allow(
+    arena: Allocator,
+    text: []const u8,
+    labels: []const []const u8,
+    boot_id: []const u8,
+    mono_ms: u64,
+) bool {
+    const parsed = std.json.parseFromSliceLeaky(LeaseFile, arena, text, .{}) catch return true;
+    const kept = parsed.labels orelse return true;
+    if (parsed.fencing) return true;
+    if (!std.mem.eql(u8, parsed.boot_id, boot_id) or parsed.sent_ms > mono_ms) return true;
+    if (parsed.lease == store.lease_none or parsed.tenure == 0) return true;
+    if (fencing.inequality_problem(parsed.ttl_ms) != null) return true;
+    if (mono_ms >= fencing.fence_at_ms(parsed.sent_ms, parsed.ttl_ms)) return true;
+    return same_label_set(kept, labels);
+}
+
+fn same_label_set(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a) |label| {
+        const found = for (b) |other| {
+            if (std.mem.eql(u8, label, other)) break true;
+        } else false;
+        if (!found) return false;
+    }
+    for (b) |label| {
+        const found = for (a) |other| {
+            if (std.mem.eql(u8, label, other)) break true;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
 
 /// The fence in progress: containers are being stopped, and killed at `kill_at_ms` (monotonic).
 const Fence = struct {
@@ -835,6 +878,7 @@ pub const Agent = struct {
             .boot_id = ctx.boot_id,
             .fencing = agent.fence.active,
             .kill_at_ms = agent.fence.kill_at_ms,
+            .labels = agent.config.labels,
         };
         const text = try records.encode(ctx.arena, file, ctx.diag);
         state.put_atomic(lease_file, text) catch |err| {
@@ -1593,4 +1637,47 @@ test "a node publishes its policy path only when the policy checks something" {
     policy.require_provenance = true;
     try std.testing.expectEqualStrings(path, published_policy(&trust));
     try std.testing.expectEqualStrings("", published_policy(null));
+}
+
+test "an agent may start under other labels only when it would not resume the kept lease" {
+    // Goal: B6 slice 3's review ruling. A relabel on the same --state-dir used to resume the
+    // lease and keep the old labels in force. Method: lease files as `persist` writes them,
+    // judged at times before and after their fence time, in another boot, while fencing, and
+    // as an older agent wrote them (no labels).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const old = [_][]const u8{ "tenant=a", "exclusive=tenant" };
+    const reordered = [_][]const u8{ "exclusive=tenant", "tenant=a" };
+    const new = [_][]const u8{"tenant=b"};
+    var file: LeaseFile = .{
+        .lease = 7,
+        .ttl_ms = constants.lease_ttl_ms,
+        .sent_ms = 1_000,
+        .tenure = 3,
+        .boot_id = "boot-1",
+        .labels = &old,
+    };
+    const fence_at = fencing.fence_at_ms(file.sent_ms, file.ttl_ms);
+    const live = try records.encode(arena, file, &diag);
+    try std.testing.expect(kept_labels_allow(arena, live, &old, "boot-1", 2_000));
+    try std.testing.expect(kept_labels_allow(arena, live, &reordered, "boot-1", 2_000));
+    try std.testing.expect(!kept_labels_allow(arena, live, &new, "boot-1", 2_000));
+    try std.testing.expect(!kept_labels_allow(arena, live, &.{}, "boot-1", fence_at - 1));
+    try std.testing.expect(!kept_labels_allow(arena, live, old[0..1], "boot-1", 2_000));
+    // The lease will not be resumed: the agent fences and registers with the new labels.
+    try std.testing.expect(kept_labels_allow(arena, live, &new, "boot-1", fence_at));
+    try std.testing.expect(kept_labels_allow(arena, live, &new, "boot-2", 2_000));
+    file.fencing = true;
+    const fencing_file = try records.encode(arena, file, &diag);
+    try std.testing.expect(kept_labels_allow(arena, fencing_file, &new, "boot-1", 2_000));
+    // A file an older agent wrote has no labels: unknown, accepted.
+    file.fencing = false;
+    file.labels = null;
+    const older = try records.encode(arena, file, &diag);
+    try std.testing.expect(std.mem.indexOf(u8, older, "labels") == null);
+    try std.testing.expect(kept_labels_allow(arena, older, &new, "boot-1", 2_000));
+    try std.testing.expect(kept_labels_allow(arena, "not json", &new, "boot-1", 2_000));
 }
