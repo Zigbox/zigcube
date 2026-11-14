@@ -67,3 +67,18 @@ Choices the brief left open, or where this slice differs from it or from slice 6
 18. **`State.earlier` comes from the record** (slice 6's 4d4ec68, merged): a rollout ran before
     when it is a rollback or its `from` is not 0. Slice 7 calls no rollback (item 8); slice 8 must
     not roll back a rollout whose `from` is 0, since there is nothing to go back to.
+19. **`from` is the generation that last completed** (supervisor ruling a, on slice 6's
+    finding 8; the fix session records it in `2026-11-14-c3-rollout-from-rule.md` on slice 6's
+    branch, not merged here yet). `rollout_controller.Run.from_of`: the previous rollout's `to`
+    if it ended `complete`, else its `from`; with no rollout of the service (the first generation
+    has none), the newest generation below the service's that its old replicas run
+    (`View.earlier_generation`: an old replica at the service's generation or above belongs to
+    a deleted incarnation or runs another spec of the same generation, and is no earlier
+    generation, so `from` stays below `to`). `docs/keys.md` says the same.
+20. **A `/rollouts` record that contradicts itself is ZC-E0301 at decode** (ruling b):
+    `records.Rollout.valid`, checked in `records.read`, refuses what `state_of` used to answer
+    with null and what would trip `State.assert_valid` or `begin` (a rollback from 0, `from` not
+    below `to`). No new code: E0301 already means "not a valid record".
+21. **Ruling c is slice 8's.** An auto-rollback the handler refuses (E0127/E0128) ends the
+    rollout `failed`, owing nothing, with the refusal recorded, never retried each pass. Slice 7
+    calls no rollback handler (item 8).

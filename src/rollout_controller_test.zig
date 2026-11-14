@@ -347,6 +347,72 @@ test "a pause between the read and the commit fails the retirement" {
     try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
 }
 
+test "an apply over a rollout still progressing starts from the generation that completed" {
+    // Goal: the supervisor's `from` rule. Generation 2 never became ready, so a rollout of
+    // generation 3 started over it names generation 1, which ran, never 2.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try testing.expectEqual(@as(u64, 1), (try fixture.rollout()).from);
+    var third = web;
+    third.image = "b3:77e0aa12";
+    third.request_id = "r-0002b12";
+    try fixture.apply(third);
+    try fixture.settle();
+    const rollout = try fixture.rollout();
+    try testing.expectEqual(@as(u64, 3), rollout.to);
+    try testing.expectEqual(@as(u64, 1), rollout.from);
+}
+
+test "a stored rollout that contradicts itself is refused at decode with ZC-E0301" {
+    // Goal: a record that would trip the plan's assertions (from not below to, an active phase
+    // of the other reason, a rollback from generation 0) is malformed, never asserted on.
+    // Method: real record text the controller wrote, edited, then read back and handed to a
+    // controller pass.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    const ctx = fixture.context();
+    const key = records.rollout_key(web.name);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    const text = got.kv.?.value;
+    const edits = [_][2][]const u8{
+        .{ "\"from\":1,", "\"from\":2," },
+        .{ "\"phase\":\"progressing\"", "\"phase\":\"rolling_back\"" },
+    };
+    for (edits) |edit| {
+        try testing.expect(std.mem.indexOf(u8, text, edit[0]) != null);
+        const bad = try std.mem.replaceOwned(u8, ctx.arena, text, edit[0], edit[1]);
+        var kv = got.kv.?;
+        kv.value = bad;
+        fixture.diag.reset();
+        const read = records.read(records.Rollout, ctx.arena, kv, &fixture.diag);
+        try testing.expectError(error.Malformed, read);
+        try testing.expectEqual(.E0301, fixture.diag.code.?);
+    }
+    const apply_text = "\"reason\":\"apply\"";
+    try testing.expect(std.mem.indexOf(u8, text, apply_text) != null);
+    const arena = ctx.arena;
+    const reason = try std.mem.replaceOwned(u8, arena, text, apply_text, "\"reason\":\"rollback\"");
+    const contradiction = try std.mem.replaceOwned(u8, arena, reason, "\"from\":1,", "\"from\":0,");
+    fixture.diag.reset();
+    var kv = got.kv.?;
+    kv.value = contradiction;
+    const read = records.read(records.Rollout, arena, kv, &fixture.diag);
+    try testing.expectError(error.Malformed, read);
+    // A pass over the stored record refuses it and asserts nothing.
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = contradiction } };
+    const role: writers.Role = .rollout_controller;
+    fixture.diag.reset();
+    const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &fixture.diag);
+    try testing.expect(done.succeeded);
+    fixture.diag.reset();
+    const pass_ctx = fixture.context();
+    if (fixture.plane.reconcile(&pass_ctx)) |_| {} else |_| {}
+}
+
 test "a pause starts nothing more until a resume, and a second pause changes nothing" {
     // Goal: R4 through the API's handler (slice 11 calls `request`). Method: pause right after
     // the first new replica starts, make it ready, and see no second one until the resume.

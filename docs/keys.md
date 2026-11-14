@@ -209,9 +209,16 @@ known). So after an upgrade the first new generation can always be rolled back t
 ```
 
 Written only by the rollout controller (role `rollout_controller`), one per service. `phase` is
-`progressing`, `paused`, `rolling_back`, `complete` or `failed`. `from` is 0 for a service's
-first generation: such a rollout that fails has nothing to roll back to and stays `failed`, owing
-no rollback, as a failed rollback does. `budget` is how many new
+`progressing`, `paused`, `rolling_back`, `complete` or `failed`. `from` is the generation the
+service last ran to completion: the `to` of its previous rollout if that ended `complete`, else
+that rollout's own `from`, so an apply over a rollout still progressing, paused or failed never
+names a generation that never became ready (with no previous rollout, the newest generation below the service's that its old
+replicas run; old replicas of a deleted incarnation at that generation or above count for none). `from` 0 means none: such a rollout that fails has nothing to roll back to and
+stays `failed`, owing no rollback, as a failed rollback does. A record that contradicts itself
+(`from` not below `to`, `reason` `rollback` with `from` 0, `progressing` with reason `rollback`
+or `rolling_back` with `apply`, `paused_at_ms` or `paused_by` set exactly when not `paused`, a
+deadline or `evidence_from_ms` before `started_at_ms`, a pause before `evidence_from_ms`) is
+refused when read (ZC-E0301). `budget` is how many new
 replicas the replica controller may start now, how many ready old ones it may retire (`retire`,
 the count that keeps `max_unavailable`) and how many old ones that are not ready it may retire
 (`retire_unready`, optional, 0 when absent; a replica that is ready when the controller acts is

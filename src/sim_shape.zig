@@ -272,5 +272,5 @@ test "the profiles are drawn by weight, each one comes up, and a draw is pure" {
     try testing.expect(cluster[0] > cluster[1]);
     try testing.expectEqual(ClusterProfile.crash_heavy, ClusterProfile.parse("crash_heavy").?);
     try testing.expect(ClusterProfile.parse("nope") == null);
-    try testing.expect(ClusterProfile.from_index(5) == null);
+    try testing.expect(ClusterProfile.from_index(ClusterProfile.weights.len) == null);
 }

@@ -255,6 +255,10 @@ pub const View = struct {
     old_records: u32 = 0,
     /// The highest generation among them.
     old_generation: u64 = 0,
+    /// The highest generation among them below the service's: one this service ran before. An
+    /// old replica at the service's generation or above ran another incarnation of it (deleted
+    /// and applied again) or another spec of the same generation, never an earlier generation.
+    earlier_generation: u64 = 0,
     held_at_ms: ?u64 = null,
     unready_since_ms: ?u64 = null,
     ready_pending_at_ms: ?u64 = null,
@@ -321,6 +325,10 @@ const Run = struct {
             if (!fresh) {
                 result.old_records += 1;
                 result.old_generation = @max(result.old_generation, replica.rec.generation);
+                if (replica.rec.generation < service.rec.generation) {
+                    const generation = replica.rec.generation;
+                    result.earlier_generation = @max(result.earlier_generation, generation);
+                }
             }
             if (!live_report(run.snap, &replica.rec)) {
                 if (fresh) result.held_at_ms = later(result.held_at_ms, held_at(track));
@@ -435,9 +443,10 @@ const Run = struct {
         found: ?*const RolloutEntry,
     ) Error!void {
         const reason = try run.reason_of(service);
-        // The service ran an earlier generation if a rollback started this, or if old replicas
-        // name one (`from`, 0 for none): a failed first generation owes no rollback.
-        const ran_before = reason == .rollback or seen.old_generation != 0;
+        const from = from_of(service, seen, found);
+        // The service ran an earlier generation if a rollback started this, or if `from` names
+        // one (0 for none): a failed first generation owes no rollback.
+        const ran_before = reason == .rollback or from != 0;
         const state = plan_mod.begin(policy, reason, ran_before, run.now);
         const facts = run.facts_of(service, seen, &state);
         const result = plan_mod.pass(policy, &state, &facts);
@@ -469,7 +478,7 @@ const Run = struct {
         var rollout: records.Rollout = .{
             .service = service.rec.name,
             .service_created = service.kv.create_revision,
-            .from = seen.old_generation,
+            .from = from,
             .to = service.rec.generation,
             .phase = .progressing,
             .started_at_ms = state.started_at_ms,
@@ -479,6 +488,21 @@ const Run = struct {
         try run.fill(&rollout, service, seen, &result);
         batch.put(key_bytes, try records.encode(run.ctx.arena, rollout, run.ctx.diag));
         try run.finish(&batch);
+    }
+
+    /// The generation the service last ran to completion: the target of its rollout if that
+    /// ended `complete`, else what that rollout started from, so an apply over a rollout still
+    /// progressing, paused or failed never names a generation that never became ready. With no
+    /// rollout of this service, the newest earlier generation its old replicas run: the first
+    /// generation has no rollout of its own.
+    fn from_of(service: *const ServiceEntry, seen: *const View, found: ?*const RolloutEntry) u64 {
+        const rollout = found orelse return seen.earlier_generation;
+        if (!records.rollout_of(&rollout.rec, service.kv.create_revision)) {
+            return seen.earlier_generation;
+        }
+        if (rollout.rec.to >= service.rec.generation) return rollout.rec.from;
+        if (rollout.rec.phase == .complete) return rollout.rec.to;
+        return rollout.rec.from;
     }
 
     fn reason_of(run: *Run, service: *const ServiceEntry) Error!plan_mod.Reason {
