@@ -1878,6 +1878,23 @@ const c1_regressions = [_][]const []const u8{
         "--c1",                "--strong",           "--profile=crash_heavy",
         "--lease-ttl-ms=8226", "--replicas-pct=200", "--heal-at=390",
     },
+    // #142 again on the b3 candidate ebfbac5: a run started in a long step, its cancel committed
+    // meanwhile; the next step read the runs (stop shown), then the read of the node's reports
+    // timed out and the pass ended with the stop withheld while keepalives went on (12,602 ms,
+    // bound 12,000). A failed reports read is kept now and the stops still go (`agent_jobs.pass`).
+    &.{
+        "2821617909",         "100",           "3",
+        "--c1",               "--strong",      "--lease-ttl-ms=10000",
+        "--replicas-pct=200", "--heal-at=130",
+    },
+    // The same shape at f49041a, where the step failed on `assigned`, before the job pass: #247
+    // (ebfbac5) already lets the pass read the runs and stop. It records the issue; it passes on
+    // ebfbac5 without this change.
+    &.{
+        "4242675264",           "145",                "4",
+        "--c1",                 "--strong",           "--profile=partitions",
+        "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=176",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).

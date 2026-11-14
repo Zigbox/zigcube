@@ -242,16 +242,24 @@ pub fn pass(
         constants.agent_node_runs_max,
     )).items;
     // A stage before this one failed with a failure that is not the runtime's (the server): no
-    // report goes out, but every stop the runs' records already decide still does (#247).
+    // report goes out, but every stop the runs' records already decide still does (#247). A
+    // failed read of the reports is kept the same way: the runs above already say which stops
+    // are committed, and a step that ended here withheld them while heartbeats went on, past
+    // J6's bound (#142, seed 2821617909).
     if (!kept.stopped) {
         const prefix = records.job_observed_prefix(agent.config.node);
-        work.observed = (try controller.list_all(
+        if (controller.list_all(
             records.JobObserved,
             &cctx,
             prefix.slice(),
             null,
             constants.job_admitted_window_max,
-        )).items;
+        )) |observed| {
+            work.observed = observed.items;
+        } else |err| {
+            kept.stage(agent, ctx, "read the runs' reports", err);
+            assert(kept.stopped); // A failed store read is never the runtime's.
+        }
     }
     // One run's failing step must not starve the runs after it (#205): like a replica's, it is
     // kept and the next run is looked at. After a failure that is not the runtime's (the server:

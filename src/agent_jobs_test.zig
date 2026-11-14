@@ -1508,6 +1508,40 @@ test "a lost answer to an earlier run's write does not hold back a later run's s
     try testing.expectEqual(@as(?records.StopCause, .cancel), seen.stop_cause);
 }
 
+test "a failed read of the runs' reports does not hold back a stop the runs already show (#142)" {
+    // Goal: #142 (seed 2821617909). The job pass reads the runs, then this node's reports. When
+    // the second read fails, the runs it already holds say which stops are committed; a pass
+    // that ended there withheld the stop for as long as that read kept failing, while the
+    // heartbeat went on (so the fence never came), and the run outlived J6's bound. Method:
+    // "train-job" runs and is cancelled; the reports' list fails (ZC-E0201) for one step. That
+    // step records the cancel as the cause and stops the container, and makes no write after
+    // the failed read; once the read works, the cancel is reported.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    try rig.ask_stop(.cancel, 60_000);
+    const prefix = records.job_observed_prefix(sim_world.node_name);
+    world.switched.down_list_prefix = prefix.slice();
+    const txns_before = world.switched.txns_since_mark;
+    world.switched.marked = true;
+    _ = world.agent_step();
+    world.switched.down_list_prefix = null;
+    try testing.expectEqual(@as(?codes.Code, .E0201), world.last_failure);
+    try testing.expectEqual(txns_before, world.switched.txns_since_mark);
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .cancel), kept.stop_cause);
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+    world.last_failure = null;
+    rig.step();
+    rig.step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .cancel), seen.stop_cause);
+}
+
 /// "train-job" running, and "other-job", which sorts first, assigned; the caller has set
 /// `lost_answer_prefix` to "other-job"'s observation, so the next step's first write of it is
 /// committed and its answer lost (ZC-E0201).
