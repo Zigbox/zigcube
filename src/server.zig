@@ -315,6 +315,10 @@ pub const Server = struct {
             assert(config_mod.is_loopback(where));
             server.insecure_listener = try listen(server.io, where, diag);
         }
+        server.shared.tls_slots = constants.http_connections_max;
+        if (server.listener != null and server.insecure_listener != null) {
+            server.shared.tls_slots -= constants.http_loopback_reserved;
+        }
     }
 
     fn close_listeners(server: *Server) void {
@@ -471,7 +475,8 @@ fn accept_loop(server: *Server, which: Listener) void {
                 continue;
             },
         };
-        const slot = shared.take_slot(stream, .connection) orelse {
+        const kind: http.SlotKind = if (tls != null) .connection_tls else .connection;
+        const slot = shared.take_slot(stream, kind) orelse {
             if (tls != null) {
                 stream.close(io);
                 continue;

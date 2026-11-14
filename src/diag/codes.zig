@@ -1688,9 +1688,8 @@ pub const registry = [_]Entry{
         \\For a client: remove its name from the revoked file and run
         \\zcube-server ca issue-client again, or choose another name.
         \\
-        \\Until the API asks for a client certificate (B7 slice 3), this binds an
-        \\honest node only: anyone who can reach the API can register a node name
-        \\and ask for a credential.
+        \\Over --listen only a node's own certificate may ask for its credential;
+        \\the loopback --insecure-listen caller is trusted, as anyone on the host.
         ,
     },
     .{
@@ -1978,7 +1977,9 @@ pub const registry = [_]Entry{
         \\A node's certificate (an agent) may call only the agent API under its own
         \\node's name: /v1/agent/nodes/<its name>/. A client certificate of scope
         \\`jobs` may submit, list, watch and cancel jobs (/v1/jobs) and ask why about
-        \\a job. Everything else needs a client certificate of scope `admin`.
+        \\a job. Everything else needs a client certificate of scope `admin`, but
+        \\no client may call /v1/agent/nodes/<name>/credential: it signs a node's
+        \\own certificate, so only that node's certificate may ask.
         \\
         \\Use a certificate with the scope the request needs: an operator issues one
         \\with `zcube-server ca issue-client NAME --scope admin`.

@@ -78,7 +78,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <h2>What it means</h2>
 <p>The server will not issue or renew a credential or certificate for this name, because it is on the server's list of removed names (the revoked file in its state directory), which holds node and client names alike. A node's current credential stays valid until it expires, within a day, and then its peers refuse it; a certificate already issued stays valid until it expires.</p>
 <p>For a node that should be in the cluster: remove its name from the revoked file and restart zcube-server; the agent asks again by itself. For a client: remove its name from the revoked file and run zcube-server ca issue-client again, or choose another name.</p>
-<p>Until the API asks for a client certificate (B7 slice 3), this binds an honest node only: anyone who can reach the API can register a node name and ask for a credential.</p>
+<p>Over --listen only a node's own certificate may ask for its credential; the loopback --insecure-listen caller is trusted, as anyone on the host.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0807</pre>

@@ -108,6 +108,10 @@ are sorted by key, with no key twice.
   (`zcube local up`) and the test harnesses. A request on it is the caller `local`, which may
   call everything: whoever can reach loopback already runs on the server's host.
 
+The two listeners share the server's 96 connection slots, but when both run TLS clients take at
+most 88: 8 are kept for `--insecure-listen`, so TLS clients cannot lock out the loopback listener
+(decisions/2026-11-14-loopback-slot-reserve.md).
+
 With neither given, the server serves TLS on `127.0.0.1:7070`, the old default address. The server names the caller from the certificate the
 handshake verified, never from a header: a node's certificate is the caller `node <name>`, a
 client certificate is `client <name>` with its scope. A certificate whose name is in `revoked`,

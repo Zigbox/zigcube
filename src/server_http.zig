@@ -63,7 +63,9 @@ const Slot = struct {
 /// Slots 0 to `http_connections_max - 1` serve connections; the rest deliver refusals.
 const slots_count = constants.http_connections_max + constants.http_refusals_max;
 
-pub const SlotKind = enum { connection, refusal };
+/// `connection_tls` may take only the first `Shared.tls_slots` connection slots; `connection`
+/// (the loopback listener) looks from the last one down, so it uses the reserve first.
+pub const SlotKind = enum { connection, connection_tls, refusal };
 
 /// Everything the connections share.
 pub const Shared = struct {
@@ -79,16 +81,27 @@ pub const Shared = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     slots: [slots_count]Slot = @splat(.{}),
     slots_mutex: std.Io.Mutex = .init,
+    /// The connection slots a TLS client may take: all of them unless both listeners run.
+    tls_slots: u32 = constants.http_connections_max,
 
     // ---- The connection table ----
 
     /// Takes a free slot of `kind` for `stream`, or null when they are all in use.
     pub fn take_slot(shared: *Shared, stream: net.Stream, kind: SlotKind) ?u32 {
+        assert(shared.tls_slots <= constants.http_connections_max);
         shared.slots_mutex.lockUncancelable(shared.io);
         defer shared.slots_mutex.unlock(shared.io);
-        const first: usize = if (kind == .connection) 0 else constants.http_connections_max;
-        const end: usize = if (kind == .connection) constants.http_connections_max else slots_count;
-        for (shared.slots[first..end], first..) |*slot, index| {
+        const connections_max = constants.http_connections_max;
+        const first: usize, const end: usize = switch (kind) {
+            .connection => .{ 0, connections_max },
+            .connection_tls => .{ 0, shared.tls_slots },
+            .refusal => .{ connections_max, slots_count },
+        };
+        for (first..end) |offset| {
+            // The loopback listener searches downward, so it takes the reserve before a slot a
+            // TLS client could use.
+            const index = if (kind == .connection) end - 1 - offset else offset;
+            const slot = &shared.slots[index];
             if (slot.stream != null) continue;
             slot.stream = stream;
             slot.state = .waiting;

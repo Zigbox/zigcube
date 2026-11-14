@@ -405,3 +405,48 @@ test "the API over TLS: replies larger than the server's write buffer arrive who
     try testing.expect(server_static.find("/mock/codes.js").?.bytes.len >= 64 * 1024);
     try testing.expect(server_static.find("/css/console.css").?.bytes.len >= 25_000);
 }
+
+test "TLS clients fill at most their slots, and the loopback listener is still served (B7)" {
+    // Goal: the loopback reserve (docs/decisions/2026-11-14-loopback-slot-reserve.md). Method:
+    // open TCP connections to the TLS port that never start a handshake until the server holds
+    // its TLS share of the slots; one more is closed unserved; a plain GET on the loopback
+    // listener still answers 200.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const io = rig.io;
+    const share = constants.http_connections_max - constants.http_loopback_reserved;
+    try testing.expectEqual(share, rig.server.shared.tls_slots);
+    var streams: [share + 1]net.Stream = undefined;
+    var opened: usize = 0;
+    defer for (streams[0..opened]) |stream| stream.close(io);
+    for (&streams) |*stream| {
+        stream.* = try rig.server.tls_address().connect(io, .{ .mode = .stream });
+        opened += 1;
+    }
+    var waited: u32 = 0;
+    while (rig.server.shared.connections() < share and waited < 200) : (waited += 1) {
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try testing.expectEqual(share, rig.server.shared.connections());
+    // The one past the share was closed without a slot: reading it ends at once.
+    var read_buffer: [64]u8 = undefined;
+    var reader = streams[share].reader(io, &read_buffer);
+    const got = reader.interface.allocRemaining(testing.allocator, .limited(64)) catch "";
+    defer if (got.len > 0) testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 0), got.len);
+
+    const stream = try rig.server.address().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll(
+        "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    try writer.interface.flush();
+    var buffer: [256]u8 = undefined;
+    var plain = stream.reader(io, &buffer);
+    const raw = try plain.interface.allocRemaining(testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(raw);
+    try testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200"));
+}
