@@ -82,6 +82,11 @@ const shell_allowlist = [_][]const u8{
     // fixture, never in a build or test, and nothing but a list of `openssl` calls; the point is
     // certificates another tool made, so the build cannot make them itself.
     "src/testdata/x509/gen.sh",
+    // The release's signing glue (docs/releases/packaging.md), ported from Zigbox's: the program
+    // that signs is gpg, and the glue only drives it between two runs of `zig build packages`.
+    // The release workflow and its test job run the same file; the test sits beside it.
+    ".github/release-sign.sh",
+    ".github/release-sign-test.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).
