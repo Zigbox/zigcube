@@ -1702,6 +1702,11 @@ const Call = struct {
         }
         const action = std.meta.stringToEnum(rollout_steer.Action, verb) orelse
             return no_such(ctx, "/v1/services/<name>/rollout/<pause|resume>");
+        // As the reads answer: a name no service can have is the request's mistake, not a
+        // service that is missing.
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid service name");
+        }
         var by: []const u8 = anonymous;
         if (body.len > 0) {
             const parsed = std.json.parseFromSliceLeaky(CancelBody, ctx.arena, body, .{}) catch

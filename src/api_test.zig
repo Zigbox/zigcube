@@ -1069,7 +1069,7 @@ test "the job routes: 201, 200, 409, GET without secrets, list, cancel 202, why"
     const created = post_job(&rig, "/v1/jobs", body);
     try testing.expectEqual(@as(u16, 201), created.status);
     try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", body).status);
-    const other = try job_json(&rig, "nightly", "b3:51aa9c04");
+    const other = try job_json(&rig, "nightly", "b3:7c02aaaaaaaa");
     try rig.refused(post_job(&rig, "/v1/jobs", other), 409, "ZC-E0131");
     const late = try std.fmt.allocPrint(rig.parsed.allocator(),
         \\{{"name":"late","image":"b3:51aa9c03","command":["true"],"deadline_ms":1,
@@ -1363,6 +1363,14 @@ test "GET .../rollout answers null, then the record; pause and resume write it, 
     try rig.refused(try rollout_post(&rig, "pause", "[1]"), 400, "ZC-E0104");
     const missing = rig.call(.{ .method = "POST", .path = "/v1/services/nope/rollout/pause" });
     try rig.refused(missing, 404, "ZC-E0101");
+    // A name no service can have is 400 on the writes as on the reads.
+    try rig.refused(rig.get("/v1/services/Nope/rollout", ""), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/services/Nope/history", ""), 400, "ZC-E0104");
+    const arena = rig.parsed.allocator();
+    for ([_][]const u8{ "pause", "resume" }) |verb| {
+        const path = try std.fmt.allocPrint(arena, "/v1/services/Nope/rollout/{s}", .{verb});
+        try rig.refused(rig.call(.{ .method = "POST", .path = path }), 400, "ZC-E0104");
+    }
 }
 
 /// `{"applied_by": "aaa..."}` with a name of `length` bytes.

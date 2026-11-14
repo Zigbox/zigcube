@@ -532,6 +532,10 @@ POST /v1/services/hello/rollout/pause      (again: already paused)
 is `"<phase before> → <phase after>"` (the decision's `change`, e.g. `progressing → paused`,
 `paused → rolling_back`) or `"no change"`. `phase` is the phase after the request.
 
+On all four routes a missing service is `404` `ZC-E0101`, and a name no service can have
+(`records.name_problem`) is `400` `ZC-E0104`; pause and resume also refuse an `applied_by` that is
+empty, longer than 64 bytes or not printable with `400` `ZC-E0104`.
+
 `GET .../rollout` answers `200` with `rollout: null`, not `404`, when there is no rollout: the
 service exists, and "no rollout" is a state of it (a record whose `service_created` is not the
 service's, `records.rollout_of`, reads as none). `policy` is the stored one with the defaults
