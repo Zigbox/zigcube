@@ -162,6 +162,9 @@ pub const Host = struct {
         // A Postgres store has no directory beside it, so the server needs one to remember the
         // highest revision it saw (ZC-E0106 without it); the same one serves every restart.
         const state_dir = try host.path_in_work("server-state");
+        // `tls_only` serves `--listen` on the demo's port; `tls_listen` adds one beside it.
+        if (host.config.tls_only) assert(host.config.tls_listen == null);
+        if (host.config.tls_listen != null) assert(!host.config.tls_only);
         var args: std.ArrayList([]const u8) = .empty;
         const listener = if (host.config.tls_only) "--listen" else "--insecure-listen";
         if (host.config.tls_only and host.pki == null) host.pki = .{
@@ -222,23 +225,24 @@ pub const Host = struct {
 
     /// With `Config.tls_only`, whether the operator's credentials are loaded: once the server
     /// wrote its CA, `ca issue-client operator --scope admin` (the first time), then loaded and
-    /// exported to the `zcube` commands. True at once without it.
+    /// exported to the `zcube` commands. True at once without it. Only a CA not yet written is
+    /// waited for: a failing `ca issue-client` or a broken state directory fails the step at once.
     fn tls_ready(host: *Host) !bool {
         if (!host.config.tls_only) return true;
         if (host.credentials != null) return true;
+        // start_server makes the Pki before it starts a tls_only server.
+        assert(host.pki != null);
         const pki = &host.pki.?;
-        if (try pki.find_ca() == null) return false;
-        const issued = pki.issue("operator", "admin") catch {
-            host.say("  {s}", .{pki.said});
-            return false;
-        };
+        const ca = pki.find_ca() catch return host.fail("{s}", .{pki.said});
+        if (ca == null) return false;
+        const issued = pki.issue("operator", "admin") catch return host.fail("{s}", .{pki.said});
         if (issued) {
             host.say("$ zcube-server ca issue-client operator --scope admin " ++
                 "--store <the store> --state-dir server-state --out certs", .{});
             host.print_indented(pki.said);
         }
-        host.credentials = try pki.load("operator");
-        try pki.export_to(&host.cli_environ, "operator");
+        host.credentials = pki.load("operator") catch return host.fail("{s}", .{pki.said});
+        pki.export_to(&host.cli_environ, "operator") catch return host.fail("{s}", .{pki.said});
         return true;
     }
 
@@ -246,17 +250,16 @@ pub const Host = struct {
     /// issued for `node` the first time (`ca issue-node`). Empty without it.
     pub fn agent_tls(host: *Host, node: []const u8) ![]const []const u8 {
         if (!host.config.tls_only) return &.{};
+        // An agent starts after the server, and start_server makes the Pki for a tls_only one.
+        assert(host.pki != null);
         const pki = &host.pki.?;
-        const issued = pki.issue(node, null) catch |err| {
-            host.say("  {s}", .{pki.said});
-            return err;
-        };
+        const issued = pki.issue(node, null) catch return host.fail("{s}", .{pki.said});
         if (issued) {
             host.say("$ zcube-server ca issue-node {s} --store <the store> " ++
                 "--state-dir server-state --out certs", .{node});
             host.print_indented(pki.said);
         }
-        const flags = try pki.flags(node);
+        const flags = pki.flags(node) catch return host.fail("{s}", .{pki.said});
         return host.arena().dupe([]const u8, &flags);
     }
 
@@ -276,9 +279,41 @@ pub const Host = struct {
     // ---- The API, for what the CLI does not show ----
 
     pub fn call(host: *Host, method: []const u8, path: []const u8, body: []const u8) !http.Reply {
-        const address = try net.IpAddress.parse("127.0.0.1", host.port);
         const tls = if (host.config.tls_only) host.credentials orelse
             return error.ApiUnreachable else null;
+        return host.call_with(tls, method, path, body);
+    }
+
+    /// How the transcript names the demo port's listener.
+    pub fn listener_text(host: *const Host) []const u8 {
+        return if (host.config.tls_only) "TLS, --listen" else "plain HTTP, --insecure-listen";
+    }
+
+    /// That the demo's port serves TLS only (B7 slice 6): a plain-HTTP `GET /v1/status` gets no
+    /// answer, and the same request with the operator's certificate gets 200. Fails the demo when
+    /// `Config.tls_only` is off, so a demo that calls it cannot quietly run over plain HTTP.
+    pub fn check_tls_only(host: *Host) !void {
+        const plain = host.call_with(null, "GET", "/v1/status", "");
+        const refused = if (plain) |reply| reply.status != 200 else |_| true;
+        try host.check(refused, "a plain-HTTP GET /v1/status on 127.0.0.1:{d} gets no answer", .{
+            host.port,
+        });
+        const credentials = host.credentials orelse
+            return host.fail("the demo holds no TLS credentials (Config.tls_only is off)", .{});
+        const reply = host.call_with(credentials, "GET", "/v1/status", "") catch |err|
+            return host.fail("GET /v1/status over TLS failed: {t}", .{err});
+        const what = "the same request over TLS, as operator, answers {d}";
+        try host.check(reply.status == 200, what, .{reply.status});
+    }
+
+    fn call_with(
+        host: *Host,
+        tls: ?*harness_tls.Credentials,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+    ) !http.Reply {
+        const address = try net.IpAddress.parse("127.0.0.1", host.port);
         const client: http.Client = .{ .io = host.io, .address = address, .tls = tls };
         var diag: Diag = undefined;
         diag.reset();

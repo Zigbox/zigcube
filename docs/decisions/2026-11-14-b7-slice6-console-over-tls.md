@@ -65,7 +65,8 @@ so part 1 is handed to a fresh session, from this decision.
 
 `src/harness_tls.zig` (`Pki`) is the shared piece:
 
-- it finds the server's `ca-<hash>.crt` in its state directory;
+- it finds the server's CA certificate in its state directory, by the server's own names
+  (`ca.crt` or `ca-<16 hex>.crt`); only a missing directory means "not yet";
 - it runs `zcube-server ca issue-client NAME --scope S` or `ca issue-node NAME` with the
   server's `--store` and `--state-dir`;
 - it returns `--ca/--cert/--key`, exports `ZCUBE_CA/CERT/KEY`, or loads credentials for
@@ -73,13 +74,18 @@ so part 1 is handed to a fresh session, from this decision.
 
 | Harness | Over `--listen` now | Notes |
 | --- | --- | --- |
-| `agent-smoke` | yes | `smoke` admin client; one node certificate per agent |
-| `demo-c0` | yes | `demo_host.Config.tls_only`; the `zcube` command gets an `operator` admin certificate through `ZCUBE_CA/CERT/KEY` |
+| `agent-smoke` | yes | `smoke` admin client; one node certificate per agent; checks that plain HTTP gets no answer and that the issued keys are 0600 |
+| `demo-c0` | yes | `demo_host.Config.tls_only`; the `zcube` command gets an `operator` admin certificate through `ZCUBE_CA/CERT/KEY`; step 0 checks that plain HTTP gets no answer (`Host.check_tls_only`), so the demo fails if `tls_only` is off |
 | `demo-c1` | yes | the same; node1's fault proxy forwards TLS bytes unchanged. Step 6 (local mode) drops `ZCUBE_SERVER` and the TLS variables, because `zcube local` serves `--insecure-listen` only |
-| `demo-b3` | yes | the guest's agent gets the CA, `node.crt` and `node.key` in `/root/tls` (0600); `guest.sh agent <node> <server> [<tls dir>]` |
+| `demo-b1` | yes | the same as `demo-c0` (fix of the slice 6 review); its `zcube job watch` gets the same variables |
+| `demo-b3` | yes | the guest's agent gets the CA, `node.crt` and `node.key` in `/root/tls`, each read back as 0600; `guest.sh agent <node> <server> [<tls dir>]` |
+| `test-store-faults` failover runs (`src/store_failover.zig`) | yes | a `failover` admin certificate; the server's store is Postgres, so its CA is `ca.crt` |
 | `local-smoke` | no | it exercises only `zcube local`, which is the insecure listener's purpose |
 | `demo-b7` | unchanged | it already runs both listeners and tests the insecure one |
-| `swarm-smoke` | **no: gap** | see below |
+| `bench-watch` | no | an in-process `Server` with `insecure_listen`: it measures the watch fan-out of 50 held polls, and a TLS handshake per poll would measure TLS instead |
+| `server_test`, `cli_test`, `agent_remote_test` | no | in-process unit tests of the handlers, the CLI and the agent's client; `api_tls_test` and `tls_conn_test` test the transport |
+| `swarm-smoke` | **no: gap** | converted in slice 7; see below |
+| `demo-c2` | **no: gap** | converted in slice 7, for the same reason as `swarm-smoke` |
 
 **Gap: the agent's `fetch` child does not speak TLS.**
 
