@@ -14,6 +14,12 @@
 //! `lost` when its supervisor is gone and left nothing. A record older than the launch is an
 //! earlier container of the same name and is ignored.
 //!
+//! **Health checks run in a worker.** `probe_begin` starts `zcube-agent probe <name> <timeout>
+//! <command...>` (`probe_worker.zig`), which runs the command in the container with
+//! `zigbox.exec_start` and `exec_wait`, kills it at the timeout and writes one line of result;
+//! `probe_poll` reaps it without blocking (`zigbox_probes.zig`). Exec blocks, so it never runs in
+//! the agent. docs/decisions/2026-11-14-probe-worker.md.
+//!
 //! ## Where it differs from the contract
 //!
 //! `stop` does not wait out a grace period (`lifecycle.stop` would block the agent's lease for

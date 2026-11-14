@@ -330,8 +330,18 @@ monotonic clock from the step and never block.
   fails), `timed_out` (a failure, ZC-W0502) or `refused` (the check could not run). The runtime
   kills a check at its `timeout_ms`. FakeRuntime settles a check from the fault file
   (`unhealthy` exits 1, `probe_timeout` times out, `probe_refused` is refused, otherwise exit 0);
-  SimRuntime from `set_health`; ZigboxRuntime refuses every check until slice 10 runs it over
-  Zigbox exec.
+  SimRuntime from `set_health`; ZigboxRuntime runs it in the container (below).
+- **ZigboxRuntime (C3 slice 10).** `probe_begin` starts a worker, `zcube-agent probe <replica>
+  <timeout_ms> <command...>` (internal, `src/probe_worker.zig`), in a process group of its own
+  with its stdout on a pipe. The worker runs the command in the container with Zigbox's
+  `exec_start` and `exec_wait` (no terminal; the command's own output goes to `/dev/null`), kills
+  it with SIGKILL through a pidfd at `timeout_ms`, and writes one line, `exited N`, `timed_out` or
+  `refused <diagnostic JSON>`, then exits. `probe_poll` reaps it with `WNOHANG` and reads the line
+  (`src/zigbox_probes.zig`); a worker that ends without a line is refused (ZC-E0502), and one
+  still running 5 s past its timeout is killed with its group and refused. A new check of the
+  same replica, a full table (the oldest goes) or the agent's exit kills the worker's group (the
+  command in the container is in it); a check never polled again (its replica went away) holds
+  its slot until then, as a zombie at most. A container that ends during the check makes it refused.
 - **When.** The first check begins the step the agent first sees the container running; the next
   is due `interval_ms` after the last one began (or at once, if it ran longer). At most
   `probes_concurrent_max` (8) are in flight per node; the due ones go in order of due time, then
