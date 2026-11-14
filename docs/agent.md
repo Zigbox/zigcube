@@ -61,11 +61,14 @@ not settled by a rule nobody reads. A label without `=`, a key given twice, or a
 naming a key the node lacks is `ZC-E0505` too
 ([decision](decisions/2026-11-14-b6-agent-labels-flag-and-file.md)).
 
-**Relabelling a node is a reinstall.** The agent sends its labels when it registers a new tenure,
-not on every keepalive, so an agent restarted with other labels while its lease lives keeps the
-labels it registered. To relabel a node, stop its agent, empty its `--state-dir` (which stops what
-it ran: a wiped node, as in B2), and start it with the new labels: it registers a new tenure with
-them, and the scheduler judges it afresh.
+**Relabelling a node.** The agent sends its labels when it registers a new tenure, not on every
+keepalive, and it records them in its lease file (`<state-dir>/lease.json`). An agent started
+with other labels while the recorded lease would still be live refuses to start (`ZC-E0505`, "the
+node's labels differ from those it registered with, and its lease is live"), since it would
+resume the old tenure under the old labels. To relabel a node, stop its agent for one lease ttl
+(the node fences, and the next start registers a new tenure with the new labels), or empty its
+`--state-dir` (which stops what it ran: a wiped node, as in B2). A lease file written before
+labels were recorded is accepted. Label keys are at most 32 bytes, at most 8 labels.
 
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
 the exit code of their blame. While it runs, a server that cannot be reached is `ZC-E0503`, shown

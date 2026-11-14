@@ -60,11 +60,11 @@ pub const usage =
     \\                     --peer-listen is 0.0.0.0 or :: (default: the --peer-listen address)
     \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
     \\                     peer has it (needs --images-dir)
-    \\  --label KEY=VALUE  a label of this node, sent at registration; give it once a label, at
-    \\                     most 8 (docs/agent.md). exclusive=KEY reserves the node for the jobs
-    \\                     that require its own KEY. Labels in both the file and the flags must
-    \\                     be the same. A node's labels change only by a reinstall: an emptied
-    \\                     --state-dir
+    \\  --label KEY=VALUE  a label of this node, sent at registration; one --label per label, at
+    \\                     most 8, keys at most 32 bytes (docs/agent.md). exclusive=KEY
+    \\                     reserves the node for the jobs that require its own KEY. Labels in
+    \\                     both the file and the flags must be the same. New labels need the
+    \\                     node's lease to have ended (one lease ttl) or an emptied --state-dir
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -267,9 +267,12 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
 /// quietly overrode the file (or the other way round) could put the node in the wrong tenant.
 fn merged_labels(flags: *const Flags, file: File, diag: *Diag) Error![]const []const u8 {
     const flagged = flags.labels[0..flags.labels_count];
-    const labels = if (file.labels) |listed| listed else flagged;
-    try check_labels(labels, diag);
-    if (file.labels != null and flags.labels_count > 0 and !same_labels(flagged, labels)) {
+    // Both sets are checked on their own, so a malformed or repeated flag is refused for what it
+    // is even when the file gives the labels.
+    try check_labels(flagged, diag);
+    const listed = file.labels orelse return flagged;
+    try check_labels(listed, diag);
+    if (flags.labels_count > 0 and !same_labels(flagged, listed)) {
         return bad(
             diag,
             "the node's labels are given by --label and by .labels in the file, and they differ",
@@ -277,9 +280,11 @@ fn merged_labels(flags: *const Flags, file: File, diag: *Diag) Error![]const []c
             "give the labels in one place",
         );
     }
-    return labels;
+    return listed;
 }
 
+/// Set equality for two lists that `check_labels` passed: neither repeats a key, so neither
+/// repeats a label, and the same length with one inside the other is the same set.
 fn same_labels(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     for (a) |label| {
@@ -304,6 +309,11 @@ pub fn check_labels(labels: []const []const u8, diag: *Diag) Error!void {
         if (at == 0) return bad(diag, "the label {s} has no key", .{label}, shape);
         if (label.len > constants.node_label_bytes_max) {
             return bad(diag, "the label {s} is longer than 128 bytes", .{label}, "shorten it");
+        }
+        // A longer key could never match a job's `placement.require`, whose keys are bounded so.
+        if (at > constants.label_key_bytes_max) {
+            const why = "the label {s} has a key longer than 32 bytes";
+            return bad(diag, why, .{label}, "shorten the key");
         }
         for (label) |byte| {
             if (!text_util.is_printable(byte)) {
@@ -914,6 +924,39 @@ test "peer_advertise from a configuration file is checked like the flag" {
     try testing.expect(!is_unspecified(try IpAddress.parse("::ffff:10.0.0.1", 1)));
 }
 
+test "labels beside the file's are checked on their own, and compared as sets" {
+    // Goal: B6 slice 3's review (SHOULD 1). Method: flags that a length-and-subset comparison
+    // alone would let through beside a file's labels.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base = [_][]const u8{
+        "--node",         "node1",   "--server",     "127.0.0.1:7070",
+        "--state-dir",    "/tmp",    "--cpu-millis", "1000",
+        "--memory-bytes", "1000000", "--images",     "fixtures/images.zon",
+    };
+    const text = ".{ .labels = .{ \"exclusive=tenant\", \"tenant=a\" } }";
+    const file = try parse_file(arena, text, "agent.zon", &diag);
+    var flags: Flags = undefined;
+    // Beside the file, the flags are still checked, and the comparison is set equality: the
+    // same number of labels but another one, a flag given twice, a flag of the wrong shape.
+    const beside_file = [_][]const []const u8{
+        &.{ "--label", "tenant=b", "--label", "exclusive=tenant" }, // same length, other set
+        &.{ "--label", "tenant=a", "--label", "tenant=a" }, // a flag twice
+        &.{ "--label", "tenant", "--label", "exclusive=tenant" }, // malformed
+    };
+    for (beside_file) |extra| {
+        var argv: [base.len + 4][]const u8 = undefined;
+        @memcpy(argv[0..base.len], &base);
+        @memcpy(argv[base.len..], extra);
+        diag.reset();
+        flags = try parse_flags(&argv, &diag);
+        try expect_bad(merge(arena, std.testing.io, flags, file, &diag), &diag);
+    }
+}
+
 test "node labels come from --label or .labels, are checked, and may not disagree" {
     // Goal: B6 slice 3's ruling. Method: labels by flag, by file, by both (the same set in another
     // order is fine; a different set is refused), and each shape the check refuses.
@@ -954,6 +997,7 @@ test "node labels come from --label or .labels, are checked, and may not disagre
         &.{"tenant=a\x01"}, // not printable
         &.{ "a=1", "b=1", "c=1", "d=1", "e=1", "f=1", "g=1", "h=1", "i=1" }, // nine
         &.{"k=" ++ @as([127]u8, @splat('v'))}, // 129 bytes
+        &.{@as([33]u8, @splat('k')) ++ "=v"}, // a key of 33 bytes: no job could require it
     };
     for (refused) |labels| {
         diag.reset();
@@ -961,6 +1005,7 @@ test "node labels come from --label or .labels, are checked, and may not disagre
     }
     diag.reset();
     try check_labels(&.{"k=" ++ @as([126]u8, @splat('v'))}, &diag);
+    try check_labels(&.{@as([32]u8, @splat('k')) ++ "=v"}, &diag);
     var nine: [base.len + 18][]const u8 = undefined;
     @memcpy(nine[0..base.len], &base);
     for (0..9) |index| {

@@ -8,6 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const process_session = @import("process_session.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -119,22 +120,61 @@ pub const Procs = struct {
         return !info.zombie;
     }
 
-    /// Kills the process group of every supervisor under the state directory (the supervisor,
-    /// its command, what that started). Returns how many it signalled.
+    /// Kills every process of every container's session: that of each supervisor running under
+    /// the state directory, and that of each supervisor a container's directory records, live
+    /// or dead. A command has a process group of its own inside its supervisor's session, and
+    /// what it started may outlive both, so a kill of the supervisor's group is not enough.
+    /// Returns how many sessions it signalled.
     pub fn kill_supervisor_groups(procs: Procs) u32 {
+        var killed: u32 = 0;
         var proc_dir = std.Io.Dir.cwd().openDir(procs.io, "/proc", .{ .iterate = true }) catch {
-            return 0;
+            return killed;
         };
         defer proc_dir.close(procs.io);
-        var killed: u32 = 0;
         var iterator = proc_dir.iterate();
         while (iterator.next(procs.io) catch null) |entry| {
             const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
             if (!procs.is_supervisor(pid)) continue;
-            std.posix.kill(-pid, .KILL) catch continue; // The group may be gone already.
+            process_session.kill_all(procs.io, pid);
+            killed += 1;
+        }
+        const recorded = procs.containers() catch return killed;
+        for (recorded) |pids| {
+            // A recorded pid is ours to kill only while a process of its session lives: Linux
+            // keeps the pid out of use until then, so it cannot be a stranger's.
+            if (pids.supervisor <= 1) continue;
+            if (process_session.count_members(procs.io, pids.supervisor) == 0) continue;
+            process_session.kill_all(procs.io, pids.supervisor);
             killed += 1;
         }
         return killed;
+    }
+
+    /// The processes that live in the session of a container whose supervisor is gone: what a
+    /// container left behind when it ended (a pid namespace would have taken it along). Zero
+    /// while the run is healthy; a demo checks it before its cleanup kills everything.
+    pub fn orphans(procs: Procs) !u32 {
+        var left: u32 = 0;
+        for (try procs.containers()) |pids| {
+            if (pids.supervisor <= 1) continue;
+            if (procs.alive(pids.supervisor)) continue;
+            left += process_session.count_members(procs.io, pids.supervisor);
+        }
+        return left;
+    }
+
+    /// What still runs after `kill_supervisor_groups`: the supervisors under the state directory
+    /// and every live process of a recorded container's session. The caller settles first: a
+    /// killed process disappears a moment later.
+    pub fn survivors(procs: Procs) !u32 {
+        var left = try procs.supervisors();
+        for (try procs.containers()) |pids| {
+            if (pids.supervisor <= 1) continue;
+            const members = process_session.count_members(procs.io, pids.supervisor);
+            // A live supervisor is counted once, by `supervisors`.
+            left += members - @intFromBool(members > 0 and procs.is_supervisor(pids.supervisor));
+        }
+        return left;
     }
 };
 

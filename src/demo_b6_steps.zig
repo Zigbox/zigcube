@@ -109,7 +109,8 @@ pub fn tenant_jobs(demo: *Demo) !void {
 pub fn open_jobs_avoid_exclusive(demo: *Demo) !void {
     const host = demo.host;
     host.section("2. jobs with no placement never land on the exclusive node2");
-    try host.check(try state.running_on(demo, node2) == 1, "node2 runs a2 alone", .{});
+    try host.check(try state.running_on(demo, node2) == 1, "node2 runs one of a1 and " ++
+        "a2, and nothing else", .{});
     for (open_jobs) |name| {
         try state.post(host, name, 250, null);
         const index = try state.wait_running(demo, name);
@@ -133,8 +134,9 @@ fn only_exclusive_fits(demo: *Demo) !void {
     try host.check(std.mem.eql(u8, view.state, "pending") and view.node == null, "n4 is " ++
         "pending, not on node2, which has 750m free", .{});
     const why = try host.zcube(&.{ "why", "job", "n4" });
-    try host.check(why.code == 0 and state.contains(why.out, "1 of them by the placement of " ++
-        "the job"), "zcube why job n4 names node2 excluded by placement", .{});
+    try host.check(why.code == 0 and state.contains(why.out, "2 of 3 nodes lack the room, " ++
+        "1 are excluded, 1 of them by the placement of the job"), "zcube why job n4 says " ++
+        "node1 and node3 lack the room and node2 is excluded by placement", .{});
     _ = try host.zcube(&.{ "job", "cancel", "n4" });
     try state.wait_state(host, "n4", "cancelled", state.job_wait_ms);
 }
@@ -209,8 +211,9 @@ fn refill(demo: *Demo, survivor: usize) !void {
     try host.check(std.mem.eql(u8, view.state, "pending") and view.node == null, "a3 is " ++
         "pending, not on node3, which has 1000m free", .{});
     const why = try host.zcube(&.{ "why", "job", "a3" });
-    try host.check(why.code == 0 and state.contains(why.out, "1 of them by the placement of " ++
-        "the job"), "zcube why job a3 names {s}'s room and node3 excluded by placement", .{home});
+    try host.check(why.code == 0 and state.contains(why.out, "1 of 3 nodes lack the room, " ++
+        "2 are excluded, 1 of them by the placement of the job"), "zcube why job a3 says " ++
+        "{s} lacks the room, and the lost node and node3 (by placement) are excluded", .{home});
     _ = try host.zcube(&.{ "job", "cancel", "a2" });
     const index = try state.wait_running(demo, "a3");
     try host.check(index == survivor, "a3 runs on {s} once a2 is cancelled", .{home});

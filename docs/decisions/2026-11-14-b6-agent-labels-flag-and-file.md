@@ -29,14 +29,23 @@ conflict is refused.
   to `constants.zig` as `node_labels_max` and `node_label_bytes_max`, which both sides use. No
   bound or default changed, so the supervisor was not asked.
 - **Relabelling is a reinstall** (as slice 2 recorded): the agent sends labels when it registers
-  a new tenure; a restart that resumes the lease from its state file keeps the old labels. The
-  documented way is to stop the agent, empty its state directory and start it with the new
-  labels. Documented in docs/agent.md ("Running it") and docs/keys.md (`/nodes/<node>`).
+  a new tenure. Slice 3 recorded that a restart resuming the lease kept the old labels silently;
+  the review fixes below refuse that start instead. The documented ways are to stop the agent for
+  one lease ttl, or to empty its state directory, and start it with the new labels. Documented in docs/agent.md ("Running it") and docs/keys.md (`/nodes/<node>`).
+
+## Added in the slice 3 review fixes
+
+- Both sets are checked on their own (`check_labels`: format, duplicates, `exclusive`) before
+  they are compared, so equal length and one-way inclusion mean the sets are equal.
+- Label keys longer than `label_key_bytes_max` (32) are refused at start-up (`ZC-E0505`).
+- The agent records its labels in `lease.json`. A start with other labels while the recorded
+  lease would be resumed (same boot, not fenced, before its fence time) is refused with
+  `ZC-E0505`, whose fix says to stop the agent for one lease ttl or empty `--state-dir`
+  (supervisor's ruling: no new code). A lease file without labels, from before this change,
+  starts as before.
 
 ## Not done (gaps to report)
 
-- An agent restarted within its lease with other labels gives no warning; it silently keeps the
-  registered ones. A warning would need a new code (owner list if wanted).
 - `zcube get nodes` does not show labels; `zcube job get` does not show `placement`; `zcube job
   run` has no flag for `placement.require`. demo-b6 reads labels with `GET /v1/list` and posts jobs
   with `POST /v1/jobs`.

@@ -18,6 +18,7 @@ const codes = @import("diag/codes.zig");
 const diag_mod = @import("diag.zig");
 const fake_files = @import("fake_files.zig");
 const fake_runtime = @import("fake_runtime.zig");
+const process_session = @import("process_session.zig");
 const runtime = @import("runtime.zig");
 const fetch_backoff = @import("fetch_backoff.zig");
 
@@ -370,6 +371,55 @@ test "a polite stop ends the command; one that ignores it needs the kill" {
     const killed = try rig.wait_stopped(stubborn);
     try testing.expectEqual(@as(u8, 9), killed.signaled);
     try rig.fake.interface().stop(stubborn, 0, &local); // Stopping a stopped one is nothing.
+}
+
+test "what a command started ends with it: on a stop, and when the command exits" {
+    // Goal: B6 slice 3's review. `sh -c` that starts a `sleep 300` used to leave the sleep
+    // running after a stop (TERM reached the shell alone) and after the shell exited (nothing
+    // ended the rest of its group). Method: two shells that each start a background sleep and
+    // write its pid; one is stopped politely, the other exits by itself. Both sleeps must die,
+    // and nothing may remain in either supervisor's session.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const stopped = try begin_parent(rig, "parent-stopped", "wait");
+    const exits = try begin_parent(rig, "parent-exits", "exit 3");
+    const stopped_sleep = try read_ready_pid(rig, "parent-stopped");
+    const exits_sleep = try read_ready_pid(rig, "parent-exits");
+    const supervisors = [_]i32{
+        try rig.pid_of("parent-stopped", fake_files.file_supervisor),
+        try rig.pid_of("parent-exits", fake_files.file_supervisor),
+    };
+    var local: Diag = undefined;
+    local.reset();
+    try rig.fake.interface().stop(stopped, constants.stop_grace_ms, &local);
+    try testing.expectEqual(@as(u8, 15), (try rig.wait_stopped(stopped)).signaled);
+    try testing.expectEqual(@as(u8, 3), (try rig.wait_stopped(exits)).exited);
+    try expect_dead(stopped_sleep);
+    try expect_dead(exits_sleep);
+    for (supervisors) |supervisor| {
+        try expect_dead(supervisor);
+        try testing.expectEqual(@as(u32, 0), process_session.count_members(testing.io, supervisor));
+    }
+}
+
+/// Starts `name`, a shell that starts `sleep 300` in the background, writes its pid to
+/// `faults/<name>-ready` and then runs `then`.
+fn begin_parent(rig: *Rig, name: []const u8, then: []const u8) !runtime.Handle {
+    var script_buffer: [constants.state_path_bytes_max + 128]u8 = undefined;
+    const script = try std.fmt.bufPrint(
+        &script_buffer,
+        "sleep 300 & echo $! > '{s}/faults/{s}-ready.tmp'; " ++
+            "mv '{s}/faults/{s}-ready.tmp' '{s}/faults/{s}-ready'; {s}",
+        .{ rig.path, name, rig.path, name, rig.path, name, then },
+    );
+    const command = [_][]const u8{ "sh", "-c", script };
+    return rig.begin(name, &command);
+}
+
+fn read_ready_pid(rig: *Rig, name: []const u8) !i32 {
+    var ready_buffer: [64]u8 = undefined;
+    const ready = try std.fmt.bufPrint(&ready_buffer, "{s}-ready", .{name});
+    return process_session.wait_pid_file(testing.io, rig.fake.faults, ready);
 }
 
 /// Starts `name`, a command that ignores TERM, and returns once the shell says its trap is in:

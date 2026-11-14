@@ -361,16 +361,11 @@ pub const Host = struct {
         _ = host.procs().kill_supervisor_groups();
     }
 
-    /// What still runs after `cleanup`: supervisors and the commands of every container the
-    /// agent made. Settles first: a killed process disappears a moment later.
+    /// What still runs after `cleanup`: supervisors and every process of the session of every
+    /// container the agent made. Settles first: a killed process disappears a moment later.
     pub fn survivors(host: *Host) !u32 {
         try host.io.sleep(.fromMilliseconds(500), .awake);
-        const procs_now = host.procs();
-        var count = try procs_now.supervisors();
-        for (try procs_now.containers()) |pids| {
-            if (procs_now.alive(pids.command)) count += 1;
-        }
-        return count;
+        return host.procs().survivors();
     }
 
     pub fn dump_logs(host: *Host) void {

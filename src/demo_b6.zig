@@ -147,12 +147,20 @@ fn run(demo: *Demo) u8 {
         demo.fleet.dump_logs();
         ok = false;
     };
+    // Before the cleanup, which kills everything: what an ended container left running.
+    const orphaned = demo.fleet.orphans() catch 1;
     const started = pids_started(demo);
     host.cleanup();
     demo.fleet.cleanup();
     host.section("Cleanup");
     const left = (demo.fleet.survivors() catch 1) +
         still_running(demo, started);
+    if (orphaned == 0) {
+        host.say("  ok: no ended container left a process running", .{});
+    } else {
+        host.say("  FAILED: {d} processes outlived the containers that started them", .{orphaned});
+        ok = false;
+    }
     if (left == 0) {
         host.say("  ok: every process the demo started is gone (agents, supervisors, ...)", .{});
     } else {
