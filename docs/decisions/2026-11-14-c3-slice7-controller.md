@@ -31,7 +31,8 @@ Choices the brief left open, or where this slice differs from it or from slice 6
    `replicas`: otherwise a pause would delete the new replica it paused on, which is the step it
    was asked to keep. R2 allows the same bound.
 6. **A scale down while paused is allowed.** The user may lower `replicas` during a pause; R4
-   exempts a scale down the service asked for and judges only starts and retirements.
+   exempts a scale down the service asked for and judges only starts and retirements, counting
+   the excess as the replica controller counts it (`2026-11-14-c3-paused-scale-down.md`).
 7. **Old replicas that stop are dead, not retired.** An old replica that ends by itself during a
    rollout is replaced at the new spec (the `replace` path), without spending the retire budget,
    since nothing was retired.
@@ -78,7 +79,8 @@ Choices the brief left open, or where this slice differs from it or from slice 6
     `from`. One addition the rule does not state: a service's first generation has no rollout of
     its own, so with no rollout of the service (or only one of a deleted incarnation) `from` is
     the newest generation below the service's that its old replicas run
-    (`View.earlier_generation`). Taken literally ("0 if none"), the rule would make every second
+    (`View.earlier_generation`; only replicas that were ready count, since the fix session:
+    `2026-11-14-c3-paused-scale-down.md`). Taken literally ("0 if none"), the rule would make every second
     generation's `from` 0, and no rollout would ever owe a rollback. An old replica at the
     service's generation or above belongs to a deleted incarnation or runs another spec of the
     same generation, and is no earlier generation, so `from` stays below `to`. `docs/keys.md`
