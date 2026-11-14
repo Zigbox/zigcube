@@ -937,6 +937,37 @@ test "a health check passes by default; the fault file fails it, times it out or
     try testing.expect((try fake.probe_poll(handle, &local)) == .refused);
 }
 
+test "a health fault word survives the agent's lists until the container ends" {
+    // Goal: a health word scripts every check, not only those before the next `list` (the list
+    // applies and deletes the other fault words). Method: write `unhealthy`, then twice list
+    // and check; both checks exit 1 and the file is still there. Once the container ends, the
+    // next list deletes it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const handle = try rig.begin("probe-kept", &forever);
+    const check = [_][]const u8{"true"};
+    try fault(rig, "probe-kept", "unhealthy");
+    var local: Diag = undefined;
+    for (0..2) |_| {
+        local.reset();
+        _ = try rig.fake.interface().list(rig.arena.allocator(), &local);
+        try testing.expectEqual(@as(u8, 1), (try probe_once(rig, handle, &check, 1_000)).exited);
+    }
+    var buffer: [64]u8 = undefined;
+    const kept = try rig.fake.faults.readFile(testing.io, "probe-kept", &buffer);
+    try testing.expectEqualStrings("unhealthy", kept);
+
+    local.reset();
+    try rig.fake.interface().signal(handle, runtime.signal_kill, &local);
+    _ = try rig.wait_stopped(handle);
+    local.reset();
+    _ = try rig.fake.interface().list(rig.arena.allocator(), &local);
+    try testing.expectError(
+        error.FileNotFound,
+        rig.fake.faults.readFile(testing.io, "probe-kept", &buffer),
+    );
+}
+
 test "a health check of a stopped container is refused" {
     var rig = try Rig.start();
     defer rig.stop();

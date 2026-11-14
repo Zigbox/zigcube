@@ -888,6 +888,8 @@ pub const FakeRuntime = struct {
         const dir = self.containers.openDir(self.io, name, .{}) catch return false;
         defer dir.close(self.io);
         if (files.exists(self.io, dir, files.file_run)) return true;
+        // A health word scripts each check until the container ends (`probe_result` reads it).
+        if (is_health_word(word)) return false;
         // Signal only what a live supervisor vouches for: a pid file can be old.
         if (!self.supervisor_alive(dir)) return false;
         const child = files.read_pid(self.io, dir, files.file_child) catch return false;
