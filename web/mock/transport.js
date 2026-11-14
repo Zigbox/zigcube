@@ -55,7 +55,8 @@ export function createMockTransport(engine, faults) {
         return found ? reply(200, found, requestId) : fail(404, [diagNotFound(`code ${m[1]}`)], requestId);
       }
       m = path.match(/^\/v1\/services\/([\w.-]+)\/(history|rollout)(?:\/(pause|resume))?$/);
-      if (m && (m[3] ? method === "POST" : method === "GET")) return services(m[1], m[2], m[3], body, requestId);
+      const steer = m && m[2] === "rollout" && m[3];
+      if (m && (steer ? method === "POST" : !m[3] && method === "GET")) return services(m[1], m[2], m[3], body, requestId);
       m = path.match(/^\/v1\/why\/(service|replica|node|job)\/([\w.-]+)$/);
       if (m) return reply(200, why(m[1], m[2], q.get("decision")), requestId);
       return fail(404, [diagNotFound(`route ${path}`)], requestId);

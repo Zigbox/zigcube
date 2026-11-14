@@ -54,33 +54,52 @@ export function serviceRollout({ client, model }, name) {
   const el = h("div", { class: "cols" },
     h("section", { class: "card", "aria-labelledby": "h-ro" }, h("h2", { id: "h-ro" }, "Rollout"), rolloutSlot),
     h("section", { class: "card", "aria-labelledby": "h-gen" }, h("div", { class: "card-h" }, h("h2", { id: "h-gen" }, "Generations"), count), historySlot));
-  let rollout = null, history = null, error = null, inflight = false, stopped = false, lastRev = -1, lastAt = 0;
+  let rollout = null, history = null, error = null, inflight = false, stopped = false, lastRev = -1, lastAt = 0, timer = null;
   const path = `/v1/services/${encodeURIComponent(name)}`;
 
   function paint() {
-    rebuild(rolloutSlot, JSON.stringify([rollout, error && error.requestId]), () => {
-      if (error) return error.diagnostics.map(d => diagnosticBlock(d, { requestId: error.requestId }));
+    rebuild(rolloutSlot, JSON.stringify([rollout, error && (error.requestId ?? error.message)]), () => {
+      if (error && error.diagnostics) return error.diagnostics.map(d => diagnosticBlock(d, { requestId: error.requestId }));
+      if (error) return h("p", { class: "muted", role: "alert" }, `The rollout could not be read: ${error.message}`);
       return rollout ? rolloutCard(name, rollout) : h("p", { class: "muted" }, "Loading…");
     });
     rebuild(historySlot, JSON.stringify(history), () => history ? generationsTable(history) : []);
     setText(count, history ? plural(history.generations.length, "generation") + " stored" : "", { flash: false });
   }
 
+  // Called unawaited, so it never rejects: an error that is not a diagnostic is shown, not thrown.
   async function load() {
     if (inflight || stopped) return;
     inflight = true; lastAt = Date.now();
+    const rev = model.rev;
     try {
       const [r, g] = await Promise.all([client.get(`${path}/rollout`), client.get(`${path}/history`)]);
       rollout = r.body; history = g.body; error = null;
-    } catch (e) { if (!e.diagnostics) throw e; error = e; }
-    finally { inflight = false; }
-    lastRev = model.rev;
-    if (!stopped) paint();
+    } catch (e) {
+      if (!e.diagnostics) console.error(e);
+      error = e.diagnostics ? e : { message: String((e && e.message) || e) };
+    } finally { inflight = false; }
+    lastRev = rev;
+    if (stopped) return;
+    paint();
+    if (model.rev !== lastRev) later();
   }
+
+  // A change inside the 2 s window is not dropped: one load runs when the window ends.
+  function later() {
+    if (timer !== null || stopped) return;
+    const wait = Math.max(0, lastAt + REFRESH_MS - Date.now());
+    timer = setTimeout(() => { timer = null; load(); }, wait);
+  }
+
   load();
   return {
     el,
-    update() { if (model.rev !== lastRev && Date.now() - lastAt > REFRESH_MS) load(); else paint(); },
-    destroy() { stopped = true; },
+    update() {
+      if (model.rev === lastRev) { paint(); return; }
+      if (!inflight && Date.now() - lastAt >= REFRESH_MS) load(); else later();
+      paint();
+    },
+    destroy() { stopped = true; if (timer !== null) clearTimeout(timer); timer = null; },
   };
 }

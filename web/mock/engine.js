@@ -299,8 +299,13 @@ export class Engine {
       Object.assign(next, { phase: "paused", paused_at_ms: at, paused_by: r.phase === "failed" ? "failure" : "user", budget: { start: 0, retire: 0 } });
       delete next.next_at_ms;
     } else {
+      // As rollout_plan.resumed: a user's pause moves the deadline by the time it was paused; a
+      // failure's restarts it from the resume.
       const deadline = svc.value.rollout?.progress_deadline_ms ?? 600000;
-      Object.assign(next, { phase: running, deadline_at_ms: at + deadline, evidence_from_ms: at });
+      const pausedAt = r.paused_at_ms ?? at;
+      const from = Math.max(at, pausedAt);
+      const deadlineAt = r.paused_by === "user" ? r.deadline_at_ms + (from - pausedAt) : from + deadline;
+      Object.assign(next, { phase: running, deadline_at_ms: deadlineAt, evidence_from_ms: from });
       delete next.paused_at_ms; delete next.paused_by;
     }
     const verb = action === "pause" ? "paused" : "resumed";

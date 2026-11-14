@@ -213,6 +213,44 @@ if (mode === "sim") {
       must(/zcube rollout resume hello/.test(t), "no resume command");
       must(/on failure rollback/.test(t), "no policy");
       must(!/\bnull\b|undefined|NaN/.test(t), "null, undefined or NaN on the card");
+      const clipped = await c3.$eval("#h-ro", el => { const c = el.closest("section").querySelector(".howto .cmd-text"); return c.scrollWidth > c.clientWidth + 1; });
+      must(!clipped, "the resume command is cut off");
+    });
+    await check(`mock c3 ${viewport.width}px: resume stretches a user pause's deadline; history takes no POST`, async () => {
+      const r = await c3.evaluate(async () => {
+        const m = window.zc.mock;
+        const before = (await m.request("GET", "/v1/services/hello/rollout")).body.rollout;
+        const steer = await m.request("POST", "/v1/services/hello/rollout/resume");
+        const after = (await m.request("GET", "/v1/services/hello/rollout")).body.rollout;
+        const pause = await m.request("POST", "/v1/services/hello/rollout/pause");
+        const history = await m.request("POST", "/v1/services/hello/history/pause");
+        return { before, steer: steer.status, after, pause: pause.status, history: history.status };
+      });
+      must(r.steer === 200 && r.after.phase === "progressing", `resume: ${r.steer} ${r.after?.phase}`);
+      const paused = r.after.evidence_from_ms - r.before.paused_at_ms;
+      must(r.after.deadline_at_ms === r.before.deadline_at_ms + paused, `deadline ${r.before.deadline_at_ms} + ${paused} != ${r.after.deadline_at_ms}`);
+      must(r.pause === 200, `pause again: ${r.pause}`);
+      must(r.history === 404, `POST history/pause answered ${r.history}`);
+    });
+    await check(`mock c3 ${viewport.width}px: a change inside the 2 s refresh window still reaches the card`, async () => {
+      await c3.evaluate(() => window.zc.mock.setPaused(true)); // nothing else changes the store
+      // The status poll notifies every 2 s and would mask a dropped change: only a new revision
+      // notifies the views while this check runs.
+      await c3.evaluate(() => {
+        const m = window.zc.model, real = m.changed;
+        let seen = m.rev;
+        m.realChanged = real;
+        m.changed = function () { if (this.rev !== seen) { seen = this.rev; real.call(this); } };
+      });
+      try {
+        await c3.evaluate(() => window.zc.mock.request("POST", "/v1/services/hello/rollout/resume"));
+        await c3.waitForFunction(() => /progressing/.test(document.querySelector("#h-ro")?.closest("section")?.innerText || ""), null, { timeout: 8000 });
+        await c3.evaluate(() => window.zc.mock.request("POST", "/v1/services/hello/rollout/pause"));
+        await c3.waitForFunction(() => /paused/.test(document.querySelector("#h-ro")?.closest("section")?.innerText || ""), null, { timeout: 8000 });
+      } finally {
+        await c3.evaluate(() => { const m = window.zc.model; m.changed = m.realChanged; delete m.realChanged; });
+        await c3.evaluate(() => window.zc.mock.setPaused(false));
+      }
     });
     await check(`mock c3 ${viewport.width}px: the generations card lists both, newest first`, async () => {
       await c3.waitForFunction(() => document.querySelectorAll("tr[data-generation]").length === 2, null, { timeout: 15000 });
