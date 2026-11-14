@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const codes = @import("diag/codes.zig");
 const records = @import("records.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
@@ -113,7 +114,7 @@ test "agent health: a passing check is healthy, failures in a row make it unheal
     try testing.expectEqual(seen.revision, (try rig.seen()).revision);
 
     try rig.script(.unhealthy);
-    rig.world.advance(2_200);
+    rig.world.advance(1_800);
     try testing.expectEqual(records.HealthState.healthy, (try rig.seen()).health.?);
     rig.world.advance(1_000);
     seen = try rig.seen();
@@ -143,7 +144,7 @@ test "agent health: a check that hangs times out (ZC-W0502), one refused is ZC-E
     rig.world.advance(3_000);
     var seen = try rig.seen();
     try testing.expectEqual(records.HealthState.unhealthy, seen.health.?);
-    try testing.expectEqualStrings("ZC-W0502", seen.code.?);
+    try testing.expectEqualStrings(codes.full_name(.W0502), seen.code.?);
     // A timed-out check has no exit: the last exit stays the last pass's.
     try testing.expectEqual(@as(?u8, 0), seen.last_probe_exit);
 
@@ -152,7 +153,7 @@ test "agent health: a check that hangs times out (ZC-W0502), one refused is ZC-E
     seen = try rig.seen();
     // A refused check counts as neither: the verdict stands.
     try testing.expectEqual(records.HealthState.unhealthy, seen.health.?);
-    try testing.expectEqualStrings("ZC-E0516", seen.code.?);
+    try testing.expectEqualStrings(codes.full_name(.E0516), seen.code.?);
     try testing.expectEqual(records.ObservedStatus.running, seen.status);
 
     try rig.script(.healthy);

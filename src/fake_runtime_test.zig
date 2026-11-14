@@ -923,7 +923,7 @@ test "a health check passes by default; the fault file fails it, times it out or
     try testing.expectEqual(@as(u8, 1), (try probe_once(rig, handle, &check, 1_000)).exited);
     try fault(rig, "probe-web", "probe_refused");
     const refused = try probe_once(rig, handle, &check, 1_000);
-    try testing.expectEqualStrings("ZC-E0502", refused.refused.code.slice());
+    try testing.expectEqualStrings(codes.full_name(.E0502), refused.refused.code.slice());
 
     try fault(rig, "probe-web", "probe_timeout");
     var local: Diag = undefined;

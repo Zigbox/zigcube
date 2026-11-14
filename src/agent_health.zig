@@ -11,6 +11,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const agent_mod = @import("agent.zig");
+const codes = @import("diag/codes.zig");
 const diag_mod = @import("diag.zig");
 const probe_scheduler = @import("probe_scheduler.zig");
 const records = @import("records.zig");
@@ -101,8 +102,8 @@ fn diag_line(buffer: []u8, diag: *const Diag) []const u8 {
     const code = diag.code.?;
     var writer: std.Io.Writer = .fixed(buffer);
     // A line too long for the buffer is cut: it is a cause line, never a failure.
-    writer.print("ZC-{s}: {s}", .{
-        @tagName(code),
+    writer.print("{s}: {s}", .{
+        codes.full_name(code),
         diag.last_cause() orelse "no cause given",
     }) catch {};
     assert(writer.end > 0);
@@ -169,7 +170,12 @@ pub fn fill(
 /// The kind of check problem an observed record carries, read back from its diagnostic.
 pub fn problem_of(observed: *const records.Observed) probe_scheduler.Problem {
     const raw = observed.diagnostic orelse return .none;
-    if (std.mem.indexOf(u8, raw.text, "\"ZC-W0502\"") != null) return .timed_out;
-    if (std.mem.indexOf(u8, raw.text, "\"ZC-E0516\"") != null) return .refused;
-    return .none;
+    var diagnostic: Diagnostic = undefined;
+    if (!records.diagnostic_parse(&diagnostic, raw)) return .none;
+    const code = codes.parse(diagnostic.code.slice()) orelse return .none;
+    return switch (code) {
+        .W0502 => .timed_out,
+        .E0516 => .refused,
+        else => .none,
+    };
 }

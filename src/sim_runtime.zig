@@ -786,6 +786,7 @@ fn sanitise(buffer: []u8, text: []const u8) []const u8 {
 const testing = std.testing;
 const ManualClock = @import("clock.zig").ManualClock;
 const repeat = @import("test_util.zig").repeat;
+const codes = @import("diag/codes.zig");
 
 const labels_of = struct {
     fn one(id: []const u8) [1]runtime.Label {
@@ -1093,7 +1094,7 @@ test "a simulated health check runs, comes out as scripted, and is reported once
     manual.advance(probe_run_ms);
     try testing.expectEqual(@as(u8, 0), (try rt.probe_poll(handle, &diag)).exited);
     const again = try rt.probe_poll(handle, &diag);
-    try testing.expectEqualStrings("ZC-E0502", again.refused.code.slice());
+    try testing.expectEqualStrings(codes.full_name(.E0502), again.refused.code.slice());
 
     try sim.set_health("r-1", .unhealthy);
     try rt.probe_begin(handle, check, 1000, &diag);
