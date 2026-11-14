@@ -105,8 +105,11 @@ are sorted by key, with no key twice.
   certificate is made from the CA at start, carries the DNS name `--tls-name` (default
   `zcube-server`), and is made again when half its life is gone.
 - `--insecure-listen HOST:PORT` serves plain HTTP on a loopback address only (127.0.0.1 or ::1;
-  anything else is `ZC-E0106`). It is for the console on the same host, the local mode
-  (`zcube local up`) and the test harnesses. A request on it is the caller `local`, which may
+  anything else is `ZC-E0106`). It is for the console on the same host (browsers offer no
+  Ed25519, so they cannot handshake with `--listen`:
+  docs/decisions/2026-11-14-b7-slice6-console-over-tls.md), the local mode (`zcube local up`) and
+  the tests of this listener. The other harnesses talk to `--listen` with certificates from
+  `ca issue-client` and `ca issue-node` (`src/harness_tls.zig`, B7 slice 6). A request on it is the caller `local`, which may
   call everything: whoever can reach loopback already runs on the server's host.
 
 The two listeners share the server's 96 connection slots, but when both run TLS clients take at

@@ -41,7 +41,8 @@ These arrive with the scaffold; keep this list current as they land.
   [--store memory|sqlite:<path>|postgres:<settings>] [--create-store]`; `--help` says the rest.
   `--listen` serves TLS 1.3 and every client presents a certificate of the store's CA;
   `--insecure-listen` serves plain HTTP on loopback only, as the caller `local`, which may call
-  everything (B7 slice 3, docs/mtls.md "The API over TLS"; the harnesses and `zcube local` use it).
+  everything (B7 slice 3, docs/mtls.md "The API over TLS"; `zcube local`, `local-smoke`, `swarm-smoke`
+  and `demo-b7` use it; the other harnesses issue certificates and use `--listen`, B7 slice 6).
   `zcube` and `zcube-agent` take `--ca`, `--cert`, `--key` and `--tls-name` for TLS.
   `zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]` with the server's
   `--store` (and `--state-dir`) writes a client certificate and key (0600) signed by that store's
