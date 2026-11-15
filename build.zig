@@ -724,6 +724,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     const help = "Run HANDOFF's C0 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c0", help).dependOn(&run.step);
     add_demo_c1_step(b, step_options, transcript);
+    add_demo_c3_step(b, step_options, transcript);
     add_demo_b1_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
@@ -766,6 +767,43 @@ fn add_demo_c1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run HANDOFF's C1 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c1", help).dependOn(&run.step);
+}
+
+/// `zig build demo-c3 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: C3's demo with
+/// `FakeRuntime` (src/demo_c3.zig, docs/demos/c3.md): rollouts, a failed one rolled back, pause,
+/// resume and rollback, judged at every revision. It writes its own image list.
+fn add_demo_c3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const exe = b.addExecutable(.{
+        .name = "demo_c3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_c3.zig"),
+            .target = step_options.target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--backend");
+    switch (step_options.backend) {
+        .sqlite => run.addArg("sqlite"),
+        .postgres => run.addArgs(&.{ "postgres", "--postgres", step_options.postgres }),
+        .memory => unreachable, // `add_store_and_demo_steps` never passes it.
+    }
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addArtifactArg(built.agent);
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run C3's demo with FakeRuntime (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
+    b.step("demo-c3", help).dependOn(&run.step);
 }
 
 /// `zig build demo-b1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: B1's demo, run for
