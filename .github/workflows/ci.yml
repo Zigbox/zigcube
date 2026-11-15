@@ -57,7 +57,7 @@ jobs:
       demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
       mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
       demo_b3: ${{ steps.pick.outputs.demo_b3 || 'true' }}
-      demo_c3: ${{ steps.pick.outputs.demo_c3 || 'true' }}
+      c3_smoke: ${{ steps.pick.outputs.c3_smoke || 'true' }}
       macos: ${{ steps.pick.outputs.macos || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -277,13 +277,13 @@ jobs:
   # everything it started. One job per backend builds once (the demos share the build cache of
   # the job) and runs the demos in sequence, each its own step, so a failure names its demo; a
   # failed demo does not stop the next from running, and the job still fails. Each demo still
-  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1, demo_c3); the job runs
+  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1, c3_smoke); the job runs
   # when any is picked. Before this they were six jobs, each downloading Zig and building the same
   # binaries.
   demos-sqlite:
     name: demos (sqlite)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_c3 == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.c3_smoke == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -304,15 +304,18 @@ jobs:
       - name: demo-b1 on SQLite
         if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
         run: zig build demo-b1 -Dbackend=sqlite -Dtranscript=demo-b1-sqlite.txt --summary all
-      - name: demo-c3 on SQLite
-        if: ${{ !cancelled() && needs.changes.outputs.demo_c3 == 'true' }}
-        run: zig build demo-c3 -Dbackend=sqlite -Dtranscript=demo-c3-sqlite.txt --summary all
+      # Not demo-c3 (KVM, real Zigbox): C3's demo script with FakeRuntime, SQLite only.
+      - name: c3-smoke on SQLite
+        if: ${{ !cancelled() && needs.changes.outputs.c3_smoke == 'true' }}
+        run: zig build c3-smoke -Dbackend=sqlite -Dtranscript=c3-smoke-sqlite.txt --summary all
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: demos-sqlite-transcripts
-          path: demo-*-sqlite.txt
+          path: |
+            demo-*-sqlite.txt
+            c3-smoke-sqlite.txt
           if-no-files-found: warn
 
   # The same image, by digest, as store-postgres. demo-c0 stops the database mid-run: the service
@@ -323,7 +326,7 @@ jobs:
   demos-postgres:
     name: demos (postgres)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_c3 == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -367,9 +370,6 @@ jobs:
       - name: demo-b1 on Postgres
         if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
         run: zig build demo-b1 -Dbackend=postgres -Dtranscript=demo-b1-postgres.txt --summary all
-      - name: demo-c3 on Postgres
-        if: ${{ !cancelled() && needs.changes.outputs.demo_c3 == 'true' }}
-        run: zig build demo-c3 -Dbackend=postgres -Dtranscript=demo-c3-postgres.txt --summary all
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

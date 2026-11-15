@@ -1,13 +1,13 @@
-//! The steps of `demo-c3` (docs/briefs/c3.md, "Demo script" and "How demo-c3 runs";
+//! The steps of `c3-smoke` (docs/briefs/c3.md, "Demo script" and "How demo-c3 runs";
 //! docs/demos/c3.md says what each asserts and what is cut). Every wait is bounded and drains the
-//! witness (`demo_c3_witness.zig`) at each poll, so every revision of the run is judged.
+//! witness (`c3_witness.zig`) at each poll, so every revision of the run is judged.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const demo_host = @import("demo_host.zig");
 const fleet_mod = @import("demo_c1_fleet.zig");
 const host_procs = @import("host_procs.zig");
-const witness_mod = @import("demo_c3_witness.zig");
+const witness_mod = @import("c3_witness.zig");
 
 const Host = demo_host.Host;
 const Json = demo_host.Json;

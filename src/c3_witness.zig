@@ -1,7 +1,8 @@
-//! demo-c3's witness: it follows the store's watch (`GET /v1/watch`) from before step 1 and judges
-//! C3's rollout rules at **every revision** of the demo's service, not by sampling (the brief's
-//! "How demo-c3 runs"). It keeps a mirror of the keys it watches, so each revision is judged on
-//! the state before it and the state after it:
+//! C3's witness (`c3-smoke`, and the KVM `demo-c3` to come): it follows the store's watch
+//! (`GET /v1/watch`) from before step 1 and judges C3's rollout rules at **every revision** of
+//! the demo's service, not by sampling (the brief's "How demo-c3 runs"). It keeps a mirror of
+//! the keys it watches, so each revision is judged on the state before it and the state after
+//! it:
 //!
 //!   R1  a revision that retires a ready replica of an older spec while a rollout is active
 //!       leaves at least `replicas - max_unavailable` ready (before it, the ready count less the

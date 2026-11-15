@@ -724,7 +724,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     const help = "Run HANDOFF's C0 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c0", help).dependOn(&run.step);
     add_demo_c1_step(b, step_options, transcript);
-    add_demo_c3_step(b, step_options, transcript);
+    add_c3_smoke_step(b, step_options, transcript);
     add_demo_b1_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
@@ -769,14 +769,15 @@ fn add_demo_c1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     b.step("demo-c1", help).dependOn(&run.step);
 }
 
-/// `zig build demo-c3 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: C3's demo with
-/// `FakeRuntime` (src/demo_c3.zig, docs/demos/c3.md): rollouts, a failed one rolled back, pause,
-/// resume and rollback, judged at every revision. It writes its own image list.
-fn add_demo_c3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+/// `zig build c3-smoke -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: C3's demo script with
+/// `FakeRuntime` (src/c3_smoke.zig, docs/demos/c3.md), a smoke and not `demo-c3`: rollouts, a
+/// failed one rolled back, pause, resume and rollback, judged at every revision. It writes its own
+/// image list.
+fn add_c3_smoke_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
     const exe = b.addExecutable(.{
-        .name = "demo_c3",
+        .name = "c3_smoke",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/demo_c3.zig"),
+            .root_source_file = b.path("src/c3_smoke.zig"),
             .target = step_options.target,
             .optimize = .Debug,
             .imports = &.{
@@ -802,8 +803,8 @@ fn add_demo_c3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     run.addArg("--agent");
     run.addArtifactArg(built.agent);
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
-    const help = "Run C3's demo with FakeRuntime (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
-    b.step("demo-c3", help).dependOn(&run.step);
+    const help = "Run C3's demo script with FakeRuntime, not demo-c3 (-Dbackend=, -Dtranscript=)";
+    b.step("c3-smoke", help).dependOn(&run.step);
 }
 
 /// `zig build demo-b1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: B1's demo, run for

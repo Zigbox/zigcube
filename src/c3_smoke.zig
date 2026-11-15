@@ -1,17 +1,17 @@
-//! `zig build demo-c3 -Dbackend=sqlite|postgres`: the C3 demo (docs/briefs/c3.md, "Demo
-//! script"), run for real with `FakeRuntime`: `zcube-server` on the chosen backend, three
-//! `zcube-agent`s (separate state directories on one machine) and the `zcube` command, driven
-//! through its command line. It is not the brief's KVM run (three QEMU guests with Zigbox):
+//! `zig build c3-smoke -Dbackend=sqlite|postgres`: C3's demo script (docs/briefs/c3.md, "Demo
+//! script") with `FakeRuntime`, a smoke and not `demo-c3`: `zcube-server` on the chosen backend,
+//! three `zcube-agent`s (separate state directories on one machine) and the `zcube` command,
+//! driven through its command line. It is not the brief's KVM run (three QEMU guests with Zigbox):
 //! docs/demos/c3.md says what that leaves out.
 //!
 //!   1. `app` v1, 3 replicas with a health check; what is refused (E0125 to E0127, E0129);
 //!   2. v2 with surge 1, unavailable 0: never fewer than 3 ready, at every revision;
 //!   3. v3 whose check never passes: the rollout stops at its first replica and rolls back;
-//!      `zcube why` names the replica;
+//!      `zcube why` is shown, not asserted (docs/demos/c3.md);
 //!   4. history, `rollback --to 1` paused (an agent restarted meanwhile keeps its containers),
 //!      resumed (the server restarted mid-rollout resumes it), and an apply during a rollback.
 //!
-//! A witness (`demo_c3_witness.zig`) follows the store's watch and judges R1 R2 R3 R4 R5 at every
+//! A witness (`c3_witness.zig`) follows the store's watch and judges R1 R2 R3 R4 R5 at every
 //! revision. Every process started is killed at the end and checked gone. Exit 0 only if every
 //! assertion held.
 
@@ -21,13 +21,13 @@ const demo_host = @import("demo_host.zig");
 const diag_mod = @import("diag.zig");
 const fleet_mod = @import("demo_c1_fleet.zig");
 const pq = @import("pq.zig");
-const steps = @import("demo_c3_steps.zig");
-const witness_mod = @import("demo_c3_witness.zig");
+const steps = @import("c3_smoke_steps.zig");
+const witness_mod = @import("c3_witness.zig");
 
 const Demo = steps.Demo;
 const Host = demo_host.Host;
 const usage =
-    \\usage: demo_c3 --backend sqlite|postgres --zcube EXE --server EXE --agent EXE
+    \\usage: c3_smoke --backend sqlite|postgres --zcube EXE --server EXE --agent EXE
     \\               [--postgres SETTINGS] [--transcript FILE]
     \\
 ;
@@ -114,7 +114,7 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
     host.config.agent_exe = try cwd.realPathFileAlloc(init.io, options.agent, arena);
     host.config.cli_exe = try cwd.realPathFileAlloc(init.io, options.zcube, arena);
     const base = init.environ_map.get("TMPDIR") orelse "/tmp";
-    host.work = try std.fmt.allocPrint(arena, "{s}/zcube-demo-c3-{d}-{d}", .{
+    host.work = try std.fmt.allocPrint(arena, "{s}/zcube-c3-smoke-{d}-{d}", .{
         base, std.os.linux.getpid(), stamp,
     });
     host.state = try std.fmt.allocPrint(arena, "{s}/state", .{host.work});
@@ -159,7 +159,7 @@ fn run(demo: *Demo) u8 {
     }
     drop_postgres_schema(demo) catch {}; // Best effort: it leaves the database as it was found.
     std.Io.Dir.cwd().deleteTree(host.io, host.work) catch {}; // Best effort: it is in /tmp.
-    host.say("\n{s}", .{if (ok) "demo-c3 PASSED" else "demo-c3 FAILED"});
+    host.say("\n{s}", .{if (ok) "c3-smoke PASSED" else "c3-smoke FAILED"});
     return if (ok) 0 else 1;
 }
 

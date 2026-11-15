@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests of .github/ci-changes.sh: a table of changed paths and the verdict each must get. The
 # changes job runs it before it classifies, so a broken rule fails CI instead of skipping a job.
-# Each row: EVENT|HEAD_REF|LABELS|paths (space separated)|expected `code store c0 c1 b1 smoke c2 mtls b3 c3` as T/F.
+# Each row: EVENT|HEAD_REF|LABELS|paths (space separated)|expected `code store c0 c1 b1 smoke c2 mtls b3 c3smoke` as T/F.
 # `check` leaves the macos output out; `check_macos` rows judge it alone.
 set -uo pipefail
 dir=$(cd "$(dirname "$0")" && pwd)
@@ -18,7 +18,7 @@ check() {
     s/demo_b1=true/T/; s/demo_b1=false/F/;
     s/zigbox_smoke=true/T/; s/zigbox_smoke=false/F/; s/demo_c2=true/T/; s/demo_c2=false/F/;
     s/mtls_interop=true/T/; s/mtls_interop=false/F/; s/demo_b3=true/T/; s/demo_b3=false/F/;
-    s/demo_c3=true/T/; s/demo_c3=false/F/; s/ //g')
+    s/c3_smoke=true/T/; s/c3_smoke=false/F/; s/ //g')
   n=$((n + 1))
   if [ "$got" != "$want" ]; then
     echo "FAIL: $event ${ref:+[$ref] }${labels:+[$labels] }${paths:-<no paths>}: want $want, got $got"
@@ -39,7 +39,7 @@ check_macos() {
 }
 
 # Verdict order: code store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3
-# demo_c3.
+# c3_smoke.
 PR=pull_request
 # Documentation only: nothing runs.
 check $PR x "" "README.md docs/core.md site/index.html" FFFFFFFFFF
@@ -124,9 +124,9 @@ check push main "" "" TTTTTTTTTT
 # demo-b1's own files run demo-b1 only; docs/demos/b1.md is documentation.
 check $PR x "" "src/demo_b1_nodes.zig docs/demos/b1.md" TFFFTFFFFF
 check $PR x "" "src/demo_b1.zig src/demo_c1.zig" TFFTTFFFFF
-# demo-c3's own files run demo-c3 only; docs/demos/c3.md is documentation.
-check $PR x "" "src/demo_c3_steps.zig src/demo_c3_witness.zig docs/demos/c3.md" TFFFFFFFFT
-check $PR x "" "src/demo_c3.zig src/demo_c1_state.zig" TFFTTFFFTT
+# c3-smoke's own files run c3-smoke only; docs/demos/c3.md is documentation.
+check $PR x "" "src/c3_smoke_steps.zig src/c3_witness.zig docs/demos/c3.md" TFFFFFFFFT
+check $PR x "" "src/c3_smoke.zig src/demo_c1_state.zig" TFFTTFFFTT
 check $PR x "" "docs/demos/c3.md" FFFFFFFFFF
 
 # The macOS job: zcube's own files, the build and CI run it; a server file, an unknown path and
