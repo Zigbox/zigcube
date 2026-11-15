@@ -11,8 +11,8 @@
 //!   - it is **live** until an admissible report says it stopped or its node is lost; a report
 //!     left after its replica record was deleted (the replica is being retired) counts as old,
 //!     live and stopping until the agent reports it stopped or deletes it;
-//!   - it is **ready** once the controller has seen it running for `min_ready_ms`. Slice 10 plugs
-//!     in at `Track.update`: with a health check, "running" becomes "running and healthy";
+//!   - it is **ready** once the controller has seen it running for `min_ready_ms`; a replica with a health
+//!     check counts as running only while its report says `healthy` (`update`);
 //!   - a new replica that is held (`hold_failed_replica`), that dies more than
 //!     `constants.rollout_restarts_max` times in all, or that is placed and not ready within
 //!     `ready_timeout_ms` fails the rollout (ZC-E0304), as `rollout_plan` decides.
@@ -259,9 +259,12 @@ fn update(
     const observed = replica_controller.admissible_in(snap, snap.observed_of(&replica.rec));
     const lost = node_lost(snap, replica.rec.id);
     const status: ?records.ObservedStatus = if (observed) |found| found.rec.status else null;
-    // C3 slice 10 plugs in here: a replica of a service with a health check is "running" for
-    // readiness only while its report says it is healthy.
-    const running = status == .running and !lost;
+    // A replica with a health check is "running" for readiness only while its report says it
+    // is healthy: `unknown` (not yet checked, or just after an agent restart) and `unhealthy`
+    // are not ready.
+    const healthy = replica.rec.health == null or
+        (observed != null and observed.?.rec.health == .healthy);
+    const running = status == .running and !lost and healthy;
     if (!running) track.running_since_ms = null;
     if (running and track.running_since_ms == null) track.running_since_ms = now;
     if (status != .stopped) return;
