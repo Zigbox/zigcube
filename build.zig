@@ -1522,6 +1522,10 @@ const c1_teeth_roots = [_]struct {
         .symptom = "J8: a run that no node started",
         .canary_seeds = 60,
         .plain_symptom = "J8: a run that no node started",
+        // C3 slice 8's automatic rollback changed every world's draws: measured 2026-11-15 over
+        // seeds 1 to 40 at 100 operations, 20 fail J8 with `--c1` (first at seed 1) and 12 plain
+        // (first at seed 11), so the plain run takes 40 seeds, not ten.
+        .plain_seeds = 40,
     },
     .{
         .name = "job_wipe",
