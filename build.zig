@@ -1915,6 +1915,16 @@ const c1_regressions = [_][]const []const u8{
         "--c1",                 "--strong",           "--profile=partitions",
         "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=176",
     },
+    // #56 on the b3 candidate 00f35c1: 35 operations drew 3 `advance`s, an 8.2 s fault phase,
+    // and one node cut while the other's call was lost delivered 17 requests, half a request
+    // short of the floor. Seed 207 (10 operations, 6.5 s, 2 delivered) is the same, found by the
+    // probe. A fault phase under 10 s is not judged by the floor now (`request_floor_met`).
+    &.{
+        "2846914288",   "35",                  "2",
+        "--strong",     "--lease-ttl-ms=8082", "--replicas-pct=200",
+        "--heal-at=42",
+    },
+    &.{ "207", "10", "1", "--strong" },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
