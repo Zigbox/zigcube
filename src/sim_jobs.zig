@@ -318,11 +318,12 @@ test "note_marks: wedges before the deadline do not count" {
     try std.testing.expectEqual(@as(u64, 0), wedged_since(&watch, 7000));
     // A wedge after the mark does count.
     try std.testing.expectEqual(@as(u64, 500), wedged_since(&watch, 7500));
-    // J6: the stop's base is taken once, at first sight of the stop.
+    // J6: the stop's base is taken once, at first sight of the stop: the stop committed 5 ms
+    // after the latest look, so the total then was at most 7,005.
     note_marks(&watch, 1000 + deadline + 5, deadline, 1000 + deadline + 5, 7600);
-    try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
+    try std.testing.expectEqual(@as(?u64, 7005), watch.stop_wedged_base_ms);
     note_marks(&watch, 1000 + deadline + 9, deadline, 1000 + deadline + 5, 9000);
-    try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
+    try std.testing.expectEqual(@as(?u64, 7005), watch.stop_wedged_base_ms);
 }
 
 test "note_marks: a mark taken late keeps the wedge after its moment (#151)" {
@@ -347,7 +348,12 @@ test "note_marks: a mark taken late keeps the wedge after its moment (#151)" {
     try std.testing.expectEqual(@as(u64, 2_500), watch.wedged_base_ms);
     try std.testing.expectEqual(@as(u64, 4_500), wedged_since(&watch, 7_000));
     // Not wedged between the looks: no credit, though the mark is late.
-    var idle: Watch = .{ .node = 0, .name_hash = 2, .first_seen_ms = 3_000, .ended_since_ms = null };
+    var idle: Watch = .{
+        .node = 0,
+        .name_hash = 2,
+        .first_seen_ms = 3_000,
+        .ended_since_ms = null,
+    };
     note_marks(&idle, 9_500, deadline, null, 2_000);
     note_marks(&idle, 14_500, deadline, null, 2_000);
     try std.testing.expectEqual(@as(u64, 0), wedged_since(&idle, 2_000));
