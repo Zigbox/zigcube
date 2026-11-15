@@ -159,6 +159,33 @@ test "agent mesh: a view that cannot be read holds no replica back" {
     try testing.expectEqual(want, world.sim.mesh_of("hello-1").?.hash);
 }
 
+const no_grants = [_]mesh_plan.Service{
+    .{ .name = "api", .mesh_address = "127.77.0.1" },
+    .{ .name = "hello", .mesh_address = "127.77.0.2" },
+};
+
+test "agent mesh: a revoked grant reaches the supervisors while the loading keeps failing" {
+    // Goal: the rules go out whatever stopped the stages before them (Review A of #263): a
+    // grant revoked in the view must not stay open for as long as a server read fails. Method:
+    // replicas under a view that grants hello -> api:8080, then every list of the replicas fails
+    // (the loading stops each step) and the grant leaves the view.
+    var feed: Feed = .{};
+    const world = try start(&feed, 30_009);
+    defer world.destroy();
+    const before = world.sim.mesh_of("hello-1").?;
+    try testing.expectEqual(try hash_under(&feed.input, "hello-1"), before.hash);
+    world.switched.down_list_prefix = records.prefix_replicas;
+    feed.input.services = &no_grants;
+    const reads = feed.reads;
+    world.advance(5_000);
+    try testing.expect(feed.reads > reads);
+    const after = world.sim.mesh_of("hello-1").?;
+    try testing.expect(after.hash != before.hash);
+    try testing.expectEqual(try hash_under(&feed.input, "hello-1"), after.hash);
+    try testing.expectEqual(before.updates + 1, after.updates);
+    world.switched.down_list_prefix = null;
+}
+
 test "agent mesh: a replica the range has no port for fails to start with ZC-E0710" {
     // Goal: a spent range is a start failure with the mesh's code, not a silent replica.
     // Method: a range of one port and two replicas; step until a report carries the code (the

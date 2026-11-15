@@ -502,13 +502,15 @@ pub const Agent = struct {
             pass.given,
             kept,
         ));
-        if (kept.stopped) return acted;
-        kept.stage(agent, ctx, "stop orphan containers", pass.orphan_containers());
-        if (kept.stopped) return acted;
-        kept.stage(agent, ctx, "remove orphan records", pass.orphan_records());
-        if (kept.stopped) return acted;
-        acted += kept.run(agent, ctx, "flush the reports", pass.flush());
-        if (kept.stopped) return acted;
+        if (!kept.stopped) {
+            kept.stage(agent, ctx, "stop orphan containers", pass.orphan_containers());
+        }
+        if (!kept.stopped) kept.stage(agent, ctx, "remove orphan records", pass.orphan_records());
+        if (!kept.stopped) acted += kept.run(agent, ctx, "flush the reports", pass.flush());
+        // The mesh rules go out whatever stopped the stages before them, as the job pass does
+        // (#142, #247): they need only the runtime and this step's view, and a grant revoked in
+        // that view must not stay open for as long as a report, an orphan or the loading keeps
+        // failing (Review A of #263).
         const plan = if (pass.mesh) |*known| known else return acted;
         acted += kept.run(agent, ctx, "send the mesh rules", agent_mesh.update(
             agent,
@@ -569,7 +571,8 @@ pub const Agent = struct {
             .node_key = records.node_key(agent.config.node),
         };
         if (!kept.stopped) kept.stage(agent, ctx, "read the replicas and assignments", pass.load());
-        if (!kept.stopped) pass.mesh = try agent_mesh.plan_now(agent, ctx);
+        // Read even after a failure: the rules it plans go out whatever stopped (`stages`).
+        pass.mesh = try agent_mesh.plan_now(agent, ctx);
         // A failed loading leaves nothing loaded: no replica is reconciled, and the job pass's
         // subjects come from the listings and the start records alone.
         if (kept.stopped) assert(pass.given.len == 0);
