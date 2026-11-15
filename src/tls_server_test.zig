@@ -1025,6 +1025,10 @@ test "browser path: a P-256 client certificate connects as a client, with its sc
         try std.testing.expectEqual(x509.Kind.client, peer.kind);
         try std.testing.expectEqualStrings("spiffe://prod/client/alice", peer.name);
         try std.testing.expectEqual(x509.Scope.jobs, peer.scope.?);
+        // The certificate's window, which the server checks again before each request: left
+        // at zero, every browser request was refused as expired (the B4-B7 bundle's merge).
+        try std.testing.expect(peer.not_before_ms > 0);
+        try std.testing.expect(peer.not_after_ms > peer.not_before_ms);
     }
 }
 

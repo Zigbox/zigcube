@@ -890,6 +890,9 @@ pub const Server = struct {
         self.peer_name_length = @intCast(name.len);
         self.peer_kind = p256.cluster_kind(parsed.kind);
         self.peer_scope = if (parsed.kind == .client) parsed.scope(leaf) else null;
+        // The window `Setup.recheck` judges before each request (B7 slice 5).
+        self.peer_not_before_ms = parsed.not_before_ms;
+        self.peer_not_after_ms = parsed.not_after_ms;
         if (!fault_on(.transcript_client_auth)) self.transcript.add(message);
         self.state = .wait_certificate_verify;
     }
