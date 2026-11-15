@@ -606,6 +606,54 @@ test "an unhealthy replica of a failed rollout is retired as not ready by the ro
     try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
 }
 
+test "an agent restart's unknown keeps old replicas ready and new ones not ready" {
+    // Goal: docs/decisions/2026-11-15-c3-rollout-health-gate.md. An agent restart reports every
+    // replica `unknown` until it probes again. An old replica last seen healthy keeps counting
+    // toward the floor (it is not free to retire as unready), and a new replica counts as ready
+    // only on `healthy`. Method: roll a checked service (surge 1, unavailable 0); report the old
+    // replicas `unknown` before any new one is ready, then the new one healthy and `unknown`.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = .{
+        .command = &.{ "test", "-f", "/tmp/ready" },
+        .interval_ms = 1000,
+        .timeout_ms = 1000,
+        .failure_threshold = 2,
+        .success_threshold = 1,
+    };
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b12";
+    try fixture.apply(checked);
+    try fixture.settle();
+    // The agent restarts: the old replicas are `unknown`. None is retired.
+    _ = try fixture.report_health(1, .running, .unknown);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    // The new replica runs healthy for min_ready_ms, then is `unknown`: still none retired.
+    _ = try fixture.report_health(2, .running, .healthy);
+    try fixture.settle();
+    _ = try fixture.report_health(2, .running, .unknown);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    // Healthy again: it is ready at once (its time was kept), and one old replica is retired.
+    _ = try fixture.report_health(2, .running, .healthy);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
+}
+
 test "a kept replica that stops between the read and the commit fails the retirement" {
     // Goal: TLA+ gap 1. A retirement compares the reports of the replicas it counts toward the
     // floor (`replicas - max_unavailable`, 3 here), so one that stops after the controller read
