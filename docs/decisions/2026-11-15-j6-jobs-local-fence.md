@@ -32,8 +32,8 @@ A read that succeeds, sent at S, reflects every stop committed before S. A stop 
 therefore seen by the first good read sent after t, or the run is fenced by
 t + ttl − fence_margin_ms + fence_stop_ms + the kill's latency. That is the "fenced" branch of
 J6's bound (`sim_jobs.stop_bound_ms`), so J6's bound does not change, and no new constant, bound or
-code is added: the owner's choice named "the same term as J6's fence". The supervisor was asked
-before it was fixed (2026-11-15).
+code is added: the owner's choice named "the same term as J6's fence". The supervisor approved
+the term, and the fault's 60 s window below, on 2026-11-15, before either was fixed.
 
 ## Limits
 
