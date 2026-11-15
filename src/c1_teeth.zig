@@ -151,6 +151,7 @@ pub const job_pass_break = declared("c1_teeth_job_pass_break");
 /// them has a stop asked, while its keepalives and every other call are answered. The agent
 /// never learns of the stop and keeps renewing, so the fence never comes either (must break J6).
 pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
+
 /// The agent kills what a fence has not stopped `fence_stop_teeth_ms` after the fence, not
 /// `constants.fence_stop_ms` (`fencing.kill_at_ms`), while the server keeps the real constants.
 /// For the Jepsen lease test's negative control (zigcube-jepsen, slice 2): a replica on a node cut
