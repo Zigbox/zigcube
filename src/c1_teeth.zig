@@ -171,6 +171,12 @@ pub const relabel_kept = declared("c1_teeth_relabel_kept");
 /// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
 pub const job_pass_break = declared("c1_teeth_job_pass_break");
 
+/// Not an agent fault but a gap shown (pending the owner, docs/decisions/
+/// 2026-11-14-j6-runs-unread-gap.md): the server fails a node's read of its runs whenever one of
+/// them has a stop asked, while its keepalives and every other call are answered. The agent
+/// never learns of the stop and keeps renewing, so the fence never comes either (must break J6).
+pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
@@ -193,7 +199,8 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
-    job_untrusted or placement_exclusive or relabel_kept or job_pass_break;
+    job_untrusted or placement_exclusive or relabel_kept or job_pass_break or
+    job_runs_unread;
 
 /// The runner a replay line names: the runner a root names itself (`sim_runner`), else the
 /// fault-on runner whose root switched a tooth on (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe`
@@ -245,4 +252,5 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_placement_exclusive", "sim_c1_teeth_placement_exclusive" },
     .{ "c1_teeth_relabel_kept", "sim_c1_teeth_relabel_kept" },
     .{ "c1_teeth_job_pass_break", "sim_c1_teeth_job_pass_break" },
+    .{ "c1_teeth_job_runs_unread", "sim_c1_teeth_job_runs_unread" },
 };

@@ -1713,6 +1713,24 @@ const c1_teeth_roots = [_]struct {
         .seeds = 225,
         .ops = 300,
     },
+    .{
+        .name = "job_runs_unread",
+        .root = "src/sim_c1_teeth_job_runs_unread_main.zig",
+        .symptom = "J6",
+        // A gap shown, not an agent fault (docs/decisions/2026-11-14-j6-runs-unread-gap.md): the
+        // server cuts a node's runs read while a stop is asked. Measured 2026-11-14 over seeds 1
+        // to 40 at 100 operations: J6 first at 11 seeds with `--c1` (2 4 7 14 17 18 22 23 25 30
+        // 32) and 13 plain; 6 others fail first on other checks (the cut also hides new runs and
+        // ended jobs), so the canary is pinned to known J6 hits, as a sparse tooth's is. Each
+        // passes with the fault off.
+        .canary_seeds = 1,
+        .canary_first = 2,
+        .also_seeds = &.{ 4, 7 },
+        .first_seed = 2,
+        .seeds = 2,
+        .plain_symptom = "J6",
+        .plain_seeds = 2,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1732,7 +1750,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 31 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the 34 negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1753,7 +1771,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_c1_comparison(b, sim, exe, step, nodes_text, false);
     add_c1_comparison(b, sim, exe, step, nodes_text, true);
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 32 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 34 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -2224,6 +2242,40 @@ const c1_regressions = [_][]const []const u8{
         "833885280",           "185",                "4",
         "--c1",                "--strong",           "--profile=crash_heavy",
         "--lease-ttl-ms=8226", "--replicas-pct=200", "--heal-at=390",
+    },
+    // #142 again on the b3 candidate ebfbac5: a run started in a long step, its cancel committed
+    // meanwhile; the next step read the runs (stop shown), then the read of the node's reports
+    // timed out and the pass ended with the stop withheld while keepalives went on (12,602 ms,
+    // bound 12,000). A failed reports read is kept now and the stops still go (`agent_jobs.pass`).
+    &.{
+        "2821617909",         "100",           "3",
+        "--c1",               "--strong",      "--lease-ttl-ms=10000",
+        "--replicas-pct=200", "--heal-at=130",
+    },
+    // The same shape at f49041a, where the step failed on `assigned`, in the loading before the
+    // job pass. A record of the issue, not a guard: it passes on ebfbac5 too, where that load
+    // still ended the step (#247 does not cover a failed load; the world the line draws
+    // changed). The guard of that half is the unit test of a failed assignments read
+    // (`agent_jobs_test.zig`, #142).
+    &.{
+        "4242675264",           "145",                "4",
+        "--c1",                 "--strong",           "--profile=partitions",
+        "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=176",
+    },
+    // #151 again on f49041a and on the b3 candidate 00f35c1: a checker false positive. The node
+    // was frozen across the run's deadline while the store was out, so the tracker took J8's
+    // wedge mark at its next look, seconds late, and dropped the frozen time between (129 ms
+    // and 340 ms over the bound). The mark is placed back at the deadline now
+    // (`sim_jobs.note_marks`).
+    &.{
+        "966942719",          "17",           "3",
+        "--c1",               "--strong",     "--lease-ttl-ms=10000",
+        "--replicas-pct=300", "--heal-at=57",
+    },
+    &.{
+        "2344280920",         "430",           "3",
+        "--c1",               "--strong",      "--lease-ttl-ms=10000",
+        "--replicas-pct=300", "--heal-at=701",
     },
 };
 

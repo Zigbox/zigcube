@@ -71,6 +71,11 @@ comptime {
     const longest = dir.len + constants.job_run_id_bytes_max + suffix.len;
     assert(longest <= agent_state.name_bytes_max);
     assert(constants.agent_node_runs_max * 2 <= agent_state.files_max);
+    // A failed store read always stops the stages (`Kept.fail`): `pass` asserts it.
+    for (@typeInfo(controller.Error).error_set.error_names.?) |name| {
+        assert(!std.mem.eql(u8, name, "RuntimeFailed"));
+        assert(!std.mem.eql(u8, name, "NotFound"));
+    }
 }
 
 const Found = union(enum) { absent, damaged, record: StartRecord };
@@ -243,16 +248,26 @@ pub fn pass(
         constants.agent_node_runs_max,
     )).items;
     // A stage before this one failed with a failure that is not the runtime's (the server): no
-    // report goes out, but every stop the runs' records already decide still does (#247).
+    // report goes out, but every stop the runs' records already decide still does (#247). A
+    // failed read of the reports is kept the same way: the runs above already say which stops
+    // are committed, and a step that ended here withheld them while heartbeats went on, past
+    // J6's bound (#142, seed 2821617909).
     if (!kept.stopped) {
         const prefix = records.job_observed_prefix(agent.config.node);
-        work.observed = (try controller.list_all(
+        if (controller.list_all(
             records.JobObserved,
             &cctx,
             prefix.slice(),
             null,
             constants.job_admitted_window_max,
-        )).items;
+        )) |observed| {
+            work.observed = observed.items;
+        } else |err| {
+            kept.stage(agent, ctx, "read the runs' reports", err);
+            // `Kept.fail`: only RuntimeFailed and NotFound do not stop, and a store read
+            // returns neither (checked at compile time below).
+            assert(kept.stopped);
+        }
     }
     // One run's failing step must not starve the runs after it (#205): like a replica's, it is
     // kept and the next run is looked at. After a failure that is not the runtime's (the server:
@@ -260,7 +275,8 @@ pub fn pass(
     // one included, is still stopped (#247, #248): a stop committed for a run later in name
     // order is not held back a step by an earlier run's report. A failure in this loop ends the
     // pass's store calls at once (`stop_only` makes none); one in an earlier stage (agent.zig
-    // `stages`) leaves the pass the one read of the runs above, and no write.
+    // `stages`), in the loading or in the image summary (`reconcile`) leaves the pass the one
+    // read of the runs above, and no write.
     // `stop_only` follows a failed `one` on the same subject, which may already have stopped a
     // stale container: the repeated grace-0 stop is harmless on a real host (`pending_stop`
     // keeps one). In the simulation a state-directory crash in mid-step is folded into
