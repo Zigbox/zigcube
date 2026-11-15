@@ -57,6 +57,7 @@ jobs:
       demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
       mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
       demo_b3: ${{ steps.pick.outputs.demo_b3 || 'true' }}
+      macos: ${{ steps.pick.outputs.macos || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,6 +124,10 @@ jobs:
       # time); the pages that the `docs` link of a diagnostic points at are checked here.
       - name: Error pages are up to date
         run: zig build errors-site-check
+      # zcube alone, compiled for aarch64-macos and x86_64-macos and not run: every change, so
+      # code zcube shares with the server cannot break the macOS build unseen (docs/macos.md).
+      - name: zcube cross-compiles for macOS
+        run: zig build mac-cross
       # The suite picks a random seed per run; a failure prints it, and -Dseed=N replays it.
       - name: Store conformance (memory)
         run: zig build test-store -Dbackend=memory --summary all
@@ -137,6 +142,38 @@ jobs:
       # directory, with real containers. It cleans up what it starts.
       - name: Local smoke (zcube local up and down)
         run: zig build local-smoke --summary all
+
+  # zcube alone on a GitHub-hosted Apple silicon runner (docs/macos.md): the unsigned build, the
+  # command line's unit tests, `zcube help`, and `zcube local` refusing. Only when zcube's own
+  # files, the build or CI change, or on a full run (ci-changes.sh, is_macos;
+  # docs/decisions/2026-11-13-macos-ci-paths.md). No secret is in reach: signing and notarization
+  # run only on the owner's Mac (`zig build mac-release`).
+  macos:
+    name: zcube on macOS
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.macos == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig-macos
+      - name: Build zcube (unsigned)
+        run: zig build cli
+      - name: The command line's unit tests
+        run: zig build test-cli --summary all
+      # `zcube help`: zcube has no --help flag.
+      - name: zcube help
+        run: zig-out/bin/zcube help
+      # Exit 2 (environment) and ZC-E0122, which says zcube local runs only on Linux.
+      - name: zcube local refuses on macOS
+        shell: /bin/bash --noprofile --norc -uo pipefail {0}
+        run: |
+          zig-out/bin/zcube local up 2> local.err
+          status=$?
+          cat local.err
+          test "${status}" -eq 2
+          grep -q 'ZC-E0122' local.err
+          grep -q 'only on Linux' local.err
 
   # The same conformance suite against a real Postgres 16, the server a deployment would run.
   # The image is pinned by digest (postgres:16.15, resolved from Docker Hub on 2026-10-26), so a

@@ -19,6 +19,7 @@
 //! `up` and `down` run one at a time: each holds a lock on `<dir>/lock` throughout.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const net = std.Io.net;
 const agent_config = @import("agent_config.zig");
@@ -235,6 +236,18 @@ fn raise_no_executable(report: *Report, name: []const u8, dir: []const u8, what:
     report.diag.fix(.{
         .sentence = "build them and run zcube from the directory they are in:",
         .command = "zig build && zig-out/bin/zcube local up",
+    });
+}
+
+/// `zcube local` on a system other than Linux (macOS): the server and the agent it would start are
+/// Linux programs (docs/macos.md). One line of cause, and the way to use zcube there.
+fn raise_not_linux(report: *Report, os: []const u8) void {
+    report.diag.raise(.E0122);
+    report.diag.while_("starting the local server and agent", .{});
+    report.diag.cause("zcube local runs only on Linux, and this is {s}", .{os});
+    report.diag.fix(.{
+        .sentence = "run zcube local on a Linux machine, or point zcube at a server:",
+        .command = "zcube --server HOST:PORT get nodes",
     });
 }
 
@@ -759,6 +772,16 @@ fn down(local: *const Local) Failed!void {
 }
 
 pub fn run(env: *const Env, action: cli_args.LocalAction, report: *Report) u8 {
+    // Comptime, so the Linux-only code below is never compiled for macOS.
+    if (comptime builtin.os.tag != .linux) {
+        raise_not_linux(report, @tagName(builtin.os.tag));
+        return constants.exit_environment;
+    } else {
+        return run_linux(env, action, report);
+    }
+}
+
+fn run_linux(env: *const Env, action: cli_args.LocalAction, report: *Report) u8 {
     var buffer: [constants.state_path_bytes_max]u8 = undefined;
     const dir = local_dir(env, &buffer) orelse {
         raise_no_dir(report);
@@ -793,6 +816,19 @@ pub fn run(env: *const Env, action: cli_args.LocalAction, report: *Report) u8 {
 // ---- Tests -----------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "zcube local off Linux is ZC-E0122 and says it runs only on Linux" {
+    // Goal: the macOS refusal (docs/macos.md). Method: raise it as macOS would and render it.
+    var report: Report = undefined;
+    report.reset();
+    raise_not_linux(&report, "macos");
+    report.seal();
+    try testing.expectEqual(constants.exit_environment, report.exit_code());
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&report.shown()[0], .text, false, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "ZC-E0122") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "only on Linux, and this is macos") != null);
+}
 
 test "the local directory follows ZCUBE_LOCAL_DIR, then XDG_STATE_HOME, then HOME" {
     // Goal: where `zcube local` keeps its files. Method: each variable alone and together, a

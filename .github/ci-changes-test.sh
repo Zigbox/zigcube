@@ -2,6 +2,7 @@
 # Tests of .github/ci-changes.sh: a table of changed paths and the verdict each must get. The
 # changes job runs it before it classifies, so a broken rule fails CI instead of skipping a job.
 # Each row: EVENT|HEAD_REF|LABELS|paths (space separated)|expected `code store c0 c1 b1 smoke c2 mtls b3` as T/F.
+# `check` leaves the macos output out; `check_macos` rows judge it alone.
 set -uo pipefail
 dir=$(cd "$(dirname "$0")" && pwd)
 failed=0
@@ -11,7 +12,7 @@ check() {
   local event=$1 ref=$2 labels=$3 paths=$4 want=$5 got out
   # GITHUB_OUTPUT is set on a runner; unset, the script writes to stdout.
   out=$(printf '%s\n' ${paths} | env -u GITHUB_OUTPUT EVENT="$event" HEAD_REF="$ref" \
-    LABELS="$labels" "$dir/ci-changes.sh" | tr '\n' ' ')
+    LABELS="$labels" "$dir/ci-changes.sh" | grep -v '^macos=' | tr '\n' ' ')
   got=$(echo "$out" | sed -E 's/code=true/T/; s/code=false/F/; s/store=true/T/; s/store=false/F/;
     s/demo_c0=true/T/; s/demo_c0=false/F/; s/demo_c1=true/T/; s/demo_c1=false/F/;
     s/demo_b1=true/T/; s/demo_b1=false/F/;
@@ -20,6 +21,18 @@ check() {
   n=$((n + 1))
   if [ "$got" != "$want" ]; then
     echo "FAIL: $event ${ref:+[$ref] }${labels:+[$labels] }${paths:-<no paths>}: want $want, got $got"
+    failed=$((failed + 1))
+  fi
+}
+
+# The macOS job: its own verdict, T or F.
+check_macos() {
+  local event=$1 ref=$2 labels=$3 paths=$4 want=$5 got
+  got=$(printf '%s\n' ${paths} | env -u GITHUB_OUTPUT EVENT="$event" HEAD_REF="$ref" \
+    LABELS="$labels" "$dir/ci-changes.sh" | sed -n 's/^macos=true$/T/p; s/^macos=false$/F/p')
+  n=$((n + 1))
+  if [ "$got" != "$want" ]; then
+    echo "FAIL: macos: $event ${ref:+[$ref] }${labels:+[$labels] }${paths:-<no paths>}: want $want, got $got"
     failed=$((failed + 1))
   fi
 }
@@ -44,6 +57,7 @@ check $PR x "" "src/sim_cluster.zig src/sim_swarm_main.zig" TFFFFFFFF
 check $PR x "" "web/app.js web/mock/c1.js tools/wasm_check.mjs" TFFFFFFFF
 check $PR x "" "src/tidy.zig src/testing/check.zig" TFFFFFFFF
 check $PR x "" "src/console_wasm.zig src/web_embed.zig" TFFFFFFFF
+check $PR x "" "src/mac_release.zig packaging/homebrew/zcube-resource.rb" TFFFFFFFF
 # One demo, one smoke, the store suites' own files.
 check $PR x "" "src/demo_c0_steps.zig" TFTFFFFFF
 check $PR x "" "src/demo_c1_fleet.zig docs/demos/c1.md" TFFTTFFFT
@@ -108,6 +122,27 @@ check push main "" "" TTTTTTTTT
 # demo-b1's own files run demo-b1 only; docs/demos/b1.md is documentation.
 check $PR x "" "src/demo_b1_nodes.zig docs/demos/b1.md" TFFFTFFFF
 check $PR x "" "src/demo_b1.zig src/demo_c1.zig" TFFTTFFFF
+
+# The macOS job: zcube's own files, the build and CI run it; a server file, an unknown path and
+# documentation do not; a full run does.
+PR=pull_request
+check_macos $PR x "" "src/cli_local.zig" T
+check_macos $PR x "" "src/zcube.zig src/server.zig" T
+check_macos $PR x "" "src/mac_release.zig" T
+check_macos $PR x "" "packaging/homebrew/zcube-resource.rb" T
+check_macos $PR x "" "build.zig" T
+check_macos $PR x "" ".github/actions/setup-zig-macos/action.yml" T
+check_macos $PR x "" ".github/workflows/ci.yml" T
+check_macos $PR x "" "src/server.zig" F
+check_macos $PR x "" "src/brand_new_file.zig" F
+check_macos $PR x "" "src/diag/codes.zig" F
+check_macos $PR x "" "docs/macos.md" F
+check_macos $PR x "" "README.md src/cli_local.zig" T
+check_macos $PR x "full-ci" "src/server.zig" T
+check_macos $PR claude/release-0.6 "" "src/server.zig" T
+check_macos push main "" "src/server.zig" T
+check_macos push main "" "README.md" F
+check_macos $PR x "" "" T
 
 if [ "$failed" -ne 0 ]; then
   echo "ci-changes-test: $failed of $n failed"
