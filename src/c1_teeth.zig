@@ -151,6 +151,14 @@ pub const job_pass_break = declared("c1_teeth_job_pass_break");
 /// them has a stop asked, while its keepalives and every other call are answered. The agent
 /// never learns of the stop and keeps renewing, so the fence never comes either (must break J6).
 pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
+/// The agent kills what a fence has not stopped `fence_stop_teeth_ms` after the fence, not
+/// `constants.fence_stop_ms` (`fencing.kill_at_ms`), while the server keeps the real constants.
+/// For the Jepsen lease test's negative control (zigcube-jepsen, slice 2): a replica on a node cut
+/// off from the server outlives the bound of I1b (1,900 ms): measured 3,335 ms. Only
+/// `zcube_agent_fence_teeth.zig` declares it, and it is not in `any`: the shipped server must not
+/// see it, and the agent's own check of the inequality reads the real constants.
+pub const fence_stop_teeth = declared("c1_teeth_fence_stop");
+pub const fence_stop_teeth_ms: u64 = if (fence_stop_teeth) 8_000 else 0;
 
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
