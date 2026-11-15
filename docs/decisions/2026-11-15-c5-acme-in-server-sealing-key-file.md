@@ -8,9 +8,15 @@ session.*
   HTTP-01 challenges from the store.
 - **Sealing key.** A 0600 file in the server's state directory, `seal-<hash>.key`, beside the CA
   key, never in the store, with the same backup rule as the CA key. Records under
-  `/edge-certs/<host>` and `/acme-account` are sealed with it (XChaCha20-Poly1305, the key path as
-  associated data). Losing it means reordering certificates, not losing data. Edges receive
-  unsealed certificate keys over mTLS and keep them in memory only.
+  `/edge-certs/<host>` and `/acme-account/<directory-hash>` are sealed with it
+  (XChaCha20-Poly1305, the key path as associated data). The ACME account key lives sealed in the
+  store, one record per directory URL, not in the state directory. Edges receive unsealed
+  certificate keys over mTLS and keep them in memory only.
+- **Lifecycle** (supervisor ruling R6). With no sealed records, the server creates the key at
+  start, so an upgrade from C3/C4 needs nothing. Sealed records with no key, or a key that does
+  not open them, stop the server with ZC-E0824. `--discard-sealed` deletes the sealed records,
+  makes a new key and warns (ZC-W0808) that every public host is reordered against Let's
+  Encrypt's limits. Losing the key costs reorders, not data.
 - **Key stores later, in C8.** Support for external key stores (cloud KMS and the like) for the
   sealing key is a later release's work, slotted into **C8** by the owner. C5 does not build it
   and does not shape an interface for it beyond keeping the key's loading in one shell function.

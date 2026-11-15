@@ -5,31 +5,45 @@
 The recorded run of demo-c5 (Let's Encrypt production, a public address) is no longer done by
 hand. It is a `workflow_dispatch` job.
 
-- **Domain.** The owner wrote "zgbox.org". The supervisor assumes **zigbox.org** (the project's
-  domain) and records that as an assumption; the owner corrects it if it is wrong.
+- **Domain.** The owner wrote "zgbox.org", read as **zigbox.org**: the project's domain
+  (`2026-11-04-errors-on-org-site.md`), which the owner controls through Cloudflare.
 - **Where.** The job lives in `Zigbox/zigcube-jepsen`, which already holds the Google Cloud
   Workload Identity access (`2026-11-15-jepsen-on-google-cloud.md`). It builds Zigcube from the
-  commit it is given (the `zig build dist` tarball of the C5 brief's PR `J`).
-- **What it does,** in order: create a VM with a reserved static IPv4 address in the Jepsen
-  project, with :80 and :443 open to the internet for that run only; write an A record
-  `hello.demo.zigbox.org` (any name under the `demo.` label will do) to that address through the
-  Cloudflare API; run the demo script against Let's Encrypt production; capture the transcript
-  and a headless-Chromium screenshot of the page as job artifacts; then delete the record, the
-  VM and the address, **even on failure** (an `always()` step).
-- **The token.** The owner gives the repository a secret `CLOUDFLARE_DNS_TOKEN`, a Cloudflare API
-  token with Zone DNS Edit on the zone `zigbox.org` only. The job never prints it and never puts
-  it on a command line: it reaches `curl` through the environment or a 0600 file
-  (`curl -H @file`), and the step masks it.
+  commit it is given (the `zig build dist` tarball of the C5 brief's PR `J`). That commit must be
+  an ancestor of Zigcube's `main` or a release tag's commit; the job refuses anything else, and
+  builds in a job with no secrets and no `id-token` permission.
+- **What it does,** in order: create a VM in the Jepsen project and attach the static IPv4
+  address **the owner reserved beforehand** (the job never creates or deletes it), with :80 and
+  :443 open to the internet for that run only; write an A record `hello.demo.zigbox.org` (TTL 60,
+  comment `zcube-demo run=<run id>`) to that address through the Cloudflare API and wait until
+  Cloudflare's authoritative nameservers answer with it; run the demo script against Let's
+  Encrypt staging, then production; capture the transcript and a headless-Chromium screenshot as
+  job artifacts; then delete the record and the VM, **even on failure** (an `always()` step).
+- **The token.** `CLOUDFLARE_DNS_TOKEN` is a secret of the GitHub Environment `demo-dns`
+  (deployments from `main` only, a required reviewer), not a repository secret: a Cloudflare API
+  token with Zone DNS Edit on one zone only. Only the DNS create and delete steps see it (`env:`
+  on those steps). The job never prints it and never puts it on a command line: it reaches `curl`
+  through the environment or a 0600 file (`curl -H @file`).
+- **Owner to choose: a delegated subzone.** Delegate `demo.zigbox.org` to a zone of its own and
+  scope the token to it, so the token cannot edit the apex or the MX records. Cloudflare offers
+  subdomain zones only on some plans; otherwise the NS records point at another DNS host.
+- **A nightly sweep** deletes records under `demo.zigbox.org` whose comment starts `zcube-demo` and
+  that are over 6 hours old, and VMs labelled for the demo.
 - **Leave the zone alone.** The apex of zigbox.org is a Cloudflare Worker (the website
   repository's AGENTS.md). The job touches only the one record it created: it refuses to run if
   that name already exists, it deletes by the record id the create call returned, and it never
   edits the apex or any other record. The record is DNS-only (not proxied): a proxied record
   would put Cloudflare's own TLS in front of the edge and the demo would prove nothing.
-- **Rate limits.** Each dispatch orders one production certificate. Let's Encrypt allows 5
-  duplicate certificates a week, so the job is dispatched by hand, once per release, not on a
-  schedule. CI on pull requests keeps using Pebble.
+- **Rate limits.** Each dispatch orders one staging and one production certificate. Let's Encrypt
+  allows 5 duplicate certificates a week, so the job is dispatched by hand, once per release, not on
+  a schedule. CI on pull requests keeps using Pebble.
 - **The record of it.** The supervisor copies the transcript into `docs/demos/c5.md` and links
-  the run; that is what the site's `recorded` badge cites.
+  the run; that is what the site's `recorded` badge cites. C5 is marked "demonstrated" when the
+  `demo-c5` CI job (Pebble) is green, as AGENTS.md requires.
+
+*Amended 2026-11-15 by the supervisor's review rulings (R7): commit restriction, build without
+secrets, the Environment secret, TTL and authoritative check, the sweep, the pre-reserved address
+and the subzone question. The owner's choices above are unchanged.*
 
 **A difference from SPEC's wording.** SPEC step 2 says "from a laptop outside the cluster". The
 browser is now a headless Chromium on the GitHub runner, which is outside the cluster and reaches
@@ -37,6 +51,6 @@ the edge over the internet. The supervisor takes that as meeting the step; the o
 otherwise.
 
 **Check before the first run.** A CAA record on zigbox.org that does not name letsencrypt.org
-would make every order fail; the first dispatch reports it as ZC-E0823 with the CA's detail.
+would make every order fail; the first dispatch reports it as ZC-E0826 with the CA's detail.
 
 Where: `docs/briefs/c5.md` ("How demo-c5 runs"); `Zigbox/zigcube-jepsen`.
