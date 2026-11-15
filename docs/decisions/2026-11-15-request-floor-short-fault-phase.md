@@ -1,9 +1,11 @@
-# sim-cluster's request floor does not judge a fault phase shorter than 10 s
+# sim-cluster's request floor does not judge a fault phase shorter than one lost call (10 s)
 
 *Decided 2026-11-15, by the slice (#56 regression on the b3 candidate 00f35c1).*
 
 `request_floor_met` (`src/sim_cluster.zig`) returns true when the fault phase lasted less than
-`request_floor_fault_ms_min`, 10,000 ms of virtual time. Above it the floors are unchanged: one
+`request_floor_fault_ms_min`, which is the agent's I/O timeout (`constants.agent_io_timeout_ms`,
+10,000 ms of virtual time): what one lost call or cut link costs the agent, and what `sim_net`
+charges for it. Above it the floors are unchanged: one
 request per operation with 120 s of summed uptime, half a request per operation below that.
 
 Why: operations are not time. Seed 2846914288 (35 operations, `--strong`, 2 nodes, ttl 8,082,
@@ -16,6 +18,9 @@ was healthy (534 agent steps, 7,057 requests, every invariant held). A probe of 
 0.93 requests per operation in every window of 10 s or more (1.08 from 20 s, 1.43 from 30 s).
 
 A cluster that is down most of the time still fails from 10 s up; below it the window holds less
-than one lost call, and the floor measured the draw, not the cluster.
+than one lost call, and the floor measured the draw, not the cluster. The unit test "the request
+floor catches a cluster cut off for a fault phase long enough to judge" cuts a node's link both ways
+for twice the minimum and needs the floor to fail; with the floor switched off, it and both other
+floor tests fail.
 
 Where: `src/sim_cluster.zig` (`request_floor_met`, its tests), `build.zig` (`c1_regressions`).
