@@ -12,6 +12,7 @@
 //!     .memory_bytes = 8589934592,
 //!     .images = "fixtures/images.zon", // the digests the fake runtime has; the default
 //!     .address = "", // what to record in /nodes/<node>, for people to read
+//!     .labels = .{ "tenant=a", "exclusive=tenant" }, // the node's labels (B6), or --label
 //! }
 //! ```
 //!
@@ -23,6 +24,9 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
+const x509_identity = @import("x509_identity.zig");
+const text_util = @import("text.zig");
+const trust_file = @import("trust_file.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -34,12 +38,14 @@ pub const usage =
     \\usage: zcube-agent [--config FILE] [--node NAME] [--server HOST:PORT] [--state-dir DIR]
     \\                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
     \\                   [--images-dir DIR] [--peer-listen HOST:PORT] [--peer-advertise HOST:PORT]
-    \\                   [--registry HOST:PORT] [--runtime fake|zigbox] [--verbose]
+    \\                   [--registry HOST:PORT] [--runtime fake|zigbox] [--trust-policy FILE]
+    \\                   [--label KEY=VALUE]... [--verbose]
+    \\                   [--ca FILE [--cert FILE --key FILE] [--tls-name NAME]]
     \\       zcube-agent --version | --help
     \\
     \\  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
     \\                     .runtime, .images, .address, .images_dir, .peer_listen, .peer_advertise
-    \\                     and .registry
+    \\                     .registry, .trust_policy, .labels, .ca, .cert, .key and .tls_name
     \\  --node NAME        this node's name (a lowercase hostname label)
     \\  --server ADDR      zcube-server's address, an IP address and a port
     \\  --state-dir DIR    where the agent keeps its containers (created if missing)
@@ -57,6 +63,20 @@ pub const usage =
     \\                     --peer-listen is 0.0.0.0 or :: (default: the --peer-listen address)
     \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
     \\                     peer has it (needs --images-dir)
+    \\  --ca FILE          the cluster CA's certificate (ca.crt): talk to the server over TLS
+    \\                     (docs/mtls.md); without it, plain HTTP (--insecure-listen)
+    \\  --cert FILE, --key FILE  the certificate and key to present until the node has its
+    \\                     own (node.crt in the state directory, issued at join)
+    \\  --tls-name NAME    the DNS name in the server's certificate (default zcube-server)
+    \\  --trust-policy FILE  this node's Zigbox trust policy: a job whose signatures it refuses is
+    \\                     never started here (ends refused, ZBX-E0905); service replicas are not
+    \\                     checked. An absolute path, owned by root or the agent's user, writable
+    \\                     by no one else. Without it the node checks nothing
+    \\  --label KEY=VALUE  a label of this node, sent at registration; one --label per label, at
+    \\                     most 8, keys at most 32 bytes (docs/agent.md). exclusive=KEY
+    \\                     reserves the node for the jobs that require its own KEY. Labels in
+    \\                     both the file and the flags must be the same. New labels need the
+    \\                     node's lease to have ended (one lease ttl) or an emptied --state-dir
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -92,6 +112,22 @@ pub const Config = struct {
     peer_advertise: ?IpAddress = null,
     /// The registry an image the node lacks is fetched from (`zcube-agent fetch`), as typed.
     registry: ?[]const u8 = null,
+    /// The node's labels, `key=value` words sent at registration (B6), checked by `check_labels`.
+    labels: []const []const u8 = &.{},
+    /// The node's own trust policy (`--trust-policy`, B5), read once at start; null: the agent
+    /// checks no job's signatures. The API cannot name, change or switch it off.
+    trust: ?trust_file.Loaded = null,
+    /// The API over TLS; null: plain HTTP.
+    tls: ?Tls = null,
+};
+
+/// `--ca`, `--cert`, `--key` and `--tls-name`. `cert` and `key` come together or not at all;
+/// without them the agent needs its own `node.crt` from an earlier join.
+pub const Tls = struct {
+    ca: []const u8,
+    cert: ?[]const u8,
+    key: ?[]const u8,
+    server_name: []const u8,
 };
 
 pub const Command = union(enum) {
@@ -122,6 +158,12 @@ const File = struct {
     peer_listen: ?[]const u8 = null,
     peer_advertise: ?[]const u8 = null,
     registry: ?[]const u8 = null,
+    ca: ?[]const u8 = null,
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
+    trust_policy: ?[]const u8 = null,
+    labels: ?[]const []const u8 = null,
 };
 
 /// The fixtures file: the digests the fake runtime has.
@@ -144,6 +186,14 @@ const Flags = struct {
     peer_listen: ?[]const u8 = null,
     peer_advertise: ?[]const u8 = null,
     registry: ?[]const u8 = null,
+    ca: ?[]const u8 = null,
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
+    trust_policy: ?[]const u8 = null,
+    /// `--label`, in the order given; `labels_count` of them are set.
+    labels: [constants.node_labels_max][]const u8 = undefined,
+    labels_count: u32 = 0,
     verbose: bool = false,
     version: bool = false,
     help: bool = false,
@@ -174,8 +224,22 @@ pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag)
     if (flags.help) return .help;
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
-    return .{ .run = try merge(arena, io, flags, file, diag) };
+    var config = try merge(arena, io, flags, file, diag);
+    if (flags.trust_policy orelse file.trust_policy) |path| {
+        try check_trust_path(path, diag);
+        config.trust = try trust_file.read(arena, io, path, trust_options, diag);
+    }
+    return .{ .run = config };
 }
+
+const trust_options: trust_file.Options = .{
+    .code = .E0505,
+    .setting = "--trust-policy",
+    .user = "the agent's user",
+    .fix = "give --trust-policy FILE naming a readable Zigbox policy file",
+    .owner_fix = "chown it to root (or the agent's user) and chmod go-w it: a policy that" ++
+        " others can rewrite gates nothing",
+};
 
 fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Error!Config {
     const node = flags.node orelse file.node orelse
@@ -218,14 +282,8 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
     const peer_listen = if (listen_text) |text| try parse_server(text, diag) else null;
     const advertise_text = flags.peer_advertise orelse file.peer_advertise;
     const peer_advertise = try peer_advertised(peer_listen, advertise_text, diag);
-    const registry = flags.registry orelse file.registry;
-    if (registry) |text| {
-        if (images_dir == null) {
-            const what = "--registry has no chunk store to fetch into";
-            return bad(diag, what, .{}, "give --images-dir DIR");
-        }
-        _ = try parse_server(text, diag);
-    }
+    const registry = try registry_of(flags.registry orelse file.registry, images_dir, diag);
+    const labels = try merged_labels(&flags, file, diag);
     const images_given = flags.images orelse file.images;
     const images_path = images_given orelse images_default;
     const pulls_wanted = kind == .zigbox and images_given != null;
@@ -243,7 +301,134 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .peer_listen = peer_listen,
         .peer_advertise = peer_advertise,
         .registry = registry,
+        .tls = try tls_absolute(arena, io, try tls_of(flags, file, diag), diag),
+        .labels = try arena.dupe([]const u8, labels),
     };
+}
+
+/// The registry to fetch images from, checked: it fetches into the chunk store, so it needs one.
+fn registry_of(registry: ?[]const u8, images_dir: ?[]const u8, diag: *Diag) Error!?[]const u8 {
+    const text = registry orelse return null;
+    if (images_dir == null) {
+        const what = "--registry has no chunk store to fetch into";
+        return bad(diag, what, .{}, "give --images-dir DIR");
+    }
+    _ = try parse_server(text, diag);
+    return text;
+}
+
+fn tls_of(flags: Flags, file: File, diag: *Diag) Error!?Tls {
+    const ca = flags.ca orelse file.ca;
+    const cert = flags.cert orelse file.cert;
+    const key = flags.key orelse file.key;
+    const name = flags.tls_name orelse file.tls_name;
+    if (ca == null) {
+        if (cert == null and key == null and name == null) return null;
+        return bad(diag, "--cert, --key and --tls-name need --ca", .{}, "give --ca FILE");
+    }
+    if ((cert == null) != (key == null)) {
+        return bad(diag, "--cert and --key go together", .{}, "give both, or neither");
+    }
+    const server_name = name orelse "zcube-server";
+    if (x509_identity.dns_problem(server_name, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "--tls-name {s} is not a DNS name", .{server_name}, "give a DNS name");
+    }
+    return .{ .ca = ca.?, .cert = cert, .key = key, .server_name = server_name };
+}
+
+/// The node's labels from `--label` or the file's `.labels`, checked. Both may be given only
+/// with the same labels: a label decides which tenant's jobs the node takes, so a flag that
+/// quietly overrode the file (or the other way round) could put the node in the wrong tenant.
+fn merged_labels(flags: *const Flags, file: File, diag: *Diag) Error![]const []const u8 {
+    const flagged = flags.labels[0..flags.labels_count];
+    // Both sets are checked on their own, so a malformed or repeated flag is refused for what it
+    // is even when the file gives the labels.
+    try check_labels(flagged, diag);
+    const listed = file.labels orelse return flagged;
+    try check_labels(listed, diag);
+    if (flags.labels_count > 0 and !same_labels(flagged, listed)) {
+        return bad(
+            diag,
+            "the node's labels are given by --label and by .labels in the file, and they differ",
+            .{},
+            "give the labels in one place",
+        );
+    }
+    return listed;
+}
+
+/// Set equality for two lists that `check_labels` passed: neither repeats a key, so neither
+/// repeats a label, and the same length with one inside the other is the same set.
+fn same_labels(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a) |label| {
+        var found = false;
+        for (b) |other| found = found or std.mem.eql(u8, label, other);
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// Each label is `key=value` with a key, printable, at most `node_label_bytes_max` bytes; no key
+/// twice; at most `node_labels_max`; and the server's own rule for `exclusive` (ZC-E0104 at
+/// registration) is checked here first, so a bad node never starts.
+pub fn check_labels(labels: []const []const u8, diag: *Diag) Error!void {
+    if (labels.len > constants.node_labels_max) {
+        return bad(diag, "the node has more than 8 labels", .{}, "give at most 8");
+    }
+    const shape = "write each label as key=value, e.g. tenant=acme";
+    for (labels, 0..) |label, index| {
+        const at = std.mem.indexOfScalar(u8, label, '=') orelse
+            return bad(diag, "the label {s} has no '='", .{label}, shape);
+        if (at == 0) return bad(diag, "the label {s} has no key", .{label}, shape);
+        if (label.len > constants.node_label_bytes_max) {
+            return bad(diag, "the label {s} is longer than 128 bytes", .{label}, "shorten it");
+        }
+        // A longer key could never match a job's `placement.require`, whose keys are bounded so.
+        if (at > constants.label_key_bytes_max) {
+            const why = "the label {s} has a key longer than 32 bytes";
+            return bad(diag, why, .{label}, "shorten the key");
+        }
+        for (label) |byte| {
+            if (!text_util.is_printable(byte)) {
+                return bad(diag, "a label holds a byte that is not printable ASCII", .{}, shape);
+            }
+        }
+        for (labels[0..index]) |earlier| {
+            const eq = std.mem.indexOfScalar(u8, earlier, '=').?;
+            if (std.mem.eql(u8, earlier[0..eq], label[0..at])) {
+                const why = "the node has two labels with the key {s}";
+                return bad(diag, why, .{label[0..at]}, "give each key once");
+            }
+        }
+    }
+    if (records.node_labels_problem(labels)) |problem| {
+        return bad(diag, "{s}", .{problem}, "label the node key=value and exclusive=key");
+    }
+}
+
+/// `tls` with its paths absolute, against the working directory, as `state_dir` is: the agent
+/// hands them to the fetch child, which runs in another directory (B7 slice 7). A file need not
+/// exist yet; its reader says so.
+fn tls_absolute(arena: Allocator, io: std.Io, tls: ?Tls, diag: *Diag) Error!?Tls {
+    const given = tls orelse return null;
+    var buffer: [constants.state_path_bytes_max]u8 = undefined;
+    const length = std.Io.Dir.cwd().realPathFile(io, ".", &buffer) catch
+        return bad(diag, "can't resolve the working directory", .{}, "run from a directory " ++
+            "that exists, or give --ca, --cert and --key as absolute paths");
+    const cwd = buffer[0..length];
+    return .{
+        .ca = try absolute_in(arena, cwd, given.ca),
+        .cert = if (given.cert) |path| try absolute_in(arena, cwd, path) else null,
+        .key = if (given.key) |path| try absolute_in(arena, cwd, path) else null,
+        .server_name = given.server_name,
+    };
+}
+
+fn absolute_in(arena: Allocator, cwd: []const u8, path: []const u8) Error![]const u8 {
+    assert(std.fs.path.isAbsolute(cwd));
+    if (std.fs.path.isAbsolute(path)) return path;
+    return std.fs.path.join(arena, &.{ cwd, path }) catch error.OutOfMemory;
 }
 
 /// The address to publish for peers: the advertised one, else the listen address if it names a
@@ -326,6 +511,17 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.peer_advertise = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--registry")) {
             flags.registry = try value_of(args, &index, diag);
+        } else if (tls_flag(&flags, arg)) |field| {
+            field.* = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--trust-policy")) {
+            flags.trust_policy = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--label")) {
+            const value = try value_of(args, &index, diag);
+            if (flags.labels_count == constants.node_labels_max) {
+                return bad(diag, "the node has more than 8 labels", .{}, "give at most 8");
+            }
+            flags.labels[flags.labels_count] = value;
+            flags.labels_count += 1;
         } else if (std.mem.eql(u8, arg, "--cpu-millis")) {
             flags.cpu_millis = try number_of(u32, args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--memory-bytes")) {
@@ -340,6 +536,14 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
         }
     }
     return flags;
+}
+
+fn tls_flag(flags: *Flags, arg: []const u8) ?*?[]const u8 {
+    if (std.mem.eql(u8, arg, "--ca")) return &flags.ca;
+    if (std.mem.eql(u8, arg, "--cert")) return &flags.cert;
+    if (std.mem.eql(u8, arg, "--key")) return &flags.key;
+    if (std.mem.eql(u8, arg, "--tls-name")) return &flags.tls_name;
+    return null;
 }
 
 fn is_flag(arg: []const u8, long: []const u8, short: []const u8) bool {
@@ -577,6 +781,19 @@ fn absolute_state_dir(
     return arena.dupe(u8, buffer[0..length]) catch error.OutOfMemory;
 }
 
+/// The path is published with the node (`/nodes/<node>.trust_policy`) as typed, so it must name
+/// the file wherever it is read: absolute, and printable ASCII (the record's text rule).
+fn check_trust_path(path: []const u8, diag: *Diag) Error!void {
+    for (path) |byte| if (!text_util.is_printable(byte)) {
+        const fix = "move the policy to a path of printable ASCII";
+        return bad(diag, "the --trust-policy path is not printable ASCII", .{}, fix);
+    };
+    if (path.len == 0 or path[0] != '/') {
+        const fix = "give the policy's absolute path: the node publishes it as typed";
+        return bad(diag, "the --trust-policy path {s} is not absolute", .{path}, fix);
+    }
+}
+
 fn bad(diag: *Diag, comptime cause: []const u8, args: anytype, fix: []const u8) Error {
     assert(diag.code == null);
     diag.raise(.E0505);
@@ -590,6 +807,19 @@ const testing = std.testing;
 fn expect_bad(result: anytype, diag: *const Diag) !void {
     try testing.expectError(error.BadConfig, result);
     try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0505), diag.code);
+}
+
+test "a --trust-policy path is absolute and printable, or it is refused" {
+    // Goal: the published path names the file on any reader's terms (review B5 slice 2). Method:
+    // an absolute path passes; a relative one, an empty one and one with a control byte are E0505.
+    var diag: Diag = undefined;
+    diag.reset();
+    try check_trust_path("/etc/zcube/trust.zon", &diag);
+    const inputs = [_][]const u8{ "trust.zon", "./trust.zon", "", "/etc/zcube/\x07.zon" };
+    for (inputs) |input| {
+        diag.reset();
+        try expect_bad(check_trust_path(input, &diag), &diag);
+    }
 }
 
 test "the server address is an IP address and a port, and nothing else" {
@@ -828,4 +1058,153 @@ test "peer_advertise from a configuration file is checked like the flag" {
     }
     try testing.expect(is_unspecified(try IpAddress.parse("::ffff:0.0.0.0", 1)));
     try testing.expect(!is_unspecified(try IpAddress.parse("::ffff:10.0.0.1", 1)));
+}
+
+test "the TLS settings: --ca alone or with --cert and --key, from flags or the file (B7)" {
+    // Goal: docs/mtls.md, the agent's client settings. Method: none given is plain HTTP; --ca
+    // with the default name; the file's settings; then each refusal.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const empty: File = .{};
+    try testing.expect(try tls_of(try parse_flags(&.{}, &diag), empty, &diag) == null);
+    const ca_only = (try tls_of(try parse_flags(&.{ "--ca", "ca.crt" }, &diag), empty, &diag)).?;
+    try testing.expectEqualStrings("ca.crt", ca_only.ca);
+    try testing.expectEqualStrings("zcube-server", ca_only.server_name);
+    try testing.expect(ca_only.cert == null);
+    const zon = ".{ .ca = \"c\", .cert = \"n.crt\", .key = \"n.key\", .tls_name = \"api.x\" }";
+    const file = try parse_file(arena, zon, "agent.zon", &diag);
+    const from_file = (try tls_of(try parse_flags(&.{}, &diag), file, &diag)).?;
+    try testing.expectEqualStrings("n.key", from_file.key.?);
+    try testing.expectEqualStrings("api.x", from_file.server_name);
+    const refusals = [_][]const []const u8{
+        &.{ "--cert", "n.crt", "--key", "n.key" },
+        &.{ "--tls-name", "api.x" },
+        &.{ "--ca", "c", "--cert", "n.crt" },
+        &.{ "--ca", "c", "--key", "n.key" },
+        &.{ "--ca", "c", "--tls-name", "not a name" },
+    };
+    for (refusals) |args| {
+        diag.reset();
+        try expect_bad(tls_of(try parse_flags(args, &diag), empty, &diag), &diag);
+    }
+}
+
+test "labels beside the file's are checked on their own, and compared as sets" {
+    // Goal: B6 slice 3's review (SHOULD 1). Method: flags that a length-and-subset comparison
+    // alone would let through beside a file's labels.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base = [_][]const u8{
+        "--node",         "node1",   "--server",     "127.0.0.1:7070",
+        "--state-dir",    "/tmp",    "--cpu-millis", "1000",
+        "--memory-bytes", "1000000", "--images",     "fixtures/images.zon",
+    };
+    const text = ".{ .labels = .{ \"exclusive=tenant\", \"tenant=a\" } }";
+    const file = try parse_file(arena, text, "agent.zon", &diag);
+    var flags: Flags = undefined;
+    // Beside the file, the flags are still checked, and the comparison is set equality: the
+    // same number of labels but another one, a flag given twice, a flag of the wrong shape.
+    const beside_file = [_][]const []const u8{
+        &.{ "--label", "tenant=b", "--label", "exclusive=tenant" }, // same length, other set
+        &.{ "--label", "tenant=a", "--label", "tenant=a" }, // a flag twice
+        &.{ "--label", "tenant", "--label", "exclusive=tenant" }, // malformed
+    };
+    for (beside_file) |extra| {
+        var argv: [base.len + 4][]const u8 = undefined;
+        @memcpy(argv[0..base.len], &base);
+        @memcpy(argv[base.len..], extra);
+        diag.reset();
+        flags = try parse_flags(&argv, &diag);
+        try expect_bad(merge(arena, std.testing.io, flags, file, &diag), &diag);
+    }
+}
+
+test "node labels come from --label or .labels, are checked, and may not disagree" {
+    // Goal: B6 slice 3's ruling. Method: labels by flag, by file, by both (the same set in another
+    // order is fine; a different set is refused), and each shape the check refuses.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base = [_][]const u8{
+        "--node",         "node1",   "--server",     "127.0.0.1:7070",
+        "--state-dir",    "/tmp",    "--cpu-millis", "1000",
+        "--memory-bytes", "1000000", "--images",     "fixtures/images.zon",
+    };
+    const two = base ++ [_][]const u8{ "--label", "tenant=a", "--label", "exclusive=tenant" };
+    const flagged = (try load(arena, std.testing.io, &two, &diag)).run;
+    try testing.expectEqual(@as(usize, 2), flagged.labels.len);
+    try testing.expectEqualStrings("exclusive=tenant", flagged.labels[1]);
+    const none = (try load(arena, std.testing.io, &base, &diag)).run;
+    try testing.expectEqual(@as(usize, 0), none.labels.len);
+
+    const text = ".{ .labels = .{ \"exclusive=tenant\", \"tenant=a\" } }";
+    const file = try parse_file(arena, text, "agent.zon", &diag);
+    var flags = try parse_flags(&two, &diag);
+    const same = try merge(arena, std.testing.io, flags, file, &diag);
+    try testing.expectEqual(@as(usize, 2), same.labels.len);
+    flags = try parse_flags(&(base ++ [_][]const u8{ "--label", "tenant=b" }), &diag);
+    try expect_bad(merge(arena, std.testing.io, flags, file, &diag), &diag);
+    diag.reset();
+    flags = try parse_flags(&base, &diag);
+    const from_file = try merge(arena, std.testing.io, flags, file, &diag);
+    try testing.expectEqualStrings("exclusive=tenant", from_file.labels[0]);
+
+    const refused = [_][]const []const u8{
+        &.{"tenant"}, // no '='
+        &.{"=a"}, // no key
+        &.{ "tenant=a", "tenant=b" }, // a key twice
+        &.{"exclusive=tenant"}, // exclusive names a key the node lacks
+        &.{"tenant=a\x01"}, // not printable
+        &.{ "a=1", "b=1", "c=1", "d=1", "e=1", "f=1", "g=1", "h=1", "i=1" }, // nine
+        &.{"k=" ++ @as([127]u8, @splat('v'))}, // 129 bytes
+        &.{@as([33]u8, @splat('k')) ++ "=v"}, // a key of 33 bytes: no job could require it
+    };
+    for (refused) |labels| {
+        diag.reset();
+        try expect_bad(check_labels(labels, &diag), &diag);
+    }
+    diag.reset();
+    try check_labels(&.{"k=" ++ @as([126]u8, @splat('v'))}, &diag);
+    try check_labels(&.{@as([32]u8, @splat('k')) ++ "=v"}, &diag);
+    var nine: [base.len + 18][]const u8 = undefined;
+    @memcpy(nine[0..base.len], &base);
+    for (0..9) |index| {
+        nine[base.len + 2 * index] = "--label";
+        nine[base.len + 2 * index + 1] = "k=v";
+    }
+    diag.reset();
+    try expect_bad(parse_flags(&nine, &diag), &diag);
+}
+
+test "the TLS paths are made absolute for the fetch child, as the state directory is (B7)" {
+    // Goal: the fetch child runs elsewhere, so a relative --ca, --cert or --key must reach it
+    // absolute. Method: relative paths gain the working directory; an absolute one is kept.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    try testing.expect(try tls_absolute(arena, testing.io, null, &diag) == null);
+    const given: Tls = .{
+        .ca = "ca.crt",
+        .cert = "d/n.crt",
+        .key = "/k/n.key",
+        .server_name = "s",
+    };
+    const got = (try tls_absolute(arena, testing.io, given, &diag)).?;
+    try testing.expect(std.fs.path.isAbsolute(got.ca));
+    try testing.expect(std.mem.endsWith(u8, got.ca, "/ca.crt"));
+    try testing.expect(std.mem.endsWith(u8, got.cert.?, "/d/n.crt"));
+    try testing.expect(std.fs.path.isAbsolute(got.cert.?));
+    try testing.expectEqualStrings("/k/n.key", got.key.?);
+    try testing.expectEqualStrings("s", got.server_name);
+    try testing.expect(diag.code == null);
 }

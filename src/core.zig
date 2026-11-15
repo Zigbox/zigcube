@@ -22,8 +22,12 @@ pub const modules = .{
     @import("agent_state.zig"),
     @import("allocations.zig"),
     @import("api.zig"),
+    @import("api_scope.zig"),
     @import("auditor.zig"),
     @import("job_api.zig"),
+    @import("job_cert.zig"),
+    @import("job_trust.zig"),
+    @import("job_trust_fixture.zig"),
     @import("apply.zig"),
     @import("chunk_summary.zig"),
     @import("mtls_smoke.zig"),
@@ -45,6 +49,7 @@ pub const modules = .{
     @import("peer.zig"),
     @import("peer_ca.zig"),
     @import("peer_limit.zig"),
+    @import("pem.zig"),
     @import("peer_serve.zig"),
     @import("records.zig"),
     @import("replica_controller.zig"),
@@ -57,6 +62,7 @@ pub const modules = .{
     @import("runtime.zig"),
     @import("sim_c0.zig"),
     @import("sim_c1.zig"),
+    @import("sim_certs.zig"),
     @import("evidence.zig"),
     @import("why_acceptance.zig"),
     @import("c1_teeth.zig"),
@@ -70,6 +76,7 @@ pub const modules = .{
     @import("sim_runtime.zig"),
     @import("sim_store.zig"),
     @import("sim_tap.zig"),
+    @import("sim_trust.zig"),
     @import("sim_world.zig"),
     @import("store.zig"),
     @import("store_failures.zig"),
@@ -79,11 +86,13 @@ pub const modules = .{
     @import("testing/history.zig"),
     @import("text.zig"),
     @import("tls_client.zig"),
+    @import("tls_server.zig"),
     @import("tls_schedule.zig"),
     @import("tls_wire.zig"),
     @import("x509.zig"),
     @import("x509_der.zig"),
     @import("x509_identity.zig"),
+    @import("x509_p256.zig"),
     @import("why.zig"),
     @import("writers.zig"),
 };
@@ -151,6 +160,7 @@ test "the X.509 tests are in this root" {
     // import their tests; they use no file, clock or environment.
     _ = @import("x509_test.zig");
     _ = @import("x509_foreign_test.zig");
+    _ = @import("x509_p256_test.zig");
 }
 
 test "the TLS key schedule and record layer tests are in this root" {
@@ -168,6 +178,7 @@ test {
     // because a `-Dtest-filter` on a TLS test name hides tests inside a named one. The scripted
     // server they use is a fixture and is imported only here.
     _ = @import("tls_client_test.zig");
+    _ = @import("tls_server_test.zig");
     _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
     _ = @import("scheduler_test.zig");

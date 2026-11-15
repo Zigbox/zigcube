@@ -38,6 +38,7 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
 const retention = @import("retention.zig");
+const scheduler = @import("scheduler.zig");
 const pull_retention = @import("pull_retention.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
@@ -159,6 +160,9 @@ const Item = struct {
     number: u32,
     /// The status of the lost node the replica is placed on, once its grace has passed.
     lost: ?*const Entry(records.NodeStatus) = null,
+    /// B6: the `/nodes` record of the node the replica is placed on, when its labels now refuse
+    /// a replica (it was registered again as `exclusive`): the replica is replaced elsewhere.
+    refused: ?*const Entry(records.Node) = null,
 };
 
 const ServicePlan = struct {
@@ -247,6 +251,10 @@ const Run = struct {
                 .number = number,
             };
             item.class = classify_one(&replica.rec, &service.rec, observed);
+            if (item.class == .live or item.class == .held) {
+                item.refused = run.refused_placement(replica.rec.id);
+                if (item.refused != null) item.class = .dead;
+            }
             if (item.class == .live) {
                 item.lost = run.lost_placement(replica.rec.id);
                 if (item.lost != null) item.class = .dead;
@@ -283,6 +291,20 @@ const Run = struct {
         }
         const status = run.snap.status_of(entry.rec.node) orelse return null;
         if (status.rec.state != .ready) return null;
+        return entry;
+    }
+
+    /// The `/nodes` record of the node `replica` is placed on, if its labels refuse a replica of a
+    /// service (B6, docs/briefs/b6.md P1): a node registered again with `exclusive` holds no
+    /// service, so the replica is removed and replaced on a node that takes it. Registration is
+    /// the agent's write and cannot move the replica itself (writers.zig), so this is the first
+    /// revision that can.
+    fn refused_placement(run: *Run, replica: []const u8) ?*const Entry(records.Node) {
+        // Test-only fault (sim-c1-teeth-relabel_kept): a relabelled node keeps its replicas.
+        if (c1_teeth.relabel_kept) return null;
+        const node = run.snap.node_of(replica) orelse return null;
+        const entry = run.snap.node_entry(node) orelse return null;
+        if (!scheduler.refuses(entry.rec.labels, &.{})) return null;
         return entry;
     }
 
@@ -485,6 +507,11 @@ const Run = struct {
     fn removal_phrase(run: *Run, item: *const Item) Error![]const u8 {
         const id = item.replica.rec.id;
         if (item.class == .stale) return controller.format(run.ctx, "{s}", .{id});
+        if (item.refused) |node| {
+            return controller.format(run.ctx, "{s} on {s}, which no longer takes it", .{
+                id, node.rec.name,
+            });
+        }
         if (item.lost) |status| {
             const node = status.kv.key[records.prefix_node_status.len..];
             return controller.format(run.ctx, "{s} lost with node {s}", .{ id, node });
@@ -496,6 +523,7 @@ const Run = struct {
 
     /// The decision and the delete for a replica whose container ended.
     fn remove_dead(run: *Run, batch: *Batch, item: *const Item) Error!DecisionId {
+        if (item.refused) |node| return run.remove_refused(batch, item.replica, node);
         if (item.lost) |status| return run.remove_lost(batch, item.replica, status);
         const observed = item.observed.?;
         const replica = item.replica;
@@ -560,6 +588,38 @@ const Run = struct {
         const placed = run.snap.assigned_of(replica.rec.id).?;
         batch.expect(placed.kv.key, placed.kv.mod_revision);
         try run.expect_node_judged(batch, node);
+        batch.delete(replica.kv.key);
+        return id;
+    }
+
+    /// The decision and the delete for a replica whose node now refuses it (B6): `stop_replica`,
+    /// so the scheduler releases the assignment as it does a scaled-down replica's. Compared: the
+    /// replica, its assignment and the node's `/nodes` record whose labels were read (once per
+    /// node per batch).
+    fn remove_refused(
+        run: *Run,
+        batch: *Batch,
+        replica: *const ReplicaEntry,
+        node: *const Entry(records.Node),
+    ) Error!DecisionId {
+        const reason = try controller.format(run.ctx, "{s} is on node {s}, which was registered " ++
+            "again with labels that do not take a service replica ({s}); it is being removed " ++
+            "and replaced under a new id", .{
+            replica.rec.id, node.rec.name, try labels_text(run.ctx, node.rec.labels),
+        });
+        const id = try controller.put_decision(run.ctx, &run.rc.source, .{
+            .actor = actor,
+            .action = "stop_replica",
+            .subject = .{ .kind = .replica, .name = replica.rec.id },
+            .reason = reason,
+            .cause = .{ .kind = .observed, .key = node.kv.key, .revision = node.kv.mod_revision },
+        }, batch);
+        batch.expect(replica.kv.key, replica.kv.mod_revision);
+        const placed = run.snap.assigned_of(replica.rec.id).?;
+        batch.expect(placed.kv.key, placed.kv.mod_revision);
+        for (batch.compares[0..batch.compares_count]) |compare| {
+            if (std.mem.eql(u8, compare.key, node.kv.key)) break;
+        } else batch.expect(node.kv.key, node.kv.mod_revision);
         batch.delete(replica.kv.key);
         return id;
     }
@@ -880,6 +940,7 @@ fn judged_by_status(observed: *const Entry(records.Observed)) bool {
 /// The node whose status and `/nodes` record the removal of `item` compares: the lost node, or the
 /// ready one an exit report came from.
 fn judged_node(item: *const Item) ?[]const u8 {
+    if (item.refused) |node| return node.rec.name;
     if (item.lost) |status| return status.kv.key[records.prefix_node_status.len..];
     const observed = item.observed orelse return null;
     if (item.class != .dead) return null;
@@ -952,6 +1013,16 @@ fn stale_behind(plan: *const ServicePlan, service: *const Entry(records.Service)
 
 fn plural(count: u32, one: []const u8, many: []const u8) []const u8 {
     return if (count == 1) one else many;
+}
+
+/// A node's labels as one line for a reason, `a=1, b=2`.
+fn labels_text(ctx: *const Context, labels: []const []const u8) Error![]const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    for (labels, 0..) |label, index| {
+        if (index > 0) text.appendSlice(ctx.arena, ", ") catch return nomem(ctx);
+        text.appendSlice(ctx.arena, label) catch return nomem(ctx);
+    }
+    return text.items;
 }
 
 fn nomem(ctx: *const Context) error{NoCapacity} {

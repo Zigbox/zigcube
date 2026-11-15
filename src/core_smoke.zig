@@ -18,6 +18,8 @@ const store = @import("store.zig");
 const writers = @import("writers.zig");
 const MemoryStore = @import("store_memory.zig").MemoryStore;
 const runtime = @import("runtime.zig");
+const job_trust = @import("job_trust.zig");
+const trust_fixture = @import("job_trust_fixture.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -38,6 +40,9 @@ pub const Step = enum(u32) {
     runtime_types,
     render_zc,
     render_zbx,
+    /// B5: a policy refuses an unsigned job with ZBX-E0905 and admits one its key signed.
+    trust_refuses_unsigned,
+    trust_admits_signed,
 };
 
 pub const Report = struct {
@@ -95,6 +100,32 @@ fn scenario(gpa: Allocator, report: *Report) Failure!void {
     try lease_lapses(report, s, arena, &manual, &diag);
     try compaction_refuses(report, s, &diag);
     try render_diagnostics(report, &diag);
+    try trust_admission(report, gpa, arena);
+}
+
+/// B5's admission check in the module: Ed25519 signing and verifying, the policy parser and
+/// the verdict, which the browser build would use as the server does.
+fn trust_admission(report: *Report, gpa: Allocator, arena: Allocator) Failure!void {
+    var fixture = trust_fixture.Fixture.init(gpa) catch
+        return fail(report, .trust_refuses_unsigned);
+    defer fixture.deinit(gpa);
+    fixture.trust_keys(&.{7}, true) catch return fail(report, .trust_refuses_unsigned);
+    const config = fixture.config();
+    var image_buffer: [67]u8 = undefined;
+    const image = trust_fixture.image(&image_buffer, 1);
+    const bare: job_trust.Job = .{ .image = image, .source = "", .signatures = &.{} };
+    const unsigned = job_trust.admit(&config, arena, bare) catch
+        return fail(report, .trust_refuses_unsigned);
+    const refused_ok = switch (unsigned) {
+        .refused => |diagnostic| std.mem.eql(u8, diagnostic.code.slice(), "ZBX-E0905"),
+        else => false,
+    };
+    try check(report, .trust_refuses_unsigned, refused_ok);
+    const line = fixture.sign_tree(arena, 7, 1) catch return fail(report, .trust_admits_signed);
+    const job: job_trust.Job = .{ .image = image, .source = "", .signatures = &.{line} };
+    const signed = job_trust.admit(&config, arena, job) catch
+        return fail(report, .trust_admits_signed);
+    try check(report, .trust_admits_signed, signed == .admitted);
 }
 
 fn fail(report: *Report, step: Step) Failure {

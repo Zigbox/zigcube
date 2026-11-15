@@ -69,6 +69,11 @@ const shell_allowlist = [_][]const u8{
     // demo-b3's guest half (docs/demos/b3.md), for the same reason: it starts the agent and a test
     // upstream as root and reads logs and listeners.
     "ops/demo-b3/guest.sh",
+    // demo-b5's guest half (docs/demos/b5.md), for the same reason: it signs with `zbx`, writes
+    // the node's trust policy, starts the agent as root and lists the runtime's containers. Its
+    // test runs it against a fake `zbx` in `zig build test`.
+    "ops/demo-b5/guest.sh",
+    "ops/demo-b5/test-guest.sh",
     // The owner's one-off recipe for demo-c2's two GHCR images (ops/demo-c2-images): it runs on
     // the owner's machine with docker and a registry login, never in a build or test, and is a
     // list of `docker buildx` calls; the build has no docker to drive from Zig.
@@ -618,11 +623,16 @@ fn import_allowed(importing_path: []const u8, target: []const u8) bool {
         return std.mem.eql(u8, importing_path, "src/agent.zig") or
             std.mem.eql(u8, importing_path, "src/c1_teeth.zig") or
             std.mem.eql(u8, importing_path, "src/fetch_plan.zig") or
+            std.mem.eql(u8, importing_path, "src/fake_supervisor.zig") or
+            std.mem.eql(u8, importing_path, "src/relay.zig") or
             std.mem.eql(u8, importing_path, "src/zcube_agent.zig");
     }
     // The scripted TLS server is a test fixture (docs/briefs/mtls-client.md): only test roots
-    // may import it, so no shipped binary can link it.
+    // may import it, so no shipped binary can link it. The scripted client likewise.
     if (std.mem.endsWith(u8, target, "tls_testpeer.zig")) return testpeer_importer(importing_path);
+    if (std.mem.endsWith(u8, target, "tls_testclient.zig")) {
+        return testclient_importer(importing_path);
+    }
     for (module_allowlist) |name| {
         if (std.mem.eql(u8, name, target)) return true;
     }
@@ -648,7 +658,15 @@ fn import_allowed(importing_path: []const u8, target: []const u8) bool {
 fn testpeer_importer(path: []const u8) bool {
     if (std.mem.endsWith(u8, path, "_test.zig")) return true;
     if (std.mem.eql(u8, path, "src/cli_golden.zig")) return true; // A test root.
+    // agent-smoke's TLS upstream: in the smoke's executable only, never in a product.
+    if (std.mem.eql(u8, path, "src/smoke_tls_upstream.zig")) return true;
     return std.mem.eql(u8, path, "src/tls_fuzz.zig");
+}
+
+/// The files that may import `tls_testclient.zig`: test files and the server's fuzzer.
+fn testclient_importer(path: []const u8) bool {
+    if (std.mem.endsWith(u8, path, "_test.zig")) return true;
+    return std.mem.eql(u8, path, "src/tls_server_fuzz.zig");
 }
 
 pub fn check_source(report: *Report, path: []const u8, source: []const u8) void {
@@ -693,9 +711,14 @@ fn print_violations(out: *std.Io.Writer, path: []const u8, report: *const Report
 /// runs in that gate, so the gate would pass without it.
 const teeth_root = "src/mtls_teeth.zig";
 
-/// Files with `teeth:` tests that belong to another gate (the store history checker's, run by
-/// `zig build test`), so `teeth_root` does not import them.
-const teeth_other_gates = [_][]const u8{"src/testing/history.zig"};
+/// Files with `teeth:` tests that belong to another gate (the store history checker's, B5's
+/// admission check's and the node's check of B5, run by `zig build test`), so `teeth_root` does
+/// not import them.
+const teeth_other_gates = [_][]const u8{
+    "src/testing/history.zig",
+    "src/job_trust.zig",
+    "src/agent_jobs_test.zig",
+};
 
 /// True when `source` (the file at `path`) has a `teeth:` test that `root_source` does not
 /// import and no other gate owns.
@@ -927,7 +950,7 @@ test "imports: std and in-repo files pass; escapes, absolute paths and packages 
     try testing.expectEqual(@as(u32, 4), report.total());
 }
 
-test "imports: the scripted TLS server is imported only from test roots" {
+test "imports: the scripted TLS server and client are imported only from test roots" {
     // Goal: no shipped module can link the test peer. Method: the same import from a test file,
     // the fuzzer and ordinary modules.
     const source = "const p = @import(\"tls_testpeer.zig\");\n";
@@ -941,6 +964,18 @@ test "imports: the scripted TLS server is imported only from test roots" {
     for (cases) |case| {
         var report: Report = .{};
         check_source(&report, case.path, source);
+        try testing.expectEqual(!case.allowed, report.contains(.import_not_allowed, 1));
+    }
+    const client_source = "const c = @import(\"tls_testclient.zig\");\n";
+    const client_cases = [_]struct { path: []const u8, allowed: bool }{
+        .{ .path = "src/tls_server_test.zig", .allowed = true },
+        .{ .path = "src/tls_server_fuzz.zig", .allowed = true },
+        .{ .path = "src/tls_server.zig", .allowed = false },
+        .{ .path = "src/zcube_server.zig", .allowed = false },
+    };
+    for (client_cases) |case| {
+        var report: Report = .{};
+        check_source(&report, case.path, client_source);
         try testing.expectEqual(!case.allowed, report.contains(.import_not_allowed, 1));
     }
 }

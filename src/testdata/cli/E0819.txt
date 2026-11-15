@@ -1,5 +1,5 @@
 error[ZC-E0819]: a certificate is of another kind than this use needs
-  cause  node2's certificate is a client certificate; this use needs a server
+  cause  node2's certificate is a workload certificate; this use needs a server
          certificate
   fix    give the peer a certificate issued for its role (docs/mtls.md)
   more   zcube explain E0819 · rerun with --verbose for the full cause chain

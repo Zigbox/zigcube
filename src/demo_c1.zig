@@ -106,6 +106,8 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
             .images = "",
             .store = "",
             .transcript_path = options.transcript,
+            // B7 slice 6: the demo talks to the TLS listener only, with certificates.
+            .tls_only = true,
             .lease_ttl_ms = state.ttl_text,
         },
         .work = "",
@@ -151,13 +153,21 @@ fn run(demo: *Demo) u8 {
         demo.fleet.dump_logs();
         ok = false;
     };
+    // Before the cleanup, which kills everything: what an ended container left running.
+    const orphaned = demo.fleet.orphans() catch 1;
     const started = pids_started(demo);
     host.cleanup();
     demo.fleet.cleanup();
     local.stop_all(demo);
     host.section("Cleanup");
-    const left = (demo.fleet.survivors() catch 1) + (local.procs(host).supervisors() catch 1) +
+    const left = (demo.fleet.survivors() catch 1) + (local.procs(host).survivors() catch 1) +
         local.live_count(host) + still_running(demo, started);
+    if (orphaned == 0) {
+        host.say("  ok: no ended container left a process running", .{});
+    } else {
+        host.say("  FAILED: {d} processes outlived the containers that started them", .{orphaned});
+        ok = false;
+    }
     if (left == 0) {
         host.say("  ok: every process the demo started is gone (agents, supervisors, ...)", .{});
     } else {
@@ -229,9 +239,10 @@ fn step_start(demo: *Demo) !void {
         return host.fail("could not empty the Postgres schema before the run", .{});
     };
     try host.start_server(state.start_wait_ms);
-    host.say("  zcube-server is up on 127.0.0.1:{d}, store {s}, lease ttl {d} ms", .{
-        host.port, demo.backend, state.ttl_ms,
+    host.say("  zcube-server is up on 127.0.0.1:{d} ({s}), store {s}, lease ttl {d} ms", .{
+        host.port, host.listener_text(), demo.backend, state.ttl_ms,
     });
+    try host.check_tls_only();
     try demo.fleet.start_proxy();
     for (0..fleet_mod.count) |index| try demo.fleet.start_agent(index);
     host.say("  three zcube-agents (FakeRuntime) started; node1 reaches the server through a " ++

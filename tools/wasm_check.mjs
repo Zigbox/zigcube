@@ -83,7 +83,13 @@ if (simSwarm) {
 
 if (simCluster) {
   // Same contract as --sim: the native report arrives as a file; the two must be equal byte for byte.
+  // After the native report: `--signed` (B5's trust world) and the worlds, `strong`, `tenants` or
+  // `strong,tenants` (B6), in any order.
   const [wasmPath, seedText, operationsText, nodesText, livenessText, profileText, nativePath] = process.argv.slice(3);
+  const rest = process.argv.slice(10);
+  const signed = rest.includes("--signed");
+  const worldsText = rest.filter((word) => !word.startsWith("--")).join(",");
+  const worlds = worldsText.split(",");
   const exports = await instantiate(readFileSync(wasmPath));
   const started = Date.now();
   const failed = exports.zcube_sim_cluster_shaped(
@@ -95,8 +101,12 @@ if (simCluster) {
     profileIndex(CLUSTER_PROFILES, profileText),
     0,
     0,
+    // sim-c1 runs the strong world (B4 slice 3 fixes), as build.zig's native run does.
+    simC1 || worlds.includes("strong") ? 1 : 0,
+    signed ? 1 : 0,
+    worlds.includes("tenants") ? 1 : 0,
   );
-  const label = simC1 ? "sim-c1" : "sim-cluster";
+  const label = simC1 ? (signed ? "sim-c1 --signed" : "sim-c1") : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_cluster_report_ptr(), exports.zcube_cluster_report_len());
   const wasmText = new TextDecoder().decode(rendered);
@@ -107,7 +117,7 @@ if (simCluster) {
     console.error(wasmText);
     process.exit(1);
   }
-  console.log(`${label}: seed ${seedText}: native and wasm agree byte for byte (${wasmText.length} bytes; ${operationsText} operations, nodes ${nodesText === "0" ? "by seed" : nodesText}, liveness ${livenessText}; wasm ${seconds} s)`);
+  console.log(`${label}: seed ${seedText}: native and wasm agree byte for byte (${wasmText.length} bytes; ${operationsText} operations, nodes ${nodesText === "0" ? "by seed" : nodesText}, liveness ${livenessText}${worldsText === "" ? "" : ", " + worldsText}; wasm ${seconds} s)`);
   process.exit(0);
 }
 

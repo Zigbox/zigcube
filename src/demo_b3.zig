@@ -79,6 +79,8 @@ pub fn main(init: std.process.Init) u8 {
         .peer_ports = @splat(0),
         .out = &vm_out.interface,
         .limit = 1,
+        // build.zig gzips the Debug agent: it is over the 8 MiB a route may serve.
+        .agent_gzipped = true,
     };
     // Only guest 1 boots, and it forwards its peer port: a free host port, unused by the demo.
     guests.peer_ports[0] = demo_host.free_port(init.io, @as(u64, host.port) * 31 + 1) catch
@@ -105,6 +107,8 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
             .images = "",
             .store = "",
             .transcript_path = options.transcript,
+            // B7 slice 6: the server serves TLS only; the guest's agent has a node certificate.
+            .tls_only = true,
         },
         .work = "",
         .state = "",
@@ -130,10 +134,12 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
         host.port,
     }));
     host.config.store = try std.fmt.allocPrint(arena, "sqlite:{s}/store.db", .{host.work});
-    // The relay `botpike` and where it leads, as the agent (on the guest) reaches it.
+    // The relay `botpike` and where it leads, as the agent (on the guest) reaches it: the plain
+    // test upstream, `.plain = true`, which only the Debug server and agent this demo runs accept
+    // (until B4 slice 4 brings TLS to the zigbox runtime's relay; build.zig, `built_debug`).
     const config_path = try host.path_in_work("server.zon");
     const config_text = try std.fmt.allocPrint(arena,
-        \\.{{ .relays = .{{ .botpike = .{{ .address = "{s}" }} }} }}
+        \\.{{ .relays = .{{ .botpike = .{{ .address = "{s}", .plain = true }} }} }}
         \\
     , .{script.upstream});
     try cwd.writeFile(init.io, .{ .sub_path = config_path, .data = config_text });

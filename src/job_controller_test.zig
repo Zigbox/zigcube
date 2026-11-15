@@ -16,6 +16,7 @@ const writers = @import("writers.zig");
 const ManualClock = @import("clock.zig").ManualClock;
 const MemoryStore = @import("store_memory.zig").MemoryStore;
 const Diag = @import("diag.zig").Diag;
+const trust_fixture = @import("job_trust_fixture.zig");
 
 const Fixture = struct {
     manual: ManualClock,
@@ -315,6 +316,43 @@ test "a job's resolved relay is carried into its run" {
     const relay = (try f.read_run("ask")).?.relay.?;
     try testing.expectEqualStrings("echo", relay.name);
     try testing.expectEqualStrings("127.0.0.1:9", relay.address);
+}
+
+test "a job's signatures are carried into its run, byte for byte (B5)" {
+    // Goal: the node's check of B5 slice 2 reads the signatures from the run, so the run must
+    // carry the job's lines unchanged (PR #241 review). Method: a job with four real envelopes
+    // (each a JSON object full of quotes) and one without; one pass; the runs read back through
+    // `records.read` hold the same lines in the same order, and none for the unsigned job.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var signer = try trust_fixture.Fixture.init(testing.allocator);
+    defer signer.deinit(testing.allocator);
+    // Not the fixture's arena, which every call resets.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var lines: [4][]const u8 = undefined;
+    for (&lines, 0..) |*line, index| {
+        line.* = try signer.sign_manifest(arena_state.allocator(), @intCast(3 + index), 1, 9);
+        try testing.expect(std.mem.indexOfScalar(u8, line.*, '"') != null);
+    }
+    const signed: records.Job = .{
+        .name = "signed",
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+        .deadline_ms = 60 * 1000,
+        .submit_by_ms = f.manual.ms,
+        .created_at_ms = f.manual.ms,
+        .signatures = &lines,
+    };
+    try f.put(.api, records.job_key("signed").slice(), signed);
+    try f.job("plain", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 2), try f.pass());
+    const run = (try f.read_run("signed")).?;
+    const carried = run.signatures orelse return error.TestRunHasNoSignatures;
+    try testing.expectEqual(lines.len, carried.len);
+    for (lines, carried) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expect((try f.read_run("plain")).?.signatures == null);
 }
 
 test "a job that has a job_created decision and no run is contradictory and never started" {
