@@ -52,6 +52,7 @@ const records = @import("records.zig");
 const store = @import("store.zig");
 const writers = @import("writers.zig");
 const text_util = @import("text.zig");
+const mesh_plan = @import("mesh_plan.zig");
 
 const Context = controller.Context;
 const peer = @import("peer.zig");
@@ -147,6 +148,7 @@ pub fn route(
     if (std.mem.eql(u8, what, "pulls")) return call.pull();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
     if (std.mem.eql(u8, what, "credential")) return call.credential();
+    if (std.mem.eql(u8, what, "mesh")) return call.mesh();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
 }
 
@@ -395,6 +397,28 @@ const Call = struct {
         }
         const pair = try call.chain();
         return reply(ctx, .{ .revision = all.revision, .kvs = mine.items, .chain = pair });
+    }
+
+    // ---- GET /v1/agent/nodes/{node}/mesh ----
+
+    /// The node's view of the mesh (C4 slice 4): every service, and the replicas whose rules on
+    /// this node depend on (`mesh_plan.input_for`), each with its readiness as the plan judges
+    /// it, at one revision. The agent plans from it as the server would (`mesh_plan.plan`).
+    fn mesh(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("GET");
+        try call.only_known();
+        try call.no_more();
+        const snapshot = controller.read_snapshot(ctx) catch return propagate(ctx);
+        const all = mesh_plan.input_of(ctx.arena, &snapshot) catch return no_memory(ctx);
+        const view = mesh_plan.input_for(ctx.arena, &all, call.node) catch return no_memory(ctx);
+        const pair = try call.chain();
+        return reply(ctx, .{
+            .revision = snapshot.revision,
+            .services = view.services,
+            .replicas = view.replicas,
+            .chain = pair,
+        });
     }
 
     // ---- GET /v1/agent/nodes/{node}/assigned ----

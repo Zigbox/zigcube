@@ -40,6 +40,8 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const agent_jobs = @import("agent_jobs.zig");
+const agent_mesh = @import("agent_mesh.zig");
+const mesh_plan = @import("mesh_plan.zig");
 const c1_teeth = @import("c1_teeth.zig");
 const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
@@ -106,6 +108,9 @@ pub const Context = struct {
     /// The agent's image store, for the summary it publishes as `/node-store/<node>`. Null
     /// publishes none (the tests that do not look at locality).
     images: ?node_store.Images = null,
+    /// Where a step reads the node's view of the mesh (C4 slice 4). Null gives no replica a
+    /// mesh (the simulator, and the tests that do not look at it).
+    mesh: ?agent_mesh.Source = null,
 
     pub fn mono_ms(ctx: *const Context) u64 {
         const clock = ctx.mono orelse ctx.clock;
@@ -140,6 +145,8 @@ pub const Config = struct {
     /// `HOST:PORT` of the node's peer server, as other nodes' fetches reach it; borrowed.
     peer: []const u8 = "",
     agent_version: []const u8 = "0.0.0",
+    /// The node's mesh ports and address (`agent_mesh.Config`); null gives no replica a mesh.
+    mesh: ?agent_mesh.Config = null,
 };
 
 /// The state file that holds the lease, in the agent's state directory.
@@ -252,6 +259,8 @@ pub const Agent = struct {
     pull_drops: u32,
     pull_drop_text: [pull_drop_text_bytes]u8,
     pull_drop_len: u8,
+    /// The mesh rules last sent to each local replica (`agent_mesh.Sent`).
+    mesh_sent: agent_mesh.Sent,
 
     const store_refusal_text_bytes = 160;
     const pull_drop_text_bytes = 200;
@@ -328,6 +337,7 @@ pub const Agent = struct {
         agent.steps = 0;
         agent.input_failure_run = 0;
         agent.input_failure_len = 0;
+        agent.mesh_sent = .{};
     }
 
     /// Notes that the server holds `run`'s `running` report (`running_reported`).
@@ -498,6 +508,14 @@ pub const Agent = struct {
         kept.stage(agent, ctx, "remove orphan records", pass.orphan_records());
         if (kept.stopped) return acted;
         acted += kept.run(agent, ctx, "flush the reports", pass.flush());
+        if (kept.stopped) return acted;
+        const plan = if (pass.mesh) |*known| known else return acted;
+        acted += kept.run(agent, ctx, "send the mesh rules", agent_mesh.update(
+            agent,
+            ctx,
+            listings,
+            plan,
+        ));
         return acted;
     }
 
@@ -551,6 +569,7 @@ pub const Agent = struct {
             .node_key = records.node_key(agent.config.node),
         };
         if (!kept.stopped) kept.stage(agent, ctx, "read the replicas and assignments", pass.load());
+        if (!kept.stopped) pass.mesh = try agent_mesh.plan_now(agent, ctx);
         // A failed loading leaves nothing loaded: no replica is reconciled, and the job pass's
         // subjects come from the listings and the start records alone.
         if (kept.stopped) assert(pass.given.len == 0);
@@ -1097,6 +1116,10 @@ const Pass = struct {
     observed: []const controller.Entry(records.Observed) = &.{},
     writes: std.ArrayList(Write) = .empty,
     node_key: records.Key = undefined,
+    /// The step's mesh plan for the node; null without a mesh or when the view was not read.
+    mesh: ?mesh_plan.Plan = null,
+    /// Mesh ports given to replicas started in this step, not yet in any listing.
+    mesh_ports: std.ArrayList(u16) = .empty,
 
     fn load(pass: *Pass) Error!void {
         const ctx = pass.ctx.as_controller();
@@ -1197,7 +1220,7 @@ const Pass = struct {
         if (listing) |found| {
             if (!is_this_replica(found, item)) return pass.replace_stale(found, item, seen);
             pass.agent.forget_stop(found.handle.name());
-            try pass.report(replica, seen, found.status);
+            try pass.report(replica, seen, found);
         } else if (seen) |record| {
             if (record.status != .stopped) try pass.report_lost(replica, record);
         } else {
@@ -1253,9 +1276,10 @@ const Pass = struct {
         pass: *Pass,
         replica: *const records.Replica,
         seen: ?*const records.Observed,
-        status: runtime.Status,
+        listing: *const runtime.Listing,
     ) Error!void {
         const now = pass.ctx.clock.now_ms();
+        const status = listing.status;
         var wanted: records.Observed = .{
             .replica = replica.id,
             .node = pass.agent.config.node,
@@ -1264,6 +1288,11 @@ const Pass = struct {
             .started_at_ms = if (seen) |record| record.started_at_ms orelse now else now,
             .reported_at_ms = now,
         };
+        if (pass.agent.config.mesh != null) {
+            if (agent_mesh.port_of(listing)) |port| {
+                wanted.endpoint = try agent_mesh.endpoint_text(pass.agent, pass.ctx, port);
+            }
+        }
         switch (status) {
             .starting => wanted.status = .starting,
             .running => {},
@@ -1327,11 +1356,22 @@ const Pass = struct {
         assert(replica.id.len > 0);
         var created_buffer: [20]u8 = undefined;
         const created = created_text(&created_buffer, created_revision);
-        const labels = [_]runtime.Label{
+        const plan = if (pass.mesh) |*known| known else null;
+        const ports = &pass.mesh_ports;
+        const listings = pass.listings;
+        const mesh = try agent_mesh.for_start(pass.agent, ctx, listings, plan, ports, replica.id);
+        var labels_buffer = [_]runtime.Label{
             .{ .key = runtime.label_replica, .value = replica.id },
             .{ .key = runtime.label_image, .value = replica.image },
             .{ .key = runtime.label_created, .value = created },
+            .{ .key = agent_mesh.label_port, .value = "" },
         };
+        const given: ?agent_mesh.Start = switch (mesh) {
+            .given => |chosen| chosen,
+            else => null,
+        };
+        if (given) |chosen| labels_buffer[3].value = chosen.label;
+        const labels = labels_buffer[0 .. @as(usize, 3) + @intFromBool(given != null)];
         const env = ctx.arena.alloc(runtime.EnvVar, replica.env.len) catch
             return failures.no_memory(ctx.diag);
         for (replica.env, env) |pair, *slot| slot.* = .{ .name = pair[0], .value = pair[1] };
@@ -1345,7 +1385,8 @@ const Pass = struct {
                 .cpu_millis = replica.limits.cpu_millis,
                 .memory_bytes = replica.limits.memory_bytes,
             },
-            .labels = &labels,
+            .labels = labels,
+            .mesh = if (given) |chosen| .{ .port = chosen.port, .rules = chosen.rules } else null,
         };
         const now = ctx.clock.now_ms();
         var observed: records.Observed = .{
@@ -1357,9 +1398,17 @@ const Pass = struct {
             .reported_at_ms = now,
         };
         if (runtime.spec_problem(&spec) != null) return pass.unstartable(&observed, replica);
+        if (mesh == .no_port) {
+            const failure = try agent_mesh.no_port_failure(pass.agent, ctx);
+            try pass.apply_exit(&observed, .{ .start_failed = failure });
+            return pass.put_observed(observed);
+        }
         const outcome = try ctx.runtime.start(&spec, ctx.diag);
         switch (outcome) {
-            .started => {},
+            .started => if (given) |chosen| {
+                observed.endpoint = chosen.endpoint;
+                pass.agent.mesh_sent.note(replica.id, runtime.mesh_rules_hash(&chosen.rules));
+            },
             .failed => |failure| try pass.apply_exit(&observed, .{ .start_failed = failure }),
         }
         try pass.put_observed(observed);
@@ -1522,9 +1571,16 @@ pub fn is_running(listing: ?*const runtime.Listing) bool {
 }
 
 /// Whether two observed records say the same thing about the container.
+fn same_text(first: ?[]const u8, second: ?[]const u8) bool {
+    const left = first orelse return second == null;
+    const right = second orelse return false;
+    return std.mem.eql(u8, left, right);
+}
+
 fn same_state(first: *const records.Observed, second: *const records.Observed) bool {
     if (first.status != second.status) return false;
     if (first.generation != second.generation) return false;
+    if (!same_text(first.endpoint, second.endpoint)) return false;
     if ((first.exit == null) != (second.exit == null)) return false;
     if (first.exit) |left| {
         if (!left.equal(second.exit.?)) return false;

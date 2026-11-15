@@ -56,6 +56,7 @@ const records = @import("records.zig");
 const Clock = @import("clock.zig").Clock;
 const fencing = @import("fencing.zig");
 const store = @import("store.zig");
+const mesh_plan = @import("mesh_plan.zig");
 const verified = @import("store_verified.zig");
 
 const Allocator = std.mem.Allocator;
@@ -227,6 +228,40 @@ pub const RemoteStore = struct {
 
     fn from(context: *anyopaque) *RemoteStore {
         return @ptrCast(@alignCast(context));
+    }
+
+    // ---- The mesh view (C4 slice 4) ----
+
+    /// The node's view of the mesh, `GET .../mesh` (agent_api.zig), checked before the agent
+    /// plans from it: a reply `mesh_plan.plan` would assert on is a bad reply, not a crash.
+    pub fn mesh_input(
+        remote: *RemoteStore,
+        arena: Allocator,
+        diag: *Diag,
+    ) store.Error!mesh_plan.Input {
+        const target = try remote.path(arena, "/mesh", diag);
+        const reply = try remote.exchange(arena, .{ .method = "GET", .target = target }, diag);
+        if (reply.status != 200) return refused(arena, reply, diag);
+        const Answer = struct {
+            services: []const mesh_plan.Service,
+            replicas: []const mesh_plan.Replica,
+        };
+        const answer = try parse(Answer, arena, reply.body, diag);
+        const input: mesh_plan.Input = .{
+            .services = answer.services,
+            .replicas = answer.replicas,
+        };
+        if (mesh_plan.input_problem(&input)) |problem| return bad(diag, problem);
+        return input;
+    }
+
+    /// `agent.Context.mesh`'s fetch, for a `RemoteStore` as its context.
+    pub fn mesh_fetch_fn(
+        context: *anyopaque,
+        arena: Allocator,
+        diag: *Diag,
+    ) store.Error!mesh_plan.Input {
+        return from(context).mesh_input(arena, diag);
     }
 
     // ---- The wait ----

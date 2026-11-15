@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
 const mesh_address = @import("mesh_address.zig");
@@ -367,6 +368,69 @@ pub fn find_service(input: *const Input, name: []const u8) ?*const Service {
     return &input.services[index];
 }
 
+/// Why an input from elsewhere (the agent's reply from the server) is not one `plan` may take:
+/// what `assert_input` and the plan's own assertions hold, checked rather than assumed.
+pub fn input_problem(input: *const Input) ?[]const u8 {
+    if (input.services.len > constants.services_max) return "it holds too many services";
+    if (input.replicas.len > constants.replicas_max) return "it holds too many replicas";
+    for (input.services, 0..) |*service, index| {
+        if (service.name.len == 0) return "a service has no name";
+        if (service.name.len > constants.service_name_bytes_max) return "a service's name is long";
+        if (service.mesh_address) |address| {
+            if (address.len == 0 or address.len > constants.mesh_address_text_bytes_max) {
+                return "a service's mesh address is not one";
+            }
+        }
+        if (service.allow.len > constants.service_allow_max) return "a service has many grants";
+        if (endpoints_counted(input, service.name) > constants.replicas_per_service_max) {
+            return "a service has more endpoints than it may have replicas";
+        }
+        if (index > 0 and std.mem.order(u8, input.services[index - 1].name, service.name) != .lt) {
+            return "the services are not in order of name, each once";
+        }
+        for (service.allow, 0..) |grant, at| {
+            if (grant.from.len == 0) return "a grant has no source";
+            const long = grant.from.len > constants.service_name_bytes_max;
+            if (long) return "a grant's source is long";
+            if (std.mem.eql(u8, grant.from, service.name)) return "a service grants itself";
+            if (grant.port == 0 or grant.port > std.math.maxInt(u16)) {
+                return "a grant's port is not a port";
+            }
+            for (service.allow[0..at]) |before| {
+                if (std.mem.eql(u8, before.from, grant.from) and before.port == grant.port) {
+                    return "a service holds a grant twice";
+                }
+            }
+        }
+    }
+    for (input.replicas, 0..) |*replica, index| {
+        if (replica.id.len == 0) return "a replica has no id";
+        if (find_service(input, replica.service) == null) return "a replica's service is missing";
+        if (replica.node == null and replica.readiness != .not_assigned) {
+            return "a replica on no node is not unassigned";
+        }
+        if (replica.endpoint) |endpoint| {
+            if (endpoint.len == 0 or endpoint.len > constants.mesh_endpoint_bytes_max) {
+                return "a replica's endpoint is not one";
+            }
+        }
+        if (index > 0 and !replica_less({}, input.replicas[index - 1], replica.*)) {
+            return "the replicas are not in order, each once";
+        }
+    }
+    return null;
+}
+
+fn endpoints_counted(input: *const Input, service: []const u8) u32 {
+    var count: u32 = 0;
+    for (input.replicas) |*replica| {
+        if (!std.mem.eql(u8, replica.service, service)) continue;
+        if (replica.node == null) continue;
+        count += @intFromBool(exclusion_of(replica) == null);
+    }
+    return count;
+}
+
 fn assert_input(input: *const Input) void {
     for (input.services, 0..) |service, index| {
         assert(service.name.len > 0);
@@ -695,6 +759,8 @@ pub fn rules_of(
         .listeners = listeners.items,
         .accepts = accepts.items,
     };
+    // The bounds hold from the input's (`input_problem`): services, grants, a service's
+    // endpoints and every text within what a supervisor takes.
     assert(runtime.mesh_rules_problem(&rules) == null);
     return rules;
 }
@@ -1201,4 +1267,27 @@ test "mesh plan: input_of drains removed and moved copies, drops stopped ones an
     try testing.expectEqualStrings("n2", found.endpoints[0].node);
     try testing.expectEqual(@as(usize, 2), found.excluded.len);
     for (found.excluded) |item| try testing.expectEqual(Exclusion.draining, item.exclusion);
+}
+
+test "mesh plan: input_problem refuses what the plan would assert on" {
+    // Goal: each refusal once, from a good input broken one field at a time.
+    var services = demo_services();
+    const replicas = [_]Replica{ready("db-1", "db", "n1", "10.0.0.1:7000")};
+    const good: Input = .{ .services = &services, .replicas = &replicas };
+    try testing.expect(input_problem(&good) == null);
+    const unknown = [_]Replica{ready("x-1", "nope", "n1", "10.0.0.1:7000")};
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &unknown }) != null);
+    var nowhere = replicas;
+    nowhere[0].node = null;
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &nowhere }) != null);
+    const twice = [_]Replica{ replicas[0], replicas[0] };
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &twice }) != null);
+    const self_grant = [_]records.Grant{.{ .from = services[0].name, .port = 1 }};
+    services[0].allow = &self_grant;
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &replicas }) != null);
+    const big_port = [_]records.Grant{.{ .from = "web", .port = 70000 }};
+    services[0].allow = &big_port;
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &replicas }) != null);
+    const backwards = [_]Service{ services[1], services[0] };
+    try testing.expect(input_problem(&.{ .services = &backwards, .replicas = &.{} }) != null);
 }

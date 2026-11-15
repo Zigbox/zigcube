@@ -330,6 +330,7 @@ fn plan_once(faults: mesh_plan.Faults, seed: u64) !void {
         try accepts_hold(&input, &plan, node);
         // C4 slice 4: the node's view plans the same, and each replica's rules are its share.
         const view = try mesh_plan.input_for(arena, &input, node);
+        try std.testing.expect(mesh_plan.input_problem(&view) == null);
         try std.testing.expectEqualDeep(plan, try mesh_plan.plan_with(arena, &view, node, faults));
         try rules_hold(arena, &input, &plan, node);
     }
