@@ -46,7 +46,20 @@ pub const SimNode = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .mesh_update = mesh_update_impl,
     };
+
+    fn mesh_update_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        rules: *const runtime.MeshRules,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const node = from(context);
+        if (node.crashed) return node.dead(diag);
+        // No crash point: the agent's sends of mesh rules do not move a world's crashes.
+        return node.containers.interface().mesh_update(handle, rules, diag);
+    }
 
     pub fn init(
         node: *SimNode,

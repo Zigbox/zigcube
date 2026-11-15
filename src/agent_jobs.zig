@@ -1334,6 +1334,7 @@ pub fn raise_spec(diag: *Diag, run: []const u8, problem: runtime.SpecProblem) vo
             "network: {s} has a relay, so its network must be loopback only",
             .{run},
         ),
+        .bad_mesh => diag.cause("mesh: {s} has a mesh port of 0 or ill-formed rules", .{run}),
     }
     diag.fix(.{ .sentence = "submit the job again with that field corrected, and report this " ++
         "with the diagnostic bundle: the API should have refused it" });

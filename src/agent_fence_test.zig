@@ -289,7 +289,18 @@ const SourceSpy = struct {
         .inspect = on_inspect,
         .list = on_list,
         .events = on_events,
+        .mesh_update = on_mesh_update,
     };
+
+    fn on_mesh_update(
+        context: *anyopaque,
+        handle: rt.Handle,
+        rules: *const rt.MeshRules,
+        diag: *Diag,
+    ) rt.Error!void {
+        const self = me(context);
+        return self.inner.vtable.mesh_update(self.inner.context, handle, rules, diag);
+    }
 
     fn me(context: *anyopaque) *SourceSpy {
         return @ptrCast(@alignCast(context));

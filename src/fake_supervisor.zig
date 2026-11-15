@@ -30,6 +30,8 @@ const relay_tls = @import("relay_tls.zig");
 const secure_random = @import("secure_random.zig");
 const runtime = @import("runtime.zig");
 const job_cert = @import("job_cert.zig");
+const fake_mesh = @import("fake_mesh.zig");
+const Mesh = fake_mesh.Mesh;
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -141,6 +143,12 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
         .flags = std.posix.SA.RESTART,
     };
     std.posix.sigaction(.USR1, &relay_fault, null);
+    const mesh_rules: std.posix.Sigaction = .{
+        .handler = .{ .handler = fake_mesh.on_rules },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.USR2, &mesh_rules, null);
     const own_pid: i32 = @intCast(std.os.linux.getpid());
     files.write_pid(io, dir, files.file_supervisor, own_pid) catch
         return constants.exit_environment;
@@ -304,12 +312,31 @@ fn supervise(
             .failed => |over| if (!fault_run_unrelayed) return record(io, dir, over),
         }
     }
-    const ending = run_command(init, dir, spec, &environ, relay);
+    // The mesh port is bound before the command runs, so a port another process holds is a
+    // start failure (ZC-E0710), not a replica nobody can reach; its thread starts after the spawn.
+    var mesh: ?*Mesh = null;
+    if (spec.mesh_port) |port| {
+        mesh = Mesh.open(init.gpa, dir.handle, port) catch |err| {
+            if (relay) |open| open.stop();
+            return record(io, dir, failed(.mesh, mesh_cause(err)));
+        };
+    }
+    const ending = run_command(init, dir, spec, &environ, .{ .relay = relay, .mesh = mesh });
     // Cleared first: after `stop` the number may name another file.
     relay_listener.store(-1, .seq_cst);
     if (relay) |open| open.stop();
+    if (mesh) |open| open.stop();
     const over = ending orelse return constants.exit_environment;
     return record(io, dir, over);
+}
+
+fn mesh_cause(err: fake_mesh.OpenError) []const u8 {
+    return switch (err) {
+        error.SocketFailed => "the socket for the mesh port could not be made",
+        error.BindFailed => "the mesh port could not be bound: another process holds it",
+        error.ListenFailed => "the mesh port could not listen",
+        error.PipeFailed => "the mesh's wake pipe could not be made",
+    };
 }
 
 const RelayOpening = union(enum) { opened: *Relay, failed: files.RunFile };
@@ -421,16 +448,20 @@ fn relay_failed(cause: []const u8) RelayOpening {
     return .{ .failed = failed(.relay, cause) };
 }
 
-/// Spawns the command, starts the relay (the supervisor is single-threaded until the command has
-/// been spawned) and waits for the command; how it ended, or null if the supervisor itself broke.
+/// What serves the command beside it: a job's relay, a replica's mesh.
+const Serving = struct { relay: ?*Relay = null, mesh: ?*Mesh = null };
+
+/// Spawns the command, starts the relay and the mesh (the supervisor is single-threaded until the
+/// command has been spawned) and waits for it; how it ended, or null if the supervisor broke.
 fn run_command(
     init: std.process.Init,
     dir: Dir,
     spec: *const files.SpecFile,
     environ: *std.process.Environ.Map,
-    relay: ?*Relay,
+    serving: Serving,
 ) ?files.RunFile {
     const io = init.io;
+    const relay = serving.relay;
     var child = std.process.spawn(io, .{
         .argv = spec.command,
         .environ_map = environ,
@@ -446,6 +477,10 @@ fn run_command(
     }
     if (relay) |open| open.run() catch {
         // Without a relay thread the command has a listener nobody serves: end it.
+        _ = std.os.linux.kill(pid, .KILL);
+    };
+    if (serving.mesh) |open| open.start() catch {
+        // A replica whose mesh is not served would be one nobody can reach and nothing reports.
         _ = std.os.linux.kill(pid, .KILL);
     };
     // Without its pid file nobody can find the command to stop it, so it ends here, by the same

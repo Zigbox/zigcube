@@ -364,6 +364,10 @@ pub const fixtures_bytes_max: u32 = 16 * 1024;
 pub const fake_start_timeout_ms: u32 = 10 * 1000;
 /// The pause between looks while `start` waits and while `events` waits.
 pub const fake_poll_ms: u32 = 10;
+/// How often a fake runtime's supervisor reads its mesh rules again with no `SIGUSR2` (one
+/// that came before its handler stood, or after an agent restart), and tries again to bind a
+/// listener that failed (C4 slice 4). Internal to the fake runtime.
+pub const fake_mesh_poll_ms: u32 = 250;
 /// Containers kept in the state directory, running or not. A start past this drops the oldest
 /// stopped one first; with none to drop it is ZC-E0502.
 pub const fake_containers_max: u32 = runtime_handles_max;

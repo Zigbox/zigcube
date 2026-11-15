@@ -123,7 +123,66 @@ pub const Spec = struct {
     network: Network = .host,
     /// Must include `label_replica`.
     labels: []const Label,
+    /// C4: the replica's place on the mesh, null if it has none (a job, or an agent with the mesh
+    /// off). Its supervisor takes mesh connections on `port` of the node and applies `rules`
+    /// until `Runtime.mesh_update` replaces them. A port that cannot be bound fails the start
+    /// with ZC-E0710.
+    mesh: ?Mesh = null,
 };
+
+/// C4 slice 4 (O2): a replica's mesh port and its first rules.
+pub const Mesh = struct {
+    port: u16,
+    rules: MeshRules,
+};
+
+/// What one replica's supervisor does on the mesh: the listeners it holds inside its container
+/// (one per granted destination and port, on the destination's mesh address) and the
+/// connections it takes on its mesh port. `mesh_plan.zig` compiles them; the agent sends each
+/// supervisor its own. The supervisor's data path is C4 slice 6.
+pub const MeshRules = struct {
+    /// The destinations its listeners forward to, each with its endpoints in the order this
+    /// replica tries them (`mesh_plan.Destination.pick`).
+    destinations: []const MeshDestination = &.{},
+    /// In ascending order of (destination, port), each pair once.
+    listeners: []const MeshListener = &.{},
+    /// In ascending order of (from, port), each pair once.
+    accepts: []const MeshAccept = &.{},
+};
+
+pub const MeshDestination = struct {
+    service: []const u8,
+    /// Its mesh address, `127.77.<hi>.<lo>`, the same in every container.
+    address: []const u8,
+    endpoints: []const MeshEndpoint,
+};
+
+pub const MeshEndpoint = struct {
+    replica: []const u8,
+    /// `<host>:<port>`: the mesh port of the replica's supervisor.
+    endpoint: []const u8,
+};
+
+pub const MeshListener = struct {
+    /// Index into `MeshRules.destinations`.
+    destination: u32,
+    port: u16,
+};
+
+pub const MeshAccept = struct {
+    /// The source service a grant names.
+    from: []const u8,
+    port: u16,
+    /// Whether it takes new connections: the replica is ready and not draining.
+    open: bool,
+};
+
+/// Bounds of one replica's rules, from the cluster's: each destination is a service, each
+/// listener a grant of one, and each accept a grant on the replica's own service.
+pub const mesh_destinations_max: u32 = constants.services_max;
+pub const mesh_listeners_max: u32 = constants.services_max * constants.service_allow_max;
+pub const mesh_accepts_max: u32 = constants.service_allow_max;
+pub const mesh_endpoints_max: u32 = constants.replicas_per_service_max;
 
 /// Why a container ended. `oom` and `pid_limit` are produced once Zigbox has cgroups (M2).
 pub const ExitReason = union(enum) {
@@ -194,6 +253,12 @@ pub const Runtime = struct {
             timeout_ms: u32,
             diag: *Diag,
         ) Error![]const StatusChange,
+        mesh_update: *const fn (
+            context: *anyopaque,
+            handle: Handle,
+            rules: *const MeshRules,
+            diag: *Diag,
+        ) Error!void,
     };
 
     /// Starts a container and returns once its command is running, or says why it could not.
@@ -264,6 +329,24 @@ pub const Runtime = struct {
         assert(changes.len <= constants.runtime_events_batch_max);
         return changes;
     }
+
+    /// Hands a running container's supervisor new mesh rules, which replace the ones it has,
+    /// and returns at once (C4, O2): it never waits for them to be applied. The supervisor
+    /// applies the newest rules it has been given, so a caller that sends twice need not wait
+    /// between. A container that has stopped, or was started without `Spec.mesh`, ignores
+    /// them. An unknown handle is `NotFound`; rules that cannot be handed over are
+    /// `RuntimeFailed` (ZC-E0711 from a runtime that has no mesh), and the caller sends them
+    /// again later.
+    pub fn mesh_update(
+        runtime: Runtime,
+        handle: Handle,
+        rules: *const MeshRules,
+        diag: *Diag,
+    ) Error!void {
+        assert(diag.code == null);
+        assert(mesh_rules_problem(rules) == null);
+        try finish(diag, runtime.vtable.mesh_update(runtime.context, handle, rules, diag));
+    }
 };
 
 /// A failed call always leaves a diagnostic behind; a successful one never does.
@@ -305,6 +388,7 @@ pub const SpecProblem = enum {
     too_many_labels,
     bad_label,
     missing_replica_label,
+    bad_mesh,
 };
 
 /// Null if the spec is well formed. A bad spec is a programmer error: the API validates a
@@ -320,6 +404,10 @@ pub fn spec_problem(spec: *const Spec) ?SpecProblem {
     if (spec.env.len > constants.runtime_env_count_max) return .too_many_env;
     if (spec.labels.len > constants.runtime_labels_max) return .too_many_labels;
     if (spec.relay.len > 0 and spec.network != .loopback) return .relay_network_open;
+    if (spec.mesh) |*mesh| {
+        if (mesh.port == 0) return .bad_mesh;
+        if (mesh_rules_problem(&mesh.rules) != null) return .bad_mesh;
+    }
     var has_replica = false;
     for (spec.labels) |label| {
         if (label.key.len == 0) return .bad_label;
@@ -329,6 +417,97 @@ pub fn spec_problem(spec: *const Spec) ?SpecProblem {
         if (std.mem.eql(u8, label.key, label_replica)) has_replica = true;
     }
     if (!has_replica) return .missing_replica_label;
+    return null;
+}
+
+/// A hash of everything in `rules`, the same on every target (Wyhash): equal rules hash equal,
+/// so the agent sends a supervisor rules only when this changes, and the simulated runtime keeps
+/// it in place of the rules.
+pub fn mesh_rules_hash(rules: *const MeshRules) u64 {
+    var hasher = std.hash.Wyhash.init(0x6d657368); // "mesh"
+    hash_count(&hasher, rules.destinations.len);
+    for (rules.destinations) |*destination| {
+        hash_text(&hasher, destination.service);
+        hash_text(&hasher, destination.address);
+        hash_count(&hasher, destination.endpoints.len);
+        for (destination.endpoints) |endpoint| {
+            hash_text(&hasher, endpoint.replica);
+            hash_text(&hasher, endpoint.endpoint);
+        }
+    }
+    hash_count(&hasher, rules.listeners.len);
+    for (rules.listeners) |listener| {
+        hash_count(&hasher, listener.destination);
+        hash_count(&hasher, listener.port);
+    }
+    hash_count(&hasher, rules.accepts.len);
+    for (rules.accepts) |accept| {
+        hash_text(&hasher, accept.from);
+        hash_count(&hasher, accept.port);
+        hash_count(&hasher, @intFromBool(accept.open));
+    }
+    return hasher.final();
+}
+
+fn hash_count(hasher: *std.hash.Wyhash, count: u64) void {
+    hasher.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, count)));
+}
+
+/// Length first, so that no two lists of texts run together into the same bytes.
+fn hash_text(hasher: *std.hash.Wyhash, text: []const u8) void {
+    hash_count(hasher, text.len);
+    hasher.update(text);
+}
+
+pub const MeshRulesProblem = enum {
+    too_many,
+    bad_destination,
+    bad_endpoint,
+    bad_listener,
+    bad_accept,
+    out_of_order,
+};
+
+/// Null if `rules` are well formed: within the bounds above, every listener names a destination,
+/// no port is 0, and listeners and accepts are in order, each once. The agent builds rules only
+/// from `mesh_plan`'s plan, so a problem is a programmer error.
+pub fn mesh_rules_problem(rules: *const MeshRules) ?MeshRulesProblem {
+    if (rules.destinations.len > mesh_destinations_max) return .too_many;
+    if (rules.listeners.len > mesh_listeners_max) return .too_many;
+    if (rules.accepts.len > mesh_accepts_max) return .too_many;
+    for (rules.destinations) |*destination| {
+        if (destination.service.len == 0) return .bad_destination;
+        if (destination.service.len > name_bytes_max) return .bad_destination;
+        if (destination.address.len == 0) return .bad_destination;
+        if (destination.address.len > constants.mesh_address_text_bytes_max) {
+            return .bad_destination;
+        }
+        if (destination.endpoints.len > mesh_endpoints_max) return .too_many;
+        for (destination.endpoints) |endpoint| {
+            if (endpoint.replica.len == 0) return .bad_endpoint;
+            if (endpoint.endpoint.len == 0) return .bad_endpoint;
+            if (endpoint.endpoint.len > constants.mesh_endpoint_bytes_max) return .bad_endpoint;
+        }
+    }
+    for (rules.listeners, 0..) |listener, index| {
+        if (listener.port == 0) return .bad_listener;
+        if (listener.destination >= rules.destinations.len) return .bad_listener;
+        if (index == 0) continue;
+        const before = rules.listeners[index - 1];
+        const order = std.math.order(before.destination, listener.destination)
+            .differ() orelse std.math.order(before.port, listener.port);
+        if (order != .lt) return .out_of_order;
+    }
+    for (rules.accepts, 0..) |accept, index| {
+        if (accept.port == 0) return .bad_accept;
+        if (accept.from.len == 0) return .bad_accept;
+        if (accept.from.len > name_bytes_max) return .bad_accept;
+        if (index == 0) continue;
+        const before = rules.accepts[index - 1];
+        const order = std.mem.order(u8, before.from, accept.from)
+            .differ() orelse std.math.order(before.port, accept.port);
+        if (order != .lt) return .out_of_order;
+    }
     return null;
 }
 
@@ -386,6 +565,103 @@ test "a spec needs a name, an image, a command and the replica label" {
     try testing.expectEqual(SpecProblem.bad_label, spec_problem(&bad).?);
 }
 
+const mesh_test_destinations: []const MeshDestination = &.{
+    .{ .service = "cache", .address = "127.77.0.2", .endpoints = &.{} },
+    .{
+        .service = "db",
+        .address = "127.77.0.3",
+        .endpoints = &.{.{ .replica = "db-1", .endpoint = "10.0.0.2:30000" }},
+    },
+};
+
+const mesh_test_rules: MeshRules = .{
+    .destinations = mesh_test_destinations,
+    .listeners = &.{ .{ .destination = 0, .port = 6379 }, .{ .destination = 1, .port = 5432 } },
+    .accepts = &.{
+        .{ .from = "batch", .port = 80, .open = true },
+        .{ .from = "web", .port = 80, .open = false },
+    },
+};
+
+test "mesh rules: listeners name a destination, ports are not 0, both lists in order" {
+    // Goal: each rule of `mesh_rules_problem` once. Method: start from good rules and break one
+    // field at a time.
+    const good = mesh_test_rules;
+    try testing.expect(mesh_rules_problem(&good) == null);
+    try testing.expect(mesh_rules_problem(&.{}) == null);
+    var bad = good;
+    bad.listeners = &.{.{ .destination = 2, .port = 6379 }};
+    try testing.expectEqual(MeshRulesProblem.bad_listener, mesh_rules_problem(&bad).?);
+    bad.listeners = &.{.{ .destination = 0, .port = 0 }};
+    try testing.expectEqual(MeshRulesProblem.bad_listener, mesh_rules_problem(&bad).?);
+    bad.listeners = &.{ .{ .destination = 1, .port = 1 }, .{ .destination = 0, .port = 2 } };
+    try testing.expectEqual(MeshRulesProblem.out_of_order, mesh_rules_problem(&bad).?);
+    bad.listeners = &.{ .{ .destination = 1, .port = 1 }, .{ .destination = 1, .port = 1 } };
+    try testing.expectEqual(MeshRulesProblem.out_of_order, mesh_rules_problem(&bad).?);
+    bad = good;
+    bad.accepts = &.{ .{ .from = "web", .port = 80, .open = true }, .{
+        .from = "batch",
+        .port = 80,
+        .open = true,
+    } };
+    try testing.expectEqual(MeshRulesProblem.out_of_order, mesh_rules_problem(&bad).?);
+    bad.accepts = &.{.{ .from = "web", .port = 0, .open = true }};
+    try testing.expectEqual(MeshRulesProblem.bad_accept, mesh_rules_problem(&bad).?);
+    bad = good;
+    bad.destinations = &.{.{ .service = "db", .address = "", .endpoints = &.{} }};
+    bad.listeners = &.{};
+    try testing.expectEqual(MeshRulesProblem.bad_destination, mesh_rules_problem(&bad).?);
+    bad.destinations = &.{.{
+        .service = "db",
+        .address = repeat('1', constants.mesh_address_text_bytes_max + 1),
+        .endpoints = &.{},
+    }};
+    try testing.expectEqual(MeshRulesProblem.bad_destination, mesh_rules_problem(&bad).?);
+    bad.destinations = &.{.{
+        .service = "db",
+        .address = "127.77.0.3",
+        .endpoints = &.{.{ .replica = "db-1", .endpoint = "" }},
+    }};
+    try testing.expectEqual(MeshRulesProblem.bad_endpoint, mesh_rules_problem(&bad).?);
+}
+
+test "mesh rules: the hash tells rules apart; a spec's mesh needs a port and good rules" {
+    const good = mesh_test_rules;
+    const destinations = mesh_test_destinations;
+    try testing.expectEqual(mesh_rules_hash(&good), mesh_rules_hash(&good));
+    var changed = good;
+    changed.accepts = good.accepts[0..1];
+    try testing.expect(mesh_rules_hash(&changed) != mesh_rules_hash(&good));
+    changed = good;
+    changed.listeners = &.{
+        .{ .destination = 0, .port = 6379 },
+        .{ .destination = 1, .port = 5433 },
+    };
+    try testing.expect(mesh_rules_hash(&changed) != mesh_rules_hash(&good));
+    changed = good;
+    changed.destinations = &.{ destinations[0], .{
+        .service = "db",
+        .address = "127.77.0.3",
+        .endpoints = &.{},
+    } };
+    try testing.expect(mesh_rules_hash(&changed) != mesh_rules_hash(&good));
+
+    var spec: Spec = .{
+        .name = "web-1",
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+        .labels = &.{.{ .key = label_replica, .value = "web-1" }},
+        .mesh = .{ .port = 30_000, .rules = good },
+    };
+    try testing.expect(spec_problem(&spec) == null);
+    spec.mesh.?.port = 0;
+    try testing.expectEqual(SpecProblem.bad_mesh, spec_problem(&spec).?);
+    var bad = good;
+    bad.listeners = &.{.{ .destination = 2, .port = 6379 }};
+    spec.mesh = .{ .port = 30_000, .rules = bad };
+    try testing.expectEqual(SpecProblem.bad_mesh, spec_problem(&spec).?);
+}
+
 /// A runtime that starts nothing, to show the vtable is implementable and the wrappers hold.
 const Refusing = struct {
     fn runtime(self: *Refusing) Runtime {
@@ -399,7 +675,22 @@ const Refusing = struct {
         .inspect = inspect,
         .list = list,
         .events = events,
+        .mesh_update = mesh_update,
     };
+
+    fn mesh_update(
+        context: *anyopaque,
+        handle: Handle,
+        rules: *const MeshRules,
+        diag: *Diag,
+    ) Error!void {
+        _ = context;
+        _ = handle;
+        _ = rules;
+        diag.raise(.E0501);
+        diag.cause("no container by that name", .{});
+        return error.NotFound;
+    }
 
     fn start(context: *anyopaque, spec: *const Spec, diag: *Diag) Error!StartOutcome {
         _ = context;
@@ -483,6 +774,9 @@ test "a failed start is an outcome carrying a diagnostic; an unknown handle is a
     try testing.expectEqual(@as(@TypeOf(diag.code.?), .E0501), diag.code.?);
     diag.reset();
     try testing.expectError(error.NotFound, runtime.inspect(handle, &diag));
+    diag.reset();
+    try testing.expectError(error.NotFound, runtime.mesh_update(handle, &.{}, &diag));
+    try testing.expectEqual(@as(@TypeOf(diag.code.?), .E0501), diag.code.?);
 
     diag.reset();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
