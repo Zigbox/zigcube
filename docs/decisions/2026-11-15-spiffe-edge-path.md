@@ -1,7 +1,7 @@
 # The edge's SPIFFE ID is spiffe://<cluster>/edge/<node>
 
-*Proposed 2026-11-15 by the supervisor (C5 brief review, ruling R2). **Status: Proposed — owner to
-confirm.** Nothing implements it until the owner says yes.*
+*Proposed 2026-11-15 by the supervisor (C5 brief review, ruling R2). **Status: Accepted (owner,
+2026-11-15).** Nothing implements it until the owner says yes.*
 
 `2026-11-04-spiffe-service-path.md` fixed workloads at `spiffe://<cluster>/service/<name>` and says
 another path kind needs its own decision. C5's edge is a mesh caller that is not a service, so it

@@ -19,14 +19,18 @@ hand. It is a `workflow_dispatch` job.
   Cloudflare's authoritative nameservers answer with it; run the demo script against Let's
   Encrypt staging, then production; capture the transcript and a headless-Chromium screenshot as
   job artifacts; then delete the record and the VM, **even on failure** (an `always()` step).
-- **The token.** `CLOUDFLARE_DNS_TOKEN` is a secret of the GitHub Environment `demo-dns`
-  (deployments from `main` only, a required reviewer), not a repository secret: a Cloudflare API
+- **The token (option b only).** `CLOUDFLARE_DNS_TOKEN` is a secret of the GitHub Environment
+  `demo-dns` (deployments from `main` only, a required reviewer), not a repository secret: a Cloudflare API
   token with Zone DNS Edit on one zone only. Only the DNS create and delete steps see it (`env:`
   on those steps). The job never prints it and never puts it on a command line: it reaches `curl`
   through the environment or a 0600 file (`curl -H @file`).
-- **Owner to choose: a delegated subzone.** Delegate `demo.zigbox.org` to a zone of its own and
-  scope the token to it, so the token cannot edit the apex or the MX records. Cloudflare offers
-  subdomain zones only on some plans; otherwise the NS records point at another DNS host.
+- **Open, the owner's choice; not decided.** Either way, `demo.zigbox.org` is delegated to a zone
+  of its own. (a) *Recommended:* the NS records point at a GCP Cloud DNS zone, and CI writes the
+  record through the existing Workload Identity Federation, so CI holds no Cloudflare token.
+  (b) A zone-wide Cloudflare DNS-edit token, kept in the `demo-dns` Environment (main only, a
+  required reviewer) and exposed only to the DNS steps. A Cloudflare token cannot be scoped below
+  the zone without an Enterprise subdomain zone, so under (b) it can edit every record in that
+  zone, including the apex and the MX records.
 - **A nightly sweep** deletes records under `demo.zigbox.org` whose comment starts `zcube-demo` and
   that are over 6 hours old, and VMs labelled for the demo.
 - **Leave the zone alone.** The apex of zigbox.org is a Cloudflare Worker (the website
