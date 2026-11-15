@@ -1,4 +1,4 @@
-//! Tests for `x509.zig`: the three certificate kinds, verification, the order of its checks, and a
+//! Tests for `x509.zig`: the five certificate kinds, verification, the order of its checks, and a
 //! table of near-miss certificates, each one edit away from a good one, with the refusal it must
 //! get. No file, clock or environment, so it runs under WASI as well (`core.zig`).
 
@@ -37,7 +37,7 @@ pub fn sample_identity() identity_mod.Identity {
 pub fn workload_request(key: [32]u8) x509.WorkloadRequest {
     return .{
         .cluster = "prod.example",
-        .service = "broker-1",
+        .name = "broker-1",
         .subject_key = key,
         .identity = sample_identity(),
         .lifetime = window,
@@ -55,6 +55,21 @@ pub fn make_workload(out: *x509.Der) !void {
     try x509.issue_workload(out, try ca_pair(), &request);
 }
 
+pub const job_uri = "spiffe://prod.example/job/nightly-7";
+
+/// A run's certificate: the `/job/` path and the job's name.
+pub fn job_request(key: [32]u8, name: []const u8) x509.WorkloadRequest {
+    var request = workload_request(key);
+    request.path = .job;
+    request.name = name;
+    return request;
+}
+
+pub fn make_job(out: *x509.Der) !void {
+    const request = job_request(try subject_key(1), "nightly-7");
+    try x509.issue_workload(out, try ca_pair(), &request);
+}
+
 pub fn make_server(out: *x509.Der) !void {
     const request: x509.ServerRequest = .{
         .dns_name = "broker.botpike.com",
@@ -62,6 +77,33 @@ pub fn make_server(out: *x509.Der) !void {
         .lifetime = window,
     };
     try x509.issue_server(out, try ca_pair(), &request);
+}
+
+pub const node_uri = "spiffe://prod.example/node/node-1";
+pub const client_uri = "spiffe://prod.example/client/ops-1";
+
+pub fn node_request(key: [32]u8) x509.NodeRequest {
+    return .{ .cluster = "prod.example", .node = "node-1", .subject_key = key, .lifetime = window };
+}
+
+pub fn client_request(key: [32]u8, scope: x509.Scope) x509.ClientRequest {
+    return .{
+        .cluster = "prod.example",
+        .client = "ops-1",
+        .scope = scope,
+        .subject_key = key,
+        .lifetime = window,
+    };
+}
+
+pub fn make_node(out: *x509.Der) !void {
+    const request = node_request(try subject_key(3));
+    try x509.issue_node(out, try ca_pair(), &request);
+}
+
+pub fn make_client(out: *x509.Der) !void {
+    const request = client_request(try subject_key(4), .admin);
+    try x509.issue_client(out, try ca_pair(), &request);
 }
 
 test "the CA certificate parses, verifies against its own key and is deterministic" {
@@ -106,6 +148,33 @@ test "a workload certificate carries its SPIFFE ID, its identity and its key" {
     try testing.expectEqual(@as(u8, 0x5A), decoded.image_digest[0]);
 }
 
+test "a job certificate carries /job/<name>, its identity and its key" {
+    // Goal: B4's certificate says which run is calling. Method: issue, verify with the SPIFFE ID
+    // as the name, then with the service path of the same name, which must not match.
+    var certificate: x509.Der = .{};
+    try make_job(&certificate);
+    const bytes = certificate.slice();
+    const ca = try ca_pair();
+    const expect: x509.Expect = .{ .kind = .workload, .name = job_uri };
+    const parsed = try x509.verify(bytes, ca.public_key.toBytes(), now, expect);
+    try testing.expectEqualStrings("nightly-7", parsed.subject_cn.of(bytes));
+    try testing.expectEqualStrings(job_uri, parsed.name.of(bytes));
+    const decoded = try identity_mod.decode(parsed.identity.of(bytes));
+    try testing.expectEqual(@as(u64, 42), decoded.placement_epoch);
+    const service_name = "spiffe://prod.example/service/nightly-7";
+    try testing.expectError(error.WrongName, x509.verify(
+        bytes,
+        ca.public_key.toBytes(),
+        now,
+        .{ .kind = .workload, .name = service_name },
+    ));
+    var again: x509.Der = .{};
+    try x509.reencode(&again, bytes, &parsed);
+    try testing.expectEqualSlices(u8, bytes, again.slice());
+    var request = job_request(try subject_key(1), "Nightly");
+    try testing.expectError(error.BadServiceName, x509.issue_workload(&again, ca, &request));
+}
+
 test "a server certificate names one DNS name and nothing else" {
     // Goal: the server kind. Method: issue, verify with the name, then with another name and with
     // the workload kind.
@@ -129,6 +198,66 @@ test "a server certificate names one DNS name and nothing else" {
     ));
 }
 
+test "a node certificate carries its SPIFFE ID and the peer key, and no identity" {
+    // Goal: the node kind (B7). Method: issue, verify as a node with its ID, then as a workload and
+    // under another node's ID.
+    var certificate: x509.Der = .{};
+    try make_node(&certificate);
+    const bytes = certificate.slice();
+    const ca = (try ca_pair()).public_key.toBytes();
+    const parsed = try x509.verify(bytes, ca, now, .{ .kind = .node, .name = node_uri });
+    try testing.expectEqualStrings("node-1", parsed.subject_cn.of(bytes));
+    try testing.expectEqualSlices(u8, &(try subject_key(3)), parsed.public_key.of(bytes));
+    try testing.expectEqual(@as(usize, 0), parsed.identity.of(bytes).len);
+    try testing.expectError(
+        error.WrongUse,
+        x509.verify(bytes, ca, now, .{ .kind = .workload, .name = null }),
+    );
+    try testing.expectError(error.WrongName, x509.verify(
+        bytes,
+        ca,
+        now,
+        .{ .kind = .node, .name = "spiffe://prod.example/node/node-2" },
+    ));
+}
+
+test "a client certificate carries its SPIFFE ID and its scope" {
+    // Goal: the client kind (B7) and the scope field of the identity extension. Method: issue one
+    // per scope, verify as a client, read the scope back; a client is not a node or a workload.
+    const ca_keys = try ca_pair();
+    const ca = ca_keys.public_key.toBytes();
+    for ([_]x509.Scope{ .jobs, .admin }) |scope| {
+        var certificate: x509.Der = .{};
+        const request = client_request(try subject_key(4), scope);
+        try x509.issue_client(&certificate, ca_keys, &request);
+        const bytes = certificate.slice();
+        const parsed = try x509.verify(bytes, ca, now, .{ .kind = .client, .name = client_uri });
+        try testing.expectEqualStrings("ops-1", parsed.subject_cn.of(bytes));
+        try testing.expectEqual(scope, parsed.scope(bytes));
+        for ([_]x509.Kind{ .node, .workload, .server }) |kind| {
+            try testing.expectError(
+                error.WrongUse,
+                x509.verify(bytes, ca, now, .{ .kind = kind, .name = null }),
+            );
+        }
+    }
+}
+
+test "the writer refuses bad node and client names" {
+    // Goal: the new kinds' names are checked on the way in. Method: an empty name and one with an
+    // upper-case letter for each.
+    const ca = try ca_pair();
+    var out: x509.Der = .{};
+    for ([_][]const u8{ "", "Node-1", "a/b" }) |name| {
+        var node = node_request(try subject_key(3));
+        node.node = name;
+        try testing.expectError(error.BadNodeName, x509.issue_node(&out, ca, &node));
+        var client = client_request(try subject_key(4), .jobs);
+        client.client = name;
+        try testing.expectError(error.BadClientName, x509.issue_client(&out, ca, &client));
+    }
+}
+
 test "the largest certificate the writer makes fits the size limit" {
     // Goal: `x509_cert_bytes_max` is not a guess. Method: the longest cluster and service names,
     // the largest label set `validate` allows, issued and parsed; the size is asserted with room.
@@ -146,7 +275,7 @@ test "the largest certificate the writer makes fits the size limit" {
     }
     var request = workload_request(try subject_key(1));
     request.cluster = cluster;
-    request.service = service;
+    request.name = service;
     request.identity.labels = &labels;
     request.lifetime = .{
         .not_before_ms = 2_600_000_000_000,
@@ -164,10 +293,12 @@ test "the largest certificate the writer makes fits the size limit" {
 
 test "parse then write gives the same bytes for every kind" {
     // Goal: the accepted set is the writer's output set. Method: reencode each kind.
-    var certificates: [3]x509.Der = .{ .{}, .{}, .{} };
+    var certificates: [5]x509.Der = @splat(.{});
     try make_ca(&certificates[0]);
     try make_workload(&certificates[1]);
     try make_server(&certificates[2]);
+    try make_node(&certificates[3]);
+    try make_client(&certificates[4]);
     for (&certificates) |*certificate| {
         const bytes = certificate.slice();
         const parsed = try x509.parse(bytes);
@@ -223,9 +354,9 @@ test "the writer refuses what the bounds forbid" {
     request.lifetime = .{ .not_before_ms = now, .not_after_ms = 253_402_300_800_000 };
     try testing.expectError(error.IssueLifetime, x509.issue_workload(&certificate, ca, &request));
     request = workload_request(try subject_key(1));
-    request.service = "Broker";
+    request.name = "Broker";
     try testing.expectError(error.BadServiceName, x509.issue_workload(&certificate, ca, &request));
-    request.service = "broker";
+    request.name = "broker";
     request.cluster = "*.prod";
     try testing.expectError(error.BadCluster, x509.issue_workload(&certificate, ca, &request));
     const server: x509.ServerRequest = .{
@@ -402,7 +533,7 @@ test "serials: certificates differing only in subject name, or any other field, 
     );
 
     var renamed = workload_request(key);
-    renamed.service = "broker-2";
+    renamed.name = "broker-2";
     var other_cluster = workload_request(key);
     other_cluster.cluster = "dev.example";
     var other_epoch = workload_request(key);

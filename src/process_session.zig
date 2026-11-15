@@ -34,24 +34,34 @@ pub fn kill_all(io: std.Io, leader: i32) void {
 
 /// One read of `/proc`: SIGKILL to each live process of session `session`. How many it signalled.
 fn kill_members(io: std.Io, session: i32) u32 {
+    return visit_members(io, session, .kill);
+}
+
+/// How many live (not zombie) processes have `session` as their session id, the leader included
+/// if it lives. Test and demo tooling counts what a container left with it.
+pub fn count_members(io: std.Io, session: i32) u32 {
+    return visit_members(io, session, .count);
+}
+
+fn visit_members(io: std.Io, session: i32, action: enum { kill, count }) u32 {
     assert(session > 1);
     const proc = std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true }) catch return 0;
     defer proc.close(io);
     var it = proc.iterate();
-    var signalled: u32 = 0;
+    var matched: u32 = 0;
     var seen: u32 = 0;
     while (seen < constants.proc_entries_max) : (seen += 1) {
-        const entry = (it.next(io) catch return signalled) orelse return signalled;
+        const entry = (it.next(io) catch return matched) orelse return matched;
         const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue; // Not a process.
         if (pid <= 1) continue;
         var buffer: [512]u8 = undefined;
         const stat = read_stat(io, proc, entry.name, &buffer) orelse continue; // Gone already.
         const member = session_of(stat) orelse continue;
         if (member.session != session or member.zombie) continue;
-        _ = linux.kill(pid, .KILL); // ESRCH: it ended in between.
-        signalled += 1;
+        if (action == .kill) _ = linux.kill(pid, .KILL); // ESRCH: it ended in between.
+        matched += 1;
     }
-    return signalled;
+    return matched;
 }
 
 fn read_stat(io: std.Io, proc: std.Io.Dir, name: []const u8, buffer: *[512]u8) ?[]const u8 {

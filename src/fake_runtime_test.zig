@@ -18,8 +18,14 @@ const codes = @import("diag/codes.zig");
 const diag_mod = @import("diag.zig");
 const fake_files = @import("fake_files.zig");
 const fake_runtime = @import("fake_runtime.zig");
+const process_session = @import("process_session.zig");
 const runtime = @import("runtime.zig");
 const fetch_backoff = @import("fetch_backoff.zig");
+const job_trust = @import("job_trust.zig");
+const records = @import("records.zig");
+const sim_world = @import("sim_world.zig");
+const trust_fixture = @import("job_trust_fixture.zig");
+const writers = @import("writers.zig");
 
 const Diag = diag_mod.Diag;
 const net = std.Io.net;
@@ -37,6 +43,8 @@ const Rig = struct {
     arena: std.heap.ArenaAllocator,
     /// How the runtime fetches an image it lacks; null: it does not (`ZBX-E0410`).
     fetch: ?fake_runtime.Fetch,
+    /// The images the runtime has.
+    images: []const []const u8 = &fixtures,
 
     /// Skips the test when the supervisor's executable cannot be found.
     fn start() !*Rig {
@@ -53,6 +61,7 @@ const Rig = struct {
         rig.clock_source = .{ .io = testing.io };
         rig.exe = exe;
         rig.fetch = null;
+        rig.images = &fixtures;
         rig.arena = .init(testing.allocator);
         rig.fake = try testing.allocator.create(fake_runtime.FakeRuntime);
         errdefer testing.allocator.destroy(rig.fake);
@@ -67,7 +76,7 @@ const Rig = struct {
             .gpa = testing.allocator,
             .state_dir = rig.path,
             .supervisor_exe = rig.exe,
-            .fixtures = &fixtures,
+            .fixtures = rig.images,
             .fetch = rig.fetch,
         }, &diag) catch |err| {
             if (diag.code) |code| std.debug.print("init: {s}\n", .{@tagName(code)});
@@ -370,6 +379,55 @@ test "a polite stop ends the command; one that ignores it needs the kill" {
     const killed = try rig.wait_stopped(stubborn);
     try testing.expectEqual(@as(u8, 9), killed.signaled);
     try rig.fake.interface().stop(stubborn, 0, &local); // Stopping a stopped one is nothing.
+}
+
+test "what a command started ends with it: on a stop, and when the command exits" {
+    // Goal: B6 slice 3's review. `sh -c` that starts a `sleep 300` used to leave the sleep
+    // running after a stop (TERM reached the shell alone) and after the shell exited (nothing
+    // ended the rest of its group). Method: two shells that each start a background sleep and
+    // write its pid; one is stopped politely, the other exits by itself. Both sleeps must die,
+    // and nothing may remain in either supervisor's session.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const stopped = try begin_parent(rig, "parent-stopped", "wait");
+    const exits = try begin_parent(rig, "parent-exits", "exit 3");
+    const stopped_sleep = try read_ready_pid(rig, "parent-stopped");
+    const exits_sleep = try read_ready_pid(rig, "parent-exits");
+    const supervisors = [_]i32{
+        try rig.pid_of("parent-stopped", fake_files.file_supervisor),
+        try rig.pid_of("parent-exits", fake_files.file_supervisor),
+    };
+    var local: Diag = undefined;
+    local.reset();
+    try rig.fake.interface().stop(stopped, constants.stop_grace_ms, &local);
+    try testing.expectEqual(@as(u8, 15), (try rig.wait_stopped(stopped)).signaled);
+    try testing.expectEqual(@as(u8, 3), (try rig.wait_stopped(exits)).exited);
+    try expect_dead(stopped_sleep);
+    try expect_dead(exits_sleep);
+    for (supervisors) |supervisor| {
+        try expect_dead(supervisor);
+        try testing.expectEqual(@as(u32, 0), process_session.count_members(testing.io, supervisor));
+    }
+}
+
+/// Starts `name`, a shell that starts `sleep 300` in the background, writes its pid to
+/// `faults/<name>-ready` and then runs `then`.
+fn begin_parent(rig: *Rig, name: []const u8, then: []const u8) !runtime.Handle {
+    var script_buffer: [constants.state_path_bytes_max + 128]u8 = undefined;
+    const script = try std.fmt.bufPrint(
+        &script_buffer,
+        "sleep 300 & echo $! > '{s}/faults/{s}-ready.tmp'; " ++
+            "mv '{s}/faults/{s}-ready.tmp' '{s}/faults/{s}-ready'; {s}",
+        .{ rig.path, name, rig.path, name, rig.path, name, then },
+    );
+    const command = [_][]const u8{ "sh", "-c", script };
+    return rig.begin(name, &command);
+}
+
+fn read_ready_pid(rig: *Rig, name: []const u8) !i32 {
+    var ready_buffer: [64]u8 = undefined;
+    const ready = try std.fmt.bufPrint(&ready_buffer, "{s}-ready", .{name});
+    return process_session.wait_pid_file(testing.io, rig.fake.faults, ready);
 }
 
 /// Starts `name`, a command that ignores TERM, and returns once the shell says its trap is in:
@@ -778,6 +836,8 @@ fn launch_relayed(rig: *Rig, name: []const u8, echo: *relay_module.Echo) !runtim
         .image = "b3:51aa9c03",
         .command = &.{ "sh", "-c", text },
         .relay = address,
+        .relay_plain = true,
+        .network = .loopback,
         .labels = &labels,
     };
     var local: Diag = undefined;
@@ -898,6 +958,8 @@ test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC
         .image = "b3:51aa9c03",
         .command = &forever,
         .relay = "[]:80",
+        .relay_plain = true,
+        .network = .loopback,
         .labels = &labels,
     };
     var local: Diag = undefined;
@@ -995,4 +1057,174 @@ fn probe_once(
     const fake = rig.fake.interface();
     try fake.probe_begin(handle, command, timeout_ms, &local);
     return fake.probe_poll(handle, &local);
+}
+
+// ---- B4 slice 2: no relay, no workload ----------------------------------------------------------
+// `zig build relay-teeth` runs these two against agents with one half switched off
+// (src/zcube_agent_relay_teeth*.zig) and passes only if they fail.
+
+test "relay fail closed: a relay that cannot be opened starts no command" {
+    // Goal: a relayed job never runs without its relay. Method: the `relay_open` fault; the
+    // start is ZC-E0702, and the command, which would write a file at once, never wrote it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "relay-o", .data = "relay_open\n" });
+    var script: [constants.state_path_bytes_max + 80]u8 = undefined;
+    const text = try std.fmt.bufPrint(
+        &script,
+        "touch {s}/ran; while true; do sleep 1; done",
+        .{rig.path},
+    );
+    const labels = [_]runtime.Label{.{ .key = runtime.label_replica, .value = "relay-o" }};
+    const value: runtime.Spec = .{
+        .name = "relay-o",
+        .image = "b3:51aa9c03",
+        .command = &.{ "sh", "-c", text },
+        .relay = "127.0.0.1:9",
+        .relay_plain = true,
+        .network = .loopback,
+        .labels = &labels,
+    };
+    var local: Diag = undefined;
+    local.reset();
+    const outcome = try rig.fake.interface().start(&value, &local);
+    try testing.io.sleep(.fromMilliseconds(500), .awake);
+    try testing.expectError(error.FileNotFound, rig.tmp.dir.access(testing.io, "ran", .{}));
+    try testing.expect(outcome == .failed);
+    try testing.expectEqualStrings("ZC-E0702", outcome.failed.code.slice());
+}
+
+test "relay fail closed: a relay that stops while the job runs takes the command with it" {
+    // Goal: a run never outlives its relay (Zigcube #228). Method: the `relay_stop` fault shuts
+    // the relay's listener down under a running command; the container ends killed by signal 9
+    // and `relay.log` says ZC-E0702.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const echo = try relay_module.Echo.start();
+    defer echo.stop();
+    const handle = try launch_relayed(rig, "relay-x", echo);
+    try expect_echo(try relay_port_of(rig, "relay-x"));
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "relay-x", .data = "relay_stop\n" });
+    var local: Diag = undefined;
+    local.reset();
+    _ = try rig.fake.interface().list(rig.arena.allocator(), &local);
+    const reason = try rig.wait_stopped(handle);
+    try testing.expectEqual(@as(u8, 9), reason.signaled);
+    const dir = try rig.fake.containers.openDir(testing.io, "relay-x", .{});
+    defer dir.close(testing.io);
+    var buffer: [1024]u8 = undefined;
+    const log = try dir.readFile(testing.io, fake_files.file_relay_log, &buffer);
+    try testing.expect(std.mem.find(u8, log, "ZC-E0702") != null);
+}
+
+// ---- The node's trust policy over real processes (B5 slice 2) ---------------------------------
+
+const trust_job = "signed";
+const trust_run = "signed-job";
+
+/// Writes the run and its assignment straight into the world's store (around the server's
+/// admission check), then runs the agent three times over the fake runtime.
+fn assign_trust_run(
+    world: *sim_world.World,
+    run_image: []const u8,
+    signatures: ?[]const []const u8,
+) !void {
+    const run: records.JobRun = .{
+        .id = trust_run,
+        .job = trust_job,
+        .image = run_image,
+        .command = &forever,
+        .deadline_ms = 600_000,
+        .start_by_ms = sim_world.epoch_ms + 1_000_000,
+        .created_at_ms = sim_world.epoch_ms,
+        .signatures = signatures,
+    };
+    const assigned: records.Assigned = .{
+        .replica = trust_run,
+        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        .reason = "test",
+        .job = trust_job,
+    };
+    const arena = world.fresh_arena();
+    const run_key = records.job_run_key(trust_job);
+    const assigned_key = records.assigned_key(sim_world.node_name, trust_run);
+    const ops = [_]@import("store.zig").Op{
+        .{ .put = .{
+            .key = run_key.slice(),
+            .value = try records.encode(arena, run, &world.diag),
+        } },
+    };
+    const store = world.store_handle();
+    var done = try writers.txn(store, .job_controller, .{ .on_success = &ops }, &world.diag);
+    try testing.expect(done.succeeded);
+    const placed = [_]@import("store.zig").Op{.{ .put = .{
+        .key = assigned_key.slice(),
+        .value = try records.encode(world.fresh_arena(), assigned, &world.diag),
+    } }};
+    done = try writers.txn(store, .scheduler, .{ .on_success = &placed }, &world.diag);
+    try testing.expect(done.succeeded);
+    for (0..3) |_| {
+        _ = world.agent_step();
+        try testing.expect(world.last_failure == null);
+    }
+}
+
+/// The exit kind the agent reported for the run, or null if none.
+fn trust_exit(world: *sim_world.World) !?records.ExitKind {
+    const arena = world.fresh_arena();
+    const key = records.job_observed_key(sim_world.node_name, trust_job);
+    const got = try world.store_handle().get(arena, key.slice(), null, &world.diag);
+    const kv = got.kv orelse return null;
+    const value = try records.read(records.JobObserved, arena, kv, &world.diag);
+    const exit = value.exit orelse return null;
+    return exit.kind;
+}
+
+/// Nothing of the run exists on the host: no container the runtime lists, no directory.
+fn expect_nothing_started(rig: *Rig) !void {
+    var local: Diag = undefined;
+    local.reset();
+    const listings = try rig.fake.interface().list(rig.arena.allocator(), &local);
+    try testing.expectEqual(@as(usize, 0), listings.len);
+    const opened = rig.fake.containers.openDir(testing.io, trust_run, .{});
+    try testing.expectError(error.FileNotFound, opened);
+}
+
+test "a refused run spawns no supervisor; the same run, signed, starts one" {
+    // Goal: B5's node check over real processes: a run the node's policy refuses is refused
+    // before the runtime is asked, so no supervisor process or container directory is made.
+    // Method: an agent with a policy that asks for key 1's signature, over `FakeRuntime` (whose
+    // fixtures hold the run's tree, so only the check stops it); the run is written straight into
+    // the store with no signature, then again in a fresh world with key 1's.
+    var fixture = try trust_fixture.Fixture.init(testing.allocator);
+    defer fixture.deinit(testing.allocator);
+    try fixture.trust_keys(&.{1}, true);
+    var config: job_trust.Trust = fixture.config();
+    var image_buffer: [67]u8 = undefined;
+    const images = [_][]const u8{trust_fixture.image(&image_buffer, 0x31)};
+    var rig = try Rig.start();
+    defer rig.stop();
+    rig.images = &images;
+    try rig.restart();
+    {
+        const world = try sim_world.World.create(testing.allocator, 5, &images);
+        defer world.destroy();
+        world.advance(2_000);
+        world.agent.config.trust = &config;
+        world.runtime_override = rig.fake.interface();
+        try assign_trust_run(world, images[0], null);
+        try testing.expectEqual(@as(?records.ExitKind, .refused), try trust_exit(world));
+        try expect_nothing_started(rig);
+    }
+    const line = try fixture.sign_tree(testing.allocator, 1, 0x31);
+    defer testing.allocator.free(line);
+    const world = try sim_world.World.create(testing.allocator, 5, &images);
+    defer world.destroy();
+    world.advance(2_000);
+    world.agent.config.trust = &config;
+    world.runtime_override = rig.fake.interface();
+    try assign_trust_run(world, images[0], &.{line});
+    try testing.expectEqual(@as(?records.ExitKind, null), try trust_exit(world));
+    const dir = try rig.fake.containers.openDir(testing.io, trust_run, .{});
+    dir.close(testing.io);
 }

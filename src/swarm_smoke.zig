@@ -26,6 +26,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fault_proxy = @import("testing/fault_proxy.zig");
+const harness_tls = @import("harness_tls.zig");
 const host_procs = @import("host_procs.zig");
 const http = @import("agent_http.zig");
 const node_store = @import("node_store.zig");
@@ -168,6 +169,10 @@ const Smoke = struct {
     /// The exit code of a failure: `exit_unverified` once the plan let a corrupt chunk through
     /// to the store, which is what `swarm-smoke-teeth` waits for.
     exit_code: u8 = 1,
+    /// The API over TLS (`--listen`, B7 slice 6): the CA, the certificates and the smoke's own
+    /// `admin` credentials, loaded once the server has written its CA.
+    pki: ?harness_tls.Pki = null,
+    credentials: ?*harness_tls.Credentials = null,
 
     fn say(smoke: *Smoke, comptime format: []const u8, args: anytype) void {
         var buffer: [512]u8 = undefined;
@@ -217,15 +222,26 @@ const Smoke = struct {
     fn start_server(smoke: *Smoke) !void {
         const arena = smoke.arena.allocator();
         const listen = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{smoke.port});
-        const store = try smoke.path("store.db");
+        const store = try std.fmt.allocPrint(arena, "sqlite:{s}", .{try smoke.path("store.db")});
+        const state_dir = try smoke.path("server-state");
         const args = [_][]const u8{
             "--listen",       listen,
-            "--store",        try std.fmt.allocPrint(arena, "sqlite:{s}", .{store}),
+            "--store",        store,
+            "--state-dir",    state_dir,
             "--create-store", "--quiet",
+        };
+        if (smoke.pki == null) smoke.pki = .{
+            .io = smoke.io,
+            .arena = arena,
+            .server_exe = smoke.server_exe,
+            .store = store,
+            .state_dir = state_dir,
+            .certs = try smoke.path("certs"),
         };
         smoke.server = try smoke.spawn(smoke.server_exe, &args, "server.log");
         const ready = struct {
             fn check(s: *Smoke) !bool {
+                if (!try s.tls_ready()) return false;
                 const reply = s.call("GET", "/v1/status", "") catch return false;
                 return reply.status == 200;
             }
@@ -253,9 +269,33 @@ const Smoke = struct {
             "--peer-listen",  mine,
             "--address",      mine,
             "--registry",     try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{registry_port}),
-        };
+        } ++ try smoke.agent_tls(nodes[at]);
         const log = try std.fmt.allocPrint(arena, "agent-{s}.log", .{nodes[at]});
         smoke.agents[at] = try smoke.spawn(smoke.agent_exe, &args, log);
+    }
+
+    /// Whether the smoke holds its `admin` credentials: once the server wrote its CA, issues
+    /// them (the first time) and loads them.
+    fn tls_ready(smoke: *Smoke) !bool {
+        if (smoke.credentials != null) return true;
+        const pki = &smoke.pki.?;
+        if (try pki.find_ca() == null) return false;
+        _ = pki.issue("smoke", "admin") catch {
+            smoke.say("ca issue-client: {s}", .{pki.said});
+            return false;
+        };
+        smoke.credentials = try pki.load("smoke");
+        return true;
+    }
+
+    /// The agent's `--ca`, `--cert` and `--key`: a node certificate issued for `node`.
+    fn agent_tls(smoke: *Smoke, node: []const u8) ![6][]const u8 {
+        const pki = &smoke.pki.?;
+        _ = pki.issue(node, null) catch |err| {
+            smoke.say("ca issue-node: {s}", .{pki.said});
+            return err;
+        };
+        return pki.flags(node);
     }
 
     fn set_fault(smoke: *Smoke, state: []const u8, name: []const u8) !void {
@@ -269,8 +309,20 @@ const Smoke = struct {
     // ---- The API ----
 
     fn call(smoke: *Smoke, method: []const u8, target: []const u8, body: []const u8) !http.Reply {
+        const credentials = smoke.credentials orelse return error.ApiUnreachable;
+        return smoke.call_with(credentials, method, target, body);
+    }
+
+    /// One request, over TLS with `credentials`, or in plain HTTP when it is null.
+    fn call_with(
+        smoke: *Smoke,
+        credentials: ?*harness_tls.Credentials,
+        method: []const u8,
+        target: []const u8,
+        body: []const u8,
+    ) !http.Reply {
         const address = try net.IpAddress.parse("127.0.0.1", smoke.port);
-        const client: http.Client = .{ .io = smoke.io, .address = address };
+        const client: http.Client = .{ .io = smoke.io, .address = address, .tls = credentials };
         var diag: Diag = undefined;
         diag.reset();
         return client.call(smoke.arena.allocator(), .{
@@ -406,6 +458,10 @@ const Smoke = struct {
 fn script(smoke: *Smoke) !void {
     try smoke.start_server();
     smoke.say("server up on 127.0.0.1:{d}", .{smoke.port});
+    // The server serves TLS only (B7 slice 7): plain HTTP gets no answer.
+    const plain = smoke.call_with(null, "GET", "/v1/status", "");
+    const refused = if (plain) |reply| reply.status != 200 else |_| true;
+    try smoke.expect(refused, "a plain-HTTP GET /v1/status answered 200", .{});
     smoke.proxy.black_hole(true);
     try step_first_from_registry(smoke);
     try step_second_from_peer(smoke);
@@ -428,13 +484,26 @@ fn wait_registered(smoke: *Smoke, want: u32) !void {
     try smoke.expect(false, "timed out waiting for {d} nodes to register", .{want});
 }
 
+/// Waits for the node's replica to run and its fetch to end. Both are needed: `FakeRuntime.start`
+/// answers `.started` once `fetch.json` and `supervisor.pid` exist, so the agent reports the
+/// replica running while the fetch child may still be fetching (its summary line, ` chunks N ...
+/// registry N `, not yet written), and the registry counts would race the fetch. docs/agent.md
+/// says such a replica is `starting`: the product gap is recorded in
+/// decisions/2026-11-14-b7-slice7-o5-over-tls.md, to be fixed after the b3 tag, not here.
 fn wait_running(smoke: *Smoke, at: usize) !void {
     var waited: u32 = 0;
     while (waited < wait_ms) : (waited += 100) {
-        if (try smoke.running_on(at) == 1) return;
+        if (try smoke.running_on(at) == 1 and try fetch_ended(smoke, at)) return;
         try smoke.io.sleep(.fromMilliseconds(100), .awake);
     }
     try smoke.expect(false, "{s} never ran its replica", .{nodes[at]});
+}
+
+/// Whether some container of the node wrote its fetch summary line.
+fn fetch_ended(smoke: *Smoke, at: usize) !bool {
+    const log = try smoke.fetch_log(nodes[at]);
+    const chunks = std.mem.find(u8, log, "chunks ") orelse return false;
+    return std.mem.find(u8, log[chunks..], " registry ") != null;
 }
 
 fn expect_registry(smoke: *Smoke, trees: u32, chunks: u32, step: []const u8) !void {
@@ -465,6 +534,8 @@ fn step_first_from_registry(smoke: *Smoke) !void {
 
 /// node1 has node2 as its only peer: the registry is not asked again.
 fn step_second_from_peer(smoke: *Smoke) !void {
+    // No wait for node2's summary: O5 makes node1, which is not elected for the tree, wait for
+    // a peer to hold it (over TLS too, B7 slice 7).
     try smoke.start_agent(0);
     try wait_registered(smoke, 2);
     try smoke.apply(2);

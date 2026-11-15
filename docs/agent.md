@@ -48,6 +48,30 @@ The images the fake runtime "has" are read from `fixtures/images.zon` (`--images
 digest is `start_failed` with the placeholder `ZBX-E0410` ([runtime-codes.md](runtime-codes.md)),
 unless `--registry` gives it a registry to fetch from (below).
 Capacity is declared, as HANDOFF's provisional answer says.
+With `--ca FILE` (and `--tls-name`) the agent speaks TLS to the server's `--listen`, presenting
+its own `node.crt` once it has joined, else `--cert` and `--key`
+([mtls.md](mtls.md), "The API over TLS"); without it, plain HTTP to `--insecure-listen`.
+
+**Node labels** (B6) are given by `--label KEY=VALUE`, once per label, or by `.labels` in the ZON
+file (`.labels = .{ "tenant=a", "exclusive=tenant" }`); at most `node_labels_max` (8), each at most
+`node_label_bytes_max` (128) bytes. `KEY=VALUE` is a label a job's `placement.require` can name;
+`exclusive=KEY` reserves the node for the jobs that require its own value of `KEY`, so `KEY` must
+be one of the node's labels. Labels are the one setting where flags do not win: if both the flags
+and the file give labels and the two sets differ, the agent refuses to start (`ZC-E0505`, "the
+node's labels are given by --label and by .labels in the file, and they differ"); the same set in
+either order is accepted. A label decides which tenants' work a node runs, so a disagreement is
+not settled by a rule nobody reads. A label without `=`, a key given twice, or an `exclusive`
+naming a key the node lacks is `ZC-E0505` too
+([decision](decisions/2026-11-14-b6-agent-labels-flag-and-file.md)).
+
+**Relabelling a node.** The agent sends its labels when it registers a new tenure, not on every
+keepalive, and it records them in its lease file (`<state-dir>/lease.json`). An agent started
+with other labels while the recorded lease would still be live refuses to start (`ZC-E0505`, "the
+node's labels differ from those it registered with, and its lease is live"), since it would
+resume the old tenure under the old labels. To relabel a node, stop its agent for one lease ttl
+(the node fences, and the next start registers a new tenure with the new labels), or empty its
+`--state-dir` (which stops what it ran: a wiped node, as in B2). A lease file written before
+labels were recorded is accepted. Label keys are at most 32 bytes, at most 8 labels.
 
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
 the exit code of their blame. While it runs, a server that cannot be reached is `ZC-E0503`, shown
@@ -154,14 +178,51 @@ behind; the server's keeps the controllers and every write from building on one.
 ## The peer identity (C2 slice 6a)
 
 At start the agent opens its state directory and loads `peer.key` (an Ed25519 seed, 64 hex
-digits, mode 0600; made on the first run), `peer.cred` and `ca.pub`. A file others can read, or
+digits, mode 0600; made on the first run), `peer.cred`, `node.crt` (B7: the node certificate
+over the same key, PEM, docs/mtls.md) and `ca.pub`. A file others can read, or
 one that does not parse, is `ZC-E0806` and the agent does not start. A stored pair that belongs to
-another key, node or CA is ignored and the agent joins again. Before each step the agent calls
+another key, node or CA is ignored and the agent joins again. A valid `peer.cred` with no
+`node.crt` beside it is kept: the agent says so once on stderr, and the next renewal brings the
+node certificate. A server older than the agent sends none (`ZC-E0504`, "the answer has no
+node_certificate: the server is older than the agent; upgrade the server first"), and the agent
+keeps its credential. **Upgrade the server before the agents.** Before each step the agent calls
 `POST /v1/agent/nodes/{node}/credential` if it has no credential or half of its life has passed
 (`agent_peer.zig`); the call's timeout stays short of the lease's fence. A failure (an
 unreachable server, `ZC-E0807` for a removed node) is shown once and retried every
 `peer_join_retry_ms`; it never stops the agent or its containers. Nothing yet uses the credential:
 slice 6b's chunk server does.
+
+### Node certificates (B7 slice 3)
+
+At start, with `--ca`, the agent picks the certificate it presents to the server:
+
+1. Its stored `node.crt`, if the CA of `--ca` issued it, it is in its validity window now (with
+   a minute of skew), it names this agent's `--node`, and it is over the key beside it
+   (`peer.key`). Otherwise the agent says why on stderr and goes on to the next.
+2. `--cert` and `--key`, under the same checks.
+3. Neither: the agent does not start, with one `ZC-E0806` whose causes name both problems.
+
+So an agent that was down past its certificate's 7 days, or whose state directory came from
+another node, does not offer a certificate the server would refuse. **Recovery:** on the server
+host run `zcube-server ca issue-node NAME --replace` (with the server's `--store` and
+`--state-dir`), copy `NAME.crt` and `NAME.key` to the node, and start the agent with them as
+`--cert` and `--key`. It joins again and the next renewal replaces `node.crt`.
+
+While it runs, the agent renews `node.crt` at half its life and tries again on failure. It also
+checks the certificate it presents before each new API connection (B7 slice 5,
+`api_tls_guard.zig`), by the same window and minute of skew as above:
+
+- Once 3/4 of the certificate's life has passed, one stderr line names its expiry and the last
+  renewal error (`none` if the last step succeeded). A renewed certificate arms the line again.
+- Once the certificate is outside its window, it is no longer presented. If `--cert` and `--key`
+  were given, they are read again from their files and, if they pass the start-up checks now,
+  presented in its place until the next renewal, with one stderr note. Otherwise the call fails
+  with `ZC-E0811`, whose causes name the expiry, the last renewal error and why `--cert` was not
+  used; the agent's loop shows it once per streak and paces its retries as for a server it
+  cannot reach. Recovery is as above: issue the node a new certificate and give it to the agent
+  as `--cert` and `--key`. An agent started with `--cert` and `--key` reads those files when it
+  needs them, so writing the new files there is enough; one started without them must be
+  restarted with them.
 
 ## The chunk store, the peer server and `fetch` (C2 slice 6b)
 
@@ -197,7 +258,8 @@ status other than 200, or nothing.
 **Zigbox mode (slice 8).** With `--runtime zigbox` and `--peer-listen`, no `--images-dir` is needed: at start the agent finds the node's Zigbox store (`XDG_DATA_HOME` or `HOME`, as `zigbox pull` does), makes it if it is not there yet, and the peer server serves its trees as bundles (`GET /v1/peer/bundle/<digest>`, docs/peer.md) and its chunks. The server's unused chunk directory is `<state-dir>/peer-chunks`. The agent's summary pass (the trees and chunk filter it reports, which the scheduler's locality uses) reads the same Zigbox store on the agent's thread (`ZigboxImages`), so a tree `pull` or a swarm fetch puts there is reported at the next summary; the store is opened in Zigbox mode whether or not `--peer-listen` is given.
 
 `zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
-[--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
+[--server HOST:PORT [--ca FILE [--tls-name NAME] [--cert FILE --key FILE]]]
+[--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
 registry (plain HTTP, `/trees/<digest>`, `/chunks/<hex>`) and the peers. It exits 0 when the tree is
 whole in the store and 3 (`exit_external`) with ZC-E0601 when it is not; 1 and 2 are this node's own
 setup. The node O5 designates to pull from the registry first does not wait: it notes so in
@@ -209,11 +271,20 @@ the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
   `/v1/list?prefix=/node-store/` in pages of `discover_page_nodes` (following `continue`), for each node's `peer` address and hex `filter` (keys.md,
   api.md). It leaves out its own node and any node with a bad name, no `peer` or no filter, says
   how many on one line of stderr, and ranks the rest by the chunks their filters claim.
+- `--ca FILE` (B7 slice 7) reads `--server` over TLS, checked against that CA (`--tls-name`,
+  default `api_tls_client.server_name_default`), presenting the node's own `node.crt` with its
+  `peer.key` from the state directory, else `--cert` and `--key` (paths: the key never goes on
+  the command line). Both runtimes pass the agent's own `--ca`, `--tls-name`, `--cert` and
+  `--key`. Over TLS a node may list `/node-store/` only (mtls.md, "Scopes"); O5's fetchers come
+  from the server's node-scoped endpoint below, over TLS or not. A read that fails, or that the server refuses, is one line in
+  `fetch.log`, and the fetch goes on with the peers named by `--peer`; a TLS setup that cannot
+  be loaded is one line too, and the server is then not read at all (never in the clear).
 - `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and
   the plan strikes it if it lies.
 - **Who pulls from the registry first (O5, docs/briefs/c2.md).** With `--server` and a full digest,
-  the fetch first reads which nodes fetch the tree: the nodes of `/assigned/<node>/<id>` whose
-  replica (`/replicas/<service>/<id>`) has that image. If a peer's `/node-store/` record lists the
+  the fetch first asks which nodes fetch the tree, `GET /v1/agent/nodes/<self>/fetchers/<digest>`:
+  the server answers the nodes of `/assigned/<node>/<id>` whose replica (`/replicas/<service>/<id>`)
+  has that image, names only (decisions/2026-11-14-b7-slice7-o5-over-tls.md). If a peer's `/node-store/` record lists the
   tree whole (`trees`) and has a `peer` address, it goes on as above. Else the node with the
   lowest `fetch_plan.registry_rank(node, tree)` (BLAKE3 of the two; ties to the lower name) goes
   on at once (no peer holds the tree, so it ends at the registry), and every other node re-reads `/node-store/` every
@@ -317,6 +388,88 @@ be interrupted, so stopping a relay whose upstream name is black-holed can wait 
 `relay_connect_timeout_ms` (10 s); IPv4 literals poll and stop at once.
 
 The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a run by its id.
+
+### The relay over TLS (B4 slice 2)
+
+A relay entry names its upstream's `server_name` and `server_ca`; the relay dials the upstream
+over TLS 1.3 with a client certificate and verifies the upstream against that CA and name. The
+files in the container's directory:
+
+| File | Written by | Holds |
+| --- | --- | --- |
+| `relay.pub` | the supervisor, at start | `<key hex> <epoch> <digest hex> <job>`: the run's fresh Ed25519 public key (the private key never leaves the supervisor's memory) |
+| `relay.crt` | the agent | the DER certificate the server signed for that key (`agent_relay_certs.zig`) |
+| `relay.refused` | the agent | the ZC-E0706 refusal line; the agent asks no more |
+| `relay.fault` | the fake runtime | the test fault `relay_open` (below) |
+
+The agent asks for the certificate once per run, and only once it knows the server holds the
+run's `running` report (the server signs only a started claim). It asks again after
+`peer_join_retry_ms` when the server is unreachable or answers anything but 200 or a 409
+ZC-E0706; a 503 ZC-E0706 (no claim with a start yet) is asked again without a word. Each
+container waits out its own retry, so one failing run never holds back another's certificate. A
+step asks at most `relay_cert_asks_per_step_max` (8) times, each within what is left of
+`relay_cert_step_ms_max` and the time before the agent's fence, so a slow server cannot hold the
+agent past its lease. It takes a certificate only if it is for the run's key. The relay waits for `relay.crt`: **no certificate, no dial**. A connection the job opens
+before then waits at most `relay_connect_timeout_ms` and is closed (ZC-E0705); after a refusal it
+is closed at once (`relay.log` says ZC-E0706). When the job ends its side, the relay
+sends close_notify and drops what the upstream sends after it.
+
+**Fail closed.** A relay that cannot be opened starts no command (ZC-E0702, a start failure). A
+relay whose listener stops while the job runs kills the command and logs ZC-E0702. Two test
+faults, written into `<state-dir>/faults/<run id>`: `relay_open` (the fake runtime writes
+`relay.fault` before the supervisor starts, so the relay cannot open) and `relay_stop` (the next
+`list` sends SIGUSR1 to the supervisor, which shuts the listener down). `zig build relay-teeth`
+builds two agents with each fail-closed check removed and passes only if the tests catch both.
+
+The Zigbox runtime's relay is still plain TCP until B4 slice 4.
+
+### The node's trust policy (B5 slice 2)
+
+`zcube-agent --trust-policy FILE` (ZON key `trust_policy`) names the node's own Zigbox trust policy
+(`docs/api.md`, "Signatures"). The agent reads it once at start through `src/trust_file.zig`, the
+reader the server uses too: a regular file, owned by root or by the agent's own user, writable by
+neither group nor others, and a policy Zigbox parses. Anything else is ZC-E0505 and the agent does
+not start. No API call names, changes or switches the node's policy off; the node record carries its
+path (`trust_policy`) so `zcube why node` can say which file the agent registered with. An agent
+without the flag checks nothing, and neither does one whose policy asks for no signature and no
+provenance: both register no path, and `zcube why node` says so ("registered without a
+--trust-policy that checks: no job run is judged"). The path must be absolute (it is published as
+typed); a relative one is ZC-E0505. Only job runs are judged; a service's replicas carry no signatures and are
+not. The file is read once, at the agent's start: an edit to it takes effect when the agent is
+restarted, not before. The path published is the one of the registration, and may be older than
+the flag the agent now runs with (see "Known limits").
+
+The check is the first thing `begin` does with a run, before the deadline and before the input is
+fetched (`trust_refusal` in `src/agent_jobs.zig`), and every path that would report a run
+`not_started` (its start bound passed, its claim ended unstarted) judges it first, so a run the
+policy refuses ends `refused`, never `failed` with cause `deadline`, even when the first report of
+the refusal was lost: `job_trust.judge_run` takes the run record's
+`signatures` and image (and `source`, when it has one) and calls Zigbox's `verdict.judge` with the
+node's policy. A run it refuses is never started: no supervisor, no container directory, no input
+fetched. The agent reports it as an exit of kind `refused` with the ZBX-E0905 or ZBX-E0906 diagnostic
+and its cause, and the job controller ends the job `failed`, cause `refused`. It is never retried and
+never placed on another node, and it counts as an ending like any other (J1 to J11). The server's
+own check (slice 1) refuses such a job at `POST`; the node's check catches what reaches the store
+without it, which `src/agent_jobs_test.zig` (over the simulated runtime) and
+`src/fake_runtime_test.zig` (over real processes) write straight into the store.
+
+With `--runtime zigbox` an admitted run's envelopes may also go to the node's Zigbox store, for
+`zbx` on the node. Only the lines that counted in the agent's verdict travel in the spec
+(`job_trust.counted_lines`: signed by a key the node's `--trust-policy` lists, about this tree and
+binding), none without a policy, so lines anyone can add to a job (the API's writes are
+unauthenticated) never reach the store, and Zigbox, which refuses a bundle whole, is never handed a
+line it would refuse. The supervisor calls `zigbox.store.import_trust` with those lines and the tree
+before `start_with_image`, but only when the node's own `zbx` policy (`/etc/zbx/policy.zon`, then
+the user's `~/.config/zbx/policy.zon`, read through Zigbox's host) asks for signatures or
+provenance; a node without one gets nothing written. Lines the store already holds are kept once.
+Nothing about the import stops the start: Zigbox's library `start` runs no trust gate of its own
+(only `zbx run` does), the agent has already judged the run, and a store that will not take the
+bundle (full: 8 signatures per tree, 4,096 records; busy; unwritable) is one line on the
+supervisor's stderr with ZBX-E0909 and its cause, and the run starts. What persists: each counted
+line, once (a line the store holds is not added again), in the tree's record, until `zbx trust
+prune --apply` removes the record of a tree that is gone; a trusted signer who signs one tree more
+than eight times fills that tree's record, which costs only `zbx`'s view, never a start. The fake and simulated
+runtimes ignore the envelopes.
 
 ## Health checks (C3 slice 9)
 
@@ -501,6 +654,21 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
 
 ## Known limits
 
+- **A restart under a live lease does not register again** (found in B5 slice 2). The agent renews
+  its remembered lease and keeps its tenure, so `/nodes/<node>` keeps the first registration's
+  `agent_version`, `capacity` and `trust_policy` for as long as it keeps that lease, which it
+  renews on every pass: the record changes only when the lease is lost (the agent was down longer
+  than the ttl, the host rebooted, or the node fenced) and the agent registers afresh. A restart
+  with a changed `--trust-policy`, or after the file was edited, enforces the new policy from the
+  restart; what `zcube why node` reports can stay the old path indefinitely. The dangerous
+  direction is the one that removes checking: an agent restarted **without** `--trust-policy`
+  (or with a policy that asks for nothing) checks no job from that restart, while `zcube why
+  node` still says "registered with --trust-policy <path>: job runs ... are judged" for as long
+  as the lease lives. Treat `why node` as what the node registered with, never as proof that it
+  checks now; to make the record follow a removed policy, stop the agent for longer than the
+  lease ttl (the lease expires, the node is fenced and registers afresh).
+  Registering again would move the tenure (the node record's revision), which fencing and job
+  claims compare, so the fix is a decision for the owner, not this slice.
 - **A whole call is bounded, connect included; Linux only.** The standard library's threaded `Io`
   panics if `connect` is given a timeout on POSIX, so `agent_http.zig` opens a non-blocking socket
   itself (`std.os.linux`), `poll`s it for the connection until the call's end, and hands the

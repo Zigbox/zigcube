@@ -35,6 +35,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const job_trust = @import("job_trust.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
@@ -142,6 +143,11 @@ pub const Config = struct {
     /// `HOST:PORT` of the node's peer server, as other nodes' fetches reach it; borrowed.
     peer: []const u8 = "",
     agent_version: []const u8 = "0.0.0",
+    /// The node's own trust policy (`--trust-policy`, B5): every run is judged against it before
+    /// it starts, and a refused one never starts. Null checks nothing. Borrowed.
+    trust: ?*const job_trust.Trust = null,
+    /// The node's labels, `key=value` words, sent at registration (B6; at most 8; borrowed).
+    labels: []const []const u8 = &.{},
 };
 
 /// The state file that holds the lease, in the agent's state directory.
@@ -161,7 +167,50 @@ const LeaseFile = struct {
     fencing: bool = false,
     /// With `fencing`: when the fence kills what is left, monotonic, in `boot_id`.
     kill_at_ms: u64 = 0,
+    /// The node's labels as this agent was configured when it kept the file (B6). Null in a
+    /// file an agent before B6 slice 3's fix wrote: unknown, and accepted.
+    labels: ?[]const []const u8 = null,
 };
+
+/// Whether an agent configured with `labels` may start on the state directory whose lease file
+/// is `text`: false if the file holds a lease this agent would resume, under other labels. A
+/// node's labels reach the server only when it registers, so resuming would keep the old ones
+/// in force (docs/decisions/2026-11-14-b6-agent-labels-flag-and-file.md). Any file the agent
+/// would not resume (unreadable, another boot, a fence begun, past its fence time, labels not
+/// recorded) is fine: the agent fences and registers again with `labels`. Order does not count.
+pub fn kept_labels_allow(
+    arena: Allocator,
+    text: []const u8,
+    labels: []const []const u8,
+    boot_id: []const u8,
+    mono_ms: u64,
+) bool {
+    const parsed = std.json.parseFromSliceLeaky(LeaseFile, arena, text, .{}) catch return true;
+    const kept = parsed.labels orelse return true;
+    if (parsed.fencing) return true;
+    if (!std.mem.eql(u8, parsed.boot_id, boot_id) or parsed.sent_ms > mono_ms) return true;
+    if (parsed.lease == store.lease_none or parsed.tenure == 0) return true;
+    if (fencing.inequality_problem(parsed.ttl_ms) != null) return true;
+    if (mono_ms >= fencing.fence_at_ms(parsed.sent_ms, parsed.ttl_ms)) return true;
+    return same_label_set(kept, labels);
+}
+
+fn same_label_set(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a) |label| {
+        const found = for (b) |other| {
+            if (std.mem.eql(u8, label, other)) break true;
+        } else false;
+        if (!found) return false;
+    }
+    for (b) |label| {
+        const found = for (a) |other| {
+            if (std.mem.eql(u8, label, other)) break true;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
 
 /// The fence in progress: containers are being stopped, and killed at `kill_at_ms` (monotonic).
 const Fence = struct {
@@ -198,6 +247,12 @@ pub const Agent = struct {
     /// Job reports the store refused (B2): only a race with a new assignment or the tenure's end,
     /// so the cluster simulation checks they stop once the world has settled (J10).
     job_reports_refused: u64,
+    /// Runs (the Wyhash of the run id) whose `running` report the server is known to hold, as a
+    /// ring of the latest. The shell asks a relayed run's certificate only for these (B4 slice
+    /// 2): the server signs only a claim with a start. An entry that outlives its run only lets
+    /// an ask through, which the server refuses or defers, so nothing else removes one.
+    running_reported: [constants.agent_node_runs_max]u64,
+    running_reported_next: u32,
     restored: bool,
     stops: [constants.agent_stops_max]PendingStop,
     stops_count: u32,
@@ -305,6 +360,8 @@ pub const Agent = struct {
         agent.fence = .{};
         agent.fences = 0;
         agent.job_reports_refused = 0;
+        agent.running_reported = @splat(0);
+        agent.running_reported_next = 0;
         agent.store_refusals = 0;
         agent.store_refused = false;
         agent.store_refusal_len = 0;
@@ -326,6 +383,26 @@ pub const Agent = struct {
         agent.input_failure_run = 0;
         agent.input_failure_len = 0;
         agent.probes.clear();
+    }
+
+    /// Notes that the server holds `run`'s `running` report (`running_reported`).
+    pub fn note_running_reported(agent: *Agent, run: []const u8) void {
+        assert(run.len > 0);
+        if (agent.running_reported_known(run)) return;
+        const index = agent.running_reported_next % constants.agent_node_runs_max;
+        agent.running_reported[index] = std.hash.Wyhash.hash(0, run);
+        agent.running_reported_next = (index + 1) % constants.agent_node_runs_max;
+        assert(agent.running_reported_known(run));
+    }
+
+    /// Whether the server is known to hold `run`'s `running` report.
+    pub fn running_reported_known(agent: *const Agent, run: []const u8) bool {
+        assert(run.len > 0);
+        const hash = std.hash.Wyhash.hash(0, run);
+        for (agent.running_reported) |held| {
+            if (held == hash) return true;
+        }
+        return false;
     }
 
     /// Keeps what the last failed input fetch of `run` said.
@@ -772,6 +849,8 @@ pub const Agent = struct {
             .agent_version = agent.config.agent_version,
             .address = agent.config.address,
             .capacity = agent.config.capacity,
+            .trust_policy = published_policy(agent.config.trust),
+            .labels = agent.config.labels,
         };
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);
@@ -819,6 +898,7 @@ pub const Agent = struct {
             .boot_id = ctx.boot_id,
             .fencing = agent.fence.active,
             .kill_at_ms = agent.fence.kill_at_ms,
+            .labels = agent.config.labels,
         };
         const text = try records.encode(ctx.arena, file, ctx.diag);
         state.put_atomic(lease_file, text) catch |err| {
@@ -1469,6 +1549,13 @@ const Pass = struct {
 
 // ---- Pure helpers ------------------------------------------------------------------------------
 
+/// The path the node registers as `trust_policy`: only a policy that asks for a signature or a
+/// provenance checks anything, so one that asks for neither is published as none (records.Node).
+fn published_policy(trust: ?*const job_trust.Trust) []const u8 {
+    const loaded = trust orelse return "";
+    return if (loaded.policy.checks()) loaded.path else "";
+}
+
 fn state_failed(ctx: *const Context, err: agent_state.Error, operation: []const u8) Error {
     // `Crashed` is the simulator's, which looks for its own flag before it reads a result.
     const mapped: agent_state.Error = if (err == error.Crashed) error.Io else err;
@@ -1598,4 +1685,63 @@ test "a kept failure keeps its diagnostic whatever the arena holds (RB-S9)" {
     try std.testing.expect(diag.code == null);
     kept.restore(&ctx);
     try std.testing.expectEqual(@import("diag/codes.zig").Code.E0502, diag.code.?);
+}
+
+test "a node publishes its policy path only when the policy checks something" {
+    // Goal: `why node` never claims checks a policy does not make (review B5 slice 2). Method: a
+    // policy that asks for nothing, one that asks for a signature, and no policy.
+    var policy: std.meta.Child(@FieldType(job_trust.Trust, "policy")) = undefined;
+    policy.clear();
+    const path = "/etc/zcube/trust.zon";
+    const trust: job_trust.Trust = .{ .policy = &policy, .path = path, .scratch = undefined };
+    try std.testing.expectEqualStrings("", published_policy(&trust));
+    policy.require_signature = true;
+    try std.testing.expectEqualStrings(path, published_policy(&trust));
+    policy.require_signature = false;
+    policy.require_provenance = true;
+    try std.testing.expectEqualStrings(path, published_policy(&trust));
+    try std.testing.expectEqualStrings("", published_policy(null));
+}
+
+test "an agent may start under other labels only when it would not resume the kept lease" {
+    // Goal: B6 slice 3's review ruling. A relabel on the same --state-dir used to resume the
+    // lease and keep the old labels in force. Method: lease files as `persist` writes them,
+    // judged at times before and after their fence time, in another boot, while fencing, and
+    // as an older agent wrote them (no labels).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const old = [_][]const u8{ "tenant=a", "exclusive=tenant" };
+    const reordered = [_][]const u8{ "exclusive=tenant", "tenant=a" };
+    const new = [_][]const u8{"tenant=b"};
+    var file: LeaseFile = .{
+        .lease = 7,
+        .ttl_ms = constants.lease_ttl_ms,
+        .sent_ms = 1_000,
+        .tenure = 3,
+        .boot_id = "boot-1",
+        .labels = &old,
+    };
+    const fence_at = fencing.fence_at_ms(file.sent_ms, file.ttl_ms);
+    const live = try records.encode(arena, file, &diag);
+    try std.testing.expect(kept_labels_allow(arena, live, &old, "boot-1", 2_000));
+    try std.testing.expect(kept_labels_allow(arena, live, &reordered, "boot-1", 2_000));
+    try std.testing.expect(!kept_labels_allow(arena, live, &new, "boot-1", 2_000));
+    try std.testing.expect(!kept_labels_allow(arena, live, &.{}, "boot-1", fence_at - 1));
+    try std.testing.expect(!kept_labels_allow(arena, live, old[0..1], "boot-1", 2_000));
+    // The lease will not be resumed: the agent fences and registers with the new labels.
+    try std.testing.expect(kept_labels_allow(arena, live, &new, "boot-1", fence_at));
+    try std.testing.expect(kept_labels_allow(arena, live, &new, "boot-2", 2_000));
+    file.fencing = true;
+    const fencing_file = try records.encode(arena, file, &diag);
+    try std.testing.expect(kept_labels_allow(arena, fencing_file, &new, "boot-1", 2_000));
+    // A file an older agent wrote has no labels: unknown, accepted.
+    file.fencing = false;
+    file.labels = null;
+    const older = try records.encode(arena, file, &diag);
+    try std.testing.expect(std.mem.indexOf(u8, older, "labels") == null);
+    try std.testing.expect(kept_labels_allow(arena, older, &new, "boot-1", 2_000));
+    try std.testing.expect(kept_labels_allow(arena, "not json", &new, "boot-1", 2_000));
 }

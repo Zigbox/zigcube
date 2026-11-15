@@ -12,6 +12,11 @@
 //! **Idempotency.** The same spec under the same name is a no-op that returns the job; a
 //! different one is ZC-E0131. The compare covers the spec fields only, never `created_at_ms`,
 //! `applied_by`, `submit_by_ms` or `cancel_requested`.
+//!
+//! **Signatures (B5).** Their shape is checked with the rest of the body; under the server's
+//! trust policy, a new job is judged (`job_trust.admit`) after the lookup and the expiry and
+//! before admission writes anything, so a refused job (`refused`, ZBX-E0905) leaves no trace and a
+//! retry of a stored job keeps the answer it had.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,13 +26,22 @@ const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
+const job_cert = @import("job_cert.zig");
+const x509_identity = @import("x509_identity.zig");
 const apply_mod = @import("apply.zig");
+const job_trust = @import("job_trust.zig");
 
 const Context = controller.Context;
 
 pub const Error = controller.Error || error{Refused};
 
 pub const actor = "api";
+
+/// `placement` as a request gave it: its pairs, and what was wrong with its shape, if anything.
+pub const PlacementInput = struct {
+    require: []const records.Pair = &.{},
+    problem: ?[]const u8 = null,
+};
 
 /// A job as a client submits it. `input` is decoded.
 pub const Input = struct {
@@ -49,8 +63,13 @@ pub const Input = struct {
     relay: ?[]const u8 = null,
     /// The server's relay table, from its configuration: what `relay` is resolved against.
     relays: []const records.JobRelay = &.{},
-    /// The request named a `placement`: refused, it is not built yet.
-    placement: bool = false,
+    /// The job's signatures (B5): DSSE envelopes, each one line of `zbx trust export`.
+    signatures: []const []const u8 = &.{},
+    /// The server's trust policy, from its configuration: null checks nothing (`job_trust.zig`).
+    trust: ?*const job_trust.Trust = null,
+    /// The job's `placement` (B6) as the request gave it, absent when it gave none. A `problem`
+    /// is a sentence about its shape that `validate_placement` refuses.
+    placement: ?PlacementInput = null,
     applied_by: []const u8,
     request_id: []const u8,
 };
@@ -68,6 +87,9 @@ pub const CreateResult = union(enum) {
     same: records.Job,
     /// The admission record or the name changed while this was made; nothing was written.
     conflict,
+    /// No signature the server's policy trusts covers the job (B5): ZBX-E0905 or E0906, in the
+    /// arena. Nothing was written; the API answers 403.
+    refused: *const job_trust.Diagnostic,
 };
 
 fn no_memory(diag: *@import("diag.zig").Diag) controller.Error {
@@ -146,6 +168,42 @@ fn validate_relay(ctx: *const Context, input: Input) Error!void {
     }
 }
 
+/// The one place that says what `placement` may hold: an object of at most `job_require_max`
+/// label keys to values, under the label bounds, each key once.
+fn validate_placement(ctx: *const Context, input: Input) Error!void {
+    const placement = input.placement orelse return;
+    if (placement.problem) |problem| return refuse(ctx, "placement", "{s}", .{problem});
+    if (placement.require.len > constants.job_require_max) {
+        return refuse(ctx, "placement", "require has {d} entries, at most {d}", .{
+            placement.require.len, constants.job_require_max,
+        });
+    }
+    for (placement.require, 0..) |pair, at| {
+        if (pair[0].len == 0) return refuse(ctx, "placement", "a require key is empty", .{});
+        if (has_nul(pair[0]) or has_nul(pair[1])) {
+            return refuse(ctx, "placement", "{s} holds a NUL byte", .{pair[0]});
+        }
+        if (pair[0].len > constants.label_key_bytes_max) {
+            return refuse(ctx, "placement", "a require key is over {d} bytes", .{
+                constants.label_key_bytes_max,
+            });
+        }
+        if (pair[1].len > constants.label_value_bytes_max) {
+            return refuse(ctx, "placement", "the value of {s} is over {d} bytes", .{
+                pair[0], constants.label_value_bytes_max,
+            });
+        }
+        if (std.mem.indexOfScalar(u8, pair[0], '=') != null) {
+            return refuse(ctx, "placement", "the key {s} holds '='", .{pair[0]});
+        }
+        for (placement.require[0..at]) |earlier| {
+            if (std.mem.eql(u8, earlier[0], pair[0])) {
+                return refuse(ctx, "placement", "require names {s} twice", .{pair[0]});
+            }
+        }
+    }
+}
+
 fn validate_env(ctx: *const Context, input: Input) Error!void {
     if (input.env.len > constants.runtime_env_count_max) {
         return refuse(ctx, "env", "at most {d} variables, it has {d}", .{
@@ -214,6 +272,10 @@ fn validate_labels(ctx: *const Context, input: Input) Error!void {
 const Problem = union(enum) {
     twice: struct { field: []const u8, name: []const u8 },
     range: struct { field: []const u8, min: u64, max: u64, value: u64 },
+    /// A relayed job's labels that its certificate refuses (B4); `bytes` is their total size.
+    cert_labels: struct { why: x509_identity.Error, bytes: u32 },
+    /// A relayed job whose image is not a full `b3:` digest, which its certificate must attest.
+    cert_image: []const u8,
 };
 
 fn range_problem(field: []const u8, value: anytype, min: u64, max: u64) ?Problem {
@@ -237,12 +299,28 @@ fn repeated_key(field: []const u8, pairs: []const records.Pair) ?Problem {
 /// outside their bounds. The one place that lists the bounds, so `create` and `validate` cannot
 /// disagree about whether there is a problem.
 fn legacy_problem(input: Input) ?Problem {
-    return spec_problem(input.env, input.labels, input.limits);
+    const relayed = input.relay != null;
+    return spec_problem(input.image, input.env, input.labels, input.limits, relayed);
 }
 
-fn spec_problem(env: []const records.Pair, labels: []const records.Pair, limits: anytype) ?Problem {
+fn spec_problem(
+    image: []const u8,
+    env: []const records.Pair,
+    labels: []const records.Pair,
+    limits: anytype,
+    relayed: bool,
+) ?Problem {
     if (repeated_key("env", env)) |problem| return problem;
     if (repeated_key("labels", labels)) |problem| return problem;
+    // The relay's certificate carries every label (B4): the labels must fit it, by its own rules.
+    if (relayed) {
+        if (job_cert.image_digest(image) == null) return .{ .cert_image = image };
+        if (job_cert.labels_problem(labels)) |why| {
+            var bytes: u32 = 0;
+            for (labels) |pair| bytes += @intCast(pair[0].len + pair[1].len);
+            return .{ .cert_labels = .{ .why = why, .bytes = bytes } };
+        }
+    }
     const c = constants;
     const checks = [_]?Problem{
         range_problem(
@@ -273,6 +351,21 @@ fn refuse_problem(ctx: *const Context, problem: Problem) error{Refused} {
         .range => |range| ctx.diag.cause("{s}: must be {d} to {d}, it is {d}", .{
             range.field, range.min, range.max, range.value,
         }),
+        .cert_image => |image| ctx.diag.cause(
+            "image: a relayed job's image must be 'b3:' and 64 lowercase hex digits, it is {s}",
+            .{image},
+        ),
+        .cert_labels => |unfit| switch (unfit.why) {
+            error.LabelsTooLarge => ctx.diag.cause(
+                "labels: a relayed job's keys and values take {d} bytes, at most {d}",
+                .{ unfit.bytes, constants.x509_labels_bytes_max },
+            ),
+            else => ctx.diag.cause(
+                "labels: a relayed job's labels do not fit its certificate ({s}): keys are " ++
+                    "printable ASCII without spaces, values are UTF-8 without control characters",
+                .{@errorName(unfit.why)},
+            ),
+        },
     }
     ctx.diag.fix(.{ .sentence = "correct the field and submit the job again" });
     return error.Refused;
@@ -368,7 +461,11 @@ fn validate_shape(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     try validate_labels(ctx, input);
     if (input.retries > 0) return not_built(ctx, "retries");
     try validate_relay(ctx, input);
-    if (input.placement) return not_built(ctx, "placement");
+    var problem_buffer: [job_trust.problem_bytes_max]u8 = undefined;
+    if (job_trust.shape_problem(&problem_buffer, input.signatures)) |problem| {
+        return refuse(ctx, "signatures", "{s}", .{problem});
+    }
+    try validate_placement(ctx, input);
     try validate_times(ctx, input, now_ms);
     try validate_input(ctx, input);
 }
@@ -413,6 +510,8 @@ pub fn run_of(job: *const records.Job, id: []const u8) records.JobRun {
         .input_digest = job.input_digest,
         .input_bytes = job.input_bytes,
         .relay = job.relay,
+        .signatures = job.signatures,
+        .placement = job.placement,
         .start_by_ms = job.created_at_ms + job.deadline_ms,
         .created_at_ms = job.created_at_ms,
         .stop = .{ .cause = .not_started, .at_ms = std.math.maxInt(u64) },
@@ -431,8 +530,10 @@ fn check_run_size(ctx: *const Context, job: *const records.Job) Error!void {
         .{ .name = "command", .bytes = try json_bytes(ctx, job.command) },
         .{ .name = "env", .bytes = try json_bytes(ctx, job.env) },
         .{ .name = "labels", .bytes = try json_bytes(ctx, job.labels) },
+        .{ .name = "placement", .bytes = try json_bytes(ctx, job.placement) },
         .{ .name = "source", .bytes = try json_bytes(ctx, job.source) },
         .{ .name = "image", .bytes = try json_bytes(ctx, job.image) },
+        .{ .name = "signatures", .bytes = try json_bytes(ctx, job.signatures) },
     };
     var biggest = members[0];
     for (members[1..]) |member| {
@@ -466,7 +567,23 @@ fn spec_equal(old: *const records.Job, new: *const records.Job) bool {
     const old_relay: ?[]const u8 = if (old.relay) |r| r.name else null;
     const new_relay: ?[]const u8 = if (new.relay) |r| r.name else null;
     if (!optional_equal(old_relay, new_relay)) return false;
+    if (!strings_equal(old.signatures orelse &.{}, new.signatures orelse &.{})) return false;
+    if (!placement_equal(old.placement, new.placement)) return false;
     return optional_equal(old.input_digest, new.input_digest);
+}
+
+/// The placement to store: none when the request gave none or an empty `require`, so that
+/// `{}` and no `placement` are the same spec.
+fn placement_of(input: Input) ?records.Placement {
+    const given = input.placement orelse return null;
+    if (given.require.len == 0) return null;
+    return .{ .require = given.require };
+}
+
+fn placement_equal(old: ?records.Placement, new: ?records.Placement) bool {
+    const left = if (old) |placement| placement.require else &.{};
+    const right = if (new) |placement| placement.require else &.{};
+    return pairs_equal(left, right);
 }
 
 fn optional_equal(a: ?[]const u8, b: ?[]const u8) bool {
@@ -594,6 +711,9 @@ pub fn create(
         .input_digest = digest,
         .input_bytes = if (input.input) |text| text.len else null,
         .relay = resolve_relay(input),
+        // Absent when there are none, so a job without them encodes as before B5.
+        .signatures = if (input.signatures.len > 0) input.signatures else null,
+        .placement = placement_of(input),
         .submit_by_ms = input.submit_by_ms,
         .created_at_ms = now_ms,
         .applied_by = input.applied_by,
@@ -609,7 +729,14 @@ pub fn create(
             const old = try records.read(records.Job, ctx.arena, kv, ctx.diag);
             // Only a stored job with a problem of its own is a legacy one; a modern job and a
             // retry that repeats a key is a bad request, not a retry.
-            const legacy = spec_problem(old.env, old.labels, old.limits) != null;
+            const relayed = old.relay != null;
+            const legacy = spec_problem(
+                old.image,
+                old.env,
+                old.labels,
+                old.limits,
+                relayed,
+            ) != null;
             if (legacy and spec_equal(&old, &job)) return .{ .same = old };
         }
         return refuse_problem(ctx, problem);
@@ -622,7 +749,25 @@ pub fn create(
         return different(ctx, input.name);
     }
     if (now_ms > input.submit_by_ms) return expired(ctx, input.name, input.submit_by_ms, now_ms);
+    // Only a job that would be created is judged: a retry of one that exists keeps its answer.
+    if (try trust_refusal(ctx, input)) |refused| return refused;
     return admit(ctx, source, input, job, key);
+}
+
+/// The server's trust policy on a job it would create: null when admitted (or no policy).
+fn trust_refusal(ctx: *const Context, input: Input) Error!?CreateResult {
+    const config = input.trust orelse return null;
+    const admission = job_trust.admit(config, ctx.arena, .{
+        .image = input.image,
+        .source = input.source,
+        .signatures = input.signatures,
+    }) catch return no_memory(ctx.diag);
+    return switch (admission) {
+        .admitted => null,
+        .malformed => |number| refuse(ctx, "signatures", "envelope {d} is not a " ++
+            "DSSE envelope zbx reads (one line of zbx trust export)", .{number}),
+        .refused => |diagnostic| .{ .refused = diagnostic },
+    };
 }
 
 fn different(ctx: *const Context, name: []const u8) error{Refused} {
@@ -1040,6 +1185,10 @@ const Rig = struct {
     }
 };
 
+const full_digest = "b3:" ++
+    "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++
+    "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03";
+
 fn sample(name: []const u8) Input {
     return .{
         .name = name,
@@ -1111,6 +1260,138 @@ test "a run record over 16 KiB escaped is ZC-E0130 naming the field, never ZC-B0
     input.env = &.{.{ "A", bytes }};
     try testing.expectError(error.Refused, create(&ctx, &rig.source, input));
     try rig.expect_code(.E0130);
+}
+
+fn repeat(comptime byte: u8, comptime count: usize) *const [count]u8 {
+    const filled: [count]u8 = @splat(byte);
+    return &filled;
+}
+
+test "a relayed job's labels must fit a certificate; a job without a relay may carry more" {
+    // Goal: B4's label bound (ZC-E0130 naming `labels` and 256). Method: 6 labels of 26 + 18 bytes
+    // is 264 bytes: refused with a relay, accepted without; 256 bytes exactly is accepted.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    const key = repeat('k', 26);
+    const long = repeat('v', 18);
+    const labels = [_]records.Pair{
+        .{ key ++ "0", long }, .{ key ++ "1", long }, .{ key ++ "2", long },
+        .{ key ++ "3", long }, .{ key ++ "4", long }, .{ key ++ "5", long },
+    };
+    var plain = sample("plain");
+    plain.labels = &labels;
+    _ = try create(&ctx, &rig.source, plain);
+    var relayed = sample("relayed");
+    relayed.labels = &labels;
+    relayed.relay = "botpike";
+    relayed.image = full_digest;
+    relayed.relays = &relays;
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, relayed));
+    try testing.expectEqual(Code.E0130, rig.diag.code.?);
+    const cause = rig.diag.last_cause().?;
+    try testing.expect(std.mem.startsWith(u8, cause, "labels: "));
+    try testing.expect(std.mem.indexOf(u8, cause, "at most 256") != null);
+    rig.diag.reset();
+    // 256 bytes exactly: 4 labels of 64 bytes each.
+    const fits = [_]records.Pair{
+        .{ repeat('a', 32), repeat('x', 32) }, .{ repeat('b', 32), repeat('x', 32) },
+        .{ repeat('c', 32), repeat('x', 32) }, .{ repeat('d', 32), repeat('x', 32) },
+    };
+    relayed.labels = &fits;
+    _ = try create(&ctx, &rig.source, relayed);
+}
+
+test "a relayed job's labels must be ones its certificate takes: characters, not only size" {
+    // Goal: B4 review MUST. Method: a space in a key, a tab in a value and a value that is not
+    // UTF-8 are each refused with ZC-E0130 naming `labels` when the job has a relay, and admitted
+    // without one (nothing is issued for it).
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    const bad = [_][1]records.Pair{
+        .{.{ "my key", "ok" }},
+        .{.{ "k", "a\tb" }},
+        .{.{ "k", "\xff\xfe" }},
+    };
+    const names = [_][]const u8{ "plain-a", "plain-b", "plain-c" };
+    for (&bad, names) |*labels, name| {
+        var relayed = sample("relayed");
+        relayed.labels = labels;
+        relayed.relay = "botpike";
+        relayed.image = full_digest;
+        relayed.relays = &relays;
+        try testing.expectError(error.Refused, create(&ctx, &rig.source, relayed));
+        try testing.expect(std.mem.startsWith(u8, rig.diag.last_cause().?, "labels: "));
+        try rig.expect_code(.E0130);
+        var plain = sample(name);
+        plain.labels = labels;
+        _ = try create(&ctx, &rig.source, plain);
+    }
+}
+
+test "a relayed job's image must be a full lowercase b3 digest; a plain job may name any" {
+    // Goal: B4 review MUST. Method: a short digest, an uppercase one, a wrong length and a tag are
+    // each refused with ZC-E0130 naming `image` when the job has a relay, and admitted without
+    // one; the full lowercase digest is admitted.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    const upper = "b3:" ++ "ABABABABABABABAB" ++ "ABABABABABABABAB" ++
+        "ABABABABABABABAB" ++ "ABABABABABABABAB";
+    const short = full_digest[0 .. full_digest.len - 1];
+    const bad = [_][]const u8{ "b3:51aa9c03", upper, short, "latest", "sha256:ab" };
+    const names = [_][]const u8{ "plain-a", "plain-b", "plain-c", "plain-d", "plain-e" };
+    for (bad, names) |image, name| {
+        var relayed = sample("relayed");
+        relayed.image = image;
+        relayed.relay = "botpike";
+        relayed.relays = &relays;
+        try testing.expectError(error.Refused, create(&ctx, &rig.source, relayed));
+        try testing.expect(std.mem.startsWith(u8, rig.diag.last_cause().?, "image: "));
+        try rig.expect_code(.E0130);
+        var plain = sample(name);
+        plain.image = image;
+        _ = try create(&ctx, &rig.source, plain);
+    }
+    var good = sample("relayed");
+    good.image = full_digest;
+    good.relay = "botpike";
+    good.relays = &relays;
+    _ = try create(&ctx, &rig.source, good);
+}
+
+test "the retry of a relayed job stored with labels a certificate refuses still answers" {
+    // Goal: B4 review SHOULD. Method: store a relayed job, rewrite its labels to ones the
+    // certificate refuses (as B3 admitted), pass the submit time, send the same spec: the stored
+    // job answers; a new job of those labels is refused.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    var input = sample("old");
+    input.relay = "botpike";
+    input.image = full_digest;
+    input.relays = &relays;
+    try store_legacy(&rig, input, spaced_key);
+    var retry = input;
+    retry.labels = &.{.{ "my key", "ok" }};
+    const again = try create(&ctx, &rig.source, retry);
+    try testing.expectEqualStrings("old", again.same.name);
+    retry.name = "new";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, retry));
+    try rig.expect_code(.E0130);
+}
+
+fn spaced_key(job: *records.Job) void {
+    job.labels = &.{.{ "my key", "ok" }};
 }
 
 test "limits outside the runtime's bounds are refused, naming the field" {

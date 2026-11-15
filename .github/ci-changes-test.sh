@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests of .github/ci-changes.sh: a table of changed paths and the verdict each must get. The
 # changes job runs it before it classifies, so a broken rule fails CI instead of skipping a job.
-# Each row: EVENT|HEAD_REF|LABELS|paths (space separated)|expected `code store c0 c1 b1 smoke c2 mtls b3 c3smoke c3` as T/F.
+# Each row: EVENT|HEAD_REF|LABELS|paths (space separated)|expected
+# `code store c0 c1 b1 smoke c2 mtls b3 c3smoke c3 b7 b5 b6` as T/F.
 # `check` leaves the macos output out; `check_macos` rows judge it alone.
 set -uo pipefail
 dir=$(cd "$(dirname "$0")" && pwd)
@@ -18,7 +19,10 @@ check() {
     s/demo_b1=true/T/; s/demo_b1=false/F/;
     s/zigbox_smoke=true/T/; s/zigbox_smoke=false/F/; s/demo_c2=true/T/; s/demo_c2=false/F/;
     s/mtls_interop=true/T/; s/mtls_interop=false/F/; s/demo_b3=true/T/; s/demo_b3=false/F/;
-    s/c3_smoke=true/T/; s/c3_smoke=false/F/; s/demo_c3=true/T/; s/demo_c3=false/F/; s/ //g')
+    s/c3_smoke=true/T/; s/c3_smoke=false/F/; s/demo_c3=true/T/; s/demo_c3=false/F/;
+    s/demo_b7=true/T/; s/demo_b7=false/F/;
+    s/demo_b5=true/T/; s/demo_b5=false/F/;
+    s/demo_b6=true/T/; s/demo_b6=false/F/; s/ //g')
   n=$((n + 1))
   if [ "$got" != "$want" ]; then
     echo "FAIL: $event ${ref:+[$ref] }${labels:+[$labels] }${paths:-<no paths>}: want $want, got $got"
@@ -39,100 +43,118 @@ check_macos() {
 }
 
 # Verdict order: code store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3
-# c3_smoke demo_c3.
+# c3_smoke demo_c3 demo_b7 demo_b5 demo_b6.
 PR=pull_request
 # Documentation only: nothing runs.
-check $PR x "" "README.md docs/core.md site/index.html" FFFFFFFFFFF
-check $PR x "" "docs/demos/c1.md" FFFFFFFFFFF
+check $PR x "" "README.md docs/core.md site/index.html" FFFFFFFFFFFFFF
+check $PR x "" "docs/demos/c1.md" FFFFFFFFFFFFFF
 # ...except src/ and web/ markdown, site/errors, and any code file.
-check $PR x "" "src/README.md" TTTTTTTTTTT
-check $PR x "" "web/README.md" TFFFFFFFFFF
-check $PR x "" "site/errors/ZC-E0001.html" TFFFFFFFFFF
-check $PR x "" "README.md ops/sim-fleet/run.sh" TFFFFFFFFFF
-check $PR x "" "ops/sim-fleet/test-canary.sh ops/sim-fleet/test-crash-record.sh" TFFFFFFFFFF
+check $PR x "" "src/README.md" TTTTTTTTTTTTTT
+check $PR x "" "web/README.md" TFFFFFFFFFFFFF
+check $PR x "" "site/errors/ZC-E0001.html" TFFFFFFFFFFFFF
+check $PR x "" "README.md ops/sim-fleet/run.sh" TFFFFFFFFFFFFF
+check $PR x "" "ops/sim-fleet/test-canary.sh ops/sim-fleet/test-crash-record.sh" TFFFFFFFFFFFFF
 # Docs only, but asked for in full.
-check $PR x "full-ci" "README.md" TTTTTTTTTTT
-check $PR claude/release-0.4 "" "README.md" TTTTTTTTTTT
+check $PR x "full-ci" "README.md" TTTTTTTTTTTTTT
+check $PR claude/release-0.4 "" "README.md" TTTTTTTTTTTTTT
 # Narrow: tests, simulations, the web console, the tools, the gate's own runner.
-check $PR x "" "src/scheduler_test.zig" TFFFFFFFFFF
-check $PR x "" "src/sim_cluster.zig src/sim_swarm_main.zig" TFFFFFFFFFF
-check $PR x "" "web/app.js web/mock/c1.js tools/wasm_check.mjs" TFFFFFFFFFF
-check $PR x "" "src/tidy.zig src/testing/check.zig" TFFFFFFFFFF
-check $PR x "" "src/console_wasm.zig src/web_embed.zig" TFFFFFFFFFF
-check $PR x "" "src/mac_release.zig packaging/homebrew/zcube-resource.rb" TFFFFFFFFFF
+check $PR x "" "src/scheduler_test.zig" TFFFFFFFFFFFFF
+check $PR x "" "src/sim_cluster.zig src/sim_swarm_main.zig" TFFFFFFFFFFFFF
+check $PR x "" "web/app.js web/mock/c1.js tools/wasm_check.mjs" TFFFFFFFFFFFFF
+check $PR x "" "src/tidy.zig src/testing/check.zig" TFFFFFFFFFFFFF
+check $PR x "" "src/console_wasm.zig src/web_embed.zig" TFFFFFFFFFFFFF
+check $PR x "" "src/mac_release.zig packaging/homebrew/zcube-resource.rb" TFFFFFFFFFFFFF
+# The relay teeth's agent roots run only in the check job (`zig build relay-teeth`).
+check $PR x "" "src/zcube_agent_relay_teeth_outlive.zig src/zcube_agent_relay_teeth_unrelayed.zig" TFFFFFFFFFFFFF
 # One demo, one smoke, the store suites' own files.
-check $PR x "" "src/demo_c0_steps.zig" TFTFFFFFFFF
-check $PR x "" "src/demo_c1_fleet.zig docs/demos/c1.md" TFFTTFFFTTF
-check $PR x "" "src/demo_c1_state.zig" TFFTTFFFTFF
-check $PR x "" "src/demo_c0_state.zig" TFTTTFFFTFF
-check $PR x "" "src/demo_c1_partition.zig" TFFTFFFFFFF
-check $PR x "" "src/zigbox_runtime.zig" TFFFFTTFTFT
-check $PR x "" "ops/zigbox-smoke/guest.sh" TFFFFTFFFFF
-check $PR x "" "src/store_faults.zig src/store_failover.zig" TTFFFFFFFFF
-check $PR x "" "src/mtls_interop.zig" TFFFFFFTFFF
-check $PR x "" "ops/mtls-interop/InteropServer.java" TFFFFFFTFFF
-check $PR x "" "src/demo_c0.zig src/demo_c1.zig" TFTTFFFFFFF
+check $PR x "" "src/demo_c0_steps.zig" TFTFFFFFFFFFFF
+check $PR x "" "src/demo_c1_fleet.zig docs/demos/c1.md" TFFTTFFFTTFTTT
+check $PR x "" "src/demo_c1_state.zig" TFFTTFFFTFFTTT
+check $PR x "" "src/demo_c0_state.zig" TFTTTFFFTFFTTT
+check $PR x "" "src/demo_c1_partition.zig" TFFTFFFFFFFFFF
+check $PR x "" "src/zigbox_runtime.zig" TFFFFTTFTFTFTF
+check $PR x "" "ops/zigbox-smoke/guest.sh" TFFFFTFFFFFFFF
+check $PR x "" "src/store_faults.zig src/store_failover.zig" TTFFFFFFFFFFFF
+check $PR x "" "src/mtls_interop.zig" TFFFFFFTFFFFFF
+check $PR x "" "ops/mtls-interop/InteropServer.java" TFFFFFFTFFFFFF
+check $PR x "" "src/demo_c0.zig src/demo_c1.zig" TFTTFFFFFFFFFF
+# The TLS server sits behind zcube-server's listener since B7 slice 3: it runs everything.
+check $PR x "" "src/tls_server.zig src/tls_server_test.zig src/tls_testclient.zig" TTTTTTTTTTTTTT
 # Everything: the build, CI itself, the shared demo driver, the server, the agent, the store
 # backends, the core, and any path no rule names (also a new directory).
-check $PR x "" "build.zig" TTTTTTTTTTT
-check $PR x "" "build.zig.zon" TTTTTTTTTTT
-check $PR x "" ".github/workflows/ci.yml" TTTTTTTTTTT
-check $PR x "" ".github/ci-changes.sh" TTTTTTTTTTT
-check $PR x "" "src/demo_host.zig" TTTTTTTTTTT
-check $PR x "" "src/server.zig" TTTTTTTTTTT
-check $PR x "" "src/agent_loop.zig" TTTTTTTTTTT
-check $PR x "" "src/store_postgres.zig" TTTTTTTTTTT
-check $PR x "" "src/store.zig" TTTTTTTTTTT
-check $PR x "" "src/core.zig" TTTTTTTTTTT
-check $PR x "" "src/c1_teeth.zig" TTTTTTTTTTT
+check $PR x "" "build.zig" TTTTTTTTTTTTTT
+check $PR x "" "build.zig.zon" TTTTTTTTTTTTTT
+check $PR x "" ".github/workflows/ci.yml" TTTTTTTTTTTTTT
+check $PR x "" ".github/ci-changes.sh" TTTTTTTTTTTTTT
+check $PR x "" "src/demo_host.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/server.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/agent_loop.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/store_postgres.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/store.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/core.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/c1_teeth.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/harness_tls.zig" TTTTTTTTTTTTTT
 # The sim job (which runs sim-fencing-teeth) runs on `code`: a change to the fencing arithmetic
 # runs everything, one to the simulator alone runs the code jobs.
-check $PR x "" "src/fencing.zig" TTTTTTTTTTT
-check $PR x "" "src/sim_cluster.zig src/sim_c1_teeth_oldrule_main.zig" TFFFFFFFFFF
-check $PR x "" "src/testing/fault_proxy.zig" TTTTTTTTTTT
-check $PR x "" "src/brand_new_file.zig" TTTTTTTTTTT
-check $PR x "" "newdir/file.txt" TTTTTTTTTTT
-check $PR x "" "fixtures/images.zon" TTTTTTTTTTT
-check $PR x "" "demo/up.sh" TTTTTTTTTTT
+check $PR x "" "src/fencing.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/sim_cluster.zig src/sim_c1_teeth_oldrule_main.zig" TFFFFFFFFFFFFF
+check $PR x "" "src/testing/fault_proxy.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/brand_new_file.zig" TTTTTTTTTTTTTT
+check $PR x "" "newdir/file.txt" TTTTTTTTTTTTTT
+check $PR x "" "fixtures/images.zon" TTTTTTTTTTTTTT
+check $PR x "" "demo/up.sh" TTTTTTTTTTTTTT
+# B5 slice 3: the trust world and its tooth are simulator files.
+check $PR x "" "src/sim_trust.zig src/sim_c1_teeth_job_untrusted_main.zig" TFFFFFFFFFFFFF
 # demo-c2: its own files, its docs (off), an unknown path (on), the label and a release branch (on).
-check $PR x "" "src/demo_c2_steps.zig ops/demo-c2/run.sh" TFFFFFTFTFF
-check $PR x "" "docs/demos/c2.md" FFFFFFFFFFF
-check $PR x "" "src/never_heard_of_it.zig" TTTTTTTTTTT
-check $PR x "full-ci" "src/demo_c2.zig" TTTTTTTTTTT
-check $PR claude/release-0.5 "" "src/demo_c2.zig" TTTTTTTTTTT
-check $PR x "" "src/scheduler_test.zig src/demo_c2.zig" TFFFFFTFFFF
+check $PR x "" "src/demo_c2_steps.zig ops/demo-c2/run.sh" TFFFFFTFTFFFTF
+check $PR x "" "docs/demos/c2.md" FFFFFFFFFFFFFF
+check $PR x "" "src/never_heard_of_it.zig" TTTTTTTTTTTTTT
+check $PR x "full-ci" "src/demo_c2.zig" TTTTTTTTTTTTTT
+check $PR claude/release-0.5 "" "src/demo_c2.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/scheduler_test.zig src/demo_c2.zig" TFFFFFTFFFFFFF
 # demo-b3: its own files, the files it shares (demo-b1's state, demo-c2's rig), the relay.
-check $PR x "" "src/demo_b3_script.zig ops/demo-b3/guest.sh" TFFFFFFFTFF
-check $PR x "" "src/demo_c2_vms.zig" TFFFFFTFTFT
-check $PR x "" "src/demo_b1_state.zig" TFFFTFFFTFF
-check $PR x "" "src/relay.zig" TFFFFTTFTFT
-check $PR x "" "docs/demos/b3.md" FFFFFFFFFFF
+check $PR x "" "src/demo_b3_script.zig ops/demo-b3/guest.sh" TFFFFFFFTFFFFF
+check $PR x "" "src/demo_c2_vms.zig" TFFFFFTFTFTFTF
+check $PR x "" "src/demo_b1_state.zig" TFFFTFFFTFFTTT
+check $PR x "" "src/relay.zig" TFFFFTTFTFTFTF
+check $PR x "" "docs/demos/b3.md" FFFFFFFFFFFFFF
+# demo-b5: its own files, and the rig and state it shares with demo-b3; its docs (off).
+check $PR x "" "src/demo_b5.zig src/demo_b5_script.zig ops/demo-b5/guest.sh" TFFFFFFFFFFFTF
+check $PR x "" "docs/demos/b5.md" FFFFFFFFFFFFFF
+check $PR x "" "src/demo_c2_check.zig" TFFFFFTFTFFFTF
 # A narrow path next to an unknown one runs everything; two narrow paths run the union.
-check $PR x "" "src/scheduler_test.zig src/server.zig" TTTTTTTTTTT
-check $PR x "" "src/zigbox_map.zig src/demo_c1_steps.zig" TFFTFTTFTFT
+check $PR x "" "src/scheduler_test.zig src/server.zig" TTTTTTTTTTTTTT
+check $PR x "" "src/zigbox_map.zig src/demo_c1_steps.zig" TFFTFTTFTFTFTF
 # Full: the label, a release branch, a push to main, an unlisted change.
-check $PR x "full-ci" "src/scheduler_test.zig" TTTTTTTTTTT
-check $PR x "bug full-ci" "src/scheduler_test.zig" TTTTTTTTTTT
-check $PR x "full-cipher" "src/scheduler_test.zig" TFFFFFFFFFF
-check $PR claude/release-0.4 "" "src/scheduler_test.zig" TTTTTTTTTTT
-check $PR claude/ci-speed "" "src/scheduler_test.zig" TFFFFFFFFFF
-check push main "" "src/scheduler_test.zig" TTTTTTTTTTT
-check push main "" "web/app.js" TTTTTTTTTTT
-check push main "" "README.md" FFFFFFFFFFF
-check $PR x "" "" TTTTTTTTTTT
-check push main "" "" TTTTTTTTTTT
+check $PR x "full-ci" "src/scheduler_test.zig" TTTTTTTTTTTTTT
+check $PR x "bug full-ci" "src/scheduler_test.zig" TTTTTTTTTTTTTT
+check $PR x "full-cipher" "src/scheduler_test.zig" TFFFFFFFFFFFFF
+check $PR claude/release-0.4 "" "src/scheduler_test.zig" TTTTTTTTTTTTTT
+check $PR claude/ci-speed "" "src/scheduler_test.zig" TFFFFFFFFFFFFF
+check push main "" "src/scheduler_test.zig" TTTTTTTTTTTTTT
+check push main "" "web/app.js" TTTTTTTTTTTTTT
+check push main "" "README.md" FFFFFFFFFFFFFF
+check $PR x "" "" TTTTTTTTTTTTTT
+check push main "" "" TTTTTTTTTTTTTT
+# demo-b7's own files run demo-b7 only; docs/demos/b7.md is documentation.
+check $PR x "" "src/demo_b7.zig src/demo_b7_steps.zig docs/demos/b7.md" TFFFFFFFFFFTFF
+# The interop harness, its server rows and the Java client run mtls-interop only.
+check $PR x "" "src/mtls_interop_server.zig ops/mtls-interop/InteropClient.java" TFFFFFFTFFFFFF
 # demo-b1's own files run demo-b1 only; docs/demos/b1.md is documentation.
-check $PR x "" "src/demo_b1_nodes.zig docs/demos/b1.md" TFFFTFFFFFF
-check $PR x "" "src/demo_b1.zig src/demo_c1.zig" TFFTTFFFFFF
+check $PR x "" "src/demo_b1_nodes.zig docs/demos/b1.md" TFFFTFFFFFFFFF
+check $PR x "" "src/demo_b1.zig src/demo_c1.zig" TFFTTFFFFFFFFF
+# demo-b6's own files run demo-b6 only; it shares demo-b1's state and fleet, so they run it too.
+check $PR x "" "src/demo_b6_steps.zig docs/demos/b6.md" TFFFFFFFFFFFFT
+check $PR x "" "src/demo_b1_fleet.zig" TFFFTFFFTFFTTT
 # c3-smoke's steps and witness run c3-smoke and demo-c3; docs/demos/c3.md is documentation.
-check $PR x "" "src/c3_smoke_steps.zig src/c3_witness.zig docs/demos/c3.md" TFFFFFFFFTT
+check $PR x "" "src/c3_smoke_steps.zig src/c3_witness.zig docs/demos/c3.md" TFFFFFFFFTTFFF
 # demo-c3: its own files; the smoke's driver is c3-smoke's alone; the rig and the adapter reach it.
-check $PR x "" "src/demo_c3.zig ops/demo-c3/guest.sh" TFFFFFFFFFT
-check $PR x "" "src/c3_smoke.zig" TFFFFFFFFTF
-check $PR x "" "src/c3_smoke_steps.zig" TFFFFFFFFTT
-check $PR x "" "src/demo_c2_steps.zig" TFFFFFTFTFF
-check $PR x "" "src/c3_smoke.zig src/demo_c1_state.zig" TFFTTFFFTTF
-check $PR x "" "docs/demos/c3.md" FFFFFFFFFFF
+check $PR x "" "src/demo_c3.zig ops/demo-c3/guest.sh" TFFFFFFFFFTFFF
+check $PR x "" "src/c3_smoke.zig" TFFFFFFFFTFFFF
+check $PR x "" "src/c3_smoke_steps.zig" TFFFFFFFFTTFFF
+check $PR x "" "src/demo_c2_steps.zig" TFFFFFTFTFFFTF
+check $PR x "" "src/c3_smoke.zig src/demo_c1_state.zig" TFFTTFFFTTFTTT
+check $PR x "" "docs/demos/c3.md" FFFFFFFFFFFFFF
 
 # The macOS job: zcube's own files, the build and CI run it; a server file, an unknown path and
 # documentation do not; a full run does.

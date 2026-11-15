@@ -66,11 +66,12 @@ const symptom_spec = @import("symptom.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--health] [--trace-steps]\n" ++
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--health] " ++
+    "[--trace-steps]\n" ++
     "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--health] [--expect-fail] " ++
-    "[--trace-steps]\n" ++
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--health] " ++
+    "[--expect-fail] [--trace-steps]\n" ++
     "       sim-cluster <seed> soak [<nodes>] (--soak-minutes=M | --soak-operations=N) " ++
     "[--soak-epoch=E] [--soak-bytes=B] [--profile=NAME] [--jobs=true|false] [--strong]\n";
 
@@ -209,6 +210,10 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.options.jobs = false;
     } else if (std.mem.eql(u8, arg, "--strong")) {
         parsed.options.strong = true;
+    } else if (std.mem.eql(u8, arg, "--signed")) {
+        parsed.options.signed = true;
+    } else if (std.mem.eql(u8, arg, "--tenants")) {
+        parsed.options.tenants = true;
     } else if (std.mem.eql(u8, arg, "--health")) {
         parsed.options.health = true;
     } else if (std.mem.eql(u8, arg, "--c1")) {
@@ -359,7 +364,7 @@ fn print_replay(
     heal_at: ?u32,
 ) !void {
     // A world or a tooth is a comptime flag of its own runner, so its replay names that runner
-    // (`sim-c1-burst` builds one; #202).
+    // (`sim-c1-burst` builds the burst world's, #202; `sim-c1-teeth-exe` the teeth's).
     const runner = c1_teeth.runner;
     try out.print("  replay: zig-out/bin/{s} {d} {d} {d}", .{
         runner, seed, operations, options.nodes orelse 0,
@@ -372,7 +377,10 @@ fn print_flags(out: *std.Io.Writer, options: sim_cluster.Options, heal_at: ?u32)
     if (!options.liveness) try out.writeAll(" --liveness=false");
     if (options.c3) try out.writeAll(" --c3") else if (options.c1) try out.writeAll(" --c1");
     if (!options.jobs) try out.writeAll(" --jobs=false");
-    if (options.strong) try out.writeAll(" --strong");
+    // A tooth that needs the strong world implies it; the line says so anyway.
+    if (options.strong or c1_teeth.strong_world) try out.writeAll(" --strong");
+    if (options.signed) try out.writeAll(" --signed");
+    if (options.tenants) try out.writeAll(" --tenants");
     if (options.health) try out.writeAll(" --health");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
     if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});

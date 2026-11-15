@@ -162,7 +162,7 @@ agent_pid() { pgrep -f "^$BIN/zcube-agent --runtime"; }
 stage_setup() {
     mkdir -p "$STATE" "$LOG"
     "$BIN/zbx" doctor >"$LOG/doctor.log" 2>&1 || fail "zbx doctor"
-    setsid "$BIN/zcube-server" --listen 127.0.0.1:$PORT --store memory --quiet \
+    setsid "$BIN/zcube-server" --insecure-listen 127.0.0.1:$PORT --store memory --quiet \
         >"$LOG/server.log" 2>&1 </dev/null &
     until_ok 30 "the server" api_get /v1/status
     start_agent

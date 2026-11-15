@@ -13,6 +13,9 @@
 #   mtls_interop  mtls-interop (stock openssl and JDK servers)
 #   demo_b3       demo-b3 (one VM, KVM, a GHCR image)
 #   c3_smoke      c3-smoke on SQLite (C3's demo script with FakeRuntime; not demo-c3)
+#   demo_b7       demo-b7 (the API over mTLS, FakeRuntime, SQLite)
+#   demo_b5       demo-b5 (one VM, KVM, a GHCR image, signed jobs)
+#   demo_b6       demo-b6 on SQLite and on Postgres
 #   macos         the macOS job: zcube alone, built and tested on a macOS runner. Not in `jobs`:
 #                 a path no rule names does not run it, only a path of zcube's own or of CI
 #                 (is_macos) or a full run does. The Linux check job cross-compiles zcube for
@@ -27,7 +30,8 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 c3_smoke demo_c3)
+jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 c3_smoke demo_c3
+  demo_b7 demo_b5 demo_b6)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -64,34 +68,41 @@ classify() {
     # What every job is built from, or CI itself, and what a demo's start scripts run.
     build.zig | build.zig.zon | .github/* | fixtures/* | demo/*) want_all; return ;;
     # The shared driver of both demos.
-    src/demo_host.zig) want_all; return ;;
+    src/demo_host.zig | src/harness_tls.zig) want_all; return ;;
     # The files of one demo: that demo only (docs/demos/*.md is documentation).
     # demo-b1 imports demo_c1_state.zig, which imports demo_c1_fleet.zig and demo_c0_state.zig.
-    src/demo_c0_state.zig) want_one demo_c0; want_one demo_c1; want_one demo_b1; want_one demo_b3; return ;;
+    # demo-b7 imports demo_b1_state.zig and demo_c1_state.zig.
+    # demo-b6 imports demo_b1_state.zig, so all of these too.
+    src/demo_c0_state.zig) want_one demo_c0; want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6; return ;;
+    src/demo_c1_state.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6; return ;;
     # c3-smoke imports demo_c1_fleet.zig alone.
-    src/demo_c1_state.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; return ;;
     src/demo_c1_fleet.zig)
-      want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one c3_smoke; return ;;
+      want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6
+      want_one c3_smoke; return ;;
     src/demo_c0*.zig) want_one demo_c0; return ;;
     src/demo_c1*.zig) want_one demo_c1; return ;;
     # demo-c3 runs c3-smoke's steps and witness on QEMU guests (src/c3_smoke.zig is the smoke's own).
     src/c3_smoke.zig) want_one c3_smoke; return ;;
     src/c3_smoke*.zig | src/c3_witness.zig) want_one c3_smoke; want_one demo_c3; return ;;
     src/demo_c3*.zig | ops/demo-c3/*) want_one demo_c3; return ;;
-    # demo-b3 imports demo_b1_state.zig (so demo_b1_fleet.zig, demo_c1_state.zig and what they import), and demo_c2_steps.zig and demo_c2_vms.zig (its rig).
-    src/demo_b1_state.zig | src/demo_b1_fleet.zig) want_one demo_b1; want_one demo_b3; return ;;
+    # demo-b3 and demo-b5 import demo_b1_state.zig (so demo_b1_fleet.zig, demo_c1_state.zig and what they import), and demo_c2_steps.zig, demo_c2_vms.zig and demo_c2_check.zig (their rig; demo_c2_steps.zig imports demo_c2_check.zig).
+    src/demo_b1_state.zig | src/demo_b1_fleet.zig) want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6; return ;;
     src/demo_b1*.zig) want_one demo_b1; return ;;
+    src/demo_b6*.zig) want_one demo_b6; return ;;
     # demo-c3 imports demo_c2_vms.zig (the rig) but not demo_c2_steps.zig.
-    src/demo_c2_vms.zig) want_one demo_c2; want_one demo_b3; want_one demo_c3; return ;;
-    src/demo_c2_steps.zig) want_one demo_c2; want_one demo_b3; return ;;
+    src/demo_c2_vms.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; want_one demo_c3; return ;;
+    src/demo_c2_steps.zig | src/demo_c2_check.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
     src/demo_c2*.zig | ops/demo-c2/*) want_one demo_c2; return ;;
     src/demo_b3*.zig | ops/demo-b3/*) want_one demo_b3; return ;;
+    src/demo_b7*.zig) want_one demo_b7; return ;;
+    src/demo_b5*.zig | ops/demo-b5/*) want_one demo_b5; return ;;
     # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
     src/zigbox_* | src/relay*.zig)
-      want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; want_one demo_c3; return ;;
+      want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; want_one demo_b5; want_one demo_c3
+      return ;;
     # The mTLS interop harness and its Java server.
-    src/mtls_interop.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
+    src/mtls_interop*.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
     # The smoke's own files.
     ops/zigbox-smoke/*) want_one zigbox_smoke; return ;;
     # The store suites' own files (the backends themselves are the server and run everything).
@@ -106,7 +117,7 @@ classify() {
       src/console_*.zig | src/web_embed.zig | src/sim_*.zig | src/tests.zig | src/tidy.zig | \
       src/errors_site.zig | src/testdata/* | src/testing/check.zig | src/wasm_core.zig | \
       src/*_test.zig | src/agent_smoke.zig | src/local_smoke.zig | src/swarm_smoke.zig | \
-      src/bench_watch.zig | src/zcube_agent_teeth.zig | \
+      src/bench_watch.zig | src/zcube_agent_teeth.zig | src/zcube_agent_relay_teeth_*.zig | \
       src/mac_release.zig | packaging/homebrew/*) return ;;
   esac
   want_all

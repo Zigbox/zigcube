@@ -62,7 +62,10 @@ pub fn run(demo: *Demo) !void {
     defer host.config.cli_exe = saved_exe;
     host.config.cli_exe = try copy_executables(host);
     var plain = try saved_environ.clone(host.arena());
-    _ = plain.swapRemove("ZCUBE_SERVER");
+    // Local mode serves `--insecure-listen` only: none of the cluster's TLS settings apply.
+    for ([_][]const u8{ "ZCUBE_SERVER", "ZCUBE_CA", "ZCUBE_CERT", "ZCUBE_KEY" }) |name| {
+        _ = plain.swapRemove(name);
+    }
     try plain.put("ZCUBE_LOCAL_DIR", try local_dir(host));
     host.cli_environ = plain;
     const up = try host.zcube(&.{ "local", "up" });

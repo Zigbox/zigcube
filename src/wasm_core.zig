@@ -118,8 +118,10 @@ export fn zcube_sim_c1(seed: u64, operations: u32, nodes: u32) u32 {
 
 /// The cluster simulation with the knobs of the command line: `operations` 0 draws the whole shape
 /// from the seed (`sim_cluster.plan`), `profile` is a `sim_shape.ClusterProfile` index or
-/// `profile_auto`, and 0 for `nodes`, `lease_ttl_ms` or `replicas_pct` leaves it unset; `health` 1
-/// is `--health`. The report is what the native runner prints for the same arguments.
+/// `profile_auto`, and 0 for `nodes`, `lease_ttl_ms` or `replicas_pct` leaves it unset; `strong`,
+/// `signed` and `tenants` non-zero are `--strong`, `--signed` (B5's trust world, J12) and
+/// `--tenants` (B6's tenant world, P1); `health` non-zero is `--health`. The report is what the
+/// native runner prints for the same arguments.
 export fn zcube_sim_cluster_shaped(
     seed: u64,
     operations: u32,
@@ -129,6 +131,9 @@ export fn zcube_sim_cluster_shaped(
     profile: u32,
     lease_ttl_ms: u32,
     replicas_pct: u32,
+    strong: u32,
+    signed: u32,
+    tenants: u32,
     health: u32,
 ) u32 {
     const requested: sim_cluster.Options = .{
@@ -142,6 +147,9 @@ export fn zcube_sim_cluster_shaped(
             sim_shape.ClusterProfile.from_index(profile).?,
         .lease_ttl_ms = if (lease_ttl_ms == 0) null else lease_ttl_ms,
         .replicas_pct = if (replicas_pct == 0) null else replicas_pct,
+        .strong = strong != 0,
+        .signed = signed != 0,
+        .tenants = tenants != 0,
         .health = health != 0,
     };
     const resolved = sim_cluster.plan(seed, if (operations == 0) null else operations, requested);

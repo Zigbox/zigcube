@@ -17,6 +17,7 @@
 //!   PUT  /v1/agent/nodes/{node}/store                  the node's image summary (advisory)
 //!   GET  /v1/agent/nodes/{node}/watch?from=&timeout=   "something changed", a long poll
 //!   POST /v1/agent/nodes/{node}/credential             a peer credential for the node's key
+//!   GET  /v1/agent/nodes/{node}/fetchers/{digest}      the nodes that fetch an image (O5)
 //!
 //! **Every answer but the credential's carries `chain`**: `{"revision": R, "hash": "<hex>"}`,
 //! the store's `status`
@@ -34,8 +35,8 @@
 //! (`Reply.hold_ms`), as for `GET /v1/watch`.
 //!
 //! **These endpoints return `env` values** (the agent must start the container with them) and
-//! write the store, and they are unauthenticated until the API has auth. They are for a private
-//! address, like the write endpoints.
+//! write the store. Over `--listen` only node `{node}`'s own certificate may call them
+//! (`api_scope.zig`, B7); `--insecure-listen` is loopback only.
 //!
 //! **Validation.** A body comes from the network and is never trusted to satisfy an assertion of
 //! `Store`: keys are built here from validated names, the observed records must name the node and
@@ -44,6 +45,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const builtin = @import("builtin");
 const constants = @import("constants.zig");
 const c1_teeth = @import("c1_teeth.zig");
 const compare_sets = @import("compare_sets.zig");
@@ -56,6 +58,8 @@ const text_util = @import("text.zig");
 const Context = controller.Context;
 const peer = @import("peer.zig");
 const peer_ca = @import("peer_ca.zig");
+const job_cert = @import("job_cert.zig");
+const x509 = @import("x509.zig");
 
 /// The route failed and `ctx.diag` says why. Same set as `api.zig`'s, so `try` passes it up.
 pub const Failure = error{Failed};
@@ -94,6 +98,9 @@ pub fn body_bytes_max(path: []const u8) u32 {
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
         return constants.agent_request_bytes_max;
     if (std.mem.eql(u8, rest[slash..], "/credential")) return constants.peer_join_request_bytes_max;
+    if (std.mem.endsWith(u8, rest[slash..], "/certificate")) {
+        return constants.peer_join_request_bytes_max;
+    }
     if (!std.mem.eql(u8, rest[slash..], "/store")) return constants.agent_request_bytes_max;
     return constants.summary_request_bytes_max;
 }
@@ -107,7 +114,7 @@ pub fn route(
     hold: bool,
     lease_ttl_ms: u32,
     pair_kept: bool,
-    ca: ?*const peer_ca.Ca,
+    issuer: Issuer,
 ) Failure!Reply {
     assert(ctx.diag.code == null);
     const nodes = parts.next() orelse return no_such(ctx, "/v1/agent");
@@ -127,7 +134,8 @@ pub fn route(
         .pair_kept = pair_kept,
         .parts = parts,
         .lease_ttl_ms = lease_ttl_ms,
-        .ca = ca,
+        .ca = issuer.ca,
+        .cluster = issuer.cluster,
     };
     const what = parts.next() orelse return call.register();
     if (std.mem.eql(u8, what, "lease")) return call.lease();
@@ -140,8 +148,16 @@ pub fn route(
     if (std.mem.eql(u8, what, "pulls")) return call.pull();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
     if (std.mem.eql(u8, what, "credential")) return call.credential();
+    if (std.mem.eql(u8, what, "fetchers")) return call.fetchers();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
 }
+
+/// What signs certificates: the cluster CA (null in the simulation, which has no peers: the
+/// endpoints that sign then answer 404) and the trust domain a run's certificate names.
+pub const Issuer = struct {
+    ca: ?*const peer_ca.Ca = null,
+    cluster: []const u8 = "",
+};
 
 const Call = struct {
     ctx: *const Context,
@@ -156,6 +172,8 @@ const Call = struct {
     lease_ttl_ms: u32,
     /// The cluster CA, null where the server has none (the simulation).
     ca: ?*const peer_ca.Ca,
+    /// The trust domain of a relayed run's certificate; empty where no relay checks its upstream.
+    cluster: []const u8,
 
     fn require_method(call: Call, wanted: []const u8) Failure!void {
         if (std.mem.eql(u8, call.method, wanted)) return;
@@ -229,9 +247,8 @@ const Call = struct {
 
     /// Signs the node's peer key (docs/peer.md), for a node that is registered under the live
     /// lease the request names. It reads `/nodes/<node>` and writes no store key: the CA is not a
-    /// store writer (authority.md), so there is no chain pair in the answer either. The API is
-    /// unauthenticated, so this binds an honest node only: whoever can reach the port and read
-    /// `/nodes/<node>` can name its lease.
+    /// store writer (authority.md), so there is no chain pair in the answer either. Over
+    /// `--listen` only node `{node}`'s own certificate may ask (`api_scope.zig`, `.node_only`).
     fn credential(call: Call) Failure!Reply {
         const ctx = call.ctx;
         try call.require_method("POST");
@@ -249,15 +266,39 @@ const Call = struct {
         if (decoded.len != node_key.len) {
             return bad_request(ctx, "node_key", "is not 64 hex digits");
         }
-        try call.registered_on(input.lease);
+        const why = "a peer credential is issued only to a registered node";
+        try call.registered_on(input.lease, why);
         const issued = ca.issue(call.node, node_key) catch |err| switch (err) {
             error.Removed => return removed(ctx, call.node),
             error.BadKey => return bad_request(ctx, "node_key", "is not an Ed25519 public key"),
+        };
+        // The node certificate (B7) certifies the same key for the same window, read from one
+        // clock reading, so the two are renewed together. Its one check beyond `issue`'s: the
+        // key is not the CA's own.
+        var certificate: x509.Der = .{};
+        ca.issue_node_certificate(&certificate, &.{
+            .node = call.node,
+            .subject_key = node_key,
+            .lifetime = .{
+                .not_before_ms = issued.not_before_ms,
+                .not_after_ms = issued.not_after_ms,
+            },
+        }) catch |err| switch (err) {
+            error.Removed => return removed(ctx, call.node),
+            error.BadKey => return bad_request(ctx, "node_key", "is not an Ed25519 public key"),
+            else => |other| {
+                // A clock past the year 9999 and nothing else: the name and key were checked.
+                assert(ctx.diag.code == null);
+                x509.raise(ctx.diag, @errorCast(other), call.node, &.{});
+                return error.Failed;
+            },
         };
         const bytes = peer.encode(&issued);
         const ca_public = ca.public();
         return reply(ctx, .{
             .credential = std.fmt.allocPrint(ctx.arena, "{x}", .{&bytes}) catch
+                return no_memory(ctx),
+            .node_certificate = std.fmt.allocPrint(ctx.arena, "{x}", .{certificate.slice()}) catch
                 return no_memory(ctx),
             .ca_public = std.fmt.allocPrint(ctx.arena, "{x}", .{&ca_public}) catch
                 return no_memory(ctx),
@@ -268,15 +309,35 @@ const Call = struct {
 
     /// The node's record is on `lease`, and `lease` is not 0 (ZC-E0205 otherwise). A lease that
     /// ended deleted its keys, so a record on it is a live registration.
-    fn registered_on(call: Call, lease_id: store.LeaseId) Failure!void {
+    fn registered_on(call: Call, lease_id: store.LeaseId, why: []const u8) Failure!void {
         const ctx = call.ctx;
         if (lease_id == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
         const key = records.node_key(call.node);
         const found = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
             return propagate(ctx);
         };
-        const kv = found.kv orelse return not_registered(ctx, call.node, lease_id);
-        if (kv.lease != lease_id) return not_registered(ctx, call.node, lease_id);
+        const kv = found.kv orelse return not_registered(ctx, call.node, lease_id, why);
+        if (kv.lease != lease_id) return not_registered(ctx, call.node, lease_id, why);
+    }
+
+    /// No other node is registered on `lease_id`: a node that put its record on another node's
+    /// lease could then keep that node alive with its own keepalives (B7 slice 3).
+    fn lease_not_elsewhere(call: Call, lease_id: store.LeaseId) Failure!void {
+        const ctx = call.ctx;
+        var skipped: u32 = 0;
+        const nodes = controller.list_all_tolerant(
+            records.Node,
+            ctx,
+            records.prefix_nodes,
+            null,
+            constants.nodes_max,
+            &skipped,
+        ) catch return propagate(ctx);
+        for (nodes.items) |entry| {
+            if (entry.kv.lease != lease_id) continue;
+            if (std.mem.eql(u8, entry.kv.key, records.node_key(call.node).slice())) continue;
+            return bad_request(ctx, "lease", "is the lease of another node's registration");
+        }
     }
 
     // ---- PUT /v1/agent/nodes/{node} ----
@@ -287,19 +348,29 @@ const Call = struct {
         try call.only_known();
         const input = try parse_body(RegisterBody, ctx, call.body);
         if (input.lease == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
+        try call.lease_not_elsewhere(input.lease);
         const capacity = input.capacity;
         if (capacity.cpu_millis == 0) return bad_request(ctx, "capacity", "needs cpu_millis");
         if (capacity.memory_bytes == 0) return bad_request(ctx, "capacity", "needs memory_bytes");
         try check_text(ctx, "agent_version", input.agent_version, node_text_bytes_max);
         try check_text(ctx, "address", input.address, node_text_bytes_max);
-        if (input.labels.len > node_labels_max) return bad_request(ctx, "labels", "has too many");
-        for (input.labels) |label| try check_text(ctx, "labels", label, node_text_bytes_max);
+        try check_text(ctx, "trust_policy", input.trust_policy, constants.config_path_bytes_max);
+        if (input.labels.len > constants.node_labels_max) {
+            return bad_request(ctx, "labels", "has too many");
+        }
+        for (input.labels) |label| {
+            try check_text(ctx, "labels", label, constants.node_label_bytes_max);
+        }
+        if (records.node_labels_problem(input.labels)) |problem| {
+            return bad_request(ctx, "labels", problem);
+        }
         const node: records.Node = .{
             .name = call.node,
             .agent_version = input.agent_version,
             .address = input.address,
             .capacity = capacity,
             .labels = input.labels,
+            .trust_policy = input.trust_policy,
         };
         const key = records.node_key(call.node);
         const value = records.encode(ctx.arena, node, ctx.diag) catch return propagate(ctx);
@@ -326,6 +397,9 @@ const Call = struct {
         const id = std.fmt.parseInt(u64, id_text, 10) catch
             return bad_request(ctx, "lease", "is not a number");
         if (id == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
+        // Only the lease of this node's registration: a node certificate may keep its own node
+        // alive and no other (B7 slice 3).
+        try call.registered_on(id, "a node keeps alive only the lease of its registration");
         const granted = ctx.store.lease_keepalive(id, ctx.diag) catch return propagate(ctx);
         const lease_reply = .{ .id = granted.id, .ttl_ms = granted.ttl_ms };
         return reply(ctx, .{ .lease = lease_reply, .chain = try call.chain() });
@@ -376,6 +450,56 @@ const Call = struct {
         return reply(ctx, .{ .revision = all.revision, .kvs = mine.items, .chain = pair });
     }
 
+    // ---- GET /v1/agent/nodes/{node}/fetchers/{digest} ----
+
+    /// The names of the nodes assigned a replica whose image is `digest`, each once, in key
+    /// order: what the swarm fetch's O5 wait needs (docs/briefs/c2.md), computed here so that a
+    /// node's certificate learns the names and nothing of the records (no spec, no env; B7 slice
+    /// 7, decisions/2026-11-14-b7-slice7-o5-over-tls.md). Any node may ask, about any digest.
+    fn fetchers(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("GET");
+        try call.only_known();
+        const digest = call.parts.next() orelse return no_such(ctx, "that path");
+        try call.no_more();
+        if (!image_digest_valid(digest)) {
+            return bad_request(ctx, "digest", "is not b3: and 8 to 64 lower-case hex digits");
+        }
+        const all = controller.list_all(
+            records.Replica,
+            ctx,
+            records.prefix_replicas,
+            null,
+            constants.replicas_max,
+        ) catch return propagate(ctx);
+        const given = controller.list_all(
+            records.Assigned,
+            ctx,
+            records.prefix_assigned,
+            all.revision,
+            constants.assigned_max,
+        ) catch return propagate(ctx);
+        var ids: std.StringHashMapUnmanaged(void) = .empty;
+        for (all.items) |entry| {
+            const match = std.mem.eql(u8, entry.rec.image, digest);
+            if (!match and !fault_on(.fetchers_digest)) continue;
+            ids.put(ctx.arena, entry.rec.id, {}) catch return no_memory(ctx);
+        }
+        var nodes: std.ArrayList([]const u8) = .empty;
+        for (given.items) |entry| {
+            if (!ids.contains(entry.rec.replica)) continue;
+            const rest = entry.kv.key[records.prefix_assigned.len..];
+            const node = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse continue];
+            const last = if (nodes.items.len == 0) "" else nodes.items[nodes.items.len - 1];
+            // Keys ascend, so one node's assignments are adjacent.
+            if (std.mem.eql(u8, last, node)) continue;
+            nodes.append(ctx.arena, node) catch return no_memory(ctx);
+        }
+        assert(nodes.items.len <= given.items.len);
+        const pair = try call.chain();
+        return reply(ctx, .{ .revision = all.revision, .nodes = nodes.items, .chain = pair });
+    }
+
     // ---- GET /v1/agent/nodes/{node}/assigned ----
 
     /// The node's assignments, as stored.
@@ -406,6 +530,11 @@ const Call = struct {
     /// is assigned to and once that node has claimed it.
     fn runs(call: Call) Failure!Reply {
         const ctx = call.ctx;
+        if (std.mem.eql(u8, call.method, "POST")) {
+            try call.only_known();
+            const name = call.parts.next() orelse return no_such(ctx, "that path");
+            return call.run_certificate(name);
+        }
         try call.require_method("GET");
         try call.only_known();
         if (call.parts.next()) |name| return call.run_input(name);
@@ -491,6 +620,107 @@ const Call = struct {
         };
         const pair = try call.chain();
         return reply(ctx, .{ .input = input, .chain = pair });
+    }
+
+    // ---- POST /v1/agent/nodes/{node}/runs/{name}/certificate (B4) ----
+
+    /// Signs a relayed run's key: `spiffe://<cluster>/job/<name>`, the image digest, placement
+    /// epoch and labels, valid until the run's last legitimate moment. `job_cert.decide` says
+    /// whether this node may have it; a refusal is ZC-E0706. Not authenticated beyond that claim
+    /// check until B7 (docs/mtls.md, threat list).
+    fn run_certificate(call: Call, name: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        const tail = call.parts.next() orelse return no_such(ctx, "that path");
+        if (!std.mem.eql(u8, tail, "certificate")) return no_such(ctx, "that path");
+        try call.no_more();
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid job name");
+        }
+        const ca = call.ca orelse return no_such(ctx, "a run's certificate: this server has no CA");
+        if (call.cluster.len == 0) {
+            return no_such(ctx, "a run's certificate: this server names no cluster");
+        }
+        const limits: BodyLimits = .{
+            .bytes_max = constants.peer_join_request_bytes_max,
+            .ignore_unknown_fields = false,
+        };
+        const input = try parse_body_up_to(CertificateBody, ctx, call.body, limits);
+        const subject_key = try hex32(ctx, "public_key", input.public_key);
+        const digest = try hex32(ctx, "image_digest", input.image_digest);
+        if (input.epoch == 0) return bad_request(ctx, "epoch", "must not be 0");
+        const now_ms = ca.wall.now_ms();
+        const subject = try call.certificate_subject(name, .{
+            .node = call.node,
+            .epoch = input.epoch,
+            .image_digest = digest,
+            .now_ms = now_ms,
+        });
+        var der: x509.Der = undefined;
+        ca.issue_job_certificate(&der, &.{
+            .cluster = call.cluster,
+            .name = subject.name,
+            .subject_key = subject_key,
+            .identity = subject.identity_of(),
+            .lifetime = subject.lifetime,
+        }) catch |err| switch (err) {
+            error.BadKey => return bad_request(ctx, "public_key", "is not an Ed25519 public key"),
+            else => {
+                ctx.diag.raise(peer_ca.code_of(err));
+                ctx.diag.cause("the certificate for job {s} could not be made: {s}", .{
+                    name, peer_ca.reason(err),
+                });
+                return error.Failed;
+            },
+        };
+        return reply(ctx, .{
+            .certificate = std.fmt.allocPrint(ctx.arena, "{x}", .{der.slice()}) catch
+                return no_memory(ctx),
+            .not_before_ms = subject.lifetime.not_before_ms,
+            .not_after_ms = subject.lifetime.not_after_ms,
+        });
+    }
+
+    /// The job, its status, this node's claim and the run's assignment, read at one revision,
+    /// and `job_cert.decide` over them.
+    fn certificate_subject(
+        call: Call,
+        name: []const u8,
+        ask: job_cert.Ask,
+    ) Failure!job_cert.Subject {
+        const ctx = call.ctx;
+        var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const id = records.job_run_id(&id_buffer, name);
+        const job_key = records.job_key(name);
+        const status_key = records.job_status_key(name);
+        const claim_key = records.job_observed_key(call.node, name);
+        const assigned_key = records.assigned_key(call.node, id);
+        const keys = [_][]const u8{
+            job_key.slice(), status_key.slice(), claim_key.slice(), assigned_key.slice(),
+        };
+        const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
+        var found: [keys.len]store.GetResult = undefined;
+        for (keys, &found) |key, *slot| {
+            slot.* = ctx.store.get(ctx.arena, key, head.revision, ctx.diag) catch
+                return propagate(ctx);
+        }
+        const job_kv = found[0].kv orelse return refused_certificate(ctx, name, error.run_ended);
+        const job = records.read(records.Job, ctx.arena, job_kv, ctx.diag) catch
+            return propagate(ctx);
+        const status: records.JobStatus = if (found[1].kv) |kv|
+            records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch return propagate(ctx)
+        else
+            return refused_certificate(ctx, name, error.no_claim);
+        const claim: ?records.JobObserved = if (found[2].kv) |kv|
+            records.read(records.JobObserved, ctx.arena, kv, ctx.diag) catch
+                return propagate(ctx)
+        else
+            null;
+        const assignment: ?job_cert.Assignment = if (found[3].kv) |kv|
+            .{ .node = call.node, .epoch = kv.mod_revision }
+        else
+            null;
+        return job_cert.decide(job, status, claim, assignment, ask) catch |refusal|
+            refused_certificate(ctx, name, refusal);
     }
 
     // ---- POST /v1/agent/nodes/{node}/job-observed ----
@@ -825,6 +1055,9 @@ const Call = struct {
         if (rec.tenure != tenure) {
             return bad_request(ctx, "puts", "a record does not name the tenure of the request");
         }
+        if (!records.observed_valid(rec)) {
+            return bad_request(ctx, "puts", "a replica record has the job-only exit kind refused");
+        }
         const wanted = records.observed_key(call.node, rec.replica);
         if (!std.mem.eql(u8, put.key, wanted.slice())) {
             return bad_request(ctx, "puts", "a key is not the observed key of its record");
@@ -914,7 +1147,6 @@ fn scan_watch(
 /// events, and a store that has this many unread batches has changed.
 const watch_batches_max: u32 = 64;
 const node_text_bytes_max: u32 = 128;
-const node_labels_max: u32 = 8;
 
 // ---- Bodies and replies ------------------------------------------------------------------------
 
@@ -924,9 +1156,21 @@ const RegisterBody = struct {
     agent_version: []const u8 = "",
     address: []const u8 = "",
     labels: []const []const u8 = &.{},
+    trust_policy: []const u8 = "",
 };
 
 const CredentialBody = struct { node_key: []const u8, lease: u64 };
+
+/// A relayed run's key, the epoch its node holds and the image digest it runs, 64 hex digits each.
+const CertificateBody = struct { public_key: []const u8, epoch: u64, image_digest: []const u8 };
+
+fn hex32(ctx: *const Context, field: []const u8, text: []const u8) Failure![32]u8 {
+    var bytes: [32]u8 = undefined;
+    if (text.len != 64) return bad_request(ctx, field, "is not 64 hex digits");
+    const problem = "is not 64 hex digits";
+    _ = std.fmt.hexToBytes(&bytes, text) catch return bad_request(ctx, field, problem);
+    return bytes;
+}
 
 const LeaseBody = struct { ttl_ms: u32 = 0 };
 
@@ -1078,6 +1322,34 @@ const Numbers = struct {
     at: ?u64 = null,
 };
 
+/// `b3:` and 8 to 64 lower-case hex digits, as the fetch child takes it (`fetch_cli.zig`).
+fn image_digest_valid(digest: []const u8) bool {
+    if (!std.mem.startsWith(u8, digest, "b3:")) return false;
+    const digits = digest[3..];
+    if (digits.len < 8 or digits.len > 64) return false;
+    for (digits) |byte| {
+        const ok = switch (byte) {
+            '0'...'9', 'a'...'f' => true,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Test-only fault for the teeth test: `fetchers` names every assigned node, not only those
+/// assigned the digest's replicas.
+pub const TestFault = enum { fetchers_digest };
+var faults: [std.enums.values(TestFault).len]bool = @splat(false);
+
+pub fn set_test_fault(fault: TestFault, on: bool) void {
+    if (builtin.is_test) faults[@backingInt(fault)] = on;
+}
+
+fn fault_on(fault: TestFault) bool {
+    return builtin.is_test and faults[@backingInt(fault)];
+}
+
 fn no_parameter(ctx: *const Context, name: []const u8) Failure {
     return bad_request(ctx, name, "this endpoint takes no such parameter");
 }
@@ -1184,19 +1456,38 @@ fn no_such(ctx: *const Context, path: []const u8) Failure {
     return error.Failed;
 }
 
-fn removed(ctx: *const Context, node: []const u8) Failure {
+/// ZC-E0706: the server will not sign this run's key; the cause is `job_cert.reason`.
+fn refused_certificate(ctx: *const Context, name: []const u8, refusal: job_cert.Refusal) Failure {
     assert(ctx.diag.code == null);
-    ctx.diag.raise(.E0807);
-    ctx.diag.cause("node {s} is on the server's list of removed nodes", .{node});
-    ctx.diag.fix(.{ .sentence = "take the name out of the revoked file and restart zcube-server" });
+    ctx.diag.raise(.E0706);
+    ctx.diag.cause("the server refused a certificate for job {s}: {s}", .{
+        name, job_cert.reason(refusal),
+    });
+    ctx.diag.fix(.{ .sentence = "none needed if the run lost its claim" });
+    // No claim yet, or a claim not yet reported running: the run may still get there, so the
+    // agent asks again (503) rather than marking it refused (docs/api.md).
+    ctx.diag.settling = refusal == error.no_claim or refusal == error.not_started;
     return error.Failed;
 }
 
-fn not_registered(ctx: *const Context, node: []const u8, lease_id: store.LeaseId) Failure {
+fn removed(ctx: *const Context, node: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0807);
+    ctx.diag.cause("node {s} is on the server's list of removed names (revoked)", .{node});
+    ctx.diag.fix(.{ .sentence = "take the name out of the revoked file (the server rereads it)" });
+    return error.Failed;
+}
+
+fn not_registered(
+    ctx: *const Context,
+    node: []const u8,
+    lease_id: store.LeaseId,
+    why: []const u8,
+) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0205);
     ctx.diag.cause("node {s} is not registered under lease {d}", .{ node, lease_id });
-    ctx.diag.cause("a peer credential is issued only to a registered node", .{});
+    ctx.diag.cause("{s}", .{why});
     ctx.diag.fix(.{ .sentence = "the agent registers first and asks again by itself" });
     return error.Failed;
 }

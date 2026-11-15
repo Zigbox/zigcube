@@ -5,7 +5,7 @@ client and model, and the first two are the product:
 
 | Mode | How | What answers `/v1` |
 | --- | --- | --- |
-| **Live server** | open the page `zcube-server` serves at `/` (or `/console/`) | the real server, on the same origin |
+| **Live server** | open the page `zcube-server` serves at `/` (or `/console/`) on `--insecure-listen` (loopback), or on `--listen` over TLS with a browser certificate from `ca issue-client --p12` and the browser CA imported as a root (B7 slice 6, [mtls.md](mtls.md) "Browsers") | the real server, on the same origin |
 | **Simulation** | `?sim=c0` | the **real control-plane core compiled to WebAssembly**, in the browser, over a memory store and the simulated runtime, on virtual time (`web/sim/`, `src/console_wasm.zig`) |
 | **Mock** | `?mock=c1`, `?mock=b1`, `?mock=c3` | a JavaScript model of the proposed API (`web/mock/`). It remains for **C1** (several nodes, failover), **B1** (jobs in every state and ending) and **C3** (a rollout record; the mock's own controller does not roll out), which the simulation does not run; the UI says "mock" |
 
@@ -246,6 +246,7 @@ The console lists once and then follows the watch, the same way an agent does.
    | ◐ Resyncing | relisting after a compaction | blue, no banner |
    | ◐ Reconnecting | a request failed less than 10 s ago | blue, banner with the diagnostic |
    | ▲ Stale, as of 14:02:31 | failing for over 10 s, or the store is down | amber, banner; the data stays on screen |
+   | ✕ Not allowed | the server refused the certificate's scope (`403`, `ZC-E0822`) | banner with the diagnostic and the fix: a client certificate of scope `admin`; retrying will not help |
    | ◌ Connecting | first load | |
 
    The pill opens a small log of the recent events. While not Live, data is never blanked: it is

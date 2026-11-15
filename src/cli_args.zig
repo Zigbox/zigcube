@@ -43,6 +43,14 @@ pub const Options = struct {
     output: Output = .text,
     /// `--server HOST:PORT`; null means the environment, then the default.
     server: ?[]const u8 = null,
+    /// `--ca FILE`, `--cert FILE`, `--key FILE`: the API over TLS (docs/mtls.md); null means the
+    /// environment (`ZCUBE_CA`, `ZCUBE_CERT`, `ZCUBE_KEY`), then plain HTTP.
+    ca: ?[]const u8 = null,
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    /// `--tls-name NAME`: the DNS name of the server's certificate; null means `ZCUBE_TLS_NAME`,
+    /// then `zcube-server`.
+    tls_name: ?[]const u8 = null,
     yes: bool = false,
     /// apply: show the change and stop.
     dry_run: bool = false,
@@ -227,6 +235,10 @@ fn split(
             index += 1;
             if (index >= args.len) return missing_value(diag, "--server", "HOST:PORT");
             options.server = args[index];
+        } else if (tls_option(options, arg)) |field| {
+            index += 1;
+            if (index >= args.len) return missing_value(diag, arg, "a value");
+            field.* = args[index];
         } else if (std.mem.eql(u8, arg, "-y") or std.mem.eql(u8, arg, "--yes")) {
             options.yes = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
@@ -260,11 +272,20 @@ fn is_job_command(words: []const []const u8, arg: []const u8) bool {
         std.mem.eql(u8, arg, "--command");
 }
 
+/// The field of `--ca`, `--cert`, `--key` or `--tls-name`; null for another argument.
+fn tls_option(options: *Options, arg: []const u8) ?*?[]const u8 {
+    if (std.mem.eql(u8, arg, "--ca")) return &options.ca;
+    if (std.mem.eql(u8, arg, "--cert")) return &options.cert;
+    if (std.mem.eql(u8, arg, "--key")) return &options.key;
+    if (std.mem.eql(u8, arg, "--tls-name")) return &options.tls_name;
+    return null;
+}
+
 fn is_global(arg: []const u8) bool {
     const names = [_][]const u8{
-        "--",        "-v", "--verbose", "-o",        "--output",
-        "--server",  "-y", "--yes",     "--dry-run", "--no-redact",
-        "--confirm",
+        "--",        "-v",   "--verbose", "-o",        "--output",
+        "--server",  "-y",   "--yes",     "--dry-run", "--no-redact",
+        "--confirm", "--ca", "--cert",    "--key",     "--tls-name",
     };
     for (names) |name| {
         if (std.mem.eql(u8, arg, name)) return true;
@@ -695,4 +716,20 @@ test "rollout takes status, pause or resume and a service; history takes a servi
         try testing.expectError(error.Failed, parse(line, &parsed, &diag));
         try testing.expect(diag.last_cause() != null);
     }
+}
+
+test "the TLS options are global, before or after the command (B7)" {
+    // Goal: --ca, --cert, --key and --tls-name reach the client wherever they stand.
+    const parsed = try parse_text(&.{
+        "--ca",  "ca.crt",  "get",        "replicas", "--cert", "ops.crt",
+        "--key", "ops.key", "--tls-name", "api.x",
+    });
+    try testing.expectEqualStrings("ca.crt", parsed.options.ca.?);
+    try testing.expectEqualStrings("ops.crt", parsed.options.cert.?);
+    try testing.expectEqualStrings("ops.key", parsed.options.key.?);
+    try testing.expectEqualStrings("api.x", parsed.options.tls_name.?);
+    var diag: Diag = undefined;
+    diag.reset();
+    var refused: Parsed = undefined;
+    try testing.expectError(error.Failed, parse(&.{ "get", "replicas", "--ca" }, &refused, &diag));
 }

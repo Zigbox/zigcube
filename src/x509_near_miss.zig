@@ -160,6 +160,8 @@ fn certificate_of(kind: Kind, out: *x509.Der) !void {
         .ca => try t.make_ca(out),
         .workload => try t.make_workload(out),
         .server => try t.make_server(out),
+        .node => try t.make_node(out),
+        .client => try t.make_client(out),
     }
 }
 
@@ -171,10 +173,11 @@ fn no_version(parts: *Parts, _: *Scratch) void {
 fn version_four(parts: *Parts, _: *Scratch) void {
     parts.tbs[0] = &.{ 0xA0, 0x03, 0x02, 0x01, 0x03 };
 }
-fn serial_negative(parts: *Parts, _: *Scratch) void {
-    var serial: [18]u8 = @splat(0x11);
-    serial[0..3].* = .{ 0x02, 0x10, 0x80 };
-    parts.tbs[1] = &serial;
+fn serial_negative(parts: *Parts, scratch: *Scratch) void {
+    // In the scratch, not on this frame's stack: a ReleaseSafe build reuses the frame.
+    var content: [16]u8 = @splat(0x11);
+    content[0] = 0x80;
+    parts.tbs[1] = scratch.tlv(der.tag_integer, &content);
 }
 fn serial_empty(parts: *Parts, _: *Scratch) void {
     parts.tbs[1] = &.{ 0x02, 0x00 };
@@ -249,10 +252,66 @@ fn san_two_uris(parts: *Parts, scratch: *Scratch) void {
     const value = scratch.tlv(der.tag_sequence, content[0 .. first.len + second.len]);
     parts.ext[3] = scratch.extension(&oid_san, null, value);
 }
-fn san_job_path(parts: *Parts, scratch: *Scratch) void {
-    const uri = "spiffe://prod.example/job/broker-1";
+/// A SAN of one URI `uri` on the workload's certificate, whose subject stays `broker-1`.
+fn repeat(comptime byte: u8, comptime count: usize) *const [count]u8 {
+    const filled: [count]u8 = @splat(byte);
+    return &filled;
+}
+
+fn san_uri(parts: *Parts, scratch: *Scratch, uri: Slice) void {
     const value = scratch.tlv(der.tag_sequence, scratch.tlv(0x86, uri));
     parts.ext[3] = scratch.extension(&oid_san, null, value);
+}
+fn san_job_other_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/other");
+}
+fn san_job_empty(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/");
+}
+fn san_job_nested(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/broker-1/x");
+}
+fn san_job_upper_path(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/Job/broker-1");
+}
+fn san_job_plural(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/jobs/broker-1");
+}
+fn san_job_no_slash(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job");
+}
+fn san_job_upper_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/Broker-1");
+}
+fn san_job_underscore(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/broker_1");
+}
+fn san_job_query(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/broker-1?run=2");
+}
+fn san_job_fragment(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/broker-1#run");
+}
+fn san_job_port(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example:443/job/broker-1");
+}
+fn san_job_userinfo(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://u@prod.example/job/broker-1");
+}
+fn san_job_dot_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/..");
+}
+fn san_job_hyphen_edge(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/-broker");
+}
+fn san_job_too_long(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/" ++ repeat('a', 64));
+}
+fn san_job_bad_cluster(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://Prod.example/job/broker-1");
+}
+fn san_job_in_server(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/job/x");
 }
 fn swap_first_two(parts: *Parts, _: *Scratch) void {
     std.mem.swap(Slice, &parts.ext[0], &parts.ext[1]);
@@ -378,6 +437,84 @@ fn add_eku(parts: *Parts, scratch: *Scratch) void {
     parts.push_ext(scratch.extension(&.{ 0x55, 0x1D, 0x25 }, null, &client_auth));
 }
 
+/// Extension `index` of a good certificate of `kind`, copied into the scratch.
+fn donor_extension(scratch: *Scratch, kind: Kind, index: usize) Slice {
+    var other: x509.Der = .{};
+    certificate_of(kind, &other) catch unreachable; // A fixed, valid request.
+    const parts = split(other.slice()) catch unreachable; // The writer's own output.
+    const piece = parts.ext[index];
+    const buffer = &scratch.pieces[scratch.used];
+    scratch.used += 1;
+    @memcpy(buffer[0..piece.len], piece);
+    return buffer[0..piece.len];
+}
+fn node_add_identity(parts: *Parts, scratch: *Scratch) void {
+    parts.push_ext(donor_extension(scratch, .workload, 4));
+}
+fn node_add_client_identity(parts: *Parts, scratch: *Scratch) void {
+    parts.push_ext(donor_extension(scratch, .client, 4));
+}
+fn client_workload_identity(parts: *Parts, scratch: *Scratch) void {
+    parts.ext[4] = donor_extension(scratch, .workload, 4);
+}
+fn workload_client_identity(parts: *Parts, scratch: *Scratch) void {
+    parts.ext[4] = donor_extension(scratch, .client, 4);
+}
+fn client_scope_three(parts: *Parts, scratch: *Scratch) void {
+    const piece = donor_extension(scratch, .client, 4);
+    const bytes: []u8 = @constCast(piece);
+    // The extension ends with the ENUMERATED scope's one content byte.
+    std.debug.assert(bytes[bytes.len - 3] == der.tag_enumerated);
+    bytes[bytes.len - 1] = 3;
+    parts.ext[4] = piece;
+}
+fn client_scope_zero(parts: *Parts, scratch: *Scratch) void {
+    const piece = donor_extension(scratch, .client, 4);
+    const bytes: []u8 = @constCast(piece);
+    std.debug.assert(bytes[bytes.len - 3] == der.tag_enumerated);
+    bytes[bytes.len - 1] = 0;
+    parts.ext[4] = piece;
+}
+fn client_version_one(parts: *Parts, scratch: *Scratch) void {
+    const piece = donor_extension(scratch, .client, 4);
+    const bytes: []u8 = @constCast(piece);
+    // SEQUENCE { INTEGER 2, ENUMERATED s }: the version's content byte is sixth from the end.
+    std.debug.assert(bytes[bytes.len - 6] == der.tag_integer);
+    bytes[bytes.len - 4] = 1;
+    parts.ext[4] = piece;
+}
+fn node_with_server_eku(parts: *Parts, scratch: *Scratch) void {
+    parts.ext[2] = donor_extension(scratch, .server, 2);
+}
+fn node_other_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/node/node-2");
+}
+fn node_bad_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/node/Node_1");
+}
+fn node_as_client(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/client/node-1");
+}
+fn node_as_service(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/service/node-1");
+}
+fn node_dns(parts: *Parts, scratch: *Scratch) void {
+    const value = scratch.tlv(der.tag_sequence, scratch.tlv(0x82, "node-1.botpike.com"));
+    parts.ext[3] = scratch.extension(&oid_san, null, value);
+}
+fn client_other_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/client/ops-2");
+}
+fn client_as_node(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/node/ops-1");
+}
+fn client_as_service(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/service/ops-1");
+}
+fn client_empty_name(parts: *Parts, scratch: *Scratch) void {
+    san_uri(parts, scratch, "spiffe://prod.example/client/");
+}
+
 fn row(name: []const u8, kind: Kind, mutate: Mutate, expect: x509.Error) Row {
     return .{ .name = name, .kind = kind, .mutate = mutate, .expect = expect };
 }
@@ -416,7 +553,23 @@ const rows = [_]Row{
     row("san bad path", .workload, san_bad_path, error.BadSan),
     row("san other service", .workload, san_other_service, error.BadName),
     row("san two uris", .workload, san_two_uris, error.BadSan),
-    row("san job path", .workload, san_job_path, error.BadSan),
+    row("san job other name", .workload, san_job_other_name, error.BadName),
+    row("san job empty name", .workload, san_job_empty, error.BadSan),
+    row("san job nested", .workload, san_job_nested, error.BadSan),
+    row("san Job path", .workload, san_job_upper_path, error.BadSan),
+    row("san jobs path", .workload, san_job_plural, error.BadSan),
+    row("san job no slash", .workload, san_job_no_slash, error.BadSan),
+    row("san job upper name", .workload, san_job_upper_name, error.BadSan),
+    row("san job underscore", .workload, san_job_underscore, error.BadSan),
+    row("san job query", .workload, san_job_query, error.BadSan),
+    row("san job fragment", .workload, san_job_fragment, error.BadSan),
+    row("san job port", .workload, san_job_port, error.BadSan),
+    row("san job userinfo", .workload, san_job_userinfo, error.BadSan),
+    row("san job dot name", .workload, san_job_dot_name, error.BadSan),
+    row("san job hyphen edge", .workload, san_job_hyphen_edge, error.BadSan),
+    row("san job name 64 bytes", .workload, san_job_too_long, error.BadSan),
+    row("san job upper cluster", .workload, san_job_bad_cluster, error.BadSan),
+    row("san job on server", .server, san_job_in_server, error.BadSan),
     row("eku code signing", .server, eku_code_signing, error.BadExtension),
     row("eku not critical", .server, eku_not_critical, error.BadExtension),
     row("ku extra bits", .server, ku_extra_bits, error.BadExtension),
@@ -430,6 +583,25 @@ const rows = [_]Row{
     row("signature 63 bytes", .workload, sig_short, error.Malformed),
     row("server with identity", .server, add_identity_from_workload, error.UnexpectedExtension),
     row("ca with eku", .ca, add_eku, error.UnexpectedExtension),
+    row("node with identity", .node, node_add_identity, error.UnexpectedExtension),
+    row("node with scope", .node, node_add_client_identity, error.UnexpectedExtension),
+    row("node with server eku", .node, node_with_server_eku, error.BadSan),
+    row("node other name", .node, node_other_name, error.BadName),
+    row("node bad name", .node, node_bad_name, error.BadSan),
+    row("node as client", .node, node_as_client, error.MissingExtension),
+    row("node as service", .node, node_as_service, error.MissingExtension),
+    row("node dns name", .node, node_dns, error.BadSan),
+    row("client no scope", .client, drop_last_extension, error.MissingExtension),
+    row("client workload identity", .client, client_workload_identity, error.BadIdentity),
+    row("client scope 3", .client, client_scope_three, error.BadIdentity),
+    row("client scope 0", .client, client_scope_zero, error.BadIdentity),
+    row("client version 1", .client, client_version_one, error.BadIdentity),
+    row("client other name", .client, client_other_name, error.BadName),
+    row("client as node", .client, client_as_node, error.UnexpectedExtension),
+    row("client as service", .client, client_as_service, error.BadIdentity),
+    row("client empty name", .client, client_empty_name, error.BadSan),
+    row("client dns name", .client, node_dns, error.BadSan),
+    row("workload with scope", .workload, workload_client_identity, error.BadIdentity),
 };
 
 test "each near-miss certificate is refused for its own reason" {

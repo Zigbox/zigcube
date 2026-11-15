@@ -79,6 +79,7 @@ test {
     _ = @import("agent_health_test.zig");
     _ = @import("sim_fleet_coverage.zig");
     _ = @import("tidy.zig");
+    _ = @import("harness_tls.zig");
 }
 
 // The files below are imported by a file-level `comptime` block, not by a test: a test that a
@@ -86,11 +87,15 @@ test {
 // the run without a word (docs/decisions/2026-11-04-c2-slice8-review-fixes.md).
 comptime {
     _ = @import("peer_fuzz.zig"); // Reads ZCUBE_FUZZ_SEED: native only, which this root is.
+    _ = @import("x509_p256_test.zig");
     _ = @import("x509_fuzz.zig"); // The same: the WASI core root has no such environment.
     _ = @import("relay_pump.zig");
     _ = @import("relay_fuzz.zig");
     _ = @import("relay.zig");
+    _ = @import("relay_tls_test.zig");
+    _ = @import("agent_relay_certs_test.zig");
     _ = @import("tls_fuzz.zig"); // The same.
+    _ = @import("tls_server_fuzz.zig"); // The same.
     _ = @import("tls_conn.zig"); // Sockets and the real clock: native only.
     _ = @import("tls_conn_test.zig");
     _ = @import("fuzz_seeds.zig");
@@ -112,11 +117,23 @@ comptime {
     _ = @import("zigbox_probes.zig");
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
+    _ = @import("server_revoked.zig");
+    _ = @import("server_tls_test.zig");
+    _ = @import("api_tls_guard_test.zig");
+    _ = @import("server_issue.zig");
+    _ = @import("server_browser_ca.zig");
+    _ = @import("pkcs12.zig");
+    _ = @import("server_issue_p12.zig");
     _ = @import("agent_run.zig");
     _ = @import("demo_c2_check.zig");
     _ = @import("job_api.zig");
+    _ = @import("job_cert.zig");
+    _ = @import("job_trust.zig");
+    _ = @import("job_trust_fixture.zig");
 }
 
 test {
     _ = @import("zigbox_limits_test.zig");
+    _ = @import("api_tls_test.zig");
+    _ = @import("trust_file.zig");
 }

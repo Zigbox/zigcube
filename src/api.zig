@@ -33,11 +33,13 @@ const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const codes = @import("diag/codes.zig");
 const agent_api = @import("agent_api.zig");
+const api_scope = @import("api_scope.zig");
 const apply_mod = @import("apply.zig");
 const history = @import("history.zig");
 const rollback = @import("rollback.zig");
 const rollout_steer = @import("rollout_steer.zig");
 const job_api = @import("job_api.zig");
+const job_trust = @import("job_trust.zig");
 const constants = @import("constants.zig");
 const accounting = @import("allocations.zig");
 const controller = @import("controller.zig");
@@ -56,7 +58,12 @@ const Context = controller.Context;
 const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 
+pub const Caller = api_scope.Caller;
+
 pub const Request = struct {
+    /// Who calls, from the client certificate the shell's TLS handshake verified (B7); `.local`
+    /// for the loopback `--insecure-listen` listener, the console module and the simulators.
+    caller: Caller,
     method: []const u8,
     /// Without the query: "/v1/list".
     path: []const u8,
@@ -105,6 +112,9 @@ pub const Api = struct {
     /// The relays the server's configuration names (B3): what a job's `relay` is resolved against
     /// at admission. The memory behind it outlives the server.
     relays: []const records.JobRelay = &.{},
+    /// The trust policy of the server's configuration (B5), checked at `POST /v1/jobs`; null
+    /// checks nothing. Its scratch is used by one write at a time.
+    trust: ?*const job_trust.Trust = null,
     /// Names the decisions the write endpoints record. Its instance number is the shell's.
     source: controller.DecisionSource = .{ .instance = 0 },
     /// The server's guard against a store that went backwards, for
@@ -118,6 +128,8 @@ pub const Api = struct {
     /// The cluster CA (docs/peer.md), for `POST /v1/agent/nodes/{node}/credential`. Null in the
     /// simulation, which has no peers: the endpoint then answers 404.
     ca: ?*const peer_ca.Ca = null,
+    /// The trust domain of relayed runs' certificates (`server_config.Config.cluster`, B4).
+    cluster: []const u8 = "",
 
     /// Answers one request. `ctx.arena` holds the answer: it stays valid until the arena is reset.
     pub fn handle(api: *Api, ctx: *const Context, request: Request) Response {
@@ -154,6 +166,9 @@ pub const Api = struct {
         if (request.request_id) |sent| {
             if (id_problem(sent)) |problem| return bad_request(ctx, "X-Request-Id", problem);
         }
+        if (api_scope.refusal(request.caller, request.method, request.path, request.query)) |need| {
+            return not_allowed(ctx, request, need);
+        }
         const prefix = "/v1/";
         if (!std.mem.startsWith(u8, request.path, prefix)) return no_such(ctx, request.path);
         var parts = std.mem.splitScalar(u8, request.path[prefix.len..], '/');
@@ -169,7 +184,7 @@ pub const Api = struct {
                 request.hold,
                 api.lease_ttl_ms,
                 api.pair_kept,
-                api.ca,
+                .{ .ca = api.ca, .cluster = api.cluster },
             );
             return .{
                 .body = agent.body,
@@ -380,8 +395,8 @@ fn check_applied_by(ctx: *const Context, text: []const u8) Failure!void {
     }
 }
 
-/// The `relay` of a job body: a string, or anything else, which is skipped (never built, like
-/// `Present`) and refused by name in `job_api` as an empty relay name.
+/// The `relay` of a job body: a string, or anything else, which is skipped (never built) and
+/// refused by name in `job_api` as an empty relay name.
 const RelayField = struct {
     name: ?[]const u8 = null,
 
@@ -398,24 +413,94 @@ const RelayField = struct {
     }
 };
 
-/// A JSON value that is skipped, not built: only its presence is kept. A `std.json.Value` of a
-/// 409,600-byte array of zeros takes about 37 times that in the arena.
-const Present = struct {
+/// The `placement` of a job body: `{"require": {"key": "value"}}`. What does not fit that shape is
+/// not an error of the parser but a `problem`, a sentence that `job_api` refuses (ZC-E0130,
+/// naming `placement`): a member other than `require`, a `require` that is not an object, a value
+/// that is not a string, a key given twice.
+const PlacementField = struct {
+    require: []const records.Pair = &.{},
+    problem: ?[]const u8 = null,
+    seen_require: bool = false,
+
     pub fn jsonParse(
         allocator: std.mem.Allocator,
         source: anytype,
         options: std.json.ParseOptions,
-    ) !Present {
-        _ = allocator;
-        _ = options;
-        try source.skipValue();
-        return .{};
+    ) !PlacementField {
+        var field: PlacementField = .{};
+        if (try source.peekNextTokenType() != .object_begin) {
+            try source.skipValue();
+            field.problem = "must be an object: {\"require\": {\"key\": \"value\"}}";
+            return field;
+        }
+        _ = try source.next();
+        while (true) {
+            const max = options.max_value_len.?;
+            const name = try source.nextAllocMax(allocator, .alloc_if_needed, max);
+            switch (name) {
+                .object_end => return field,
+                .string, .allocated_string => |text| {
+                    if (std.mem.eql(u8, text, "require")) {
+                        if (field.seen_require) {
+                            field.problem = field.problem orelse "names require twice";
+                        }
+                        field.seen_require = true;
+                        try field.read_require(allocator, source, options);
+                    } else {
+                        try source.skipValue();
+                        field.problem = field.problem orelse
+                            "has a member the API does not know; it takes only require";
+                    }
+                },
+                else => return error.UnexpectedToken,
+            }
+        }
+    }
+
+    fn read_require(
+        field: *PlacementField,
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !void {
+        if (try source.peekNextTokenType() != .object_begin) {
+            try source.skipValue();
+            field.problem = field.problem orelse "require must be an object of strings";
+            return;
+        }
+        _ = try source.next();
+        var pairs: std.ArrayList(records.Pair) = .empty;
+        field.require = &.{};
+        while (true) {
+            const max = options.max_value_len.?;
+            const name = try source.nextAllocMax(allocator, .alloc_if_needed, max);
+            const key = switch (name) {
+                .object_end => {
+                    field.require = pairs.items;
+                    return;
+                },
+                .string, .allocated_string => |text| text,
+                else => return error.UnexpectedToken,
+            };
+            if (try source.peekNextTokenType() != .string) {
+                try source.skipValue();
+                field.problem = field.problem orelse "every value in require must be a string";
+                continue;
+            }
+            const value = try std.json.innerParse([]const u8, allocator, source, options);
+            for (pairs.items) |pair| {
+                if (std.mem.eql(u8, pair[0], key)) {
+                    field.problem = field.problem orelse "require names a key twice";
+                }
+            }
+            try pairs.append(allocator, .{ key, value });
+        }
     }
 };
 
 /// The body of `POST /v1/jobs`: a job as JSON. `relay` is the name of a relay of the server's
-/// configuration (B3); `placement` is parsed so that it can be refused by name (not built yet),
-/// not as an unknown field.
+/// configuration (B3); `placement` (B6) is parsed by `PlacementField`, whose problems are refused
+/// by name, not as an unknown field.
 const JobBody = struct {
     name: []const u8,
     image: []const u8,
@@ -431,7 +516,8 @@ const JobBody = struct {
     input_env: ?[]const u8 = null,
     submit_by_ms: u64,
     relay: ?RelayField = null,
-    placement: ?Present = null,
+    signatures: []const []const u8 = &.{},
+    placement: ?PlacementField = null,
     applied_by: []const u8 = anonymous,
 };
 
@@ -455,6 +541,10 @@ const JobSpec = struct {
     input_bytes: ?u64,
     /// The name of the relay the job asked for; absent when it asked for none.
     relay: ?[]const u8,
+    /// The job's signatures (B5), as submitted; empty when it has none.
+    signatures: []const []const u8,
+    /// B6: what the job requires of a node; absent when it asked for nothing.
+    placement: ?records.Placement,
     submit_by_ms: u64,
     created_at_ms: u64,
     applied_by: []const u8,
@@ -476,6 +566,8 @@ const JobSpec = struct {
             .input_digest = job.input_digest,
             .input_bytes = job.input_bytes,
             .relay = if (job.relay) |relay| relay.name else null,
+            .signatures = job.signatures orelse &.{},
+            .placement = job.placement,
             .submit_by_ms = job.submit_by_ms,
             .created_at_ms = job.created_at_ms,
             .applied_by = job.applied_by,
@@ -510,6 +602,17 @@ fn job_reply(ctx: *const Context, status: u16, reply: JobReply) Failure!Reply {
     return done;
 }
 
+/// A job no trusted signature covers (B5): 403 with Zigbox's diagnostic, ZBX-E0905 or E0906, in
+/// the body every error has.
+fn refused_reply(ctx: *const Context, id: []const u8, diagnostic: *const Diagnostic) Failure!Reply {
+    assert(std.mem.startsWith(u8, diagnostic.code.slice(), "ZBX-E09"));
+    // The body drops the diagnostic's `docs`, so it writes a copy in the request's arena.
+    const copy = ctx.arena.create(Diagnostic) catch return no_memory(ctx);
+    copy.* = diagnostic.*;
+    const body = error_body(ctx, id, copy) catch return no_memory(ctx);
+    return .{ .status = 403, .body = body };
+}
+
 fn job_conflict(ctx: *const Context, name: []const u8) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0105);
@@ -520,7 +623,7 @@ fn job_conflict(ctx: *const Context, name: []const u8) Failure {
 
 fn job_input(
     ctx: *const Context,
-    relays: []const records.JobRelay,
+    api: *const Api,
     body: []const u8,
     id: []const u8,
 ) Failure!job_api.Input {
@@ -553,8 +656,13 @@ fn job_input(
         .submit_by_ms = parsed.submit_by_ms,
         // A relay that is not a string becomes the empty name, which `job_api` refuses.
         .relay = if (parsed.relay) |field| field.name orelse "" else null,
-        .relays = relays,
-        .placement = parsed.placement != null,
+        .relays = api.relays,
+        .signatures = parsed.signatures,
+        .trust = api.trust,
+        .placement = if (parsed.placement) |field| .{
+            .require = field.require,
+            .problem = field.problem,
+        } else null,
         .applied_by = parsed.applied_by,
         .request_id = id,
     };
@@ -698,6 +806,46 @@ fn no_service(ctx: *const Context, name: []const u8) Failure {
     return error.Failed;
 }
 
+/// ZC-E0822: the caller's certificate does not allow the request; nothing was read or written.
+fn not_allowed(ctx: *const Context, request: Request, need: api_scope.Need) Failure {
+    assert(ctx.diag.code == null);
+    raise_not_allowed(ctx.diag, request.caller, request.method, request.path, need);
+    return error.Failed;
+}
+
+/// Raises ZC-E0822 for `caller`'s request (public for the CLI's golden test).
+pub fn raise_not_allowed(
+    diag: *Diag,
+    caller: api_scope.Caller,
+    method: []const u8,
+    path: []const u8,
+    need: api_scope.Need,
+) void {
+    diag.raise(.E0822);
+    diag.cause("{f} may not {s} {s}: it needs {f}", .{ caller, method, path, need });
+    switch (need) {
+        .node, .node_only => |name| {
+            var buffer: [constants.diag_command_bytes_max]u8 = undefined;
+            const command =
+                std.fmt.bufPrint(&buffer, "zcube-server ca issue-node {s}", .{name}) catch
+                    "zcube-server ca issue-node NAME";
+            diag.fix(.{
+                .sentence = "check that the agent's --node names the node of its certificate," ++
+                    " or ask an operator for this node's certificate:",
+                .command = command,
+            });
+        },
+        .jobs => diag.fix(.{
+            .sentence = "ask an operator for a client certificate of scope jobs:",
+            .command = "zcube-server ca issue-client NAME --scope jobs",
+        }),
+        .any_node, .admin => diag.fix(.{
+            .sentence = "ask an operator for a client certificate of scope admin:",
+            .command = "zcube-server ca issue-client NAME --scope admin",
+        }),
+    }
+}
+
 fn no_such(ctx: *const Context, path: []const u8) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0101);
@@ -739,8 +887,10 @@ fn error_response(ctx: *const Context, request_id: []const u8) Response {
     var diagnostic: Diagnostic = undefined;
     diag_mod.to_diagnostic(&diagnostic, ctx.diag);
     const body = error_body(ctx, request_id, &diagnostic) catch "{\"diagnostics\":[]}";
+    // A refusal that rests on state still settling is one to retry (B4, ZC-E0706).
+    if (ctx.diag.settling) assert(diagnostic.blame == .environment);
     return .{
-        .status = status_for(code, diagnostic.blame),
+        .status = if (ctx.diag.settling) 503 else status_for(code, diagnostic.blame),
         .request_id = request_id,
         .body = body,
     };
@@ -751,6 +901,7 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
         .user => {
             if (code == .E0101) return 404;
             if (code == .E0203) return 410;
+            if (code == .E0822) return 403;
             // The state the request rested on is not (or no longer) there.
             if (code == .E0105 or code == .E0402 or code == .E0403) return 409;
             if (code == .E0131) return 409;
@@ -760,7 +911,12 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
             if (code == .E0134) return 410;
             return 400;
         },
-        .environment => return 503,
+        .environment => {
+            // A refused certificate rests on the run's claim, which is not the asker's (B4);
+            // one that rests on a claim still settling is 503 (`Diag.settling`).
+            if (code == .E0706) return 409;
+            return 503;
+        },
         .external => {
             if (code == .E0201 or code == .E0213) return 503;
             return 502;
@@ -1821,7 +1977,7 @@ const Call = struct {
 
     fn job_create(call: Call, body: []const u8, id: []const u8) Failure!Reply {
         const ctx = call.ctx;
-        const input = try job_input(ctx, call.api.relays, body, id);
+        const input = try job_input(ctx, call.api, body, id);
         for (0..apply_attempts_max) |_| {
             const result = job_api.create(ctx, &call.api.source, input) catch
                 return propagate(ctx);
@@ -1841,6 +1997,7 @@ const Call = struct {
                     .state = job_api.current_state(ctx, old.name) catch return propagate(ctx),
                 }),
                 .conflict => {},
+                .refused => |diagnostic| return refused_reply(ctx, id, diagnostic),
             }
         }
         return job_conflict(ctx, input.name);

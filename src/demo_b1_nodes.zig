@@ -62,6 +62,14 @@ fn node_ready(want: Ready, host: *Host) !bool {
     return row.is_ready();
 }
 
+/// What is left of the lease of node `name`, as the server reports it (`remaining_ms`).
+fn lease_left_ms(host: *Host, name: []const u8) !u64 {
+    const rows = try state.c1.need_nodes(host);
+    const row = state.c1.find_node(rows, name) orelse return host.fail("{s} unlisted", .{name});
+    const left = row.remaining_ms orelse return host.fail("{s} has no lease", .{name});
+    return @intCast(left);
+}
+
 /// The node under the running `doomed` is powered off; the job is failed `unreachable`.
 pub fn power_off(demo: *Demo) !void {
     const host = demo.host;
@@ -74,6 +82,12 @@ pub fn power_off(demo: *Demo) !void {
     const index = try state.node_index(host, try state.need_job(host, "doomed"));
     const other = 1 - index;
     const name = fleet_mod.names[index];
+    // The lease's expiry is at least `remaining_ms` after a read sent before the power-off (a
+    // renewal after the read only moves it later). The last renewal may be up to the renewal
+    // interval (ttl / 3 at 8 s) old at the power-off, so the expiry can come well before
+    // ttl after it; the job controller fails the running job `lost_grace_ms` after the expiry.
+    const read_ms = host.now_ms();
+    const left_ms = try lease_left_ms(host, name);
     host.say("  # power off {s}: kill -9 of its agent, then of every supervisor's group", .{name});
     const off_ms = host.now_ms();
     try demo.fleet.power_off(index);
@@ -82,14 +96,10 @@ pub fn power_off(demo: *Demo) !void {
     const cli = try state.wait_job(host, "doomed", 11, "failed");
     try host.check(state.contains(cli.out, "end: failed (unreachable)"), "doomed failed: " ++
         "unreachable", .{});
-    // The server's expiry is at or after the last acknowledged keepalive's receipt plus the
-    // ttl, and that keepalive is at most one pass old when the power goes off. The job is failed
-    // at the expiry (`lost_grace_ms` only holds back unstarted claims).
-    const floor: u64 = state.ttl_ms - state.keepalive_slack_ms;
+    const floor: u64 = (read_ms + left_ms + state.lost_grace_ms) -| off_ms;
     try host.check(failed_after + state.c1.tolerance_ms >= floor, "it was read failed {d} ms " ++
-        "after the power-off (not before the lease ran out: at least {d} ms)", .{
-        failed_after, floor,
-    });
+        "after the power-off (not before the lease ran out, {d} ms left when read, and the " ++
+        "grace passed: at least {d} ms)", .{ failed_after, left_ms, floor });
     const view = try state.need_job(host, "doomed");
     try host.check(view.retries == 0, "its retries are 0", .{});
     try host.settle("the job must not be started on the other node", state.settle_ms);

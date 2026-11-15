@@ -5,6 +5,7 @@
 const std = @import("std");
 const testing = std.testing;
 const api_mod = @import("api.zig");
+const agent_api = @import("agent_api.zig");
 const agent_state = @import("agent_state.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
@@ -64,7 +65,7 @@ const Rig = struct {
     }
 
     fn get(rig: *Rig, path: []const u8, query: []const u8) api_mod.Response {
-        return rig.call(.{ .method = "GET", .path = path, .query = query });
+        return rig.call(.{ .caller = .local, .method = "GET", .path = path, .query = query });
     }
 
     /// The body parsed, copied out of the world's arena so a later call cannot disturb it.
@@ -277,6 +278,7 @@ test "watch answers what is ready with a bookmark and leaves the waiting to the 
     const waiting = rig.get("/v1/watch", waiting_query);
     try testing.expectEqual(@as(u32, 5000), waiting.hold_ms);
     const again = rig.call(.{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/watch",
         .query = waiting_query,
@@ -391,15 +393,22 @@ test "request ids are assigned, echoed, and reported with failures" {
     try testing.expectEqualStrings("r-0000001", first.request_id);
     try testing.expectEqualStrings("r-0000002", rig.get("/v1/status", "").request_id);
     const sent = rig.call(.{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/status",
         .request_id = "from-the-cli-0001",
     });
     try testing.expectEqualStrings("from-the-cli-0001", sent.request_id);
-    const short = rig.call(.{ .method = "GET", .path = "/v1/status", .request_id = "abc" });
+    const short = rig.call(.{
+        .caller = .local,
+        .method = "GET",
+        .path = "/v1/status",
+        .request_id = "abc",
+    });
     try rig.refused(short, 400, "ZC-E0104");
     try testing.expect(!std.mem.eql(u8, short.request_id, "abc"));
     const odd = rig.call(.{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/status",
         .request_id = "has spaces here",
@@ -414,7 +423,11 @@ test "requests the API cannot understand are ZC-E0104 and write nothing" {
     // a dangling continue, a bad escape.
     var rig = try Rig.start(7);
     defer rig.stop();
-    try rig.refused(rig.call(.{ .method = "POST", .path = "/v1/status" }), 400, "ZC-E0104");
+    try rig.refused(rig.call(.{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/status",
+    }), 400, "ZC-E0104");
     try rig.refused(rig.get("/v1/status", "x=1"), 400, "ZC-E0104");
     try rig.refused(rig.get("/v1/list", "limit=0"), 400, "ZC-E0104");
     try rig.refused(rig.get("/v1/list", "limit=501"), 400, "ZC-E0104");
@@ -485,7 +498,13 @@ const hello_json =
 ;
 
 fn post(rig: *Rig, query: []const u8, body: []const u8) api_mod.Response {
-    return rig.call(.{ .method = "POST", .path = "/v1/apply", .query = query, .body = body });
+    return rig.call(.{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/apply",
+        .query = query,
+        .body = body,
+    });
 }
 
 test "POST /v1/apply creates, scales, answers a dry run without writing, and reports no change" {
@@ -586,17 +605,30 @@ test "DELETE /v1/services/{name} deletes, and a missing service is ZC-E0101" {
     defer rig.stop();
     _ = try rig.json(post(&rig, "", hello_json));
     rig.world.advance(2000);
-    const deleted = rig.call(.{ .method = "DELETE", .path = "/v1/services/hello" });
+    const deleted = rig.call(.{
+        .caller = .local,
+        .method = "DELETE",
+        .path = "/v1/services/hello",
+    });
     const body = try rig.json(deleted);
     try testing.expectEqual(@as(u16, 200), deleted.status);
     try testing.expectEqualStrings("delete", field(body, "action").string);
     try testing.expect(field(body, "decision").string.len > 0);
     rig.world.advance(5000);
     try testing.expectEqual(@as(u32, 0), rig.world.replica_count("hello"));
-    const again = rig.call(.{ .method = "DELETE", .path = "/v1/services/hello" });
+    const again = rig.call(.{ .caller = .local, .method = "DELETE", .path = "/v1/services/hello" });
     try rig.refused(again, 404, "ZC-E0101");
-    try rig.refused(rig.call(.{ .method = "DELETE", .path = "/v1/list" }), 400, "ZC-E0104");
-    const odd = rig.call(.{ .method = "PUT", .path = "/v1/apply", .body = hello_json });
+    try rig.refused(rig.call(.{
+        .caller = .local,
+        .method = "DELETE",
+        .path = "/v1/list",
+    }), 400, "ZC-E0104");
+    const odd = rig.call(.{
+        .caller = .local,
+        .method = "PUT",
+        .path = "/v1/apply",
+        .body = hello_json,
+    });
     try rig.refused(odd, 400, "ZC-E0104");
 }
 
@@ -618,7 +650,7 @@ fn corrupt_node1(rig: *Rig) !void {
 
 fn repair(rig: *Rig, query: []const u8) api_mod.Response {
     const path = "/v1/repair/allocations/" ++ sim_world.node_name;
-    return rig.call(.{ .method = "POST", .path = path, .query = query });
+    return rig.call(.{ .caller = .local, .method = "POST", .path = path, .query = query });
 }
 
 test "status lists the auditor's finding; check shows it; repair asks, then writes and cites it" {
@@ -805,6 +837,7 @@ test "stats pull at its read cap with the largest records fits the request arena
     var ctx = rig.world.controller_context();
     ctx.arena = arena.allocator();
     const response = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/stats/pull",
         .query = "limit=500",
@@ -1033,7 +1066,7 @@ fn job_json(rig: *Rig, name: []const u8, image: []const u8) ![]const u8 {
 }
 
 fn post_job(rig: *Rig, path: []const u8, body: []const u8) api_mod.Response {
-    return rig.call(.{ .method = "POST", .path = path, .body = body });
+    return rig.call(.{ .caller = .local, .method = "POST", .path = path, .body = body });
 }
 
 test "a job body that does not parse says why, under ZC-E0104" {
@@ -1059,6 +1092,72 @@ test "a job body that does not parse says why, under ZC-E0104" {
             return error.TestExpectedEqual;
         }
     }
+}
+
+/// A job body named `name` whose last members are `tail` (the closing brace included).
+fn job_with(rig: *Rig, name: []const u8, tail: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        rig.parsed.allocator(),
+        "{{\"name\":\"{s}\",\"image\":\"b3:51aa9c03\",\"command\":[\"true\"]," ++
+            "\"deadline_ms\":1000,\"submit_by_ms\":{d},{s}",
+        .{ name, rig.world.now_ms() + 30_000, tail },
+    );
+}
+
+test "a job's placement.require is stored, checked, and refused by name when it is wrong" {
+    // Goal: B6's field. Method: a good require is created and read back, the same body is
+    // idempotent, another require is a 409, an empty require equals none, and each malformed
+    // require is ZC-E0130 naming `placement`.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const good = try job_with(&rig, "p", "\"placement\":{\"require\":{\"tenant\":\"acme\"}}}");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", good).status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", good).status);
+    const got = try rig.json(rig.get("/v1/jobs/p", ""));
+    const stored = field(field(field(got, "job"), "placement"), "require");
+    try testing.expectEqualStrings("acme", field(stored, "tenant").string);
+    const other = try job_with(&rig, "p", "\"placement\":{\"require\":{\"tenant\":\"beta\"}}}");
+    try rig.refused(post_job(&rig, "/v1/jobs", other), 409, "ZC-E0131");
+
+    const five = "{\"a\":\"1\",\"b\":\"1\",\"c\":\"1\",\"d\":\"1\",\"e\":\"1\"}";
+    const bad = [_][]const u8{
+        "\"placement\":{\"require\":[1]}}",
+        "\"placement\":{\"require\":{\"tenant\":\"acme\"},\"require\":{}}}",
+        "\"placement\":{\"require\":{},\"require\":{\"tenant\":\"acme\"}}}",
+        "\"placement\":{\"prefer\":{}}}",
+        "\"placement\":{\"require\":{\"a\":1}}}",
+        "\"placement\":{\"require\":{\"a\":\"1\",\"a\":\"2\"}}}",
+        "\"placement\":{\"require\":" ++ five ++ "}}",
+        "\"placement\":{\"require\":{\"\":\"1\"}}}",
+        "\"placement\":{\"require\":{\"a=b\":\"1\"}}}",
+    };
+    for (bad, 0..) |tail, index| {
+        var name: [8]u8 = undefined;
+        const body = try job_with(&rig, try std.fmt.bufPrint(&name, "b{d}", .{index}), tail);
+        const response = post_job(&rig, "/v1/jobs", body);
+        try rig.refused(response, 400, "ZC-E0130");
+        try testing.expect(std.mem.indexOf(u8, response.body, "placement") != null);
+    }
+    // An empty require is no placement: the same job with and without it is one job.
+    const plain = try job_with(&rig, "e", "\"labels\":[]}");
+    const empty = try job_with(&rig, "e", "\"placement\":{\"require\":{}}}");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", plain).status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", empty).status);
+}
+
+test "a service apply refuses placement: it is a job's field" {
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const body = "{\"name\":\"web\",\"image\":\"b3:51aa9c03\",\"replicas\":1," ++
+        "\"command\":[\"true\"]," ++
+        "\"placement\":{\"require\":{\"tenant\":\"acme\"}}}";
+    const response = rig.call(.{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/apply",
+        .body = body,
+    });
+    try rig.refused(response, 400, "ZC-E0104");
 }
 
 test "the job routes: 201, 200, 409, GET without secrets, list, cancel 202, why" {
@@ -1179,7 +1278,12 @@ test "a relay array filling the whole body is refused by name, without building 
     defer arena.deinit();
     var ctx = rig.world.controller_context();
     ctx.arena = arena.allocator();
-    const response = rig.api.handle(&ctx, .{ .method = "POST", .path = "/v1/jobs", .body = body });
+    const response = rig.api.handle(&ctx, .{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/jobs",
+        .body = body,
+    });
     try rig.refused(response, 400, "ZC-E0130");
     try testing.expect(std.mem.indexOf(u8, response.body, "relay") != null);
     try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
@@ -1228,12 +1332,15 @@ test "the jobs watch decodes statuses, filters by label and refuses the name wat
 }
 
 /// A job body with the given extra members (JSON text, starting with a comma or empty).
+const relay_image = "b3:" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++
+    "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03";
+
 fn relay_body(rig: *Rig, name: []const u8, extra: []const u8) ![]const u8 {
     return std.fmt.allocPrint(rig.parsed.allocator(),
-        \\{{"name":"{s}","image":"b3:51aa9c03","command":["true"],"deadline_ms":60000,
+        \\{{"name":"{s}","image":"{s}","command":["true"],"deadline_ms":60000,
     ++
         \\"submit_by_ms":{d}{s}}}
-    , .{ name, rig.world.now_ms() + 30_000, extra });
+    , .{ name, relay_image, rig.world.now_ms() + 30_000, extra });
 }
 
 test "a job names a relay the server configures; any other name or an env override is refused" {
@@ -1247,7 +1354,7 @@ test "a job names a relay the server configures; any other name or an env overri
     const good = try relay_body(&rig, "r1", ",\"relay\":\"botpike\"");
     try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", good).status);
     try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", good).status);
-    const got = rig.call(.{ .method = "GET", .path = "/v1/jobs/r1" });
+    const got = rig.call(.{ .caller = .local, .method = "GET", .path = "/v1/jobs/r1" });
     try testing.expect(std.mem.indexOf(u8, got.body, "\"relay\":\"botpike\"") != null);
     try testing.expect(std.mem.indexOf(u8, got.body, "127.0.0.1") == null);
 
@@ -1568,4 +1675,495 @@ test "POST /v1/apply takes health and rollout, and refuses invalid ones" {
         \\ "rollout":{"max_surge":0,"max_unavailable":0}}
     ;
     try rig.refused(post(&rig, "", bad), 400, "ZC-E0126");
+}
+
+const Allowed = struct { node1: bool, jobs: bool, admin: bool = true };
+const ScopeRow = struct {
+    method: []const u8,
+    path: []const u8,
+    query: []const u8 = "",
+    allowed: Allowed,
+};
+const scope_none: Allowed = .{ .node1 = false, .jobs = false };
+const scope_jobs: Allowed = .{ .node1 = false, .jobs = true };
+const scope_own: Allowed = .{ .node1 = true, .jobs = false };
+/// The credential endpoint: node1's own certificate and nothing else, no admin bootstrap
+/// (decisions/2026-11-13-node-cert-bootstrap.md).
+const scope_own_only: Allowed = .{ .node1 = true, .jobs = false, .admin = false };
+/// Every endpoint, and who may call it besides an admin (who may call all but the credential).
+const scope_rows = [_]ScopeRow{
+    .{ .method = "GET", .path = "/v1/status", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/list", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/watch", .query = "timeout=0", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/leases", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/why/service/hello", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/why/replica/hello-0", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/why/node/node1", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/why/job/build", .allowed = scope_jobs },
+    .{ .method = "GET", .path = "/v1/stats/pull", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/codes", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/explain/ZC-E0822", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/apply", .query = "dry_run=1", .allowed = scope_none },
+    .{ .method = "DELETE", .path = "/v1/services/hello", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/services/hello/history", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/services/hello/rollout", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/services/hello/rollout/pause", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/services/hello/rollout/resume", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/services/hello/rollback", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/check/allocations", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/store/accept-rollback", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/repair/allocations/node1", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/jobs", .allowed = scope_jobs },
+    .{ .method = "GET", .path = "/v1/jobs", .allowed = scope_jobs },
+    .{ .method = "GET", .path = "/v1/jobs/build", .allowed = scope_jobs },
+    .{ .method = "GET", .path = "/v1/jobs/watch", .query = "timeout=0", .allowed = scope_jobs },
+    .{ .method = "POST", .path = "/v1/jobs/build/cancel", .allowed = scope_jobs },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/credential", .allowed = scope_own_only },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease/1/keepalive", .allowed = scope_own },
+    .{ .method = "PUT", .path = "/v1/agent/nodes/node1", .allowed = scope_own },
+    .{ .method = "PUT", .path = "/v1/agent/nodes/node1/store", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/pulls", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/replicas", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/assigned", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/observed", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/observed", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs/build/input", .allowed = scope_own },
+    .{
+        .method = "POST",
+        .path = "/v1/agent/nodes/node1/runs/build/certificate",
+        .allowed = scope_own,
+    },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/job-observed", .allowed = scope_own },
+    .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node1/fetchers/b3:51aa9c03",
+        .allowed = scope_own,
+    },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/job-observed", .allowed = scope_own },
+    .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node1/watch",
+        .query = "timeout=0",
+        .allowed = scope_own,
+    },
+    // Another node's keys: node1's agent may not write or read them.
+    .{ .method = "PUT", .path = "/v1/agent/nodes/node2", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node2/lease", .allowed = scope_none },
+    .{
+        .method = "POST",
+        .path = "/v1/agent/nodes/node2/credential",
+        .allowed = .{ .node1 = false, .jobs = false, .admin = false },
+    },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node2/observed", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node2/job-observed", .allowed = scope_none },
+    .{
+        .method = "POST",
+        .path = "/v1/agent/nodes/node2/runs/build/certificate",
+        .allowed = scope_none,
+    },
+    .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node2/fetchers/b3:51aa9c03",
+        .allowed = scope_none,
+    },
+    .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node2/watch",
+        .query = "timeout=0",
+        .allowed = scope_none,
+    },
+};
+
+fn node2_owns(path: []const u8) bool {
+    const own = "/v1/agent/nodes/node2";
+    if (!std.mem.startsWith(u8, path, own)) return false;
+    return path.len == own.len or path[own.len] == '/';
+}
+
+test "scopes: every endpoint as an agent, a jobs client and an admin client (B7)" {
+    // node2 may call only its own node's paths: node1's lease, credential, reports and watch
+    // are refused to it (docs/decisions/2026-11-13-node-cert-bootstrap.md).
+    var rig = try Rig.start(91);
+    defer rig.stop();
+    const node1: api_mod.Caller = .{ .node = "node1" };
+    const node2: api_mod.Caller = .{ .node = "node2" };
+    const app: api_mod.Caller = .{ .client = .{ .name = "app", .scope = .jobs } };
+    const ops: api_mod.Caller = .{ .client = .{ .name = "ops", .scope = .admin } };
+    for (scope_rows) |row| {
+        const cases = [_]struct { caller: api_mod.Caller, allowed: bool }{
+            .{ .caller = node1, .allowed = row.allowed.node1 },
+            .{ .caller = node2, .allowed = node2_owns(row.path) },
+            .{ .caller = app, .allowed = row.allowed.jobs },
+            .{ .caller = ops, .allowed = row.allowed.admin },
+        };
+        for (cases) |case| {
+            const response = rig.call(.{
+                .caller = case.caller,
+                .method = row.method,
+                .path = row.path,
+                .query = row.query,
+                .body = "{}",
+            });
+            if (case.allowed) {
+                // The handler answered; what it said is its own business (400, 404, ...).
+                if (response.status == 403) std.debug.print("{s} {s}\n", .{ row.method, row.path });
+                try testing.expect(response.status != 403);
+            } else {
+                if (response.status != 403) std.debug.print("{s} {s}\n", .{ row.method, row.path });
+                try rig.refused(response, 403, "ZC-E0822");
+            }
+        }
+    }
+}
+
+test "scopes: a refused agent writes nothing under another node's keys (B7)" {
+    var rig = try Rig.start(92);
+    defer rig.stop();
+    const before = rig.world.revision().?;
+    const node1: api_mod.Caller = .{ .node = "node1" };
+    const body = "{\"capacity\":{\"cpu_millis\":1000,\"memory_bytes\":1073741824}}";
+    const response = rig.call(.{
+        .caller = node1,
+        .method = "PUT",
+        .path = "/v1/agent/nodes/node2",
+        .body = body,
+    });
+    try rig.refused(response, 403, "ZC-E0822");
+    try testing.expectEqual(before, rig.world.revision().?);
+}
+
+const peer_ca = @import("peer_ca.zig");
+const x509 = @import("x509.zig");
+
+/// Writes `r1`'s assignment to node1, its claim and status as running under that epoch, as the
+/// scheduler and the agent would; returns the epoch.
+/// Places run r1 on node1 with the status `status_state`; its claim is `running` (started now)
+/// when the status is `running` or terminal, else `claimed` with no start yet.
+fn place_relayed_run(rig: *Rig, status_state: records.JobState) !u64 {
+    var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const id = records.job_run_id(&id_buffer, "r1");
+    const assigned = records.assigned_key("node1", id);
+    const put_assigned = [_]store.Op{.{ .put = .{ .key = assigned.slice(), .value = "{}" } }};
+    rig.world.diag.reset();
+    const placed = try rig.world.store_handle().txn(
+        .{ .on_success = &put_assigned },
+        &rig.world.diag,
+    );
+    const epoch: u64 = @intCast(placed.revision);
+    const arena = rig.parsed.allocator();
+    const terminal = records.job_state_terminal(status_state);
+    const begun = terminal or status_state == .running;
+    const started: ?u64 = if (begun) rig.world.now_ms() else null;
+    const now = rig.world.now_ms();
+    const status = try std.json.Stringify.valueAlloc(arena, records.JobStatus{
+        .state = status_state,
+        .node = "node1",
+        .epoch = epoch,
+        .tenure = 1,
+        .started_at_ms = started,
+        .ended_at_ms = if (terminal) now else null,
+        .end = if (terminal) .{ .kind = .cancelled } else null,
+        .reported_at_ms = now,
+    }, .{});
+    const observed = try std.json.Stringify.valueAlloc(arena, records.JobObserved{
+        .run = id,
+        .node = "node1",
+        .tenure = 1,
+        .assignment = epoch,
+        .status = if (begun) .running else .claimed,
+        .started_at_ms = started,
+        .reported_at_ms = now,
+    }, .{});
+    const status_key = records.job_status_key("r1");
+    const claim_key = records.job_observed_key("node1", "r1");
+    const writes = [_]store.Op{
+        .{ .put = .{ .key = status_key.slice(), .value = status } },
+        .{ .put = .{ .key = claim_key.slice(), .value = observed } },
+    };
+    rig.world.diag.reset();
+    _ = try rig.world.store_handle().txn(.{ .on_success = &writes }, &rig.world.diag);
+    return epoch;
+}
+
+fn certificate_body(rig: *Rig, epoch: u64, digest: []const u8, key: [32]u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        rig.parsed.allocator(),
+        "{{\"epoch\":{d},\"image_digest\":\"{s}\",\"public_key\":\"{x}\"}}",
+        .{ epoch, digest, &key },
+    );
+}
+
+test "a relayed run's certificate: issued to its claim, refused (ZC-E0706) to any other" {
+    // Goal: B4's issuance over the agent API. Method: admit a relayed job, write its placement,
+    // ask for a certificate as node1 under the epoch, parse what comes back as a /job/ workload
+    // certificate signed by the CA; then ask as node2, under an older epoch, with another image,
+    // and after the run ended: each is ZC-E0706 and nothing is signed.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const table = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    rig.api.relays = &table;
+    var clock = rig.world.manual.clock();
+    const ca: peer_ca.Ca = .{
+        .key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7)),
+        .revoked = .{},
+        .wall = clock,
+    };
+    _ = &clock;
+    rig.api.ca = &ca;
+    rig.api.cluster = "test.cluster";
+    const extra = ",\"relay\":\"botpike\",\"labels\":[[\"team\",\"x\"]]";
+    const good = try relay_body(&rig, "r1", extra);
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", good).status);
+    const digest = relay_image["b3:".len..];
+    const run_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9)))
+        .public_key.toBytes();
+    const path = "/v1/agent/nodes/node1/runs/r1/certificate";
+    // Claimed, not yet reported running: still settling, so 503 (the agent asks again), not a
+    // refusal for good.
+    const claimed = try place_relayed_run(&rig, .placed);
+    const early = try certificate_body(&rig, claimed, digest, run_key);
+    try rig.refused(post_job(&rig, path, early), 503, "ZC-E0706");
+    const epoch = try place_relayed_run(&rig, .running);
+    const ok = post_job(&rig, path, try certificate_body(&rig, epoch, digest, run_key));
+    if (ok.status != 200) std.debug.print("{s}\n", .{ok.body});
+    try testing.expectEqual(@as(u16, 200), ok.status);
+    const answer = try rig.json(ok);
+    const hex = field(answer, "certificate").string;
+    var der: [constants.x509_cert_bytes_max]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&der, hex);
+    var detail: x509.Detail = .{};
+    const cert = try x509.parse_profile(bytes, .cluster, &detail);
+    try testing.expectEqualSlices(u8, &run_key, cert.public_key.of(bytes));
+    try testing.expect(std.mem.indexOf(u8, bytes, "spiffe://test.cluster/job/r1") != null);
+    const not_after = field(answer, "not_after_ms").integer;
+    try testing.expect(not_after > field(answer, "not_before_ms").integer);
+
+    const other = try certificate_body(&rig, epoch, digest, run_key);
+    const node2 = "/v1/agent/nodes/node2/runs/r1/certificate";
+    // node2 has no claim of its own: settling as far as the server can tell, so 503.
+    try rig.refused(post_job(&rig, node2, other), 503, "ZC-E0706");
+    const stale = try certificate_body(&rig, epoch - 1, digest, run_key);
+    try rig.refused(post_job(&rig, path, stale), 409, "ZC-E0706");
+    const zeros: [64]u8 = @splat('0');
+    const wrong_image = try certificate_body(&rig, epoch, &zeros, run_key);
+    try rig.refused(post_job(&rig, path, wrong_image), 409, "ZC-E0706");
+    const nobody = try certificate_body(&rig, epoch, digest, run_key);
+    const unknown = "/v1/agent/nodes/node1/runs/nope/certificate";
+    try rig.refused(post_job(&rig, unknown, nobody), 409, "ZC-E0706");
+    _ = try place_relayed_run(&rig, .cancelled);
+    const late = try certificate_body(&rig, epoch, digest, run_key);
+    try rig.refused(post_job(&rig, path, late), 409, "ZC-E0706");
+    try rig.refused(post_job(&rig, path, "{\"epoch\":1}"), 400, "ZC-E0104");
+}
+
+// ---- B5: signatures at admission ------------------------------------------------------------
+
+const job_trust = @import("job_trust.zig");
+const trust_fixture = @import("job_trust_fixture.zig");
+
+/// A job of `tree(tree_byte)`, pinned to the manifest of `source(9)`, with `signatures`.
+fn signed_body(
+    rig: *Rig,
+    name: []const u8,
+    tree_byte: u8,
+    signatures: []const []const u8,
+) ![]const u8 {
+    const arena = rig.parsed.allocator();
+    var image_buffer: [67]u8 = undefined;
+    var source_buffer: [128]u8 = undefined;
+    const image = trust_fixture.image(&image_buffer, tree_byte);
+    const source = trust_fixture.source(&source_buffer, 9);
+    var list: std.Io.Writer.Allocating = .init(arena);
+    for (signatures, 0..) |line, index| {
+        if (index > 0) try list.writer.writeAll(",");
+        try list.writer.print("{f}", .{std.json.fmt(line, .{})});
+    }
+    return std.fmt.allocPrint(arena,
+        \\{{"name":"{s}","image":"{s}","source":"{s}","command":["true"],"deadline_ms":60000,
+    ++
+        \\"submit_by_ms":{d},"signatures":[{s}]}}
+    , .{ name, image, source, rig.world.now_ms() + 30_000, list.written() });
+}
+
+test "without a trust policy every job is admitted, and its signatures are kept and shown" {
+    // Goal: B5's "with no trust entry, everything is accepted as before". Method: an unsigned
+    // job and a job with a line no key would count are both created; the second's GET shows
+    // its signature as submitted.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    var fixture = try trust_fixture.Fixture.init(testing.allocator);
+    defer fixture.deinit(testing.allocator);
+    const arena = rig.parsed.allocator();
+    const unsigned = try signed_body(&rig, "plain", 1, &.{});
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", unsigned).status);
+    const line = try fixture.sign_tree(arena, 5, 2); // Another key, another tree.
+    const body = try signed_body(&rig, "kept", 1, &.{line});
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", body).status);
+    const got = try rig.ok("/v1/jobs/kept", "");
+    const shown = field(field(got, "job"), "signatures").array.items;
+    try testing.expectEqual(@as(usize, 1), shown.len);
+    try testing.expectEqualStrings(line, shown[0].string);
+}
+
+test "under a policy, POST /v1/jobs answers 403 ZBX-E0905 for an uncovered job and writes nothing" {
+    // Goal: B5 slice 1's refusal. Method: under a policy trusting key 7, an unsigned job, one
+    // signed by key 5, one over another tree and one bound to another manifest are each 403
+    // with ZBX-E0905 and leave no job behind; a malformed line is 400 ZC-E0130; the good
+    // signature is 201.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    var fixture = try trust_fixture.Fixture.init(testing.allocator);
+    defer fixture.deinit(testing.allocator);
+    try fixture.trust_keys(&.{7}, true);
+    const config = fixture.config();
+    rig.api.trust = &config;
+    const arena = rig.parsed.allocator();
+    const status_before = try rig.ok("/v1/status", "");
+    const revision = field(field(status_before, "store"), "revision").integer;
+
+    const untrusted = try fixture.sign_tree(arena, 5, 1);
+    const other_tree = try fixture.sign_tree(arena, 7, 2);
+    const other_manifest = try fixture.sign_manifest(arena, 7, 1, 8);
+    const refused = [_][]const []const u8{
+        &.{}, &.{untrusted}, &.{other_tree}, &.{other_manifest},
+    };
+    for (refused) |signatures| {
+        const body = try signed_body(&rig, "guarded", 1, signatures);
+        const response = post_job(&rig, "/v1/jobs", body);
+        try rig.refused(response, 403, "ZBX-E0905");
+        try testing.expect(std.mem.indexOf(u8, response.body, "/etc/zcube/trust.zon") != null);
+        try testing.expectEqual(@as(u16, 404), rig.get("/v1/jobs/guarded", "").status);
+    }
+    const after = try rig.ok("/v1/status", "");
+    try testing.expectEqual(revision, field(field(after, "store"), "revision").integer);
+
+    const malformed = try signed_body(&rig, "guarded", 1, &.{"not an envelope"});
+    try rig.refused(post_job(&rig, "/v1/jobs", malformed), 400, "ZC-E0130");
+
+    const good = try fixture.sign_manifest(arena, 7, 1, 9);
+    const body = try signed_body(&rig, "guarded", 1, &.{ untrusted, good });
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", body).status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", body).status);
+}
+
+test "the signatures' bounds hold with or without a policy" {
+    // Goal: B5's bounds, ZC-E0130 naming the field. Method: five envelopes, an empty one and one
+    // with a control character are refused without a policy.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const five = [_][]const u8{ "a", "b", "c", "d", "e" };
+    const cases = [_][]const []const u8{ &five, &.{""}, &.{"tab\there"} };
+    for (cases) |signatures| {
+        const body = try signed_body(&rig, "bounded", 1, signatures);
+        const response = post_job(&rig, "/v1/jobs", body);
+        try rig.refused(response, 400, "ZC-E0130");
+        try testing.expect(std.mem.indexOf(u8, response.body, "signatures") != null);
+    }
+}
+
+test "a signatures array filling the whole body is refused by name within the request arena" {
+    // Goal: `signatures` is built as slices before its count is checked; even a body of empty
+    // strings stays within the production request arena and the answer is ZC-E0130 naming it.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const head = "{\"name\":\"big\",\"image\":\"b3:51aa9c03\",\"command\":[\"true\"]," ++
+        "\"deadline_ms\":1000,\"submit_by_ms\":9999999999999,\"signatures\":[";
+    const tail = "\"\"]}";
+    const body = try rig.parsed.allocator().alloc(u8, constants.job_request_bytes_max);
+    @memcpy(body[0..head.len], head);
+    var at: usize = head.len;
+    while (at + 3 < body.len - tail.len) : (at += 3) @memcpy(body[at..][0..3], "\"\",");
+    const rest = body.len - tail.len;
+    @memset(body[at..rest], ' ');
+    @memcpy(body[rest..], tail);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = rig.world.controller_context();
+    ctx.arena = arena.allocator();
+    const response = rig.api.handle(&ctx, .{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/jobs",
+        .body = body,
+    });
+    try rig.refused(response, 400, "ZC-E0130");
+    try testing.expect(std.mem.indexOf(u8, response.body, "signatures") != null);
+    try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
+}
+
+/// `hello` (2 replicas) and `other` (1 replica, another image) applied and placed on node1.
+fn fetchers_rig(seed: u64) !Rig {
+    var rig = try Rig.start(seed);
+    errdefer rig.stop();
+    _ = try rig.world.apply(hello);
+    var other = hello;
+    other.name = "other";
+    other.image = "b3:0123abcd";
+    other.replicas = 1;
+    _ = try rig.world.apply(other);
+    rig.world.advance(3000);
+    return rig;
+}
+
+/// The `nodes` a node's certificate is told fetch `digest`, checking the reply holds nothing else.
+fn fetchers_of(rig: *Rig, digest: []const u8) ![]const Json {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/v1/agent/nodes/node1/fetchers/{s}", .{
+        digest,
+    });
+    const response = rig.call(.{ .caller = .{ .node = "node1" }, .method = "GET", .path = path });
+    if (response.status != 200) std.debug.print("{s}\n", .{response.body});
+    try testing.expectEqual(@as(u16, 200), response.status);
+    const body = try rig.json(response);
+    // Names, the revision and the chain pair: no record, no env.
+    try testing.expectEqual(@as(usize, 3), body.object.count());
+    try testing.expect(body.object.get("revision") != null);
+    try testing.expect(body.object.get("chain") != null);
+    try testing.expect(std.mem.indexOf(u8, response.body, "s3cr3t") == null);
+    const nodes = field(body, "nodes").array.items;
+    for (nodes) |node| try testing.expect(node == .string);
+    return nodes;
+}
+
+test "fetchers names the nodes assigned a digest's replicas, once each, and nothing more (B7)" {
+    // Goal: the O5 wait over TLS (decisions/2026-11-14-b7-slice7-o5-over-tls.md): a node's
+    // certificate learns which nodes fetch a tree from names alone, never the replica records.
+    var rig = try fetchers_rig(93);
+    defer rig.stop();
+    const hello_nodes = try fetchers_of(&rig, hello.image);
+    try testing.expectEqual(@as(usize, 1), hello_nodes.len); // Two replicas, one node.
+    try testing.expectEqualStrings("node1", hello_nodes[0].string);
+    try testing.expectEqual(@as(usize, 1), (try fetchers_of(&rig, "b3:0123abcd")).len);
+    try testing.expectEqual(@as(usize, 0), (try fetchers_of(&rig, "b3:99999999")).len);
+    const node1: api_mod.Caller = .{ .node = "node1" };
+    const bad = [_][]const u8{
+        "/v1/agent/nodes/node1/fetchers",
+        "/v1/agent/nodes/node1/fetchers/sha256:51aa9c03",
+        "/v1/agent/nodes/node1/fetchers/b3:51AA9C03",
+        "/v1/agent/nodes/node1/fetchers/b3:51aa",
+        "/v1/agent/nodes/node1/fetchers/b3:51aa9c03/x",
+    };
+    for (bad) |path| {
+        const response = rig.call(.{ .caller = node1, .method = "GET", .path = path });
+        try testing.expect(response.status == 400 or response.status == 404);
+    }
+    const posted = rig.call(.{
+        .caller = node1,
+        .method = "POST",
+        .path = "/v1/agent/nodes/node1/fetchers/b3:51aa9c03",
+    });
+    try rig.refused(posted, 400, "ZC-E0104");
+}
+
+test "teeth: without the digest filter fetchers names nodes that fetch another image" {
+    // Goal: the digest is what keeps `fetchers` to the tree's own fetchers. The negative half
+    // runs here too: `mtls-teeth` does not run the plain tests.
+    var rig = try fetchers_rig(94);
+    defer rig.stop();
+    try testing.expectEqual(@as(usize, 0), (try fetchers_of(&rig, "b3:99999999")).len);
+    agent_api.set_test_fault(.fetchers_digest, true);
+    defer agent_api.set_test_fault(.fetchers_digest, false);
+    try testing.expectEqual(@as(usize, 1), (try fetchers_of(&rig, "b3:99999999")).len);
 }

@@ -103,6 +103,10 @@ pub const runtime_handles_max: u32 = 512;
 pub const runtime_events_batch_max: u32 = 64;
 pub const label_key_bytes_max: u32 = 32;
 pub const label_value_bytes_max: u32 = 128;
+/// A node's labels (`/nodes/<n>.labels`, B6): at most this many `key=value` words, each at most
+/// `node_label_bytes_max` bytes, as the agent API admits at registration.
+pub const node_labels_max: u32 = 8;
+pub const node_label_bytes_max: u32 = 128;
 /// "b3:" and 64 hex digits; shorter forms are fixture names in the fake runtime.
 pub const image_digest_bytes_max: u32 = 67;
 /// The longest OCI reference a service's `source` may hold: Zigbox's `reference_bytes_max`
@@ -254,6 +258,11 @@ pub const why_text_bytes_max: u32 = 480;
 
 /// Connections the HTTP server serves at once; the next one is answered 503 and closed.
 pub const http_connections_max: u32 = 96;
+/// Of those, kept for `--insecure-listen` when both listeners run: TLS clients take at most
+/// `http_connections_max - http_loopback_reserved`, so a flood of them (or of slow handshakes)
+/// never locks out the loopback listener the harnesses and `zcube local` use (supervisor,
+/// 2026-11-14, docs/decisions/2026-11-14-loopback-slot-reserve.md).
+pub const http_loopback_reserved: u32 = 8;
 /// Long-poll watches held open at once. Each holds one store watch (and, on Postgres, one
 /// connection), so this stays well under `store_postgres_watches_max`. 50 agents hold one each
 /// (owner, 2026-11-02); Postgres then needs `max_connections` of at least 80.
@@ -592,6 +601,11 @@ pub const peer_join_request_bytes_max: u32 = 512;
 pub const peer_join_retry_ms: u32 = 5 * 1000;
 /// One join call waits this long at most (less near the lease's fence).
 pub const peer_join_timeout_ms: u32 = 3 * 1000;
+/// Relayed runs' certificates asked for in one step of the agent's loop (B4 slice 2). With
+/// `relay_cert_step_ms_max` it bounds how long the step can hold back a keepalive.
+pub const relay_cert_asks_per_step_max: u32 = 8;
+/// All the asks of one step together take at most this long (and never past the fence).
+pub const relay_cert_step_ms_max: u32 = peer_join_timeout_ms;
 /// Handshakes the peer server starts for one source address in one window; the next is refused.
 /// It bounds unauthenticated public-key work (a few hundred microseconds each), and is sized for
 /// a whole cluster behind one NAT address: every fetch connection to this server carries
@@ -674,6 +688,9 @@ pub const x509_foreign_key_purposes_max: u32 = 8;
 pub const x509_foreign_ttl_ms_max: u64 = x509_ca_ttl_ms_max;
 /// The cluster part of a SPIFFE ID: a sequence of DNS labels.
 pub const x509_cluster_bytes_max: u32 = 63;
+/// Seeds drawn for one P-256 key before giving up. A seed fails only when the derived scalar is
+/// zero (about 2^-256), so a second failure means the random source is broken.
+pub const x509_p256_key_attempts_max: u32 = 4;
 /// A server leaf's `dNSName`, exact match (no wildcard); it is also the subject CN.
 pub const x509_dns_name_bytes_max: u32 = x509_cn_bytes_max;
 /// `spiffe://<cluster>/service/<name>`.
@@ -685,6 +702,9 @@ comptime {
     assert(x509_labels_bytes_max < x509_cert_bytes_max / 2);
     assert(x509_leaf_ttl_ms_max < x509_ca_ttl_ms_max);
     assert(x509_leaf_ttl_ms_max % 1000 == 0);
+    // A node certificate (B7) lives exactly as long as the credential it is issued beside, so
+    // every credential life a verifier accepts is a life the x509 profile admits.
+    assert(peer_credential_ttl_ms_max <= x509_leaf_ttl_ms_max);
     assert(x509_ca_ttl_ms_max % 1000 == 0);
     assert(x509_cn_bytes_max >= node_name_bytes_max);
     assert(x509_cn_bytes_max >= 9 + 16);
@@ -809,6 +829,9 @@ comptime {
     // 256 names of the longest length, a newline each, fit the file bound.
     assert(peer_revoked_max * (node_name_bytes_max + 1) <= peer_file_bytes_max);
     assert(peer_join_timeout_ms < agent_io_timeout_ms);
+    assert(relay_cert_asks_per_step_max > 0);
+    assert(relay_cert_asks_per_step_max <= agent_node_runs_max);
+    assert(relay_cert_step_ms_max <= peer_join_timeout_ms);
 }
 
 comptime {
@@ -870,6 +893,7 @@ comptime {
     // The controller's watch, and one spare, besides the held watches.
     assert(http_holds_max + 2 < store_postgres_watches_max);
     assert(http_holds_max <= http_connections_max);
+    assert(http_holds_max <= http_connections_max - http_loopback_reserved);
     assert(http_head_bytes_max < http_body_bytes_max);
     assert(http_watchdog_ms < http_idle_timeout_ms);
     assert(http_hold_slice_ms <= api_watch_timeout_ms_max);
@@ -1005,13 +1029,24 @@ pub const job_input_bytes_max: u32 = 64 * 1024;
 /// The body of `POST /v1/jobs` only; every other route keeps `api_request_bytes_max`. Six times
 /// the input (every byte a control character escaped as `\u00XX`) plus 16 KiB for the other
 /// fields, so every input that meets `job_input_bytes_max` is accepted however the client escapes
-/// it (docs/decisions/2026-11-05-b1-job-input-wire-size-answer.md, option B).
-pub const job_request_bytes_max: u32 = 6 * job_input_bytes_max + 16 * 1024;
+/// it (docs/decisions/2026-11-05-b1-job-input-wire-size-answer.md, option B), plus twice the
+/// signatures (B5: an envelope is printable ASCII, so escaping at most doubles it).
+pub const job_request_bytes_max: u32 =
+    6 * job_input_bytes_max + 16 * 1024 + 2 * job_signatures_max * job_signature_bytes_max;
+/// The signatures of a job (B5): DSSE envelopes, each one line of `zbx trust export`. Stricter
+/// than Zigbox's own bounds (`zigbox.trust.limits`, checked in `job_trust.zig`): an envelope
+/// with a provenance statement is larger than this, and a job carries tree and manifest
+/// signatures only (docs/decisions/2026-11-13-b5-signature-bounds.md).
+pub const job_signatures_max: u32 = 4;
+pub const job_signature_bytes_max: u32 = 2048;
 pub const job_command_words_max: u32 = runtime_command_words_max;
 /// The name of the variable a job's input is given in (`input_env`).
 pub const job_input_env_bytes_max: u32 = 64;
 /// Labels of a job: `runtime_labels_max` less `zcube.replica` and `zcube.job`.
 pub const job_labels_max: u32 = runtime_labels_max - 2;
+/// Entries of a job's `placement.require` (B6). Four is what a job can say about where it runs:
+/// a tenant, and three more labels a pool may carry.
+pub const job_require_max: u32 = 4;
 /// The bounds of a job's `limits`, those of Zigbox's runtime (`zigbox` `constants.zig`): a value
 /// outside them would be refused when the run starts, long after the job was accepted.
 /// Mirrors Zigbox's `limit_cpu_millis_min`.
@@ -1030,6 +1065,10 @@ pub const job_limit_pids_max: u32 = 4_194_304;
 /// creation) ends `failed deadline`. A job with no deadline is a service, so 0 is refused.
 pub const job_deadline_ms_max: u64 = 24 * 60 * 60 * 1000;
 pub const job_grace_ms_max: u32 = 60 * 1000;
+/// A run's certificate (docs/briefs/b4.md) expires this long after the run's deadline and grace
+/// have passed, so a job that runs to its deadline still holds a valid certificate while it is
+/// stopped.
+pub const workload_cert_slack_ms: u64 = 60 * 1000;
 /// `submit_by_ms` may be at most this far ahead of the server's clock at receipt, and a retained
 /// ended job is never younger than `job_finished_age_ms_min` when deleted, so a retried POST
 /// inside the window finds the job it created.
@@ -1079,11 +1118,16 @@ comptime {
     // The body, its parse and the decoded input must sit in the request arena well within it.
     assert(job_request_bytes_max * 8 <= request_arena_bytes_max);
     assert(job_labels_max == 6);
+    // `require` and `labels` are both in the run record the agents read: `job_run_bytes_max` bounds
+    // it, and `check_run_size` counts `require` with the rest.
+    assert(job_require_max == 4);
     assert(job_command_words_max == runtime_command_words_max);
     // The run id is a container name (a hostname label), and `<service>-<n>` never equals it.
     assert(job_run_id_bytes_max <= 63);
     assert(job_deadline_ms_max <= x509_leaf_ttl_ms_max); // A leaf of a job outlives its deadline.
     assert(job_grace_ms_max <= job_deadline_ms_max);
+    // The longest run certificate: start, deadline, grace and slack, under the leaf bound.
+    assert(job_deadline_ms_max + job_grace_ms_max + workload_cert_slack_ms < x509_leaf_ttl_ms_max);
     assert(job_submit_window_ms_max <= job_finished_age_ms_min);
     assert(job_finished_age_ms_min <= job_finished_age_ms_max);
     // 73 h: the start backstop, the deadline, retention and an hour's submit window.
@@ -1126,6 +1170,10 @@ pub const relay_connect_timeout_ms: u32 = 10_000;
 pub const relay_buffer_bytes: u32 = 16 * 1024;
 /// How often the relay's loop looks at its stop flag when nothing else wakes it.
 pub const relay_poll_ms: u32 = 50;
+/// `Relay.stop` returns within this, whatever its connections wait for (a connect, a handshake
+/// record, a write): it shuts their sockets down, and every other wait is a poll of
+/// `relay_poll_ms`.
+pub const relay_cancel_ms_max: u32 = 2 * relay_poll_ms;
 /// The relay's own log in the container directory (`relay.log`): at most this many bytes.
 pub const relay_log_bytes_max: u32 = 8 * 1024;
 
@@ -1135,6 +1183,7 @@ comptime {
     assert(relay_connections_max > 0);
     assert(relay_connect_timeout_ms < relay_idle_ms);
     assert(relay_poll_ms < relay_connect_timeout_ms);
+    assert(relay_cancel_ms_max <= 100); // The brief's bound on cancelling a relay.
     assert(relay_connection_bytes_max > relay_buffer_bytes);
     assert(relay_port >= 1024); // The job is unprivileged, and so is the listener.
 }

@@ -21,6 +21,7 @@ const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const agent_jobs = @import("agent_jobs.zig");
 const agent_records = @import("agent_records.zig");
+const api = @import("api.zig");
 const cli = @import("cli.zig");
 const cli_env = @import("cli_env.zig");
 const cli_local = @import("cli_local.zig");
@@ -369,6 +370,11 @@ fn relay_broken(diag: *diag_mod.Diag) void { // relay.zig
     sample(diag, .E0705, &.{cause}, "none needed for a reset; check the network if it repeats");
 }
 
+fn relay_refused_cert(diag: *diag_mod.Diag) void { // agent_relay_cert.zig
+    const cause = "the server refused a certificate for job ingest-7: a stale epoch";
+    sample(diag, .E0706, &.{cause}, "none needed if the run lost its claim");
+}
+
 fn relay_full(diag: *diag_mod.Diag) void { // relay.zig
     const cause = "relay llm has 16 connections open; a seventeenth was closed";
     sample(diag, .W0701, &.{cause}, "reuse connections or close them when done");
@@ -619,8 +625,8 @@ fn peer_removed(diag: *diag_mod.Diag) void { // agent_api.zig
     sample(
         diag,
         .E0807,
-        &.{"node node3 is on the server's list of removed nodes"},
-        "remove its name from the revoked file, then restart zcube-server",
+        &.{"node node3 is on the server's list of removed names (revoked)"},
+        "remove its name from the revoked file; the server rereads it within 5 seconds",
     );
 }
 
@@ -723,6 +729,12 @@ fn tls_overlong_record(diag: *diag_mod.Diag) void { // tls_client.zig
 
 fn entropy_failed(diag: *diag_mod.Diag) void { // secure_random.zig
     secure_random.raise(diag, "the TLS key share");
+}
+
+fn scope_refused(diag: *diag_mod.Diag) void { // api.zig
+    const caller: api.Caller = .{ .client = .{ .name = "app", .scope = .jobs } };
+    const path = "/v1/list";
+    api.raise_not_allowed(diag, caller, "GET", path, .admin);
 }
 
 fn tls_cut_off(diag: *diag_mod.Diag) void { // tls_client.zig
@@ -1028,6 +1040,7 @@ const cases = [_]Case{
     relayed(.E0819, x509_wrong_use),
     relayed(.E0820, tls_signer_failed),
     relayed(.E0821, entropy_failed),
+    relayed(.E0822, scope_refused),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),
@@ -1041,6 +1054,7 @@ const cases = [_]Case{
     relayed(.E0703, relay_unserved),
     relayed(.E0704, relay_timeout),
     relayed(.E0705, relay_broken),
+    relayed(.E0706, relay_refused_cert),
     relayed(.W0701, relay_full),
     relayed(.W0702, relay_bound),
 };

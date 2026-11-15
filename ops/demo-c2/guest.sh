@@ -44,11 +44,19 @@ start_agent() {
 }
 
 cmd_agent() {
-    [ $# -eq 3 ] || fail "usage: guest.sh agent <node> <server> <advertised>"
+    [ $# -eq 3 ] || [ $# -eq 4 ] ||
+        fail "usage: guest.sh agent <node> <server> <advertised> [<tls dir>]"
     mkdir -p "$STATE/faults" "$LOG"
+    tls=""
+    if [ $# -eq 4 ]; then
+        for file in ca.crt node.crt node.key; do
+            [ -f "$4/$file" ] || fail "no $4/$file"
+        done
+        tls="--ca $4/ca.crt --cert $4/node.crt --key $4/node.key"
+    fi
     echo "--runtime zigbox --node $1 --server $2 --state-dir $STATE --cpu-millis 2000" \
         "--memory-bytes 1073741824 --peer-listen 0.0.0.0:$PEER_PORT --peer-advertise $3" \
-        "--verbose" >"$ARGS"
+        "--verbose $tls" >"$ARGS"
     start_agent
     sleep 1
     agent_pid >/dev/null || fail "the agent exited at once: $(tail -20 "$LOG/agent.log")"

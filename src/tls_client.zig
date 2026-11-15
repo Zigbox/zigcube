@@ -50,7 +50,12 @@ pub const Config = struct {
     /// The ephemeral x25519 secret.
     secret: [32]u8,
     client_auth: ClientAuth = .none,
+    /// Which rules the server's leaf is held to: a cluster server's, or (a relay's upstream, B4)
+    /// a foreign server's, signed by an anchor of its own (`x509.verify_foreign_server`).
+    server_profile: ServerProfile = .cluster,
 };
+
+pub const ServerProfile = enum { cluster, foreign };
 
 /// Whether and how the client authenticates. A required authentication always has an identity, so
 /// the state "required, with nothing to present" cannot be written.
@@ -145,6 +150,7 @@ fn fault_on(fault: TestFault) bool {
 pub const Client = struct {
     state: State,
     anchor: [32]u8,
+    server_profile: ServerProfile,
     now_ms: u64,
     name: [constants.tls_server_name_bytes_max]u8,
     name_length: u32,
@@ -188,6 +194,7 @@ pub const Client = struct {
         assert(config.server_name.len <= constants.tls_server_name_bytes_max);
         self.state = .idle;
         self.anchor = config.anchor;
+        self.server_profile = config.server_profile;
         self.now_ms = config.now_ms;
         self.name_length = @intCast(config.server_name.len);
         @memcpy(self.name[0..config.server_name.len], config.server_name);
@@ -674,10 +681,20 @@ pub const Client = struct {
         };
         const name = self.name[0..self.name_length];
         var detail: x509.Detail = .{};
-        const parsed = x509.verify_detailed(chain.leaf, self.anchor, self.now_ms, .{
-            .kind = .server,
-            .name = name,
-        }, &detail) catch |err| {
+        const verified = switch (self.server_profile) {
+            .cluster => x509.verify_detailed(chain.leaf, self.anchor, self.now_ms, .{
+                .kind = .server,
+                .name = name,
+            }, &detail),
+            .foreign => x509.verify_foreign_server(
+                chain.leaf,
+                self.anchor,
+                self.now_ms,
+                name,
+                &detail,
+            ),
+        };
+        const parsed = verified catch |err| {
             x509.raise(diag, err, name, &detail);
             return self.refuse(diag, certificate_alert(err));
         };
@@ -1106,7 +1123,7 @@ pub const Client = struct {
     }
 };
 
-fn message_name(kind: u8) []const u8 {
+pub fn message_name(kind: u8) []const u8 {
     return switch (kind) {
         wire.handshake_server_hello => "ServerHello",
         wire.handshake_encrypted_extensions => "EncryptedExtensions",
@@ -1120,7 +1137,7 @@ fn message_name(kind: u8) []const u8 {
     };
 }
 
-fn ed25519_verifies(key: *const [32]u8, content: []const u8, signature: *const [64]u8) bool {
+pub fn ed25519_verifies(key: *const [32]u8, content: []const u8, signature: *const [64]u8) bool {
     const public_key = Ed25519.PublicKey.fromBytes(key.*) catch return false;
     const parsed = Ed25519.Signature.fromBytes(signature.*);
     parsed.verify(content, public_key) catch return false;
@@ -1144,7 +1161,7 @@ fn refuses_certificate(code: u8) bool {
     };
 }
 
-fn certificate_alert(err: x509.Error) wire.Alert {
+pub fn certificate_alert(err: x509.Error) wire.Alert {
     return switch (err) {
         error.WrongIssuer, error.BadSignature => .unknown_ca,
         error.Expired, error.NotYetValid => .certificate_expired,
@@ -1153,7 +1170,7 @@ fn certificate_alert(err: x509.Error) wire.Alert {
     };
 }
 
-fn wire_alert(err: wire.Error) wire.Alert {
+pub fn wire_alert(err: wire.Error) wire.Alert {
     return switch (err) {
         error.Malformed => .decode_error,
         error.IllegalParameter,
@@ -1168,7 +1185,7 @@ fn wire_alert(err: wire.Error) wire.Alert {
     };
 }
 
-fn record_alert(err: schedule.Error) wire.Alert {
+pub fn record_alert(err: schedule.Error) wire.Alert {
     return switch (err) {
         error.BadRecordMac => .bad_record_mac,
         error.RecordOverflow => .record_overflow,
@@ -1180,7 +1197,7 @@ fn record_alert(err: schedule.Error) wire.Alert {
     };
 }
 
-fn wire_reason(err: wire.Error) []const u8 {
+pub fn wire_reason(err: wire.Error) []const u8 {
     return switch (err) {
         error.Malformed => "malformed (cut short or a length that does not add up)",
         error.IllegalParameter => "not allowed here (an illegal value)",

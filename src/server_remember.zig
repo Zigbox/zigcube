@@ -84,7 +84,10 @@ pub const Remembered = struct {
         var opened: Remembered = .{ .io = io, .path = path, .dir = undefined };
         @memcpy(opened.name_buffer[0..file.len], file);
         opened.name_length = @intCast(file.len);
-        cwd.createDirPath(io, path) catch |err| return unusable(diag, &opened, "create", err);
+        // 0700 whatever the umask: this is the state directory the CA key shares, which must not
+        // be writable by group or others (ZC-E0806, docs/decisions/2026-11-13-state-dir-0700.md).
+        _ = cwd.createDirPathStatus(io, path, .fromMode(0o700)) catch |err|
+            return unusable(diag, &opened, "create", err);
         opened.dir = cwd.openDir(io, path, .{ .iterate = true }) catch |err|
             return unusable(diag, &opened, "open", err);
         return opened;
