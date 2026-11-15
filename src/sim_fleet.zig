@@ -749,17 +749,27 @@ fn check_token(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.GitHubStopped,
     };
-    if (http.token_expiry_unread) {
-        log.writeAll("sim-fleet: GitHub's token expiry header has a form sim_fleet does " ++
-            "not read: no expiry warning\n") catch {}; // Nowhere else.
-    }
-    state.token_expires = http.token_expires orelse 0;
-    try save(arena, io, args.state, &state);
     const now = std.Io.Clock.real.now(io).toSeconds();
+    state.token_expires = http.token_expires orelse 0;
+    if (http.token_expires == null) note_no_expiry(&state, now, http.token_expiry_unread, log);
+    try save(arena, io, args.state, &state);
     if (token_expires_soon(&state, now)) {
         log.writeAll("sim-fleet: ") catch {}; // Nowhere else.
         write_expiry_line(log, state.token_expires) catch {}; // Nowhere else.
     }
+}
+
+/// Logs, once per UTC day (kept in the state), that GitHub sent no token expiry sim_fleet could
+/// read: a missing or unreadable header never fails the round, and is not news every round.
+fn note_no_expiry(state: *state_file.State, now: i64, unread: bool, log: *std.Io.Writer) void {
+    const today = state_file.ymd_of(now);
+    if (state.token_noted) |noted| {
+        if (std.mem.eql(u8, &noted, &today)) return;
+    }
+    state.token_noted = today;
+    const what = if (unread) "has a form sim_fleet does not read" else "was not sent";
+    log.print("sim-fleet: GitHub's token expiry header {s}: no expiry warning " ++
+        "(logged once a day)\n", .{what}) catch {}; // Nowhere else.
 }
 
 /// The state at `path`: empty if there is no such file, an error for anything else that keeps
@@ -1620,4 +1630,22 @@ test "the canary's arguments come together or not at all" {
             "--kind", "sim-canary", "--canary", "sim_teeth", "--canary-seeds", "1..2",
         }),
     }) |bad| try std.testing.expect(parse_args(bad) == null);
+}
+
+test "a missing or unread token expiry is logged once a day, never every round" {
+    var state: state_file.State = .{};
+    var log: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer log.deinit();
+    const day = 1_794_700_000;
+    note_no_expiry(&state, day, false, &log.writer);
+    note_no_expiry(&state, day + 600, true, &log.writer);
+    try std.testing.expectEqualStrings(
+        "sim-fleet: GitHub's token expiry header was not sent: no expiry warning " ++
+            "(logged once a day)\n",
+        log.written(),
+    );
+    log.clearRetainingCapacity();
+    note_no_expiry(&state, day + 86_400, true, &log.writer);
+    try std.testing.expect(std.mem.indexOf(u8, log.written(), "does not read") != null);
+    try std.testing.expectEqualSlices(u8, &state_file.ymd_of(day + 86_400), &state.token_noted.?);
 }

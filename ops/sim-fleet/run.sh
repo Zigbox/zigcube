@@ -179,6 +179,11 @@ follow_refs() {
         log "git ls-remote failed or timed out; keeping every branch's build"
         return 0
     fi
+    # An answer with no branch at all is not taken as every branch deleted.
+    if [ ! -s "$STATE/heads.new" ]; then
+        log "git ls-remote listed no branch; keeping every branch's build"
+        return 0
+    fi
     for name in $REFS; do
         dir=$(ref_dir "$name")
         mkdir -p "$dir"

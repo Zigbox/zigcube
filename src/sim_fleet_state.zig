@@ -12,12 +12,14 @@
 //!     reported <YYYY-MM-DD>
 //!     soak <YYYY-MM-DD> <commit> <run kind> <seeds> <failed> <first unix> <last unix> <ref>
 //!     token-expires <unix seconds>
+//!     token-noted <YYYY-MM-DD>
 //!
 //! Version 4 added the `soak` lines, what each commit ran on a day by kind, from the start of its
 //! first round to the end of its last (ref `-` when the runner named none), and `token-expires`,
-//! when GitHub says the token expires (`sim_fleet heartbeat`). A version 3 file is read as it
-//! is. A release that writes only version 3 refuses a version 4 file; to roll back, delete both
-//! kinds of line and write `version 3` (ops/sim-fleet/README.md, "Rolling back").
+//! when GitHub says the token expires (`sim_fleet heartbeat`), and `token-noted`, the last day the
+//! log said GitHub sent no expiry it could read (once a day). A version 3 file is read as it
+//! is. A release that writes only version 3 refuses a version 4 file; to roll back, delete those
+//! lines and write `version 3` (ops/sim-fleet/README.md, "Rolling back").
 //!
 //! Version 3 added the `kind` lines: a day's seeds and failures split by the run that produced them
 //! (`sim-cluster`, `sim-c1`, `sim-swarm`). A version 2 file, which only ever ran `sim-cluster`,
@@ -106,6 +108,8 @@ pub const State = struct {
     soaks: std.ArrayList(Soak) = .empty,
     /// When GitHub said the token expires (unix seconds); 0 if it did not say.
     token_expires: i64 = 0,
+    /// The last day the log said the expiry was missing or unread, null if never.
+    token_noted: ?Ymd = null,
     /// The latest day whose totals were posted, "" if none.
     reported: []const u8 = "",
     /// Unix seconds before which nothing is written to GitHub (it asked to wait); 0 if none.
@@ -377,6 +381,7 @@ pub const State = struct {
         if (state.token_expires > 0) {
             try out.print("token-expires {d}\n", .{state.token_expires});
         }
+        if (state.token_noted) |noted| try out.print("token-noted {s}\n", .{&noted});
     }
 };
 
@@ -480,6 +485,8 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!State {
         } else if (std.mem.eql(u8, kind, "token-expires") and format >= 4) {
             state.token_expires = try parse_number(i64, &words);
             if (state.token_expires < 0) return error.BadState;
+        } else if (std.mem.eql(u8, kind, "token-noted") and format >= 4) {
+            state.token_noted = try parse_ymd(&words);
         } else if (std.mem.eql(u8, kind, "reported")) {
             state.reported = words.next() orelse return error.BadState;
         } else {
@@ -823,6 +830,7 @@ test "a version 3 state file, as the host wrote it, is read and written as versi
         .ref = "release/0.6",
     });
     state.token_expires = 1_795_000_000;
+    state.token_noted = "2026-11-14".*;
     var out: std.Io.Writer.Allocating = .init(arena);
     try state.render(&out.writer);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "version 4\n"));
@@ -832,6 +840,9 @@ test "a version 3 state file, as the host wrote it, is read and written as versi
     try std.testing.expectEqual(@as(usize, 1), again.soaks.items.len);
     try std.testing.expectEqualStrings("release/0.6", again.soaks.items[0].ref);
     try std.testing.expectEqual(@as(i64, 1_795_000_000), again.token_expires);
+    try std.testing.expectEqualStrings("2026-11-14", &again.token_noted.?);
+    const noted_v3 = "version 3\ntoken-noted 2026-11-14\n";
+    try std.testing.expectError(error.BadState, parse(arena, noted_v3));
     // Rolled back by the README's sed, the file is version 3 text again.
     try std.testing.expectError(error.BadState, parse(arena, "version 3\ntoken-expires 5\n"));
     try std.testing.expectError(
