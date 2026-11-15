@@ -92,9 +92,10 @@ const excess_ms_max: u64 = 120_000;
 const excess_slots_max: u32 = 512;
 /// A placed replica of a good image must have a running container on its own node within this
 /// long, counted like `excess_ms_max` (agent up, link not cut, store up) and only while the
-/// agent's last step worked: a failing step (a flaky link) explains why nothing moved. Seeds 1
-/// to 300 at 100 operations reach 20.1 s with the agent fix, 25 to 48 s without it
-/// (docs/DECISIONS.md).
+/// agent's last step worked and it is not fencing: a failing step (a flaky link) explains why
+/// nothing moved, and so does a fence, which starts nothing until every container of the node
+/// has stopped (#260). Seeds 1 to 300 at 100 operations reach 20.1 s with the agent fix, 25 to
+/// 48 s without it (docs/DECISIONS.md).
 const starved_ms_max: u64 = 24_000;
 /// The cluster's successful agent steps per minute of uptime while the faults were on must be at
 /// least this (`cluster_ok_rate`).
@@ -3024,6 +3025,11 @@ fn track_unassigned(
     c.excess_count = count;
 }
 
+/// Whether a placed replica's wait on `node` counts against `starved_ms_max`.
+fn starving(node: *const Node) bool {
+    return reachable(node) and node.last_ok and !node.agent.fence.active;
+}
+
 fn starved_accrued(c: *const Cluster, node: u32, name_hash: u64) u64 {
     for (c.starved[0..c.starved_count]) |entry| {
         if (entry.node == node and entry.name_hash == name_hash) return entry.accrued_ms;
@@ -3032,9 +3038,16 @@ fn starved_accrued(c: *const Cluster, node: u32, name_hash: u64) u64 {
 }
 
 /// Per placed replica of a good image: its own node must come to hold a running container of
-/// it. Time accrues while the node's agent is up and its link is not cut (the store is up, or
-/// this is not reached); a running container resets it. A replica of a service whose image is
-/// the broken one is skipped.
+/// it. Time accrues while the node's agent is up, its link is not cut (the store is up, or this
+/// is not reached), its last step worked and it is not fencing; a running container resets it.
+/// A replica of a service whose image is the broken one is skipped.
+///
+/// A fence is left out because it may rightly outlast the bound together with a start timeout
+/// (#260): an agent dies between a replica's record and its process, so the record reads
+/// `starting` for `fake_start_timeout_ms` before it is lost; the agent dies again mid-start of
+/// another container, and the host restart fences, which must wait the same timeout for that
+/// record (its process could still come up). A fence that never ends is caught elsewhere: the
+/// node's lease lapses, the replica is placed again, and the run does not converge.
 fn track_starved(
     c: *Cluster,
     replicas: []const controller.Entry(records.Replica),
@@ -3051,7 +3064,7 @@ fn track_starved(
         if (live_container(node, replica.id) == true) continue;
         const hash = std.hash.Wyhash.hash(0, replica.id);
         var accrued = starved_accrued(c, node.index, hash);
-        if (reachable(node) and node.last_ok) accrued += delta_ms;
+        if (starving(node)) accrued += delta_ms;
         c.starved_worst_ms = @max(c.starved_worst_ms, accrued);
         try check(c, accrued <= starved_ms_max, "a placed replica has no running container " ++
             "on its node");
@@ -4603,6 +4616,41 @@ test "the fencing check fires on a node that runs containers long after it lost 
     try track_fencing(c);
     c.manual.advance(1);
     try testing.expectError(error.StepFailed, track_fencing(c));
+    try testing.expect(report.failed);
+}
+
+test "a placed replica's wait accrues while its agent works, not while it fences (#260)" {
+    // Goal: track_starved has teeth, and a fence (which starts nothing until the node's
+    // containers have stopped, a never-started record's start timeout included) is not charged
+    // to the replica. Method: run replicas, stop their containers behind the agent's back, then
+    // move the clock past the bound without letting any node step, once fencing and once not.
+    var report: Report = .{};
+    const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
+    defer c.destroy();
+    c.apply("hello", hello_digest, 2);
+    c.advance(5_000);
+    try testing.expect(!report.failed);
+    const node = c.nodes[0];
+    var stopped: u32 = 0;
+    for (node.sim.containers.containers.items) |*container| {
+        if (container.phase == .stopped) continue;
+        container.phase = .{ .stopped = .{ .exited = 0 } };
+        stopped += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), stopped);
+    try testing.expect(starving(node));
+    node.agent.fence.active = true;
+    try testing.expect(!starving(node));
+    try track_excess(c);
+    c.manual.advance(starved_ms_max + 1);
+    try track_excess(c);
+    try testing.expect(!report.failed);
+    node.agent.fence.active = false;
+    c.manual.advance(starved_ms_max);
+    try track_excess(c);
+    try testing.expect(!report.failed);
+    c.manual.advance(1);
+    try testing.expectError(error.StepFailed, track_excess(c));
     try testing.expect(report.failed);
 }
 

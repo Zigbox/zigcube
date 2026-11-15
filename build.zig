@@ -2676,6 +2676,17 @@ const c1_regressions = [_][]const []const u8{
     // (docs/decisions/2026-11-14-c3-paused-scale-down.md).
     &.{ "202", "150", "0", "--c3", "--heal-at=125" },
     &.{ "207", "150", "0", "--c3", "--heal-at=127" },
+    // #260 on b629ece: a checker false positive. node2's agent died between alpha-41's record
+    // and its process (`starting` for the 10 s start timeout, then lost), then again mid-start
+    // of a job; the host restart fenced and waited that timeout for the job's record too, and
+    // the fence was charged to the replica (28.4 s, bound 24 s). A fence accrues nothing now
+    // (`starving`). A record, not a guard: the B4-B7 world draws differently and ad4c6ca passes
+    // it unfixed; the guard is the unit test of `starving` in `sim_cluster.zig`.
+    &.{
+        "3312603916",    "68",                  "3",
+        "--strong",      "--lease-ttl-ms=8221", "--replicas-pct=300",
+        "--heal-at=129",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
