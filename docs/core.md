@@ -405,7 +405,7 @@ world's teardown the counting allocator must hold nothing (`soak: memory still h
 world was torn down`). `--soak-bytes=B` (1.5 GiB by default) ends the soak as held at the epoch
 whose live bytes reach B (`budget reached`), and a held soak prints its world hash. Wall time is
 printed, never judged, so the verdict is the seed's. The tooth, `src/sim_soak_teeth_main.zig`
-(16 KiB never freed per operation), must fail the teardown check; `ops/sim-fleet/test-soak.sh`
+(16 KiB never freed per operation), must fail the teardown check; `ops/sim-fleet/test-soak-loop.sh`
 runs it in `zig build test` (`docs/decisions/2026-11-14-c3-soak-leak-judge.md`). `--c1` is refused (its tap grows about 1 GB by 2,000
 operations). The decisions check now reads up to 1,024 pages (`decision_pages_max`, 512,000
 decisions; it was 64, which a soak passes near 10,000 operations). Operations per second fall as

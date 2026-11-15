@@ -205,7 +205,7 @@ pub const tenant_world = placement_exclusive or relabel_kept;
 /// The long soak's leak (`sim_cluster <seed> soak`, src/sim_soak.zig): every operation takes
 /// `soak_leak_bytes` from the run's allocator and never gives them back (must fail the soak's
 /// teardown check, "memory still held after the world was torn down"). Only
-/// `src/sim_soak_teeth_main.zig` declares it; `ops/sim-fleet/test-soak.sh` runs it.
+/// `src/sim_soak_teeth_main.zig` declares it; `ops/sim-fleet/test-soak-loop.sh` runs it.
 pub const soak_leak = declared("c1_teeth_soak_leak");
 pub const soak_leak_bytes: usize = if (soak_leak) 16 * 1024 else 0;
 

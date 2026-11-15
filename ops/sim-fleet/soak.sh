@@ -2,9 +2,10 @@
 # The long soak (ops/sim-fleet/README.md, item 8; docs/briefs/c3.md, item 6): one seed of
 # `sim_cluster` for hours, judged at every epoch (src/sim_soak.zig) for leaks, counters near
 # their range and a world that stopped moving, then handed to `sim_fleet ingest --kind sim-soak`.
-# It runs beside run.sh, not inside it: it takes the binaries run.sh last built
-# ($SIM_FLEET_STATE_DIR/built), copies them so run.sh may prune them meanwhile, and keeps a
-# state file of its own. One soak per round; SIM_SOAK_ROUNDS=0 (the default) loops for ever.
+# It runs beside run.sh, not inside it: it takes the `sim_cluster` run.sh last built for main
+# ($SIM_FLEET_STATE_DIR/built) and the fleet's own reporter ($SIM_FLEET_STATE_DIR/fleet, run.sh's
+# build_reporter), copies them so run.sh may prune them meanwhile, and keeps a state file of its
+# own. One soak per round; SIM_SOAK_ROUNDS=0 (the default) loops for ever.
 # The token is a file; this script never prints it.
 set -eu
 
@@ -73,16 +74,18 @@ log() {
     printf '%s sim-soak: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 }
 
-# Copies the binaries of the commit run.sh last built into $SOAK/bin and sets $built; fails when
-# there are none.
+# Copies `sim_cluster` of the commit run.sh last built for main, and the fleet's own `sim_fleet`
+# (run.sh builds no commit's reporter), into $SOAK/bin and sets $built; fails when either is
+# missing.
 take_binaries() {
     built=$(cat "$FLEET/built" 2>/dev/null || true)
     if [ -z "$built" ]; then return 1; fi
     from=$FLEET/bin/$built/bin
-    if [ ! -x "$from/sim_cluster" ] || [ ! -x "$from/sim_fleet" ]; then return 1; fi
+    reporter=$FLEET/fleet/bin/sim_fleet
+    if [ ! -x "$from/sim_cluster" ] || [ ! -x "$reporter" ]; then return 1; fi
     rm -rf "$SOAK/bin.new"
     mkdir -p "$SOAK/bin.new"
-    cp "$from/sim_cluster" "$from/sim_fleet" "$SOAK/bin.new/" || return 1
+    cp "$from/sim_cluster" "$reporter" "$SOAK/bin.new/" || return 1
     rm -rf "$SOAK/bin"
     mv "$SOAK/bin.new" "$SOAK/bin"
 }
@@ -175,7 +178,7 @@ ingest() {
     return "$code"
 }
 
-# Sourced by ops/sim-fleet/test-soak.sh for the functions only.
+# Sourced by ops/sim-fleet/test-soak-loop.sh for the functions only.
 if [ -n "${SIM_FLEET_SOURCE_ONLY:-}" ]; then return 0 2>/dev/null || true; fi
 main "$@"
 exit $?

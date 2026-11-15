@@ -26,7 +26,10 @@ export SIM_FLEET_SOURCE_ONLY
 . "$here/run.sh"
 STATE=$work/state
 built=abc123
+ref=main
+SIM_FLEET_BRANCH=main
 bin=$STATE/bin/$built/bin
+reporter=$bin/sim_fleet
 round=$STATE/round
 SIM_FLEET_HOME=$work/home
 SIM_FLEET_DRY_RUN=1
@@ -47,7 +50,8 @@ WRAP
 chmod +x "$bin/sim_fleet"
 printf '#!/bin/sh\nexit 0\n' >"$SIM_FLEET_PG_BIN/initdb"
 chmod +x "$SIM_FLEET_PG_BIN/initdb"
-git() { :; } # The checkout of the built commit: the host's, not this test's.
+# The worktree of the round's branch: the host's, not this test's (never this repository's).
+worktree_at() { mkdir -p "$1"; }
 fail() { echo "FAIL ($case_name): $*" >&2; exit 1; }
 expect() { case "$out" in *"$1"*) ;; *) fail "wanted '$1' in: $out" ;; esac; }
 refuse() { case "$out" in *"$1"*) fail "unwanted '$1' in: $out" ;; esac; }

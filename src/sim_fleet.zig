@@ -4,9 +4,12 @@
 //!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|sim-soak|store-faults]
 //!                      [--dry-run]
 //!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT[|TEXT...]]]
+//!                      [--ref BRANCH] [--round-started UNIX]
 //!                      < one run kind's output of a round
 //!     sim_fleet coverage|bias --kind sim-cluster|sim-c1 --commit SHA --file FILE
 //!                      (src/sim_fleet_coverage.zig)
+//!     sim_fleet heartbeat [--repo OWNER/NAME --token-file FILE --state FILE]
+//!                         [--url-file FILE] [--clean]
 //!
 //! Reads what one kind of producer printed in one round on stdin: for `sim-cluster`, each
 //! `sim_cluster --seeds A..B <operations> --shrink`; for `sim-c1`, the same with `--c1`; for
@@ -27,9 +30,25 @@
 //! check starts with TEXT) and each crash are failures (`issue.canary_verdict`). It prints
 //! `sim-fleet: canary RUNNER: caught|MISSED|WRONG SYMPTOM|CRASHED`, and exits 2 when GitHub's
 //! hold kept a canary failure from being filed, so `run.sh` runs that canary again next round.
+//! Any other round GitHub kept from being written in full (a hold, a tracker that refused the
+//! post, a locked issue) is counted and exits 3, so `run.sh` sends no heartbeat for it.
 //!
-//! Exit codes: 0 done, 1 usage or bad input, 2 environment (state file, token, GitHub). The state
-//! file is saved whenever it was read, whatever GitHub answered.
+//! `--ref` names the branch whose tip the round ran (`run.sh`, `SIM_FLEET_SOAK_REFS`) and
+//! `--round-started` when the round began: the state file keeps each commit's seeds per kind and
+//! its hours under soak per day, and the daily post lists them.
+//!
+//! `heartbeat` runs once a round, after the ingests. With `--repo`, it asks GitHub for the
+//! repository with the token: a 401 is logged as "token refused (expired or revoked): replace
+//! /etc/sim-fleet/token", and the expiry GitHub reports goes into the state file; under
+//! `fleet_token_warn_seconds` away it is logged ("token expires <date>: replace it") and the
+//! daily post says so. Then, with `--clean` (a clean round: some seed counted and every ingest
+//! of the round exited 0), a token that worked and a non-empty `--url-file`, it GETs that URL,
+//! following no redirect, and logs "heartbeat sent" or "heartbeat failed: ...". The URL is never
+//! printed.
+//!
+//! Exit codes: 0 done, 1 usage or bad input, 2 environment (state file, token, GitHub), 3 counted
+//! but GitHub kept part of it from being written (`exit_external`). The state file is saved
+//! whenever it was read, whatever GitHub answered.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -51,10 +70,15 @@ const usage_text =
     "--shrink` (sim-swarm), concatenated, or `zig build test-store-faults` (store-faults,\n" ++
     "once a day); with --canary, the fault-on RUNNER's run of that\n" ++
     "kind over seeds A..B, filed as sim-canary\n" ++
+    "       sim_fleet ingest ... [--ref BRANCH] [--round-started UNIX]\n" ++
     "       sim_fleet coverage --kind sim-cluster|sim-c1 --commit SHA --file FILE\n" ++
     "adds the `coverage: profile=` lines of that kind's round on stdin to FILE\n" ++
     "       sim_fleet bias --kind sim-cluster|sim-c1 --commit SHA --file FILE\n" ++
-    "prints the fault profile a biased round runs (src/sim_fleet_coverage.zig)\n";
+    "prints the fault profile a biased round runs (src/sim_fleet_coverage.zig)\n" ++
+    "       sim_fleet heartbeat [--repo OWNER/NAME --token-file FILE --state FILE]\n" ++
+    "                           [--url-file FILE] [--clean]\n" ++
+    "checks the token (and records its expiry), then after a clean round GETs the URL in\n" ++
+    "the file, which it never prints\n";
 
 pub const Options = struct {
     kind: []const u8 = issue.kind_sim_cluster,
@@ -62,6 +86,10 @@ pub const Options = struct {
     /// The issue the daily totals go to; none means they are not posted.
     tracker: ?u32 = null,
     now_seconds: i64,
+    /// The branch whose tip `commit` is, `-` if the runner did not say.
+    ref: []const u8 = "-",
+    /// When the round began (unix seconds); null: when it was ingested.
+    round_started: ?i64 = null,
 };
 
 /// What an ingest did, for the line it prints.
@@ -184,6 +212,20 @@ fn count_round(
     groups: []Group,
 ) error{OutOfMemory}!void {
     try state.count(arena, today, options.kind, counts, options.commit);
+    // A round that began before midnight counts from midnight on the day it is counted on. A
+    // canary's seeds are the fault-on runner's, not the commit's: they are not soak.
+    const midnight = options.now_seconds - @mod(options.now_seconds, 86_400);
+    const started = options.round_started orelse options.now_seconds;
+    if (!std.mem.eql(u8, options.kind, issue.kind_sim_canary)) try state.soak(arena, today, .{
+        .ymd = today,
+        .commit = options.commit,
+        .kind = options.kind,
+        .seeds = counts.seeds,
+        .failed = counts.failed,
+        .first = std.math.clamp(started, midnight, options.now_seconds),
+        .last = options.now_seconds,
+        .ref = options.ref,
+    });
     for (groups) |*group| {
         const fp = try arena.dupe(u8, &group.fingerprint);
         const number = if (state.find(fp)) |filed| filed.issue else 0;
@@ -321,7 +363,7 @@ fn post_daily_totals(
     const tracker = options.tracker orelse return;
     assert(tracker > 0);
     for (try state.unreported(arena, today)) |day| {
-        const text = try totals_text(arena, state, &day);
+        const text = try totals_text(arena, state, &day, options.now_seconds);
         github.comment(arena, tracker, text) catch |err| switch (err) {
             error.GitHubGone, error.GitHubForbidden => {
                 summary.tracker_refused = true;
@@ -338,11 +380,15 @@ fn totals_text(
     arena: std.mem.Allocator,
     state: *const state_file.State,
     day: *const state_file.Day,
+    now_seconds: i64,
 ) error{OutOfMemory}![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
-    write_totals(w, state, day, try state.seen_on(arena, day.ymd)) catch
-        return error.OutOfMemory;
+    const seen = try state.seen_on(arena, day.ymd);
+    const soaked = try state_file.soaked_on(state, arena, day.ymd);
+    write_totals(w, state, day, seen) catch return error.OutOfMemory;
+    write_soaked(w, state, day, soaked) catch return error.OutOfMemory;
+    write_expiry(w, state, now_seconds) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
@@ -375,6 +421,86 @@ fn write_totals(
     }
 }
 
+/// Each commit the day soaked: its branch, its hours that day (first round's start to last
+/// round's end, so commits soaked side by side share hours), since when it has been under soak,
+/// and its seeds per kind.
+fn write_soaked(
+    w: *std.Io.Writer,
+    state: *const state_file.State,
+    day: *const state_file.Day,
+    soaked: []const state_file.Soaked,
+) std.Io.Writer.Error!void {
+    if (soaked.len == 0) return;
+    try w.writeAll("\nCommits soaked (hours: the time its rounds ran):\n");
+    for (soaked) |item| {
+        try w.print("- `{s}` ({s}): ", .{ item.commit, item.refs });
+        try write_hours(w, item.seconds);
+        try w.writeAll(" this day, ");
+        try write_hours(w, item.since_seconds);
+        try w.writeAll(" since ");
+        try write_time(w, item.since);
+        var separator: []const u8 = ";";
+        for (issue.kinds) |kind| {
+            var seeds: u64 = 0;
+            var failed: u64 = 0;
+            var any = false;
+            for (state.soaks.items) |line| {
+                if (!std.mem.eql(u8, &line.ymd, &day.ymd)) continue;
+                if (!std.mem.eql(u8, line.commit, item.commit)) continue;
+                if (!std.mem.eql(u8, line.kind, kind)) continue;
+                seeds += line.seeds;
+                failed += line.failed;
+                any = true;
+            }
+            if (!any) continue;
+            try w.print("{s} {s} {d} seeds ({d} failed)", .{ separator, kind, seeds, failed });
+            separator = ",";
+        }
+        try w.writeAll("\n");
+    }
+}
+
+/// `2.6 h`, in tenths of an hour, rounded down.
+fn write_hours(w: *std.Io.Writer, seconds: u64) std.Io.Writer.Error!void {
+    const tenths = seconds * 10 / 3600;
+    try w.print("{d}.{d} h", .{ tenths / 10, tenths % 10 });
+}
+
+/// The token-expiry warning, when GitHub said the token expires within the warning time.
+fn write_expiry(
+    w: *std.Io.Writer,
+    state: *const state_file.State,
+    now_seconds: i64,
+) std.Io.Writer.Error!void {
+    if (!token_expires_soon(state, now_seconds)) return;
+    try w.writeAll("\n");
+    try write_expiry_line(w, state.token_expires);
+}
+
+fn token_expires_soon(state: *const state_file.State, now_seconds: i64) bool {
+    if (state.token_expires == 0) return false;
+    return state.token_expires - now_seconds < constants.fleet_token_warn_seconds;
+}
+
+/// "token expires <date>: replace it (ops/sim-fleet/README.md)", the post's and the journal's.
+fn write_expiry_line(w: *std.Io.Writer, expires: i64) std.Io.Writer.Error!void {
+    assert(expires > 0);
+    try w.writeAll("token expires ");
+    try write_time(w, expires);
+    try w.writeAll(": replace it (ops/sim-fleet/README.md)\n");
+}
+
+/// "YYYY-MM-DD HH:MM UTC".
+fn write_time(w: *std.Io.Writer, unix_seconds: i64) std.Io.Writer.Error!void {
+    assert(unix_seconds >= 0);
+    const of_day = @mod(unix_seconds, 86_400);
+    try w.print("{s} {d:0>2}:{d:0>2} UTC", .{
+        &state_file.ymd_of(unix_seconds),
+        @as(u64, @intCast(@divFloor(of_day, 3600))),
+        @as(u64, @intCast(@divFloor(@mod(of_day, 3600), 60))),
+    });
+}
+
 const Args = struct {
     repo: []const u8 = "",
     commit: []const u8 = "",
@@ -386,6 +512,8 @@ const Args = struct {
     canary: ?[]const u8 = null,
     canary_seeds: ?[]const u8 = null,
     symptom: ?[]const u8 = null,
+    ref: []const u8 = "-",
+    round_started: ?i64 = null,
 };
 
 /// The canary of `--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT]`, null without
@@ -414,6 +542,20 @@ fn canary_of(args: Args) error{BadCanary}!?issue.Canary {
         .last = last,
         .symptom = args.symptom,
     };
+}
+
+/// A branch name as git allows it and the state file can hold as a word (run.sh checks the
+/// same before it fetches one).
+fn ref_valid(ref: []const u8) bool {
+    if (ref.len == 0 or ref.len > constants.fleet_ref_bytes_max) return false;
+    if (ref[0] == '-') return std.mem.eql(u8, ref, "-");
+    if (std.mem.indexOf(u8, ref, "..") != null) return false;
+    for (ref) |byte| {
+        const allowed = std.ascii.isAlphanumeric(byte) or
+            byte == '.' or byte == '_' or byte == '/' or byte == '-';
+        if (!allowed) return false;
+    }
+    return true;
 }
 
 /// Null if the command line is not valid `ingest`.
@@ -446,6 +588,12 @@ fn parse_args(args: []const []const u8) ?Args {
             parsed.canary_seeds = value;
         } else if (std.mem.eql(u8, arg, "--expect-symptom")) {
             parsed.symptom = value;
+        } else if (std.mem.eql(u8, arg, "--ref")) {
+            if (!ref_valid(value)) return null;
+            parsed.ref = value;
+        } else if (std.mem.eql(u8, arg, "--round-started")) {
+            parsed.round_started = std.fmt.parseInt(i64, value, 10) catch return null;
+            if (parsed.round_started.? < 0) return null;
         } else if (std.mem.eql(u8, arg, "--tracker")) {
             parsed.tracker = std.fmt.parseInt(u32, value, 10) catch return null;
             if (parsed.tracker.? == 0) return null;
@@ -466,14 +614,15 @@ pub fn main(init: std.process.Init) u8 {
     const arena = init.arena.allocator();
     const argv = init.minimal.args.toSlice(arena) catch return constants.exit_user;
     if (coverage.parse_args(argv)) |args| return run_coverage(init, args);
-    const args = parse_args(argv) orelse {
-        std.Io.File.stderr().writeStreamingAll(init.io, usage_text) catch {}; // Nowhere else.
-        return constants.exit_user;
-    };
     var err_buffer: [1024]u8 = undefined;
     var err_writer = std.Io.File.stderr().writerStreaming(init.io, &err_buffer);
     const log = &err_writer.interface;
     defer log.flush() catch {}; // Nowhere else to report it.
+    if (parse_heartbeat_args(argv)) |args| return heartbeat(init, arena, args, log);
+    const args = parse_args(argv) orelse {
+        log.writeAll(usage_text) catch {}; // Nowhere else.
+        return constants.exit_user;
+    };
     return run(init, arena, args, log) catch |err| {
         log.print("sim-fleet: {s}\n", .{explain(err)}) catch {}; // Nowhere else.
         return switch (err) {
@@ -545,6 +694,131 @@ fn explain(err: RunError) []const u8 {
     };
 }
 
+const HeartbeatArgs = struct {
+    repo: []const u8 = "",
+    token_file: ?[]const u8 = null,
+    state: []const u8 = "",
+    url_file: ?[]const u8 = null,
+    clean: bool = false,
+};
+
+/// Null if the command line is not valid `heartbeat`: the repo, token file and state come
+/// together or not at all.
+fn parse_heartbeat_args(args: []const []const u8) ?HeartbeatArgs {
+    if (args.len < 2 or !std.mem.eql(u8, args[1], "heartbeat")) return null;
+    var parsed: HeartbeatArgs = .{};
+    var index: usize = 2;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--clean")) {
+            parsed.clean = true;
+            continue;
+        }
+        index += 1;
+        if (index >= args.len) return null;
+        const value = args[index];
+        if (value.len == 0) return null;
+        if (std.mem.eql(u8, arg, "--repo")) {
+            parsed.repo = value;
+        } else if (std.mem.eql(u8, arg, "--token-file")) {
+            parsed.token_file = value;
+        } else if (std.mem.eql(u8, arg, "--state")) {
+            parsed.state = value;
+        } else if (std.mem.eql(u8, arg, "--url-file")) {
+            parsed.url_file = value;
+        } else {
+            return null;
+        }
+    }
+    const given = @as(u8, @intFromBool(parsed.repo.len > 0)) +
+        @intFromBool(parsed.token_file != null) + @intFromBool(parsed.state.len > 0);
+    if (given != 0 and given != 3) return null;
+    return parsed;
+}
+
+/// `sim_fleet heartbeat`: checks the token if asked, then sends the heartbeat after a clean
+/// round. Exit 2 when the token check or the heartbeat failed.
+fn heartbeat(
+    init: std.process.Init,
+    arena: std.mem.Allocator,
+    args: HeartbeatArgs,
+    log: *std.Io.Writer,
+) u8 {
+    const io = init.io;
+    if (args.token_file) |token_file| {
+        check_token(init, arena, args, token_file, log) catch |err| {
+            if (err != error.GitHubStopped) {
+                log.print("sim-fleet: {s}\n", .{explain(err)}) catch {}; // Exits 2.
+            }
+            log.writeAll("sim-fleet: token check failed: no heartbeat\n") catch {}; // Exits 2.
+            return constants.exit_environment;
+        };
+    }
+    if (!args.clean) return constants.exit_ok;
+    const url_file = args.url_file orelse return constants.exit_ok;
+    const limit: std.Io.Limit = .limited(constants.fleet_heartbeat_url_bytes_max);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, url_file, arena, limit) catch |err| {
+        // run.sh said at start that there is none; the path and the reason only.
+        if (err == error.FileNotFound) return constants.exit_ok;
+        log.print("sim-fleet: {s}: {s}\n", .{ url_file, @errorName(err) }) catch {}; // Exits 2.
+        return constants.exit_environment;
+    };
+    const url = std.mem.trim(u8, text, " \t\r\n");
+    if (url.len == 0) return constants.exit_ok;
+    var client: std.http.Client = .{ .allocator = init.gpa, .io = io };
+    defer client.deinit();
+    if (!github_api.send_heartbeat(&client, url, log)) return constants.exit_environment;
+    return constants.exit_ok;
+}
+
+/// One request with the token; the expiry it reports goes into the state file, and is logged
+/// when it is near.
+fn check_token(
+    init: std.process.Init,
+    arena: std.mem.Allocator,
+    args: HeartbeatArgs,
+    token_file: []const u8,
+    log: *std.Io.Writer,
+) RunError!void {
+    const io = init.io;
+    assert(args.repo.len > 0);
+    assert(args.state.len > 0);
+    var state = try load_state(arena, io, std.Io.Dir.cwd(), args.state, log);
+    const token = try read_token(arena, io, token_file, log);
+    var http: github_api.Http = .{
+        .client = .{ .allocator = init.gpa, .io = io },
+        .repo = args.repo,
+        .token = token,
+        .log = log,
+    };
+    defer http.client.deinit();
+    http.check_token(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.GitHubStopped,
+    };
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    state.token_expires = http.token_expires orelse 0;
+    if (http.token_expires == null) note_no_expiry(&state, now, http.token_expiry_unread, log);
+    try save(arena, io, args.state, &state);
+    if (token_expires_soon(&state, now)) {
+        log.writeAll("sim-fleet: ") catch {}; // Nowhere else.
+        write_expiry_line(log, state.token_expires) catch {}; // Nowhere else.
+    }
+}
+
+/// Logs, once per UTC day (kept in the state), that GitHub sent no token expiry sim_fleet could
+/// read: a missing or unreadable header never fails the round, and is not news every round.
+fn note_no_expiry(state: *state_file.State, now: i64, unread: bool, log: *std.Io.Writer) void {
+    const today = state_file.ymd_of(now);
+    if (state.token_noted) |noted| {
+        if (std.mem.eql(u8, &noted, &today)) return;
+    }
+    state.token_noted = today;
+    const what = if (unread) "has a form sim_fleet does not read" else "was not sent";
+    log.print("sim-fleet: GitHub's token expiry header {s}: no expiry warning " ++
+        "(logged once a day)\n", .{what}) catch {}; // Nowhere else.
+}
+
 /// The state at `path`: empty if there is no such file, an error for anything else that keeps
 /// it from being read (M6: a state file that exists is never silently treated as empty).
 fn load_state(
@@ -613,6 +887,8 @@ fn run(
         .commit = args.commit,
         .tracker = args.tracker,
         .now_seconds = std.Io.Clock.real.now(io).toSeconds(),
+        .ref = args.ref,
+        .round_started = args.round_started,
     };
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
@@ -652,10 +928,15 @@ fn run(
 /// How a round that was ingested ends: GitHub stopping it is `GitHubStopped`; a canary's
 /// failure that a hold kept from being filed is `CanaryHeld`. A canary runs once in many
 /// rounds, so both are found again soon (run.sh retries on exit 2, with a cap), not when the
-/// cycle comes back to the canary.
+/// cycle comes back to the canary. A round that was counted but that GitHub kept something
+/// from being written for (a hold, a tracker that refused the totals, a locked issue) exits 3
+/// (`exit_external`): run.sh does not ingest it again (it is counted) and sends no heartbeat.
 fn exit_of(canary: bool, summary: *const Summary) error{ GitHubStopped, CanaryHeld }!u8 {
     if (summary.stopped != null) return error.GitHubStopped;
     if (canary and summary.held and summary.failed > summary.infra) return error.CanaryHeld;
+    if (summary.held or summary.tracker_refused or summary.forbidden > 0) {
+        return constants.exit_external;
+    }
     return constants.exit_ok;
 }
 
@@ -1038,6 +1319,87 @@ test "parse_args wants a commit and a state, and a repo and token unless dry" {
     try std.testing.expect(spaced == null);
 }
 
+test "--ref and --round-started are checked; heartbeat's repo, token and state come together" {
+    const base = [_][]const u8{ "f", "ingest", "--commit", "c", "--state", "s", "--dry-run" };
+    const with_ref = parse_args(&(base ++ [_][]const u8{
+        "--ref", "release/0.6", "--round-started", "1793581200",
+    }));
+    try std.testing.expectEqualStrings("release/0.6", with_ref.?.ref);
+    try std.testing.expectEqual(@as(?i64, 1_793_581_200), with_ref.?.round_started);
+    for ([_][]const u8{ "a b", "-x", "a..b", "", "a;b", "a\nb" }) |bad| {
+        try std.testing.expect(parse_args(&(base ++ [_][]const u8{ "--ref", bad })) == null);
+    }
+    try std.testing.expect(parse_args(&(base ++ [_][]const u8{ "--round-started", "-1" })) == null);
+    const full = parse_heartbeat_args(&.{
+        "f",       "heartbeat", "--repo",     "a/b",                     "--token-file", "t",
+        "--state", "s",         "--url-file", "/run/cred/heartbeat-url", "--clean",
+    }).?;
+    try std.testing.expect(full.clean);
+    try std.testing.expectEqualStrings("t", full.token_file.?);
+    const dry = parse_heartbeat_args(&.{ "f", "heartbeat", "--url-file", "u", "--clean" }).?;
+    try std.testing.expect(dry.token_file == null);
+    try std.testing.expect(parse_heartbeat_args(&.{ "f", "heartbeat", "--repo", "a/b" }) == null);
+    try std.testing.expect(parse_heartbeat_args(&.{ "f", "heartbeat", "--url", "u" }) == null);
+    try std.testing.expect(parse_heartbeat_args(&.{ "f", "ingest" }) == null);
+}
+
+test "the daily post lists each commit soaked with its hours and seeds, and a token expiring" {
+    // Goal: the owner sees, per commit soaked that day, the seeds per kind and the hours its
+    // rounds ran (not the span from first to last: the gap between rounds is not soak; the two
+    // kinds of one round count it once; a day with no round before it starts "since" again),
+    // and is told in time to replace the token. Method: aaa runs two days before day one, then
+    // two rounds of ten minutes three hours apart on day one, bbb one; the next day's ingest
+    // posts the totals, with the expiry inside the warning time.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
+    defer fake.deinit();
+    var state: state_file.State = .{};
+    const clean = "sim-cluster: seeds 1..10, 100 operations: 0 of 10 failed\n";
+    const swarm = "sim-swarm: seeds 1..5, 100 operations: 0 of 5 failed\n";
+    const Round = struct { commit: []const u8, ref: []const u8, at: i64, kind: []const u8 };
+    const rounds = [_]Round{
+        .{ .commit = "aaa", .ref = "main", .at = day_one - 2 * 86_400, .kind = "" },
+        .{ .commit = "aaa", .ref = "main", .at = day_one, .kind = issue.kind_sim_cluster },
+        .{ .commit = "bbb", .ref = "release/0.6", .at = day_one + 1800, .kind = "" },
+        .{ .commit = "aaa", .ref = "main", .at = day_one + 9000, .kind = issue.kind_sim_cluster },
+        .{ .commit = "aaa", .ref = "main", .at = day_one + 9000, .kind = issue.kind_sim_swarm },
+    };
+    for (rounds) |round| {
+        const kind = if (round.kind.len == 0) issue.kind_sim_cluster else round.kind;
+        const text = if (std.mem.eql(u8, kind, issue.kind_sim_swarm)) swarm else clean;
+        var options = test_options(round.commit, round.at);
+        options.kind = kind;
+        options.ref = round.ref;
+        options.round_started = round.at - 600;
+        _ = try ingest(arena, fake.github(), &state, try issue.parse(arena, kind, text), options);
+    }
+    state.token_expires = day_two + 3 * 86_400;
+    const next = try issue.parse(arena, issue.kind_sim_cluster, clean);
+    _ = try ingest(arena, fake.github(), &state, next, test_options("aaa", day_two));
+    const posted = fake.comments.items[fake.comments.items.len - 1].body;
+    const lines = [_][]const u8{
+        "\nCommits soaked (hours: the time its rounds ran):\n" ++
+            "- `aaa` (main): 0.3 h this day, 0.3 h since 2026-11-02 00:50 UTC; " ++
+            "sim-cluster 20 seeds (0 failed), sim-swarm 5 seeds (0 failed)\n" ++
+            "- `bbb` (release/0.6): 0.1 h this day, 0.1 h since 2026-11-02 01:20 UTC; " ++
+            "sim-cluster 10 seeds (0 failed)\n",
+        "\ntoken expires 2026-11-06 01:00 UTC: replace it (ops/sim-fleet/README.md)\n",
+    };
+    for (lines) |line| {
+        if (std.mem.indexOf(u8, posted, line) == null) {
+            std.debug.print("missing:\n{s}\nin:\n{s}\n", .{ line, posted });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Further away than the warning time, nothing is said.
+    var far: state_file.State = .{ .token_expires = day_two + 30 * 86_400 };
+    try std.testing.expect(!token_expires_soon(&far, day_two));
+    far.token_expires = 0;
+    try std.testing.expect(!token_expires_soon(&far, day_two));
+}
+
 test "three kinds on one day: separate issues, separate counts, and the totals break them down" {
     // Goal: the same check failing in sim-cluster and sim-c1 is two issues, and the daily post
     // says how many seeds each kind ran. Method: ingest one failure per kind, then the next day.
@@ -1225,8 +1587,9 @@ test "a canary held by GitHub is not counted, is not filed, and ends as CanaryHe
     try std.testing.expectEqual(@as(u32, 0), held.filed);
     try std.testing.expectEqual(@as(u32, 0), fake.requests);
     try std.testing.expectError(error.CanaryHeld, exit_of(true, &held));
-    // Any other kind held is not run again by the canary rule.
-    try std.testing.expectEqual(constants.exit_ok, try exit_of(false, &held));
+    // Any other kind held is not run again by the canary rule; it is counted, so it exits 3:
+    // no second ingest, and no heartbeat (run.sh).
+    try std.testing.expectEqual(constants.exit_external, try exit_of(false, &held));
     try std.testing.expectEqual(@as(usize, 0), state.days.items.len);
 
     state.hold_until = 0;
@@ -1236,6 +1599,13 @@ test "a canary held by GitHub is not counted, is not filed, and ends as CanaryHe
     try std.testing.expectEqual(@as(u64, 4), state.days.items[0].seeds);
     const stopped: Summary = .{ .stopped = error.GitHubRateLimited };
     try std.testing.expectError(error.GitHubStopped, exit_of(true, &stopped));
+    // A tracker that refused the totals, or a locked issue, is counted and written short: 3.
+    const refused: Summary = .{ .seeds = 3, .tracker_refused = true };
+    try std.testing.expectEqual(constants.exit_external, try exit_of(false, &refused));
+    const locked: Summary = .{ .seeds = 3, .forbidden = 1 };
+    try std.testing.expectEqual(constants.exit_external, try exit_of(false, &locked));
+    const clean: Summary = .{ .seeds = 3, .throttled = 1, .dropped = 1 };
+    try std.testing.expectEqual(constants.exit_ok, try exit_of(false, &clean));
 }
 
 test "a canary that is caught while GitHub holds writes is counted once" {
@@ -1250,8 +1620,10 @@ test "a canary that is caught while GitHub holds writes is counted once" {
     state.hold_until = day_one + 60;
     const held = try canary_ingest(arena, fake.github(), &state, canary_wedge_caught, "aaa");
     try std.testing.expect(held.held);
-    try std.testing.expectEqual(constants.exit_ok, try exit_of(true, &held));
+    try std.testing.expectEqual(constants.exit_external, try exit_of(true, &held));
     try std.testing.expectEqual(@as(u64, 4), state.days.items[0].seeds);
+    // The canary's seeds are the fault-on runner's: no soak line.
+    try std.testing.expectEqual(@as(usize, 0), state.soaks.items.len);
     state.hold_until = 0;
     _ = try canary_ingest(arena, fake.github(), &state, canary_wedge_caught, "aaa");
     try std.testing.expectEqual(@as(u64, 8), state.days.items[0].seeds);
@@ -1328,4 +1700,22 @@ test "the canary's arguments come together or not at all" {
             "--kind", "sim-canary", "--canary", "sim_teeth", "--canary-seeds", "1..2",
         }),
     }) |bad| try std.testing.expect(parse_args(bad) == null);
+}
+
+test "a missing or unread token expiry is logged once a day, never every round" {
+    var state: state_file.State = .{};
+    var log: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer log.deinit();
+    const day = 1_794_700_000;
+    note_no_expiry(&state, day, false, &log.writer);
+    note_no_expiry(&state, day + 600, true, &log.writer);
+    try std.testing.expectEqualStrings(
+        "sim-fleet: GitHub's token expiry header was not sent: no expiry warning " ++
+            "(logged once a day)\n",
+        log.written(),
+    );
+    log.clearRetainingCapacity();
+    note_no_expiry(&state, day + 86_400, true, &log.writer);
+    try std.testing.expect(std.mem.indexOf(u8, log.written(), "does not read") != null);
+    try std.testing.expectEqualSlices(u8, &state_file.ymd_of(day + 86_400), &state.token_noted.?);
 }

@@ -55,7 +55,7 @@ history. Reading only the new ones would make the soak's check differ from the p
 reach this costs is recorded in the earlier decision.
 
 **The tooth.** `src/sim_soak_teeth_main.zig` switches on `c1_teeth.soak_leak` (16 KiB taken per
-operation, never freed). `ops/sim-fleet/test-soak.sh`, in `zig build test` and so in `zig build
+operation, never freed). `ops/sim-fleet/test-soak-loop.sh`, in `zig build test` and so in `zig build
 check`, runs it (Debug, seed 42, 300 operations) through `soak.sh` and the real reporter and
 requires the issue `sim-soak: soak: memory still held after the world was torn down`; it also
 runs a real held soak through the same path. `zig build sim-soak-teeth-exe` installs the tooth.

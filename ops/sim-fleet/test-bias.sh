@@ -18,6 +18,7 @@ export SIM_FLEET_SOURCE_ONLY
 STATE=$work/state
 built=abc123
 bin=$STATE/bin/$built/bin
+reporter=$bin/sim_fleet
 KINDS="sim-cluster sim-c1"
 SIM_FLEET_DRY_RUN=1
 SIM_FLEET_REPORT_TIMEOUT=60

@@ -34,6 +34,7 @@ mkdir -p "$bin" "$STATE/bin/$built/share/sim-fleet" "$STATE/crashes"
 manifest=$STATE/bin/$built/share/sim-fleet/canaries.txt
 cp "$manifest_in" "$manifest"
 ln -s "$fleet" "$bin/sim_fleet"
+reporter=$bin/sim_fleet # run.sh runs its own reporter; here it is the one under test
 fail() { echo "FAIL ($case_name): $*" >&2; exit 1; }
 expect() { case "$out" in *"$1"*) ;; *) fail "wanted '$1' in: $out" ;; esac; }
 refuse() { case "$out" in *"$1"*) fail "unwanted '$1' in: $out" ;; esac; }

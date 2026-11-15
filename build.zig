@@ -2842,16 +2842,24 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     // The long soak's loop (`soak.sh`): a real soak that held and a real one that leaked (the
     // soak tooth, `src/sim_soak_teeth_main.zig`, which the soak must fail), through the real
     // reporter; and crashed, killed and refused runs of a fake runner.
-    const soak = b.addSystemCommand(&.{"sh"});
-    soak.addFileArg(b.path("ops/sim-fleet/test-soak.sh"));
-    soak.addArtifactArg(exe);
-    soak.addArtifactArg(sim_debug_exe(b, sim, "sim_cluster", "src/sim_cluster_main.zig"));
+    const soak_loop = b.addSystemCommand(&.{"sh"});
+    soak_loop.addFileArg(b.path("ops/sim-fleet/test-soak-loop.sh"));
+    soak_loop.addArtifactArg(exe);
+    soak_loop.addArtifactArg(sim_debug_exe(b, sim, "sim_cluster", "src/sim_cluster_main.zig"));
     const soak_teeth = sim_debug_exe(b, sim, "sim_soak_teeth", "src/sim_soak_teeth_main.zig");
-    soak.addArtifactArg(soak_teeth);
+    soak_loop.addArtifactArg(soak_teeth);
     // Only this named step installs the tooth, so `zig build` never puts it in zig-out.
     b.step("sim-soak-teeth-exe", "Install the soak's leaking runner (test-only)")
         .dependOn(&b.addInstallArtifact(soak_teeth, .{}).step);
-    soak.addFileInput(b.path("ops/sim-fleet/soak.sh"));
+    soak_loop.addFileInput(b.path("ops/sim-fleet/soak.sh"));
+    soak_loop.expectExitCode(0);
+    test_step.dependOn(&soak_loop.step);
+    // Its soak branches and heartbeat, against a local git remote and a local fake server.
+    const soak = b.addSystemCommand(&.{"sh"});
+    soak.addFileArg(b.path("ops/sim-fleet/test-soak.sh"));
+    soak.addArtifactArg(exe);
+    soak.addFileInput(b.path("ops/sim-fleet/run.sh"));
+    soak.addFileInput(b.path("ops/sim-fleet/test-soak-zig.sh"));
     soak.expectExitCode(0);
     test_step.dependOn(&soak.step);
     const store_faults = b.addSystemCommand(&.{"sh"});
