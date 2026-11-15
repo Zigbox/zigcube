@@ -1277,7 +1277,7 @@ pub const Cluster = struct {
             c.settle();
             if (c.jobs_on and c.strong) c.supervise_certs();
             if (c.strong) c.supervise_mesh();
-            if (c.mesh_on) sim_mesh_conns.tick(&c.conns, c.nodes, c.manual.ms);
+            if (c.mesh_on) c.tend_conns();
             if (c.jobs_on) c.watch_client();
             // The wedge totals J1, J6 and J8 judge by are kept whenever jobs are on,
             // not only under c1: a plain run judges the same bounds.
@@ -1321,6 +1321,14 @@ pub const Cluster = struct {
         if (store_faulty(c)) return;
         const ctx = c.certs_context();
         sim_mesh_certs.supervise(&c.mesh, &ctx, c.nodes, &c.net, c.manual.ms);
+    }
+
+    /// C4 slice 5: the store's grants and the agents' liveness as they stand (the truth M1 and M2
+    /// are also judged against), then one tick of the supervisors' connections.
+    fn tend_conns(c: *Cluster) void {
+        const ctx = c.certs_context();
+        sim_mesh_conns.observe(&c.conns, &ctx, c.nodes, c.manual.ms);
+        sim_mesh_conns.tick(&c.conns, c.nodes, c.manual.ms);
     }
 
     /// The context the certificate model reads the store through: the tap's memory store, the
@@ -3015,6 +3023,7 @@ fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
 fn heal(c: *Cluster) void {
     c.fault_totals = c.phase_totals();
     c.mesh.healed_at_ms = c.manual.ms;
+    c.conns.healed_at_ms = c.manual.ms;
     c.set_store_down(false);
     c.ack_loss.loss_per_mille = 0;
     c.swarm.net = .{};
@@ -3402,6 +3411,11 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         if (c.report.failed) return error.StepFailed;
         c.enter("convergence");
         try converged(c);
+        if (c.mesh_on) {
+            // C4: every supervisor holds the store's grants at rest (`sim_mesh_conns.at_rest`).
+            sim_mesh_conns.at_rest(&c.conns, c.nodes);
+            try check(c, c.conns.violation == null, c.conns.violation orelse "");
+        }
         try fencing_settles(c);
         if (c.jobs_on) try reports_settle(c);
     } else {
@@ -3641,9 +3655,15 @@ fn print_conns(c: *Cluster) void {
         n.requests, n.accepted, n.failed, n.refused,         n.unreached,
         n.finished, n.revoked,  n.broken, n.conns.items.len,
     });
-    c.report.print("mesh conns: grant draws={d} supervisor cuts={d} longest after a " ++
-        "revocation {d} ms (M2 bound {d}) routes to unready replicas={d}\n", .{
-        n.grant_draws, n.cuts, n.revoke_max_ms, constants.mesh_revoke_ms, n.unready_routes,
+    c.report.print("mesh conns: grant draws={d} supervisor cuts={d} routes to unready " ++
+        "replicas={d} to draining replicas={d} unjudged={d} judged at rest={d}\n", .{
+        n.grant_draws,     n.cuts,     n.unready_routes,
+        n.draining_routes, n.unjudged, n.rest_judged,
+    });
+    c.report.print("mesh conns: longest from a grant's removal to the close {d} ms; after " ++
+        "the heal {d} ms (bound {d}); past a view's delivery {d} ms (bound {d})\n", .{
+        n.revoke_max_ms,    n.revoke_healed_max_ms,   sim_mesh_conns.truth_bound_ms,
+        n.view_late_max_ms, constants.mesh_revoke_ms,
     });
     c.report.print("mesh conns: direct dials={d} accepted={d}\n", .{
         n.rogues, n.rogues_accepted,

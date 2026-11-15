@@ -756,6 +756,8 @@ pub fn rules_of(
             .open = accept.open,
         });
     }
+    // sim-c4's stale-accept tooth (`c1_teeth.zig`): false in every shipped program and test.
+    if (c1_teeth.mesh_stale_accept) try stale.keep(arena, replica, &accepts);
     const rules: runtime.MeshRules = .{
         .destinations = destinations.items,
         .listeners = listeners.items,
@@ -766,6 +768,74 @@ pub fn rules_of(
     assert(runtime.mesh_rules_problem(&rules) == null);
     return rules;
 }
+
+/// The stale-accept tooth's memory: every accept `rules_of` ever gave a replica, given again
+/// (open) after its grant is gone. Test-only (`c1_teeth.mesh_stale_accept`); a full table keeps
+/// what it has.
+const stale = struct {
+    const Entry = struct {
+        replica: u64,
+        from_buf: [constants.service_name_bytes_max]u8,
+        from_len: u8,
+        port: u16,
+
+        fn from(entry: *const Entry) []const u8 {
+            return entry.from_buf[0..entry.from_len];
+        }
+    };
+    var entries: [1024]Entry = undefined;
+    var count: u32 = 0;
+
+    fn keep(
+        arena: Allocator,
+        replica: []const u8,
+        accepts: *std.ArrayList(runtime.MeshAccept),
+    ) Allocator.Error!void {
+        const key = std.hash.Wyhash.hash(0, replica);
+        for (accepts.items) |accept| {
+            if (find(key, accept.from, accept.port) != null) continue;
+            if (count == entries.len) break;
+            assert(accept.from.len <= constants.service_name_bytes_max);
+            const entry = &entries[count];
+            entry.* = .{
+                .replica = key,
+                .from_buf = undefined,
+                .from_len = @intCast(accept.from.len),
+                .port = accept.port,
+            };
+            @memcpy(entry.from_buf[0..accept.from.len], accept.from);
+            count += 1;
+        }
+        next: for (entries[0..count]) |*entry| {
+            if (entry.replica != key) continue;
+            for (accepts.items) |accept| {
+                if (accept.port == entry.port and std.mem.eql(u8, accept.from, entry.from())) {
+                    continue :next;
+                }
+            }
+            const from = try arena.dupe(u8, entry.from());
+            try accepts.append(arena, .{ .from = from, .port = entry.port, .open = true });
+        }
+        // A supervisor takes accepts in order of source and port (`mesh_rules_problem`).
+        std.mem.sort(runtime.MeshAccept, accepts.items, {}, before);
+    }
+
+    fn before(_: void, left: runtime.MeshAccept, right: runtime.MeshAccept) bool {
+        return switch (std.mem.order(u8, left.from, right.from)) {
+            .lt => true,
+            .gt => false,
+            .eq => left.port < right.port,
+        };
+    }
+
+    fn find(key: u64, from: []const u8, port: u16) ?*const Entry {
+        for (entries[0..count]) |*entry| {
+            if (entry.replica != key or entry.port != port) continue;
+            if (std.mem.eql(u8, entry.from(), from)) return entry;
+        }
+        return null;
+    }
+};
 
 fn endpoints_in_order(
     arena: Allocator,

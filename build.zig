@@ -1727,12 +1727,18 @@ const c4_teeth_roots = [_]struct {
         .name = "mesh_revoke_late",
         .root = "src/sim_c4_teeth_mesh_revoke_late_main.zig",
         .symptom = "M2",
-        .canary_seeds = 20,
+        .canary_seeds = 40,
     },
     .{
         .name = "mesh_route_unready",
         .root = "src/sim_c4_teeth_mesh_route_unready_main.zig",
         .symptom = "M4",
+        .canary_seeds = 20,
+    },
+    .{
+        .name = "mesh_stale_accept",
+        .root = "src/sim_c4_teeth_mesh_stale_accept_main.zig",
+        .symptom = "M1|M2|M4",
         .canary_seeds = 20,
     },
 };

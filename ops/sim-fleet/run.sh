@@ -40,11 +40,12 @@ main() {
     : "${SIM_FLEET_BATCH_C1:=$SIM_FLEET_BATCH}"
     : "${SIM_FLEET_BATCH_C4:=$SIM_FLEET_BATCH}"
     : "${SIM_FLEET_BATCH_SWARM:=50000}"
-    # Parallel workers per kind (one core each). Four kinds use all of a 4 vCPU host: set one to 0
-    # to leave a core for the reporter, git and builds. A kind set to 0 is not run.
+    # Parallel workers per kind (one core each). A kind set to 0 is not run. sim-c4 defaults to 0
+    # (Review B of #263): three kinds then leave a core of a 4 vCPU host for the reporter, git and
+    # builds; set it to 1 (and another kind to 0) to run sim-c4 on such a host.
     : "${SIM_FLEET_WORKERS_CLUSTER:=1}"
     : "${SIM_FLEET_WORKERS_C1:=1}"
-    : "${SIM_FLEET_WORKERS_C4:=1}"
+    : "${SIM_FLEET_WORKERS_C4:=0}"
     : "${SIM_FLEET_WORKERS_SWARM:=1}"
     : "${SIM_FLEET_CACHE_MB:=8192}"
     # The teeth canary: 1 round in this many also runs the next fault-on runner of the cycle

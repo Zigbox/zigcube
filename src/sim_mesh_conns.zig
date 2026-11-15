@@ -33,6 +33,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
+const controller = @import("controller.zig");
 const mesh_plan = @import("mesh_plan.zig");
 const records = @import("records.zig");
 const runtime = @import("runtime.zig");
@@ -51,7 +52,20 @@ const held_max = 512;
 /// Nodes the model knows (`sim_cluster.nodes_max`).
 pub const nodes_max = 16;
 
+/// After the heal, a grant that left the store reaches every live end within this: an agent that
+/// backed off while it was cut off waits out its pause (`server_retry_ms_max` at most), its next
+/// step reads the view (`agent_resync_ms` at most, with a retry of a call cut while the network
+/// settles) and the supervisor closes within `mesh_revoke_ms`. M1 and M2 against the store's
+/// truth count from the commit, the heal, or the time the end's agent came back, whichever is
+/// last. A bound of the simulator's check, not of the product: 8 s.
+pub const truth_bound_ms: u64 = constants.server_retry_ms_max + constants.mesh_revoke_ms +
+    2 * constants.agent_resync_ms;
+
+/// A grant `S -> D:P` as a bit of `State.truth`.
+const grant_bits = services.len * services.len * ports.len;
+
 comptime {
+    assert(grant_bits <= 32);
     assert(services.len <= std.math.maxInt(u8));
     assert(constants.mesh_revoke_ms >= 2 * 100); // Two ticks at least.
 }
@@ -122,7 +136,10 @@ const Conn = struct {
     destination: Key,
     grant: Grant,
     end_ms: u64,
-    /// The true time an end received a view without the grant; null while both hold it.
+    /// False for a direct dial: the source's supervisor never saw it, so only the destination's
+    /// holds it (and M2 applies at the destination only).
+    source_held: bool = true,
+    /// The true time a holding end received a view without the grant; null while each holds it.
     revoked_ms: ?u64 = null,
 };
 
@@ -150,11 +167,30 @@ pub const State = struct {
     /// with a grant in its view, else M1 fails).
     rogues: u32 = 0,
     rogues_accepted: u32 = 0,
-    /// The longest an open connection outlived the revocation of its grant, in ms.
+    /// The longest from a grant's removal in the store to the close of a connection on it, in
+    /// ms, over the run, and after the heal counted as M2's truth bound counts (`truth_since`).
     revoke_max_ms: u64 = 0,
-    /// Endpoints delivered to a source whose view held the replica not ready or draining: M4's
+    revoke_healed_max_ms: u64 = 0,
+    /// The longest an open connection outlived the delivery of a view without its grant (only
+    /// the `mesh_revoke_late` tooth leaves one open).
+    view_late_max_ms: u64 = 0,
+    /// Endpoints delivered to a source whose view held the replica not ready, or draining: M4's
     /// openings (none without the `mesh_route_unready` tooth).
     unready_routes: u64 = 0,
+    draining_routes: u64 = 0,
+    /// Deliveries to supervisors past `held_max`, which the model leaves out (not judged).
+    unjudged: u32 = 0,
+    /// Supervisors and accepts compared with the store at rest (`at_rest`).
+    rest_judged: u32 = 0,
+    /// The store's grants as committed (`observe`), a bit per grant (`grant_bit`), and the true
+    /// time each last left the store (0: never seen leave).
+    truth: u32 = 0,
+    truth_known: bool = false,
+    truth_gone_ms: [grant_bits]u64 = @splat(0),
+    /// The heal (`sim_cluster.heal`): the truth's bounds count from it at the earliest.
+    healed_at_ms: ?u64 = null,
+    /// Since when each node's agent has been up and reachable; null while it is not.
+    live_since_ms: [nodes_max]?u64 = @splat(null),
     /// The first of M1, M2 and M4 to fail; the cluster's safety check reports it.
     violation: ?[]const u8 = null,
 
@@ -231,7 +267,10 @@ pub fn deliver(
         return;
     };
     const held = found orelse made: {
-        if (state.held.items.len == held_max) return; // Beyond the model: not judged.
+        if (state.held.items.len == held_max) {
+            state.unjudged += 1; // Beyond the model: not judged.
+            return;
+        }
         const made = state.gpa.create(Held) catch return;
         made.* = .{
             .arena = .init(state.gpa),
@@ -259,7 +298,8 @@ pub fn deliver(
     for (held.rules.destinations) |destination| {
         for (destination.endpoints) |endpoint| {
             const peer = held.peer(endpoint.replica) orelse continue;
-            if (!peer.ready or peer.draining) state.unready_routes += 1;
+            if (!peer.ready) state.unready_routes += 1;
+            if (peer.draining) state.draining_routes += 1;
         }
     }
 }
@@ -405,9 +445,10 @@ fn running(
     return null;
 }
 
-/// M2 and the end of connections: one whose end stopped, or whose time is up, is closed; one
-/// whose grant an end's view lost is closed (unless `mesh_revoke_late`), and must not stay open
-/// `mesh_revoke_ms` past that view's delivery.
+/// M2 and the end of connections: one whose end stopped, or whose time is up, is closed; each end
+/// that holds one closes it when its own rules drop the grant (unless `mesh_revoke_late`). M2 is
+/// judged twice: against each holding end's view, within `mesh_revoke_ms` of its delivery, and
+/// against the store's truth, within `truth_bound_ms` of the commit (`judge_truth`).
 fn tend(state: *State, nodes: anytype, true_ms: u64) void {
     var index: usize = 0;
     while (index < state.conns.items.len) {
@@ -422,16 +463,20 @@ fn tend(state: *State, nodes: anytype, true_ms: u64) void {
 }
 
 fn close_why(state: *State, nodes: anytype, conn: *Conn, true_ms: u64) bool {
-    const ends = [_]*const Key{ &conn.source, &conn.destination };
-    for (ends) |end| {
+    // Index 0 is the destination, which holds every connection; 1 the source, for a routed one.
+    const ends = [_]*const Key{ &conn.destination, &conn.source };
+    var holders: [2]?*const Held = .{ null, null };
+    for (ends, 0..) |end, index| {
         if (running(nodes, end.node, end.name()) == null) {
             state.broken += 1;
             return true;
         }
+        if (index == 1 and !conn.source_held) continue;
         const held = state.find(end.node, end.name()) orelse {
             state.broken += 1;
             return true;
         };
+        holders[index] = held;
         if (conn.revoked_ms == null and !held.grants_hold(conn.grant)) {
             conn.revoked_ms = held.at_ms;
         }
@@ -440,23 +485,195 @@ fn close_why(state: *State, nodes: anytype, conn: *Conn, true_ms: u64) bool {
         state.broken += 1;
         return true;
     }
+    const dropped = !accepts_any(holders[0].?, conn.grant) or
+        (conn.source_held and !listens(holders[1].?, conn.grant));
+    if (dropped and !c1_teeth.mesh_revoke_late) {
+        state.revoked += 1;
+        note_revoked(state, conn, true_ms);
+        return true;
+    }
     if (conn.revoked_ms) |since| {
-        if (!c1_teeth.mesh_revoke_late) {
-            state.revoked += 1;
-            return true;
-        }
         const late = true_ms -| since;
-        state.revoke_max_ms = @max(state.revoke_max_ms, late);
+        state.view_late_max_ms = @max(state.view_late_max_ms, late);
         if (late > constants.mesh_revoke_ms) {
-            state.fail("M2: a connection outlived its grant's revocation by more than " ++
-                "mesh_revoke_ms");
+            state.fail("M2: a connection outlived its grant's revocation in an end's view by " ++
+                "more than mesh_revoke_ms");
         }
     }
+    judge_truth(state, conn, true_ms);
     if (true_ms >= conn.end_ms) {
         state.finished += 1;
         return true;
     }
     return false;
+}
+
+/// Whether the destination's rules accept `grant` at all (open or not: a replica that drains
+/// keeps its connections; slice 6).
+fn accepts_any(destination: *const Held, grant: Grant) bool {
+    for (destination.rules.accepts) |known| {
+        if (known.port == grant.port and std.mem.eql(u8, known.from, services[grant.from])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether the source's rules listen for `grant`'s service on its port.
+fn listens(source: *const Held, grant: Grant) bool {
+    for (source.rules.listeners) |listener| {
+        if (listener.port != grant.port) continue;
+        const destination = &source.rules.destinations[listener.destination];
+        if (std.mem.eql(u8, destination.service, services[grant.to])) return true;
+    }
+    return false;
+}
+
+fn grant_bit(grant: Grant) u32 {
+    const index = (@as(u32, grant.from) * services.len + grant.to) * ports.len +
+        port_index(grant.port);
+    assert(index < grant_bits);
+    return @as(u32, 1) << @intCast(index);
+}
+
+fn port_index(port: u32) u32 {
+    for (ports, 0..) |known, index| {
+        if (known == port) return @intCast(index);
+    }
+    unreachable; // Grants name only `ports` (`draw_allow`, `copy`).
+}
+
+/// When the store's truth starts to bind ends `nodes` on `grant`, or null: the grant is in the
+/// store, the run has not healed, the store has not been read, or no end's agent is live. The
+/// latest of the commit that removed it, the heal, and the earliest of the ends' agents' return.
+fn truth_since(state: *const State, grant: Grant, nodes: []const u32) ?u64 {
+    if (!state.truth_known) return null;
+    if (state.truth & grant_bit(grant) != 0) return null;
+    const healed = state.healed_at_ms orelse return null;
+    var live: ?u64 = null;
+    for (nodes) |node| {
+        const since = state.live_since_ms[node] orelse continue;
+        live = if (live) |known| @min(known, since) else since;
+    }
+    const gone = state.truth_gone_ms[std.math.log2_int(u32, grant_bit(grant))];
+    return @max(@max(gone, healed), live orelse return null);
+}
+
+fn holding_nodes(conn: *const Conn, buffer: *[2]u32) []const u32 {
+    buffer[0] = conn.destination.node;
+    if (!conn.source_held) return buffer[0..1];
+    buffer[1] = conn.source.node;
+    return buffer[0..2];
+}
+
+/// M2 against the store: a connection on a grant the store no longer holds is closed within
+/// `truth_bound_ms` of `truth_since`.
+fn judge_truth(state: *State, conn: *const Conn, true_ms: u64) void {
+    var buffer: [2]u32 = undefined;
+    const since = truth_since(state, conn.grant, holding_nodes(conn, &buffer)) orelse return;
+    if (true_ms -| since > truth_bound_ms) {
+        state.fail("M2: a connection stayed open longer than truth_bound_ms after its grant " ++
+            "left the store");
+    }
+}
+
+fn note_revoked(state: *State, conn: *const Conn, true_ms: u64) void {
+    if (!state.truth_known or state.truth & grant_bit(conn.grant) != 0) return;
+    const gone = state.truth_gone_ms[std.math.log2_int(u32, grant_bit(conn.grant))];
+    if (gone > 0) state.revoke_max_ms = @max(state.revoke_max_ms, true_ms -| gone);
+    var buffer: [2]u32 = undefined;
+    const since = truth_since(state, conn.grant, holding_nodes(conn, &buffer)) orelse return;
+    state.revoke_healed_max_ms = @max(state.revoke_healed_max_ms, true_ms -| since);
+}
+
+/// Reads the store's grants as committed (`ctx` over the committed store, beneath the faults) and
+/// each node's liveness, once per tick before `tick`. A read that fails keeps the last truth.
+pub fn observe(state: *State, ctx: *const controller.Context, nodes: anytype, true_ms: u64) void {
+    for (nodes, 0..) |node, index| {
+        const partitioned = if (node.partitioned_until_ms) |until| until > true_ms else false;
+        const frozen = if (node.frozen_until_ms) |until| until > true_ms else false;
+        if (node.down or partitioned or frozen) {
+            state.live_since_ms[index] = null;
+        } else if (state.live_since_ms[index] == null) {
+            state.live_since_ms[index] = true_ms;
+        }
+    }
+    // A grant binds when both services exist with a mesh address: one that names a service that
+    // does not exist is allowed (ZC-W0704, docs/briefs/c4.md) and opens nothing.
+    var found: [services.len]?records.Service = @splat(null);
+    for (services, 0..) |name, index| {
+        ctx.diag.reset();
+        const key = records.service_key(name);
+        const got = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
+            ctx.diag.reset();
+            return;
+        };
+        const kv = got.kv orelse continue;
+        const service = records.read(records.Service, ctx.arena, kv, ctx.diag) catch {
+            ctx.diag.reset();
+            return;
+        };
+        if (service.mesh_address != null) found[index] = service;
+    }
+    var truth: u32 = 0;
+    for (found, 0..) |maybe, to| {
+        const service = maybe orelse continue;
+        for (service.allow) |granted| {
+            const from = service_index(granted.from) orelse continue;
+            if (found[from] == null) continue;
+            truth |= grant_bit(.{ .from = from, .to = @intCast(to), .port = granted.port });
+        }
+    }
+    const gone = state.truth & ~truth;
+    if (state.truth_known and gone != 0) {
+        for (0..grant_bits) |bit| {
+            if (gone & (@as(u32, 1) << @intCast(bit)) != 0) state.truth_gone_ms[bit] = true_ms;
+        }
+    }
+    state.truth = truth;
+    state.truth_known = true;
+}
+
+/// At rest, after the heal and convergence (J10's style): every running mesh replica on a live
+/// node has a supervisor whose accepts are exactly the store's grants into its service. An agent
+/// that stops sending rules (or sends stale ones) leaves a supervisor holding grants the store
+/// dropped, or missing new ones.
+pub fn at_rest(state: *State, nodes: anytype) void {
+    if (!state.truth_known) return;
+    for (nodes) |node| {
+        if (node.down) continue;
+        for (node.sim.containers.containers.items) |*container| {
+            if (container.phase != .running or container.mesh_port == null) continue;
+            const replica = sim_certs.label_of(container.labels, runtime.label_replica) orelse
+                continue;
+            const to = service_of_replica(replica) orelse continue;
+            const held = state.find(node.index, container.name) orelse {
+                if (state.unjudged > 0) continue;
+                state.fail("M2 at rest: a running mesh replica's supervisor holds no rules");
+                return;
+            };
+            state.rest_judged += 1;
+            for (0..services.len) |from| {
+                for (ports) |port| {
+                    const grant: Grant = .{ .from = @intCast(from), .to = to, .port = port };
+                    const want = state.truth & grant_bit(grant) != 0;
+                    if (want == accepts_any(held, grant)) continue;
+                    state.fail("M2 at rest: a supervisor's accepts differ from the store's " ++
+                        "grants into its service");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The service of a replica id (`<service>-<suffix>`, `records.replica_key`).
+fn service_of_replica(replica: []const u8) ?u8 {
+    for (services, 0..) |name, index| {
+        if (replica.len <= name.len or replica[name.len] != '-') continue;
+        if (std.mem.startsWith(u8, replica, name)) return @intCast(index);
+    }
+    return null;
 }
 
 /// One request from `source` on a listener drawn from its rules.
@@ -476,7 +693,7 @@ fn request(state: *State, nodes: anytype, source: *const Held, true_ms: u64) voi
         if (attempt == attempts_max) break;
         attempt += 1;
         const reached = reach(state, nodes, source, endpoint, true_ms) orelse continue;
-        if (!accept(state, reached, grant, endpoint.replica)) continue;
+        if (!accept(state, reached, grant, endpoint.replica, true_ms)) continue;
         const long = random.uintLessThan(u32, 4) == 0;
         const span: u64 = if (long)
             2000 + random.uintLessThan(u32, 8000)
@@ -510,9 +727,18 @@ fn rogue(state: *State, nodes: anytype, source: *const Held, true_ms: u64) void 
     state.rogues += 1;
     const endpoint: runtime.MeshEndpoint = .{ .replica = peer.id, .endpoint = endpoint_text };
     const reached = reach(state, nodes, source, endpoint, true_ms) orelse return;
-    // An accepted dial is counted, not kept: the source's supervisor never held it, so M2 (judged
-    // on both ends' views) does not apply to it.
-    if (accept(state, reached, grant, peer.id)) state.rogues_accepted += 1;
+    if (!accept(state, reached, grant, peer.id, true_ms)) return;
+    // Kept as a connection the destination's supervisor alone holds: the source's never saw it,
+    // so M2 applies at the destination only.
+    state.rogues_accepted += 1;
+    if (state.conns.items.len == conns_max) return;
+    state.conns.append(state.gpa, .{
+        .source = .of(source.node, source.name),
+        .destination = .of(reached.node, reached.name),
+        .grant = grant,
+        .end_ms = true_ms + 10 + random.uintLessThan(u32, 4000),
+        .source_held = false,
+    }) catch return;
 }
 
 /// The destination supervisor an attempt reaches: running, on the endpoint's port, for the
@@ -551,7 +777,13 @@ fn reach(
 }
 
 /// The destination's check, then M1 and M4's destination side for what it accepts.
-fn accept(state: *State, destination: *const Held, grant: Grant, replica: []const u8) bool {
+fn accept(
+    state: *State,
+    destination: *const Held,
+    grant: Grant,
+    replica: []const u8,
+    true_ms: u64,
+) bool {
     if (destination.service != grant.to) {
         state.refused += 1;
         return false;
@@ -570,6 +802,13 @@ fn accept(state: *State, destination: *const Held, grant: Grant, replica: []cons
     }
     if (!destination.grants_hold(grant)) {
         state.fail("M1: a connection was accepted without a grant in the destination's view");
+    }
+    const at = [_]u32{destination.node};
+    if (truth_since(state, grant, &at)) |since| {
+        if (true_ms -| since > truth_bound_ms) {
+            state.fail("M1: a connection was accepted longer than truth_bound_ms after its " ++
+                "grant left the store");
+        }
     }
     if (!ready) state.fail("M4: a connection was accepted by a replica its own view held " ++
         "not ready or draining");
@@ -660,8 +899,10 @@ test "a destination accepts only what a grant in its rules opens, and forgets on
     try testing.expectEqual(@as(usize, 1), held.grants.len);
     try testing.expect(!held.peer("beta-1").?.ready);
     const beta = service_index("beta").?;
-    try testing.expect(accept(&state, held, .{ .from = beta, .to = 0, .port = 8080 }, "alpha-1"));
-    try testing.expect(!accept(&state, held, .{ .from = beta, .to = 0, .port = 5432 }, "alpha-1"));
+    const web: Grant = .{ .from = beta, .to = 0, .port = 8080 };
+    const db: Grant = .{ .from = beta, .to = 0, .port = 5432 };
+    try testing.expect(accept(&state, held, web, "alpha-1", 5));
+    try testing.expect(!accept(&state, held, db, "alpha-1", 5));
     try testing.expectEqual(@as(u32, 1), state.refused);
     try testing.expect(state.violation == null);
     deliver(&state, 0, "c-alpha-1", &labels, null, null, 6);

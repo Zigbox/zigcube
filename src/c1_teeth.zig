@@ -189,8 +189,15 @@ pub const mesh_revoke_late = declared("c1_teeth_mesh_revoke_late");
 /// (`mesh_plan.Faults.route_unready`).
 pub const mesh_route_unready = declared("c1_teeth_mesh_route_unready");
 
+/// C4 fixups of #263 (Review B), the tooth of closing on rules: `mesh_plan.rules_of` hands each
+/// replica every accept it was ever given, so a supervisor keeps accepting, and keeps open the
+/// connections it alone holds, after their grant is gone (M1 against the destination's view, or
+/// M2, must fail).
+pub const mesh_stale_accept = declared("c1_teeth_mesh_stale_accept");
+
 /// The C4 teeth run in a mesh world (`sim_cluster --c4`).
-pub const mesh_world = mesh_no_dst_check or mesh_revoke_late or mesh_route_unready;
+pub const mesh_world = mesh_no_dst_check or mesh_revoke_late or mesh_route_unready or
+    mesh_stale_accept;
 
 /// Not an agent fault but a gap shown (pending the owner, docs/decisions/
 /// 2026-11-14-j6-runs-unread-gap.md): the server fails a node's read of its runs whenever one of
@@ -266,4 +273,5 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_mesh_no_dst_check", "sim_c4_teeth_mesh_no_dst_check" },
     .{ "c1_teeth_mesh_revoke_late", "sim_c4_teeth_mesh_revoke_late" },
     .{ "c1_teeth_mesh_route_unready", "sim_c4_teeth_mesh_route_unready" },
+    .{ "c1_teeth_mesh_stale_accept", "sim_c4_teeth_mesh_stale_accept" },
 };
