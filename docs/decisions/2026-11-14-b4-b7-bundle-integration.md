@@ -157,6 +157,19 @@ its merits, and both behaviours were kept. A whole file was never taken from one
    - **Tests.** `mtls_teeth_runner.zig` expects 51: 6 more from slice 7. `zig build mtls-teeth`
      counts 51.
 
+14. **Slice 5's recheck against slice 6's browser path (8205982).** No textual conflict, but the
+   merged code failed together.
+   - **What broke.** Slice 5 checks the peer's certificate window again before each request,
+     from `Peer.not_before_ms` and `not_after_ms`. Slice 6's P-256 path
+     (`on_browser_certificate`) never set them. They stayed 0, so every request on a browser
+     connection got 403 as expired.
+   - **How it was caught.** `check` passed on bc4b2d5. mtls-interop then failed its two
+     browser-path "accepted" rows (`GET /v1/jobs: HTTP/1.1 403`), 2 of 38.
+   - **The fix.** The browser path copies the window as the Ed25519 path does. The browser-path
+     unit test now asserts the window, and it fails without the fix.
+   - **For the reviewers.** No gate in `check` drives a browser connection through `serve_tls`.
+     mtls-interop (not in `check`) is the only one that does.
+
 ## Diagnostic codes
 
 There is no collision.
