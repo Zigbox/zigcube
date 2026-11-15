@@ -27,9 +27,8 @@ pub const job_wait_ms: u32 = 25_000;
 /// A node powered off and its job read `failed`: the lease runs out, the grace passes, and the
 /// controllers and agents take a few of their one-second passes.
 pub const failover_ms: u32 = c1.failover_ms;
-/// How old the last acknowledged keepalive may be when a node's power goes off (the agent's
-/// one-second pass).
-pub const keepalive_slack_ms: u32 = 1_000;
+/// How long after a node's lease ran out the job controller fails its running job `unreachable`.
+pub const lost_grace_ms: u32 = @import("constants.zig").lost_grace_ms;
 /// A window in which nothing may change.
 pub const settle_ms: u32 = c1.settle_ms;
 /// The longest the watcher's printed lines may take to arrive.
