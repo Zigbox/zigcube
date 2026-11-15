@@ -12,6 +12,7 @@
 #   demo_c2       demo-c2 (four VMs, KVM, GHCR images)
 #   mtls_interop  mtls-interop (stock openssl and JDK servers)
 #   demo_b3       demo-b3 (one VM, KVM, a GHCR image)
+#   demo_c3       demo-c3 on SQLite and on Postgres
 #   macos         the macOS job: zcube alone, built and tested on a macOS runner. Not in `jobs`:
 #                 a path no rule names does not run it, only a path of zcube's own or of CI
 #                 (is_macos) or a full run does. The Linux check job cross-compiles zcube for
@@ -26,7 +27,7 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3)
+jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 demo_c3)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -67,9 +68,13 @@ classify() {
     # The files of one demo: that demo only (docs/demos/*.md is documentation).
     # demo-b1 imports demo_c1_state.zig, which imports demo_c1_fleet.zig and demo_c0_state.zig.
     src/demo_c0_state.zig) want_one demo_c0; want_one demo_c1; want_one demo_b1; want_one demo_b3; return ;;
-    src/demo_c1_state.zig | src/demo_c1_fleet.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; return ;;
+    # demo-c3 imports demo_c1_fleet.zig alone.
+    src/demo_c1_state.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; return ;;
+    src/demo_c1_fleet.zig)
+      want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_c3; return ;;
     src/demo_c0*.zig) want_one demo_c0; return ;;
     src/demo_c1*.zig) want_one demo_c1; return ;;
+    src/demo_c3*.zig) want_one demo_c3; return ;;
     # demo-b3 imports demo_b1_state.zig (so demo_b1_fleet.zig, demo_c1_state.zig and what they import), and demo_c2_steps.zig and demo_c2_vms.zig (its rig).
     src/demo_b1_state.zig | src/demo_b1_fleet.zig) want_one demo_b1; want_one demo_b3; return ;;
     src/demo_b1*.zig) want_one demo_b1; return ;;
