@@ -11,8 +11,9 @@
 //!   - it is **live** until an admissible report says it stopped or its node is lost; a report
 //!     left after its replica record was deleted (the replica is being retired) counts as old,
 //!     live and stopping until the agent reports it stopped or deletes it;
-//!   - it is **ready** once the controller has seen it running for `min_ready_ms`; a replica with a health
-//!     check counts as running only while its report says `healthy` (`update`);
+//!   - it is **ready** once the controller has seen it running for `min_ready_ms`; a replica
+//!     with a health check counts as running only while its report says `healthy` (`update`,
+//!     and the replica controller's `running_healthy`);
 //!   - a new replica that is held (`hold_failed_replica`), that dies more than
 //!     `constants.rollout_restarts_max` times in all, or that is placed and not ready within
 //!     `ready_timeout_ms` fails the rollout (ZC-E0304), as `rollout_plan` decides.

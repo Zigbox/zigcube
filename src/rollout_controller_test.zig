@@ -563,6 +563,49 @@ test "a replica with a health check is ready only while its report says healthy"
     try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
 }
 
+test "an unhealthy replica of a failed rollout is retired as not ready by the rollback" {
+    // Goal: demo-c3 step 3. A new replica that runs but never passes its check fails the
+    // rollout at `ready_timeout_ms`; the rollback retires it within `budget.retire_unready`
+    // (the replica controller agrees it is not ready) and ends on the old spec. Method: roll a
+    // checked service, report the new replica running and unhealthy, pass the timeout, then
+    // bring the rollback's replicas up healthy one by one.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = .{
+        .command = &.{ "test", "-f", "/tmp/ready" },
+        .interval_ms = 1000,
+        .timeout_ms = 1000,
+        .failure_threshold = 2,
+        .success_threshold = 1,
+    };
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b11";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .unhealthy));
+    try fixture.settle();
+    fixture.manual.advance((records.RolloutPolicy{}).ready_timeout_ms + 100);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+    for (0..3) |_| {
+        _ = try fixture.report_health(3, .running, .healthy);
+        try fixture.settle();
+        fixture.manual.advance(min_ready_ms);
+        try fixture.settle();
+    }
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(2));
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(3));
+    try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
+}
+
 test "a kept replica that stops between the read and the commit fails the retirement" {
     // Goal: TLA+ gap 1. A retirement compares the reports of the replicas it counts toward the
     // floor (`replicas - max_unavailable`, 3 here), so one that stops after the controller read
