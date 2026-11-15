@@ -874,9 +874,11 @@ test "job run, get --wait, cancel, list and watch against a live server, and no 
 
 test "history and rollout status, pause and resume against a live server, on its real answers" {
     // Goal: C3 slice 11's commands read what the server really sends (REVIEW.md: a fixture is
-    // checked against real output). Method: apply hello, then a new image; `history` lists both
-    // generations; with no rollout controller in this build (slice 7), `rollout status` says
-    // "no rollout" and pause and resume are ZC-E0129.
+    // checked against real output). Method: apply hello and let its 2 replicas run, then apply a
+    // new image; `history` lists both generations; the server's rollout controller starts the
+    // rollout on its own thread once it sees the old replicas, so the test waits for `rollout
+    // status` to show it (the agent is not stepped again, so it stays progressing), then pauses
+    // and resumes it.
     var world: World = undefined;
     try world.start();
     defer world.stop();
@@ -884,6 +886,7 @@ test "history and rollout status, pause and resume against a live server, on its
     const arena = world.arena_state.allocator();
     const path = try std.fmt.allocPrint(arena, "{s}/hello.zon", .{world.dir});
     try apply_hello(&world, path, 2);
+    try world.converge("hello", "2/2");
     const first = try hello_zon(2);
     defer testing.allocator.free(first);
     const second = try std.mem.replaceOwned(u8, arena, first, "b3:51aa9c03", "b3:9d20c4f1");
@@ -896,21 +899,33 @@ test "history and rollout status, pause and resume against a live server, on its
     try expect_contains(world.out(), "1    b3:51aa9c03  apply");
     try testing.expectEqualStrings("", world.err());
 
-    try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "status", "hello" }));
-    try testing.expectEqualStrings(
-        "hello: generation 2, 2 replicas\nno rollout\npolicy: rolling, surge 1, " ++
-            "unavailable 0, min ready 5s, deadline 600s, on failure rollback\n",
-        world.out(),
-    );
-    try testing.expectEqual(@as(u8, 1), world.run(&.{ "rollout", "pause", "hello" }));
-    try expect_contains(world.err(), "ZC-E0129");
-    try testing.expectEqual(@as(u8, 1), world.run(&.{ "rollout", "resume", "hello" }));
-    try expect_contains(world.err(), "ZC-E0129");
+    try wait_rollout(&world, "hello");
+    try expect_contains(world.out(), "hello: generation 2, 2 replicas\nrollout ");
+    try expect_contains(world.out(), " → 2 (apply): progressing, started ");
+    try expect_contains(world.out(), "\npolicy: rolling, surge 1, unavailable 0, min ready 5s, " ++
+        "deadline 600s, on failure rollback\n");
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "pause", "hello" }));
+    try expect_contains(world.out(), "hello: progressing → paused (decision ");
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "pause", "hello" }));
+    try testing.expectEqualStrings("hello: already paused, no change\n", world.out());
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "resume", "hello" }));
+    try expect_contains(world.out(), "hello: paused → progressing (decision ");
     try testing.expectEqual(@as(u8, 1), world.run(&.{ "history", "nosuch" }));
     try expect_contains(world.err(), "ZC-E0101");
     const json_args: []const []const u8 = &.{ "rollout", "status", "hello", "-o", "json" };
     try testing.expectEqual(@as(u8, 0), world.run(json_args));
-    try expect_contains(world.out(), "\"rollout\":null");
+    try expect_contains(world.out(), "\"to\":2,\"phase\":\"progressing\"");
+}
+
+/// Runs `zcube rollout status <name>` until it shows a rollout; the output is the last run's.
+fn wait_rollout(world: *World, name: []const u8) !void {
+    for (0..400) |_| {
+        try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "status", name }));
+        if (std.mem.indexOf(u8, world.out(), "\nno rollout\n") == null) return;
+        try world.io.sleep(.fromMilliseconds(25), .awake);
+    }
+    std.debug.print("no rollout of {s} began: {s}{s}\n", .{ name, world.out(), world.err() });
+    return error.NoRollout;
 }
 
 /// A server from before C3 slice 11, played by the live one: every request goes to a path the
