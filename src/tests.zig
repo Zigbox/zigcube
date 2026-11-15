@@ -116,6 +116,7 @@ comptime {
     _ = @import("service_cert.zig"); // Core: here too, so `-Dtest-filter` finds its tests.
     _ = @import("sim_mesh_certs.zig"); // The same.
     _ = @import("agent_mesh.zig"); // The same.
+    _ = @import("agent_mesh_test.zig"); // The same.
 }
 
 test {

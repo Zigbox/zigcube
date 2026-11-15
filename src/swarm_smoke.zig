@@ -243,6 +243,7 @@ const Smoke = struct {
         if (at == 0) try smoke.set_fault(state, "peer-corrupt");
         const registry_port = if (at == 2) smoke.proxy.port else smoke.registry.listener.port;
         const mine = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{smoke.peer_ports[at]});
+        const first = 31_000 + 100 * at;
         const args = [_][]const u8{
             "--node",         nodes[at],
             "--server",       try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{smoke.port}),
@@ -253,6 +254,8 @@ const Smoke = struct {
             "--peer-listen",  mine,
             "--address",      mine,
             "--registry",     try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{registry_port}),
+            // Three agents on one host: each gives its replicas mesh ports of its own.
+            "--mesh-ports",   try std.fmt.allocPrint(arena, "{d}-{d}", .{ first, first + 99 }),
         };
         const log = try std.fmt.allocPrint(arena, "agent-{s}.log", .{nodes[at]});
         smoke.agents[at] = try smoke.spawn(smoke.agent_exe, &args, log);

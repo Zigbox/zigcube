@@ -411,6 +411,9 @@ pub const World = struct {
     state_override: ?agent_state.AgentState = null,
     /// The agent's image store, for the summary it writes; null in every simulation but a test's.
     images: ?@import("node_store.zig").Images = null,
+    /// Where the agent reads its node's mesh view; null in every simulation but a test's (the
+    /// mesh is off unless the agent's `Config.mesh` is set too).
+    mesh_source: ?@import("agent_mesh.zig").Source = null,
     server: control_plane.ControlPlane,
     agent: *agent_mod.Agent,
     /// The agent's files (the kept lease), which a restart of the agent finds again.
@@ -560,6 +563,7 @@ pub const World = struct {
                 .set_fn = World.set_call_cap,
                 .hook_fn = World.set_call_hook,
             },
+            .mesh = world.mesh_source,
         };
         world.stats.agent_steps += 1;
         world.switched.in_agent_step = true;

@@ -28,6 +28,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const agent_mod = @import("agent.zig");
+const agent_mesh = @import("agent_mesh.zig");
 const build_options = @import("build_options");
 const clock_mod = @import("agent_clock.zig");
 const config_mod = @import("agent_config.zig");
@@ -199,6 +200,7 @@ const Shell = struct {
                 .set_fn = remote_mod.RemoteStore.deadline_fn,
                 .hook_fn = remote_mod.RemoteStore.hook_fn,
             },
+            .mesh = .{ .context = shell.remote, .fetch_fn = remote_mod.RemoteStore.mesh_fetch_fn },
         };
         const before = shell.agent.lease;
         const fences = shell.agent.fences;
@@ -409,6 +411,28 @@ fn peer_address(buffer: *[64]u8, advertise: ?std.Io.net.IpAddress) []const u8 {
     return std.fmt.bufPrint(buffer, "{f}", .{address}) catch unreachable;
 }
 
+/// The node's mesh (C4 slice 4): the host of the address advertised for peers, which every
+/// endpoint the node's replicas publish names, and the range of ports; null without an address.
+fn mesh_config(peer: []const u8, ports: config_mod.MeshPorts) ?agent_mesh.Config {
+    if (peer.len == 0) return null;
+    // `{f}` of an IpAddress always ends in `:port`; an IPv6 host keeps its brackets.
+    const colon = std.mem.lastIndexOfScalar(u8, peer, ':').?;
+    return .{ .host = peer[0..colon], .ports_first = ports.first, .ports_last = ports.last };
+}
+
+/// The agent core's settings from the agent's configuration; `buffer` holds the peer address.
+fn agent_settings(config: config_mod.Config, buffer: *[64]u8) agent_mod.Config {
+    const peer_text = peer_address(buffer, config.peer_advertise);
+    return .{
+        .node = config.node,
+        .capacity = config.capacity,
+        .address = config.address,
+        .peer = peer_text,
+        .mesh = mesh_config(peer_text, config.mesh_ports),
+        .agent_version = build_options.version,
+    };
+}
+
 /// Runs the agent until it is told to stop. Returns the process's exit code.
 pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const io = init.io;
@@ -444,14 +468,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     var peer_buffer: [64]u8 = undefined;
-    const peer_text = peer_address(&peer_buffer, config.peer_advertise);
-    agent.init(.{
-        .node = config.node,
-        .capacity = config.capacity,
-        .address = config.address,
-        .peer = peer_text,
-        .agent_version = build_options.version,
-    });
+    agent.init(agent_settings(config, &peer_buffer));
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
     var swarm: Swarm = .{};
     defer swarm.stop(gpa); // Also after a start that failed with the store open.
@@ -1000,4 +1017,13 @@ test "stopping a fake backend started with a registry frees what the start alloc
     );
     try std.testing.expectEqualStrings("127.0.0.1:4000", backend.fetch_server);
     backend.stop(std.testing.allocator);
+}
+
+test "the mesh's host is the advertised peer address without its port, and none without one" {
+    const ports: config_mod.MeshPorts = .{ .first = 31_000, .last = 31_009 };
+    const four = mesh_config("10.0.0.1:7171", ports).?;
+    try std.testing.expectEqualStrings("10.0.0.1", four.host);
+    try std.testing.expectEqual(@as(u16, 31_009), four.ports_last);
+    try std.testing.expectEqualStrings("[::1]", mesh_config("[::1]:7171", ports).?.host);
+    try std.testing.expect(mesh_config("", ports) == null);
 }
