@@ -166,6 +166,16 @@ pub const SimRuntime = struct {
     /// simulation sets it to keep a ledger of starts (sim-c1's J2 and J7).
     on_start: ?*const fn (context: *anyopaque, spec: *const runtime.Spec) void = null,
     on_start_context: *anyopaque = undefined,
+    /// Called when a container's supervisor takes mesh rules (a `start` with `Spec.mesh`, or a
+    /// `mesh_update`), and with null rules when a start gives a name none: sim-c4's model of the
+    /// data path (`sim_mesh_conns.zig`) keeps what each supervisor holds.
+    on_mesh: ?*const fn (
+        context: *anyopaque,
+        name: []const u8,
+        labels: []const runtime.Label,
+        rules: ?*const runtime.MeshRules,
+    ) void = null,
+    on_mesh_context: *anyopaque = undefined,
     /// Listeners opened and closed so far (the report's tally of the relay model).
     relays_opened: u32 = 0,
     relays_closed: u32 = 0,
@@ -220,6 +230,8 @@ pub const SimRuntime = struct {
         if (container.mesh_port == null) return;
         container.mesh_rules_hash = runtime.mesh_rules_hash(rules);
         container.mesh_updates += 1;
+        const hook = self.on_mesh orelse return;
+        hook(self.on_mesh_context, container.name, container.labels, rules);
     }
 
     /// Initialises in place. `fixtures` is borrowed: it must outlive the runtime.
@@ -544,6 +556,10 @@ pub const SimRuntime = struct {
             return no_memory(diag);
         };
         self.relays_opened += @intFromBool(spec.relay.len > 0);
+        if (self.on_mesh) |hook| {
+            const rules: ?*const runtime.MeshRules = if (spec.mesh) |*mesh| &mesh.rules else null;
+            hook(self.on_mesh_context, spec.name, spec.labels, rules);
+        }
         return .{ .started = runtime.Handle.init(spec.name) };
     }
 

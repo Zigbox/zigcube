@@ -22,7 +22,9 @@ import { join } from "node:path";
 
 const wasi = process.argv[2] === "--wasi";
 const sim = process.argv[2] === "--sim";
-const simC1 = process.argv[2] === "--sim-c1";
+// `--sim-c4` is sim-c1 with the mesh (C4 slice 5): the export's flags word sets bit 1.
+const simC4 = process.argv[2] === "--sim-c4";
+const simC1 = process.argv[2] === "--sim-c1" || simC4;
 const simCluster = process.argv[2] === "--sim-cluster" || simC1;
 const simSwarm = process.argv[2] === "--sim-swarm";
 const path = process.argv[wasi || sim || simCluster || simSwarm ? 3 : 2];
@@ -52,7 +54,7 @@ function firstDifference(left, right) {
 }
 
 // The profile names, in the order of `sim_shape.zig`'s enums; "auto" asks for the seed's draw.
-const CLUSTER_PROFILES = ["mixed", "partitions", "skew", "crash_heavy", "slow_store"];
+const CLUSTER_PROFILES = ["mixed", "partitions", "skew", "crash_heavy", "slow_store", "mesh"];
 const SWARM_PROFILES = ["mixed", "liars", "silent", "refusers", "honest"];
 function profileIndex(names, text) {
   if (text === "auto") return 0xffffffff;
@@ -91,12 +93,12 @@ if (simCluster) {
     operationsText === "auto" ? 0 : Number(operationsText),
     Number(nodesText),
     simC1 || livenessText === "true" ? 1 : 0,
-    simC1 ? 1 : 0,
+    (simC1 ? 1 : 0) | (simC4 ? 2 : 0),
     profileIndex(CLUSTER_PROFILES, profileText),
     0,
     0,
   );
-  const label = simC1 ? "sim-c1" : "sim-cluster";
+  const label = simC4 ? "sim-c4" : simC1 ? "sim-c1" : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_cluster_report_ptr(), exports.zcube_cluster_report_len());
   const wasmText = new TextDecoder().decode(rendered);

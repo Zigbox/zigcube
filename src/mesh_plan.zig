@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
@@ -174,7 +175,8 @@ pub const Faults = struct {
 
 /// The rules of `node`.
 pub fn plan(arena: Allocator, input: *const Input, node: []const u8) Allocator.Error!Plan {
-    return compile(arena, input, node, .{});
+    // sim-c4's M4 tooth (`c1_teeth.zig`): false in every shipped program and test.
+    return compile(arena, input, node, .{ .route_unready = c1_teeth.mesh_route_unready });
 }
 
 /// `plan` with test-only faults on (the fuzzer's teeth). It exists only in a test build: in any

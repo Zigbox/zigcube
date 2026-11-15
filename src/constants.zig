@@ -153,6 +153,9 @@ pub const mesh_endpoint_bytes_max: u32 = 256 + ":65535".len;
 /// renews at half of it with a fresh key; one not renewed by its `not_after` takes the replica
 /// off the mesh (ZC-W0703) but does not stop it.
 pub const workload_cert_ttl_ms: u64 = 60 * 60 * 1000;
+/// After a grant's removal, how long a supervisor may keep a connection on it open once it has
+/// received rules without the grant (M2; owner answer O9). sim-c4 judges it from C4 slice 5.
+pub const mesh_revoke_ms: u64 = 1000;
 
 comptime {
     assert(mesh_address_min > 0);

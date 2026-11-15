@@ -178,6 +178,20 @@ pub const mesh_renew_late = declared("c1_teeth_mesh_renew_late");
 /// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
 pub const job_pass_break = declared("c1_teeth_job_pass_break");
 
+/// C4 slice 5, M1's tooth (`sim_mesh_conns.zig`): the destination supervisor skips its accept
+/// check.
+pub const mesh_no_dst_check = declared("c1_teeth_mesh_no_dst_check");
+
+/// C4 slice 5, M2's tooth: supervisors leave open connections open when a grant goes.
+pub const mesh_revoke_late = declared("c1_teeth_mesh_revoke_late");
+
+/// C4 slice 5, M4's tooth: `mesh_plan.plan` makes unready replicas endpoints
+/// (`mesh_plan.Faults.route_unready`).
+pub const mesh_route_unready = declared("c1_teeth_mesh_route_unready");
+
+/// The C4 teeth run in a mesh world (`sim_cluster --c4`).
+pub const mesh_world = mesh_no_dst_check or mesh_revoke_late or mesh_route_unready;
+
 /// Not an agent fault but a gap shown (pending the owner, docs/decisions/
 /// 2026-11-14-j6-runs-unread-gap.md): the server fails a node's read of its runs whenever one of
 /// them has a stop asked, while its keepalives and every other call are answered. The agent
@@ -188,7 +202,7 @@ pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
-    mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late;
+    mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late or mesh_world;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
@@ -197,7 +211,7 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
     mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late or
-    job_pass_break or job_runs_unread;
+    job_pass_break or job_runs_unread or mesh_world;
 
 /// The runner a replay line names: the fault-on runner whose root switched a tooth on
 /// (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe` installs it), the burst world's own runner, or
@@ -249,4 +263,7 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_mesh_reuse_key", "sim_c1_teeth_mesh_reuse_key" },
     .{ "c1_teeth_mesh_issue_any_node", "sim_c1_teeth_mesh_issue_any_node" },
     .{ "c1_teeth_mesh_renew_late", "sim_c1_teeth_mesh_renew_late" },
+    .{ "c1_teeth_mesh_no_dst_check", "sim_c4_teeth_mesh_no_dst_check" },
+    .{ "c1_teeth_mesh_revoke_late", "sim_c4_teeth_mesh_revoke_late" },
+    .{ "c1_teeth_mesh_route_unready", "sim_c4_teeth_mesh_route_unready" },
 };

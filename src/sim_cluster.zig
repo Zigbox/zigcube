@@ -59,6 +59,9 @@ const job_retention = @import("job_retention.zig");
 const runtime = @import("runtime.zig");
 const sim_certs = @import("sim_certs.zig");
 const sim_mesh_certs = @import("sim_mesh_certs.zig");
+const sim_mesh_conns = @import("sim_mesh_conns.zig");
+const agent_mesh = @import("agent_mesh.zig");
+const mesh_plan = @import("mesh_plan.zig");
 const sim_jobs = @import("sim_jobs.zig");
 const sim_jobs_watch = @import("sim_jobs_watch.zig");
 const sim_runtime = @import("sim_runtime.zig");
@@ -318,6 +321,12 @@ pub const Swarm = struct {
                 swarm.w_server = 2 + r.uintLessThan(u32, 4);
                 swarm.w_runtime = 8 + r.uintLessThan(u32, 16);
             },
+            .mesh => {
+                // Slow agents: their links to the server are slow; the supervisor cuts and the
+                // grant churn are `sim_mesh_conns`'s.
+                swarm.net.request.delay_ms_max = 300 + r.uintLessThan(u32, 700);
+                swarm.net.reply.delay_ms_max = 300 + r.uintLessThan(u32, 700);
+            },
             .slow_store => {
                 swarm.ack_loss_per_mille = 20 + r.uintLessThan(u32, 80);
                 swarm.w_outage = 4 + r.uintLessThan(u32, 6);
@@ -429,6 +438,12 @@ const Node = struct {
     started_next: u16 = 0,
     /// The link is cut until this true time.
     partitioned_until_ms: ?u64,
+    /// C4 slice 5, mesh worlds: the host the node's supervisors listen on, and the view of the
+    /// mesh the agent's step in progress read (its slices live in `arena`; null when it read
+    /// none), which `sim_mesh_conns` keeps with each delivery of rules.
+    mesh_host_buf: [16]u8,
+    mesh_host_len: u8,
+    mesh_view: ?mesh_plan.Input,
     crashes: u32,
     /// Successful agent steps and virtual time with the agent up, while the faults were on.
     ok_steps: u32,
@@ -469,7 +484,39 @@ const Node = struct {
             .node = node.name(),
             .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
             .address = "10.0.0.5:7070",
+            .mesh = if (node.cluster.mesh_on) .{ .host = node.mesh_host() } else null,
         };
+    }
+
+    fn mesh_host(node: *const Node) []const u8 {
+        return node.mesh_host_buf[0..node.mesh_host_len];
+    }
+
+    /// `agent.Context.mesh` in a mesh world: the agent's own fetch, and the view kept for the
+    /// step's deliveries of rules.
+    fn mesh_fetch_fn(
+        context: *anyopaque,
+        arena: Allocator,
+        diag: *Diag,
+    ) store.Error!mesh_plan.Input {
+        const node: *Node = @ptrCast(@alignCast(context));
+        node.mesh_view = null;
+        const input = try node.remote.mesh_input(arena, diag);
+        node.mesh_view = input;
+        return input;
+    }
+
+    /// `SimRuntime.on_mesh`: a supervisor on this node took rules (or a start gave it none).
+    fn mesh_delivered(
+        context: *anyopaque,
+        name_: []const u8,
+        labels: []const runtime.Label,
+        rules: ?*const runtime.MeshRules,
+    ) void {
+        const node: *Node = @ptrCast(@alignCast(context));
+        const c = node.cluster;
+        const view: ?*const mesh_plan.Input = if (node.mesh_view) |*known| known else null;
+        sim_mesh_conns.deliver(&c.conns, node.index, name_, labels, rules, view, c.manual.ms);
     }
 
     /// The network as the agent sees it, with the time its calls take added up.
@@ -597,6 +644,7 @@ const Node = struct {
         const clock_ahead = node.nclock.busy_until_true_ms > c.manual.ms;
         if (clock_ahead) assert(c.manual.ms < node.resume_ms);
         node.spent_ms = 0;
+        node.mesh_view = null;
         const clock = node.nclock.clock();
         const ctx: agent_mod.Context = .{
             .store = node.remote.interface(),
@@ -612,6 +660,7 @@ const Node = struct {
                 .hook_fn = Node.deadline_hook_fn,
             },
             .images = node.store_images.images(),
+            .mesh = if (c.mesh_on) .{ .context = node, .fetch_fn = Node.mesh_fetch_fn } else null,
         };
         node.remote.set_deadline(clock, std.math.maxInt(u64));
         c.stats.agent_steps += 1;
@@ -872,6 +921,10 @@ pub const Cluster = struct {
     certs: sim_certs.State,
     /// C4 slice 3: service replicas' certificates (`sim_mesh_certs.zig`), strong runs.
     mesh: sim_mesh_certs.State,
+    /// C4 slice 5: the mesh world is on (`Options.mesh`): agents give replicas mesh ports and
+    /// rules, and `conns` models the supervisors' connections (`sim_mesh_conns.zig`).
+    mesh_on: bool,
+    conns: sim_mesh_conns.State,
     /// J4: the client that follows the job endings through the watch, and its own random stream.
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
@@ -955,14 +1008,21 @@ pub const Cluster = struct {
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
         c.init_reuse();
-        c.strong = options.strong or c1_teeth.strong_world;
-        c.host_crashes = 0;
+        c.init_worlds(gpa, options);
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
         c.server.check_i6 = true;
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// The strong and mesh worlds (sim-c4's connection model with the mesh).
+    fn init_worlds(c: *Cluster, gpa: Allocator, options: Options) void {
+        c.strong = options.strong or c1_teeth.strong_world;
+        c.mesh_on = options.mesh or c1_teeth.mesh_world;
+        c.conns = .init(gpa, c.seed, options.profile == .mesh);
+        c.host_crashes = 0;
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -1029,6 +1089,16 @@ pub const Cluster = struct {
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
         node.sim.containers.on_start = job_started;
         node.sim.containers.on_start_context = node;
+        node.mesh_view = null;
+        const host = sim_mesh_conns.host_of(index, &node.mesh_host_buf);
+        node.mesh_host_len = @intCast(host.len);
+        if (c.mesh_on) {
+            node.sim.containers.on_mesh = Node.mesh_delivered;
+            node.sim.containers.on_mesh_context = node;
+            // Replicas report `starting`, with their endpoint, for 1 to 4 s (drawn from the seed,
+            // not the cluster's stream): views then hold endpoints that are not ready (M4).
+            node.sim.warmup_ms = 1000 + (c.seed *% 0x9e3779b97f4a7c15 +% index) % 3000;
+        }
         node.agent.init(node.config());
         // Its own generator: the store's contents must not move the cluster's stream.
         var store_prng = std.Random.DefaultPrng.init(c.seed ^ (0x5f5f0000 + index));
@@ -1084,6 +1154,7 @@ pub const Cluster = struct {
             gpa.destroy(node);
         }
         gpa.free(c.nodes);
+        c.conns.deinit();
         c.net.deinit();
         c.tap_arena.deinit();
         c.recorder.deinit();
@@ -1206,6 +1277,7 @@ pub const Cluster = struct {
             c.settle();
             if (c.jobs_on and c.strong) c.supervise_certs();
             if (c.strong) c.supervise_mesh();
+            if (c.mesh_on) sim_mesh_conns.tick(&c.conns, c.nodes, c.manual.ms);
             if (c.jobs_on) c.watch_client();
             // The wedge totals J1, J6 and J8 judge by are kept whenever jobs are on,
             // not only under c1: a plain run judges the same bounds.
@@ -1452,12 +1524,15 @@ pub const Cluster = struct {
 
     fn apply(c: *Cluster, name: []const u8, image: []const u8, replicas: u32) void {
         var buffer: [16]u8 = undefined;
+        var allow: [sim_mesh_conns.services.len * sim_mesh_conns.ports.len]records.Grant =
+            undefined;
         const id = c.request_id(&buffer);
         const ctx = c.controller_context();
         _ = apply_mod.apply(&ctx, &c.api_source, .{
             .name = name,
             .image = if (c.strong) full_digest(image) else image,
             .replicas = replicas,
+            .allow = if (c.mesh_on) sim_mesh_conns.draw_allow(&c.conns, name, &allow) else &.{},
             .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
             .applied_by = "alex@laptop",
             .request_id = id,
@@ -2387,6 +2462,8 @@ fn safety(c: *Cluster) Failure!void {
     try track_jobs(c);
     // C4 slice 3: M3 and M6, judged at each issue (`sim_mesh_certs.zig`).
     try check(c, c.mesh.violation == null, c.mesh.violation orelse "");
+    // C4 slice 5: M1, M2 and M4, judged at each attempt, accept and tick (`sim_mesh_conns.zig`).
+    try check(c, c.conns.violation == null, c.conns.violation orelse "");
 }
 
 /// I3 (docs/authority.md §3): no container runs on a node the server has given up on for longer
@@ -3186,6 +3263,12 @@ pub const Options = struct {
     /// world it was before those faults existed, bit for bit (a replay line of an older failure
     /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
     strong: bool = false,
+    /// C4 slice 5: services connect (`sim_mesh_conns.zig`): agents run the mesh, services get
+    /// grants, supervisors open connections, and M1, M2 and M4 are checked. `plan` turns it on
+    /// for `c4`, drawn operations (`auto`) and the `mesh` profile.
+    mesh: bool = false,
+    /// sim-c4 (docs/briefs/c4.md): `c1`, `strong` and `mesh` together.
+    c4: bool = false,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -3209,7 +3292,13 @@ pub fn plan(seed: u64, operations: ?u32, requested: Options) Plan {
         options.profile = sim_shape.draw_cluster_profile(seed);
         options.profile_auto = false;
     }
+    if (options.c4) {
+        options.c1 = true;
+        options.strong = true;
+    }
+    if (options.c4 or options.profile == .mesh or c1_teeth.mesh_world) options.mesh = true;
     if (operations == null) {
+        options.mesh = true;
         options.strong = true;
         if (options.nodes == null) options.nodes = shape.nodes;
         if (options.lease_ttl_ms == null) options.lease_ttl_ms = shape.lease_ttl_ms;
@@ -3521,6 +3610,7 @@ fn print_summary(c: *Cluster) void {
     }
     if (c.jobs_on) print_jobs(c);
     if (c.strong) print_mesh(c);
+    if (c.mesh_on) print_conns(c);
     report.print("world hash: {x:0>16}\n", .{world_hash(c)});
 }
 
@@ -3540,6 +3630,23 @@ fn print_mesh(c: *Cluster) void {
     const wait = "mesh: longest wait for a certificate after the heal {d} ms (M3r bound {d})\n";
     c.report.print(wait, .{
         mesh.due_max_ms, sim_mesh_certs.ask_interval_ms + sim_mesh_certs.renew_cut_ms,
+    });
+}
+
+/// C4 slice 5's lines: the supervisors' requests and connections (`sim_mesh_conns.zig`).
+fn print_conns(c: *Cluster) void {
+    const n = &c.conns;
+    c.report.print("mesh conns: requests={d} accepted={d} failed={d} refused={d} " ++
+        "unreached={d} finished={d} revoked={d} broken={d} open={d}\n", .{
+        n.requests, n.accepted, n.failed, n.refused,         n.unreached,
+        n.finished, n.revoked,  n.broken, n.conns.items.len,
+    });
+    c.report.print("mesh conns: grant draws={d} supervisor cuts={d} longest after a " ++
+        "revocation {d} ms (M2 bound {d}) routes to unready replicas={d}\n", .{
+        n.grant_draws, n.cuts, n.revoke_max_ms, constants.mesh_revoke_ms, n.unready_routes,
+    });
+    c.report.print("mesh conns: direct dials={d} accepted={d}\n", .{
+        n.rogues, n.rogues_accepted,
     });
 }
 
