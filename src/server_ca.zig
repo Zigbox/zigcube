@@ -3,7 +3,8 @@
 //!
 //! `ca.key` is the Ed25519 seed, made on the first start (mode 0600) and loaded afterwards. A
 //! server with no state directory (a memory store) makes a fresh CA in memory each start and
-//! says so on stderr: its agents join again. `revoked` is read once, at start.
+//! says so on stderr: its agents join again. `revoked` is read at start, and again whenever it
+//! changes (`server_revoked.zig`, B7 slice 5).
 
 const std = @import("std");
 const secure_random = @import("secure_random.zig");
@@ -221,17 +222,32 @@ fn read_revoked(
     path: []const u8,
     diag: *Diag,
 ) Error!void {
+    return load_revoked(&ca.revoked, gpa, io, dir, path, diag);
+}
+
+/// Fills `revoked` from `path`'s `revoked` file, or empties it when there is none: what the
+/// server does at start and again when the file changes (`server_revoked.zig`). On failure
+/// `diag` says why (ZC-E0806) and `revoked` holds nothing usable.
+pub fn load_revoked(
+    revoked: *peer_ca.Revoked,
+    gpa: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    diag: *Diag,
+) Error!void {
+    revoked.* = .{};
     const buffer = try gpa.alloc(u8, constants.peer_file_bytes_max + 1);
     defer gpa.free(buffer);
     const text = try files.read(io, dir, path, revoked_file, .anchor, buffer, diag) orelse return;
-    ca.revoked.parse(text) catch |err| {
+    revoked.parse(text) catch |err| {
         const why = switch (err) {
             error.BadName => "a line is not a node name",
             error.TooMany => "it names more nodes than the server keeps",
         };
         var line_buffer: [96]u8 = undefined;
         const detail = std.fmt.bufPrint(&line_buffer, "line {d}: {s}", .{
-            ca.revoked.bad_line, why,
+            revoked.bad_line, why,
         }) catch why;
         const fix = "write one node name per line in revoked, or delete the file";
         return files.unusable_fix(diag, path, revoked_file, "parse", detail, fix);

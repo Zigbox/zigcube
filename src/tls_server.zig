@@ -80,6 +80,9 @@ pub const Peer = struct {
     name: []const u8,
     /// A client certificate's scope; null for every other kind.
     scope: ?x509.Scope,
+    /// The certificate's validity, for the checks after the handshake (B7 slice 5).
+    not_before_ms: u64,
+    not_after_ms: u64,
 };
 
 const peer_name_bytes_max: u32 =
@@ -192,6 +195,8 @@ pub const Server = struct {
     peer_name: [peer_name_bytes_max]u8,
     peer_name_length: u32,
     peer_scope: ?x509.Scope,
+    peer_not_before_ms: u64,
+    peer_not_after_ms: u64,
     authenticated: bool,
     record: [schedule.sealed_bytes_max]u8,
     record_length: u32,
@@ -234,6 +239,8 @@ pub const Server = struct {
         self.peer_kind = first_kind(config.client_kinds);
         self.peer_name_length = 0;
         self.peer_scope = null;
+        self.peer_not_before_ms = 0;
+        self.peer_not_after_ms = 0;
         self.authenticated = false;
         self.record_length = 0;
         self.record_total = 0;
@@ -290,6 +297,8 @@ pub const Server = struct {
             .kind = self.peer_kind,
             .name = self.peer_name[0..self.peer_name_length],
             .scope = self.peer_scope,
+            .not_before_ms = self.peer_not_before_ms,
+            .not_after_ms = self.peer_not_after_ms,
         };
     }
 
@@ -852,6 +861,8 @@ pub const Server = struct {
         self.peer_name_length = @intCast(name.len);
         self.peer_kind = parsed.kind;
         self.peer_scope = if (parsed.kind == .client) parsed.scope(chain.leaf) else null;
+        self.peer_not_before_ms = parsed.not_before_ms;
+        self.peer_not_after_ms = parsed.not_after_ms;
         if (!fault_on(.transcript_client_auth)) self.transcript.add(message);
         self.state = .wait_certificate_verify;
     }

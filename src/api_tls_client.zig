@@ -144,7 +144,7 @@ pub const Credentials = struct {
         std.crypto.secureZero(u8, std.mem.asBytes(&c.key_pair));
     }
 
-    fn options(c: *Credentials, io: std.Io, fd: std.posix.fd_t) tls_conn.Options {
+    pub fn options(c: *Credentials, io: std.Io, fd: std.posix.fd_t) tls_conn.Options {
         c.chain = .{c.certificate.slice()};
         return .{
             .io = io,

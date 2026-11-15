@@ -70,6 +70,12 @@ const slots_count = constants.http_connections_max + constants.http_refusals_max
 /// (the loopback listener) looks from the last one down, so it uses the reserve first.
 pub const SlotKind = enum { connection, connection_tls, refusal };
 
+/// Work the watchdog does on each tick besides its sweep. It must not block for long.
+pub const Tick = struct {
+    context: *anyopaque,
+    run: *const fn (context: *anyopaque) void,
+};
+
 /// Everything the connections share.
 pub const Shared = struct {
     gpa: Allocator,
@@ -86,6 +92,8 @@ pub const Shared = struct {
     slots_mutex: std.Io.Mutex = .init,
     /// The connection slots a TLS client may take: all of them unless both listeners run.
     tls_slots: u32 = constants.http_connections_max,
+    /// More work for each watchdog tick: the server's watch of its `revoked` file.
+    tick: ?Tick = null,
 
     // ---- The connection table ----
 
@@ -155,6 +163,7 @@ pub const Shared = struct {
         while (true) {
             shared.io.sleep(.fromMilliseconds(constants.http_watchdog_ms), .awake) catch return;
             shared.sweep();
+            if (shared.tick) |tick| tick.run(tick.context);
         }
     }
 
@@ -226,6 +235,8 @@ const Transport = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     tls: ?*server_tls.Conn,
+    /// The TLS listener's setup, which checks the peer again before each request; null with `tls`.
+    setup: ?*server_tls.Setup,
     /// Who the connection's certificate names: every request of it is made as this caller.
     caller: api_mod.Caller,
 };
@@ -246,6 +257,7 @@ pub fn serve(shared: *Shared, slot: u32, stream: net.Stream, tls: ?*server_tls.S
         .reader = &reader.interface,
         .writer = &writer.interface,
         .tls = null,
+        .setup = null,
         .caller = .local,
     });
     serve_tls(shared, slot, stream, setup, &reader.interface, &writer.interface);
@@ -287,6 +299,7 @@ fn serve_tls(
         .reader = &tls.conn.reader,
         .writer = &tls.conn.writer,
         .tls = &tls.conn,
+        .setup = setup,
         .caller = caller,
     });
 }
@@ -356,6 +369,12 @@ fn answer(work: *Work, request: *http.Server.Request) Closed!bool {
     const started = shared.clock.now_ms();
     const ctx = work.context();
     const parsed = copy_head(&ctx, request) orelse return error.Closed;
+    if (!peer_still_valid(work.transport, ctx.diag)) {
+        // The certificate expired, or its name was revoked, since the handshake (B7 slice 5):
+        // 403 with the diagnostic, the body left unread, and the connection closed.
+        const response = api_mod.refusal(&ctx, shared.new_id(&ctx), 403);
+        return respond_api(work, request, response, started, parsed, false);
+    }
     if (is_api(parsed.path) and refused_unread(work.transport.caller, parsed)) {
         // The API refuses it from its method and path (ZC-E0822) without its body, which is
         // left unread: the reply closes the connection.
@@ -371,6 +390,13 @@ fn answer(work: *Work, request: *http.Server.Request) Closed!bool {
         return respond_api(work, request, response, started, parsed, true);
     }
     return respond_static(work, &ctx, request, parsed, started);
+}
+
+/// Whether a TLS connection's peer may still make requests: always true on the loopback listener.
+/// False raises the reason on `diag`.
+fn peer_still_valid(transport: *const Transport, diag: *Diag) bool {
+    const setup = transport.setup orelse return true;
+    return setup.recheck(transport.tls.?, diag);
 }
 
 /// The parts of a request head the handlers need, copied into the arena because reading the body
