@@ -192,7 +192,11 @@ pub fn exchange(
     assert(diag.code == null);
     const conn = try arena.create(tls_conn.Conn);
     defer conn.deinit();
-    const options = c.options(io, fd);
+    var options = c.options(io, fd);
+    // The handshake ends by `end_ms` too: the agent's calls end before its fence, and a server
+    // that stops answering mid-handshake must not hold one for the handshake's own 10 s.
+    const left_ms = end_ms -| peer_stream.boot_ms(io);
+    options.handshake_timeout_ms = @intCast(@max(1, @min(left_ms, options.handshake_timeout_ms)));
     conn.open(&options, diag) catch |err| return ended(err, &.{});
     for (parts) |part| {
         conn.write(part, end_ms, diag) catch |err| return ended(err, &.{});

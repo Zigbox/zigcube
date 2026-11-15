@@ -370,6 +370,60 @@ test "a server that accepts and says nothing is ZC-E0503 after the wait, not a c
     try testing.expect(std.mem.endsWith(u8, diag.last_cause().?, "it did not answer in time"));
 }
 
+test "a TLS handshake that gets no answer ends by the call's wait, not the handshake's 10 s" {
+    // Goal: the B4-B7 bundle's demo-c1 fenced 6 s late when its partition cut node1's link
+    // mid-handshake: `exchange` left the handshake on `tls_handshake_timeout_ms` (10 s), not on
+    // the call's end, which the fence caps. Method: a listener that never accepts (the kernel
+    // completes the connection, nothing answers the ClientHello) and a client that waits 100 ms.
+    const io = testing.io;
+    const born_ms: u64 = 1_700_000_000_000;
+    const day_ms: u64 = 86_400_000;
+    var clock: @import("clock.zig").ManualClock = .{ .ms = born_ms };
+    const ca = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0xCA));
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(1));
+    const x509 = @import("x509.zig");
+    var cluster_buffer: [@import("peer_ca.zig").cluster_bytes]u8 = undefined;
+    var der: x509.Der = .{};
+    try x509.issue_node(&der, ca, &.{
+        .cluster = @import("peer_ca.zig").cluster_of(ca.public_key.toBytes(), &cluster_buffer),
+        .node = "node1",
+        .subject_key = key.public_key.toBytes(),
+        .lifetime = .{ .not_before_ms = born_ms, .not_after_ms = born_ms + day_ms },
+    });
+    var credentials: api_tls_client.Credentials = undefined;
+    credentials.anchor = ca.public_key.toBytes();
+    credentials.server_name = api_tls_client.server_name_default;
+    credentials.certificate = .{};
+    try testing.expectEqual(null, credentials.present(&der, key, "node1", born_ms));
+    var guard: api_tls_guard.Guard = .{
+        .io = io,
+        .wall = clock.clock(),
+        .fallback = null,
+        .silent = true,
+    };
+    const any = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try any.listen(io, .{});
+    defer listener.deinit(io);
+    const client: Client = .{
+        .io = io,
+        .address = listener.socket.address,
+        .io_timeout_ms = 100,
+        .tls = &credentials,
+        .guard = &guard,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const request: Request = .{ .method = "GET", .target = "/v1/status" };
+    const started_ms = client.now_ms();
+    const result = client.call(arena_state.allocator(), request, &diag);
+    const took_ms = client.now_ms() - started_ms;
+    try testing.expectError(error.Unreachable, result);
+    try testing.expectEqual(@as(u32, 0), guard.raised);
+    try testing.expect(took_ms < 2_000); // 10 s without the cap.
+}
+
 test "an expired certificate fails the call with ZC-E0811 before it connects" {
     // Goal: review of slice 5, S2: `call` runs the guard before each connection. Method: a
     // listener that never accepts (the kernel would complete a connection) and a manual clock

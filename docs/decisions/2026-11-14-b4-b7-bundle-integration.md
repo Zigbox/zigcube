@@ -169,6 +169,19 @@ its merits, and both behaviours were kept. A whole file was never taken from one
      unit test now asserts the window, and it fails without the fix.
    - **For the reviewers.** No gate in `check` drives a browser connection through `serve_tls`.
      mtls-interop (not in `check`) is the only one that does.
+15. **The agent's TLS handshake outlived its fence (B7 slice 3's client, exposed by slice 6,
+   part 2).** No conflict either.
+   - **What broke.** `api_tls_client.exchange` ran the handshake on its own
+     `tls_handshake_timeout_ms` (10 s), not on the call's end, which the agent caps at its fence.
+     Slice 6, part 2 put demo-c1 over TLS. When step 5's partition cut node1's link
+     mid-handshake, the agent waited about 10 s and fenced 2868 ms after the server's expiry,
+     against a bound of 100 ms before it. It happened in 1 of 5 runs on SQLite.
+   - **The fix.** The handshake's timeout is now the smaller of its own and what is left of the
+     call. A new `agent_http` test (a TLS server that never answers, a 100 ms wait) fails without
+     the fix, after 10 s, and passes with it. The CLI's calls get the same cap. No bound or
+     default changes: the 10 s still applies when the call allows longer.
+   - **For the reviewers.** Any other place that opens a `tls_conn.Conn` with a deadline of its
+     own should be checked the same way (the relay passes its own connect timeout).
 
 ## Diagnostic codes
 
