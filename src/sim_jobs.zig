@@ -62,6 +62,11 @@ pub const Watch = struct {
     /// The node's total of wedged time when the run's `stop` was first seen (J6 counts only
     /// wedged time after the stop).
     stop_wedged_base_ms: ?u64 = null,
+    /// The latest look before this one (`note_marks`): when, and the node's total of wedged
+    /// time then. A mark taken late (no look fell between the deadline or the stop and now:
+    /// the store was out) is placed back at the moment it stands for (#151).
+    seen_ms: u64 = 0,
+    seen_wedged_total_ms: u64 = 0,
 };
 
 /// How long a watched run's node was wedged since the mark `note_marks` took.
@@ -70,22 +75,39 @@ pub fn wedged_since(watch: *const Watch, wedged_total_ms: u64) u64 {
 }
 
 /// Takes the node's total of wedged time at the moments the bounds start to count it (every
-/// tick, wedged or not): J8's at the run's deadline, J6's at the run's stop.
+/// tick, wedged or not): J8's at the run's deadline, J6's at the run's stop (`stop_at_ms`, on
+/// true time). The tracker does not look every tick (not while the store is out), so a mark may
+/// be taken after its moment: the total then is not known, only that it grew by at most the
+/// time that passed since the latest look. The base is that bound, capped at the total now: it
+/// is never below the true total at the moment, so the wedge it credits is never more than the
+/// node's wedge after it (#151: a node frozen across a deadline the tracker did not look at).
 pub fn note_marks(
     watch: *Watch,
     now_ms: u64,
     deadline_ms: u64,
-    stopped: bool,
+    stop_at_ms: ?u64,
     wedged_total_ms: u64,
 ) void {
+    assert(watch.seen_wedged_total_ms <= wedged_total_ms);
     const age = now_ms -| watch.first_seen_ms;
     if (!watch.wedge_marked and age >= deadline_ms) {
         watch.wedge_marked = true;
-        watch.wedged_base_ms = wedged_total_ms;
+        watch.wedged_base_ms = mark_base(watch, watch.first_seen_ms + deadline_ms, wedged_total_ms);
     }
-    if (stopped and watch.stop_wedged_base_ms == null) {
-        watch.stop_wedged_base_ms = wedged_total_ms;
+    if (stop_at_ms) |at| {
+        if (watch.stop_wedged_base_ms == null) {
+            watch.stop_wedged_base_ms = mark_base(watch, at, wedged_total_ms);
+        }
     }
+    watch.seen_ms = now_ms;
+    watch.seen_wedged_total_ms = wedged_total_ms;
+}
+
+/// The latest the node's total of wedged time can have been at `at_ms`: the latest look's
+/// total, plus the time from that look to `at_ms`, but never more than the total now.
+fn mark_base(watch: *const Watch, at_ms: u64, wedged_total_ms: u64) u64 {
+    const most = watch.seen_wedged_total_ms + (at_ms -| watch.seen_ms);
+    return @min(wedged_total_ms, most);
 }
 
 /// The bound of J6: from the commit of a run's `stop`, the larger of what an agent whose link is
@@ -287,20 +309,58 @@ test "note_marks: wedges before the deadline do not count" {
         .ended_since_ms = null,
     };
     // 5 s of wedge, long before the window.
-    note_marks(&watch, 1000 + 10_000, deadline, false, 5000);
+    note_marks(&watch, 1000 + 10_000, deadline, null, 5000);
     try std.testing.expect(!watch.wedge_marked);
     try std.testing.expectEqual(@as(u64, 5000), wedged_since(&watch, 5000));
     // At the deadline: the wedge base is taken, and the earlier wedge no longer counts.
-    note_marks(&watch, 1000 + deadline, deadline, false, 7000);
+    note_marks(&watch, 1000 + deadline, deadline, null, 7000);
     try std.testing.expectEqual(@as(u64, 7000), watch.wedged_base_ms);
     try std.testing.expectEqual(@as(u64, 0), wedged_since(&watch, 7000));
     // A wedge after the mark does count.
     try std.testing.expectEqual(@as(u64, 500), wedged_since(&watch, 7500));
     // J6: the stop's base is taken once, at first sight of the stop.
-    note_marks(&watch, 1000 + deadline + 5, deadline, true, 7600);
+    note_marks(&watch, 1000 + deadline + 5, deadline, 1000 + deadline + 5, 7600);
     try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
-    note_marks(&watch, 1000 + deadline + 9, deadline, true, 9000);
+    note_marks(&watch, 1000 + deadline + 9, deadline, 1000 + deadline + 5, 9000);
     try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
+}
+
+test "note_marks: a mark taken late keeps the wedge after its moment (#151)" {
+    // Goal: the tracker skipped the looks around the deadline (the store was out) while the
+    // node was frozen; the mark taken at the next look must still credit the frozen time after
+    // the deadline, and no more. A mutant that takes the base as the total at the late look
+    // credits 0 here (seed 966942719's 129 ms over the bound).
+    const deadline: u64 = 7_000;
+    var watch: Watch = .{
+        .node = 0,
+        .name_hash = 1,
+        .first_seen_ms = 3_000,
+        .ended_since_ms = null,
+    };
+    // A look at 9,500 ms: 2,000 ms of wedge so far (frozen since 7,500 ms).
+    note_marks(&watch, 9_500, deadline, null, 2_000);
+    try std.testing.expect(!watch.wedge_marked);
+    // No look until 14,500 ms, still frozen: the total grew by the 5,000 ms that passed.
+    note_marks(&watch, 14_500, deadline, null, 7_000);
+    try std.testing.expect(watch.wedge_marked);
+    // The deadline fell at 10,000 ms: at most 2,500 ms of the wedge came before it.
+    try std.testing.expectEqual(@as(u64, 2_500), watch.wedged_base_ms);
+    try std.testing.expectEqual(@as(u64, 4_500), wedged_since(&watch, 7_000));
+    // Not wedged between the looks: no credit, though the mark is late.
+    var idle: Watch = .{ .node = 0, .name_hash = 2, .first_seen_ms = 3_000, .ended_since_ms = null };
+    note_marks(&idle, 9_500, deadline, null, 2_000);
+    note_marks(&idle, 14_500, deadline, null, 2_000);
+    try std.testing.expectEqual(@as(u64, 0), wedged_since(&idle, 2_000));
+    // J6 the same way: a stop committed at 11,000 ms, first seen at 14,500 ms.
+    var stopped: Watch = .{
+        .node = 0,
+        .name_hash = 3,
+        .first_seen_ms = 3_000,
+        .ended_since_ms = null,
+    };
+    note_marks(&stopped, 9_500, deadline, null, 2_000);
+    note_marks(&stopped, 14_500, deadline, 11_000, 7_000);
+    try std.testing.expectEqual(@as(?u64, 3_500), stopped.stop_wedged_base_ms);
 }
 
 test "a full start ledger is a failure, not a skip" {
