@@ -270,7 +270,9 @@ d-7)`, or `hello: already paused, no change`. Without a rollout, or once it is c
 [--to GENERATION]` (slice 8) applies one of the stored generations again as a new generation
 (users address versions by generation, owner 2026-11-05): without `--to`, the newest stored one
 below the current. It prints `hello: generation 7 → 8, restoring 6 (decision d-9)`; `-o json` prints
-the server's answer. `--to` is refused on any other command. The codes these relay, `ZC-E0125` to
+the server's answer. After an automatic rollback (say generation 7 failed and generation 8 restored
+6), a bare `zcube rollback` restores 7, the newest below the current: the broken one. Name the
+generation you want with `--to` (`zcube history` lists them). `--to` is refused on any other command. The codes these relay, `ZC-E0125` to
 `E0129`, are in [api.md](api.md), "Rollouts and history".
 
 ### Upgrading
