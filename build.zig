@@ -1418,8 +1418,8 @@ const c1_teeth_roots = [_]struct {
         .symptom = "J12",
         // The `job_pass_break` loop with the local job fence on: the fence falls on a node whose
         // steps skipped the job pass since its last good runs read, and J12 must say so. Sparse:
-        // seeds 2 and 44 of the evict world (measured 2026-11-15 over seeds 1..80, 225 and 44;
-        // seed 225 fails J6 first).
+        // J12 fails at seeds 2, 15, 44 and 48 of the evict world (measured 2026-11-15 over seeds
+        // 1..15, 41..48 and 225; seed 225 fails J6 first). The tooth runs 2 and 44.
         .canary_seeds = 1,
         .canary_first = 2,
         .also_seeds = &.{44},

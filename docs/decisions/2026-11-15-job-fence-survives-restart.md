@@ -61,8 +61,9 @@ A hung or slow call that uses up the term is a legitimate fence (seed 30 of the 
 showed one), which is why the first clause counts skipped passes rather than reads not tried.
 
 `sim-c1-teeth-job_pass_break_fenced` is the `job_pass_break` agent with the fence kept on: J12
-must fail it. It is sparse: seeds 2 and 44 of the evict world fail J12, and seed 225 fails J6
-first (see the measurement in the handoff of PR #262). The `job_pass_break` tooth itself (fence off, J6) is
+must fail it. It is sparse: measured over seeds 1..15, 41..48 and 225 of the evict world (300
+operations, `--c1`), J12 fails at seeds 2, 15, 44 and 48, seed 225 fails J6 first, and the rest
+pass; the tooth runs seeds 2 and 44. The `job_pass_break` tooth itself (fence off, J6) is
 unchanged.
 
 ## The runs-unread world reports what it tested
