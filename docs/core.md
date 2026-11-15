@@ -593,29 +593,52 @@ supervisor's rules, with the view of the mesh the agent compiled them from, are 
 simulated runtime receives them (`SimRuntime.on_mesh`). `src/sim_mesh_conns.zig` then models the
 supervisors' connections: each tick a supervisor with listeners may open one, trying its
 destination's endpoints in order; the destination accepts by its own rules; connections last
-10 ms to 10 s and close when an end stops or loses its rules, when a cut between two
-supervisors falls, or when a rule update removes their grant. One request in four is instead a
-direct dial: a workload that skips its own listeners and connects to a peer's mesh port, a peer
-its view holds ready, on a drawn port, which only the destination's grant check can refuse (M1's
-tooth needs it: listeners exist only for granted destinations). In the mesh world a started
-container reports `starting` for 1 to 4 s (`SimNode.warmup_ms`, drawn from the seed), so views
-hold replicas with an endpoint that are not ready yet (M4's tooth needs them). Its checks, at
-every tick:
+10 ms to 10 s and close when an end stops, when a cut between two supervisors falls, or when
+either holding end's rules drop their grant (the destination's accepts, the source's listeners).
+One request in four is instead a direct dial: a workload that skips its own listeners and
+connects to a peer's mesh port, a peer its view holds ready, on a drawn port, which only the
+destination's grant check can refuse (M1's tooth needs it: listeners exist only for granted
+destinations). An accepted dial is kept as a connection the destination alone holds
+(`Conn.source_held = false`), so M2 is judged at that end only
+(docs/decisions/2026-11-15-c4-m2-each-end.md). In the mesh world a started container reports
+`starting` for 1 to 4 s (`SimNode.warmup_ms`, drawn from the seed), so views hold replicas with
+an endpoint that are not ready yet (M4's tooth needs them). Each tick the model also reads the
+store's grants (`observe`; a grant counts only when both services exist with a mesh address,
+ZC-W0704). Its checks, at every tick:
 
-- **M1**: an accepted connection's grant is in the destination's view.
-- **M2**: an open connection whose grant its destination's rules dropped is closed within
-  `mesh_revoke_ms` (1,000 ms, owner answer O9). The sim closes it at the next tick, 100 ms.
+- **M1**: an accepted connection's grant is in the destination's view. After the heal, it is also
+  not accepted more than `truth_bound_ms` after its grant left the store.
+- **M2**: an open connection whose grant either holding end's view dropped is closed within
+  `mesh_revoke_ms` (1,000 ms, owner answer O9) of that view's delivery. The sim closes it at the
+  next tick, 100 ms. After the heal, it is also closed within `truth_bound_ms` of its grant
+  leaving the store. That time counts from the latest of the commit, the heal and the moment the
+  holding end's agent was up and reachable again. `truth_bound_ms` is `server_retry_ms_max +
+  mesh_revoke_ms + 2 * agent_resync_ms` (8 s), because an agent cut off is backing off at the
+  heal. Before the heal there is no such bound: a cut-off agent keeps its last rules.
 - **M4**: a connection reaches only a replica the source's view held ready and not draining,
   and is accepted only by one its own view held so. The destination's own `open` refuses an
   unready one, so the source side is where `mesh_route_unready` shows.
 
+At rest, after the heal and convergence (J10's style), every running mesh replica on a live node
+has a supervisor whose accepts are exactly the store's grants into its service. This is what
+catches an agent that stops sending rules: with `agent_mesh.update` returning 0, every seed of 1
+to 10 fails it, where the per-view checks passed them all.
+
 M5 and `mesh_no_drain` come with slice 6 (docs/demos/c4.md, "Cuts"). `--c4` is `--c1 --strong
 --mesh`; `auto` operations turn `--mesh` on too, and the `mesh` fault profile (weight 2:
 supervisor cuts of 1 to 10 s, slow agents, more grant churn) implies it, so auto worlds drawn
-before slice 5 differ (docs/decisions/2026-11-15-c4-sim-c4-worlds.md). The report adds three
-`mesh conns:` lines. `zig build sim-c4` runs it natively and as WASM; `sim-c4-teeth` runs
-`mesh_no_dst_check` (the destination skips its grant lookup; M1), `mesh_revoke_late` (connections
-outlive a revocation; M2) and `mesh_route_unready` (the plan routes to unready replicas; M4).
+before slice 5 differ (docs/decisions/2026-11-15-c4-sim-c4-worlds.md), and so do mesh worlds drawn
+before the fixups of #263 (the model now keeps direct dials). The report adds three `mesh conns:`
+lines. The first counts grant draws, supervisor cuts, routes to unready and to draining replicas,
+deliveries left unjudged past the model's 512 supervisors, and supervisors judged at rest. The
+second gives the longest time from a grant's removal to the close, over the run and after the heal
+(against `truth_bound_ms`), and past a view's delivery (against `mesh_revoke_ms`). The third
+counts direct dials. `zig build sim-c4` runs it natively and as WASM. `sim-c4-teeth` runs four
+teeth:
+- `mesh_no_dst_check`: the destination skips its grant lookup (M1).
+- `mesh_revoke_late`: connections outlive a revocation (M2).
+- `mesh_route_unready`: the plan routes to unready replicas (M4).
+- `mesh_stale_accept`: `rules_of` keeps every accept it once gave a replica (M1, M2 or M4).
 
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`, then
 `sim-c4` at 40 operations (`sim-c4: seed N`) and `sim-c4-teeth`.
