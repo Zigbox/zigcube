@@ -40,6 +40,9 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const agent_jobs = @import("agent_jobs.zig");
+const agent_mesh = @import("agent_mesh.zig");
+const mesh_plan = @import("mesh_plan.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
 const compare_sets = @import("compare_sets.zig");
@@ -105,6 +108,9 @@ pub const Context = struct {
     /// The agent's image store, for the summary it publishes as `/node-store/<node>`. Null
     /// publishes none (the tests that do not look at locality).
     images: ?node_store.Images = null,
+    /// Where a step reads the node's view of the mesh (C4 slice 4). Null gives no replica a
+    /// mesh (the simulator, and the tests that do not look at it).
+    mesh: ?agent_mesh.Source = null,
 
     pub fn mono_ms(ctx: *const Context) u64 {
         const clock = ctx.mono orelse ctx.clock;
@@ -139,6 +145,8 @@ pub const Config = struct {
     /// `HOST:PORT` of the node's peer server, as other nodes' fetches reach it; borrowed.
     peer: []const u8 = "",
     agent_version: []const u8 = "0.0.0",
+    /// The node's mesh ports and address (`agent_mesh.Config`); null gives no replica a mesh.
+    mesh: ?agent_mesh.Config = null,
 };
 
 /// The state file that holds the lease, in the agent's state directory.
@@ -251,6 +259,8 @@ pub const Agent = struct {
     pull_drops: u32,
     pull_drop_text: [pull_drop_text_bytes]u8,
     pull_drop_len: u8,
+    /// The mesh rules last sent to each local replica (`agent_mesh.Sent`).
+    mesh_sent: agent_mesh.Sent,
 
     const store_refusal_text_bytes = 160;
     const pull_drop_text_bytes = 200;
@@ -327,6 +337,7 @@ pub const Agent = struct {
         agent.steps = 0;
         agent.input_failure_run = 0;
         agent.input_failure_len = 0;
+        agent.mesh_sent = .{};
     }
 
     /// Notes that the server holds `run`'s `running` report (`running_reported`).
@@ -480,7 +491,10 @@ pub const Agent = struct {
     ) u32 {
         var acted: u32 = 0;
         pass.replicas(kept);
-        if (kept.stopped) return acted;
+        // The job pass runs even after a failure that is not the runtime's, in a replica stage
+        // (#247), in the loading or in the image summary (#142): it then makes one read (the
+        // runs) and no write, and stops the runs whose stop is decided.
+        if (kept.stopped and c1_teeth.job_pass_break) return acted;
         acted += kept.run(agent, ctx, "run the job pass", agent_jobs.pass(
             agent,
             ctx,
@@ -488,12 +502,22 @@ pub const Agent = struct {
             pass.given,
             kept,
         ));
-        if (kept.stopped) return acted;
-        kept.stage(agent, ctx, "stop orphan containers", pass.orphan_containers());
-        if (kept.stopped) return acted;
-        kept.stage(agent, ctx, "remove orphan records", pass.orphan_records());
-        if (kept.stopped) return acted;
-        acted += kept.run(agent, ctx, "flush the reports", pass.flush());
+        if (!kept.stopped) {
+            kept.stage(agent, ctx, "stop orphan containers", pass.orphan_containers());
+        }
+        if (!kept.stopped) kept.stage(agent, ctx, "remove orphan records", pass.orphan_records());
+        if (!kept.stopped) acted += kept.run(agent, ctx, "flush the reports", pass.flush());
+        // The mesh rules go out whatever stopped the stages before them, as the job pass does
+        // (#142, #247): they need only the runtime and this step's view, and a grant revoked in
+        // that view must not stay open for as long as a report, an orphan or the loading keeps
+        // failing (Review A of #263).
+        const plan = if (pass.mesh) |*known| known else return acted;
+        acted += kept.run(agent, ctx, "send the mesh rules", agent_mesh.update(
+            agent,
+            ctx,
+            listings,
+            plan,
+        ));
         return acted;
     }
 
@@ -533,7 +557,12 @@ pub const Agent = struct {
         // A grant or a keepalive moves the fence: the calls that follow are capped by the new one.
         agent.cap_calls(ctx);
         const listings = listed orelse try ctx.runtime.list(ctx.arena, ctx.diag);
-        try agent.publish_store(ctx, listings);
+        // The summary is advisory and the loading only feeds the stages: a failure of either
+        // that is not the runtime's (the server) is kept like a stage's, and the job pass still
+        // reads the runs and stops what they decide. A step that ended here withheld a committed
+        // stop for as long as these calls kept failing while the keepalive went on (#142).
+        var kept: Kept = .{};
+        kept.stage(agent, ctx, "publish the image summary", agent.publish_store(ctx, listings));
         if (agent.fence.active) return agent.fence_step(ctx, now);
         var pass: Pass = .{
             .agent = agent,
@@ -541,8 +570,12 @@ pub const Agent = struct {
             .listings = listings,
             .node_key = records.node_key(agent.config.node),
         };
-        try pass.load();
-        var kept: Kept = .{};
+        if (!kept.stopped) kept.stage(agent, ctx, "read the replicas and assignments", pass.load());
+        // Read even after a failure: the rules it plans go out whatever stopped (`stages`).
+        pass.mesh = try agent_mesh.plan_now(agent, ctx);
+        // A failed loading leaves nothing loaded: no replica is reconciled, and the job pass's
+        // subjects come from the listings and the start records alone.
+        if (kept.stopped) assert(pass.given.len == 0);
         acted += agent.stages(ctx, &pass, listings, &kept);
         agent.forget_finished_stops(listings);
         if (kept.err) |err| {
@@ -1021,6 +1054,8 @@ const Write = struct { key: []const u8, value: ?[]const u8 };
 pub const Kept = struct {
     err: ?Error = null,
     diag: ?Diag = null,
+    /// What the kept failure was doing, to describe it if a later one takes its place.
+    what: []const u8 = "",
     /// A failure that is not the runtime's (the server, the state directory, a crash): the
     /// stages after it are not run, as the step would have ended there before.
     stopped: bool = false,
@@ -1048,10 +1083,22 @@ pub const Kept = struct {
         };
     }
 
+    /// Only the runtime's failures (`RuntimeFailed`, `NotFound`) let the stages go on; any other
+    /// sets `stopped`. The step's error (what `why` shows) is the first failure that stopped the
+    /// stages, else the first failure: a runtime failure kept earlier must not hide the server
+    /// failure that cut the step's store calls short, so it is described instead.
     fn fail(kept: *Kept, agent: *Agent, ctx: *const Context, what: []const u8, err: Error) void {
-        if (err != error.RuntimeFailed and err != error.NotFound) kept.stopped = true;
-        if (kept.err != null) return agent.note_enforce_failure(ctx, what);
+        const stops = err != error.RuntimeFailed and err != error.NotFound;
+        if (kept.err != null) {
+            if (!stops or kept.stopped) return agent.note_enforce_failure(ctx, what);
+            const current = ctx.diag.*;
+            ctx.diag.* = kept.diag.?;
+            agent.note_enforce_failure(ctx, kept.what);
+            ctx.diag.* = current;
+        }
+        kept.stopped = stops;
         kept.err = err;
+        kept.what = what;
         // Kept by value: a copy in the arena could fail, and the error would then reach
         // `agent_run.fail` with no coded diagnostic (RB-S9).
         kept.diag = ctx.diag.*;
@@ -1072,6 +1119,10 @@ const Pass = struct {
     observed: []const controller.Entry(records.Observed) = &.{},
     writes: std.ArrayList(Write) = .empty,
     node_key: records.Key = undefined,
+    /// The step's mesh plan for the node; null without a mesh or when the view was not read.
+    mesh: ?mesh_plan.Plan = null,
+    /// Mesh ports given to replicas started in this step, not yet in any listing.
+    mesh_ports: std.ArrayList(u16) = .empty,
 
     fn load(pass: *Pass) Error!void {
         const ctx = pass.ctx.as_controller();
@@ -1102,8 +1153,6 @@ const Pass = struct {
             if (!wanted.contains(item.rec.id)) continue;
             mine.append(ctx.arena, item) catch return failures.no_memory(ctx.diag);
         }
-        pass.mine = mine.items;
-        pass.given = given.items;
         const prefix = records.observed_prefix(pass.agent.config.node);
         const seen = try controller.list_all(
             records.Observed,
@@ -1112,6 +1161,9 @@ const Pass = struct {
             null,
             constants.replicas_max,
         );
+        // Set together, after the last read: a failed loading leaves nothing half loaded.
+        pass.mine = mine.items;
+        pass.given = given.items;
         pass.observed = seen.items;
     }
 
@@ -1171,7 +1223,7 @@ const Pass = struct {
         if (listing) |found| {
             if (!is_this_replica(found, item)) return pass.replace_stale(found, item, seen);
             pass.agent.forget_stop(found.handle.name());
-            try pass.report(replica, seen, found.status);
+            try pass.report(replica, seen, found);
         } else if (seen) |record| {
             if (record.status != .stopped) try pass.report_lost(replica, record);
         } else {
@@ -1227,9 +1279,10 @@ const Pass = struct {
         pass: *Pass,
         replica: *const records.Replica,
         seen: ?*const records.Observed,
-        status: runtime.Status,
+        listing: *const runtime.Listing,
     ) Error!void {
         const now = pass.ctx.clock.now_ms();
+        const status = listing.status;
         var wanted: records.Observed = .{
             .replica = replica.id,
             .node = pass.agent.config.node,
@@ -1238,6 +1291,11 @@ const Pass = struct {
             .started_at_ms = if (seen) |record| record.started_at_ms orelse now else now,
             .reported_at_ms = now,
         };
+        if (pass.agent.config.mesh != null) {
+            if (agent_mesh.port_of(listing)) |port| {
+                wanted.endpoint = try agent_mesh.endpoint_text(pass.agent, pass.ctx, port);
+            }
+        }
         switch (status) {
             .starting => wanted.status = .starting,
             .running => {},
@@ -1301,11 +1359,22 @@ const Pass = struct {
         assert(replica.id.len > 0);
         var created_buffer: [20]u8 = undefined;
         const created = created_text(&created_buffer, created_revision);
-        const labels = [_]runtime.Label{
+        const plan = if (pass.mesh) |*known| known else null;
+        const ports = &pass.mesh_ports;
+        const listings = pass.listings;
+        const mesh = try agent_mesh.for_start(pass.agent, ctx, listings, plan, ports, replica.id);
+        var labels_buffer = [_]runtime.Label{
             .{ .key = runtime.label_replica, .value = replica.id },
             .{ .key = runtime.label_image, .value = replica.image },
             .{ .key = runtime.label_created, .value = created },
+            .{ .key = agent_mesh.label_port, .value = "" },
         };
+        const given: ?agent_mesh.Start = switch (mesh) {
+            .given => |chosen| chosen,
+            else => null,
+        };
+        if (given) |chosen| labels_buffer[3].value = chosen.label;
+        const labels = labels_buffer[0 .. @as(usize, 3) + @intFromBool(given != null)];
         const env = ctx.arena.alloc(runtime.EnvVar, replica.env.len) catch
             return failures.no_memory(ctx.diag);
         for (replica.env, env) |pair, *slot| slot.* = .{ .name = pair[0], .value = pair[1] };
@@ -1319,7 +1388,8 @@ const Pass = struct {
                 .cpu_millis = replica.limits.cpu_millis,
                 .memory_bytes = replica.limits.memory_bytes,
             },
-            .labels = &labels,
+            .labels = labels,
+            .mesh = if (given) |chosen| .{ .port = chosen.port, .rules = chosen.rules } else null,
         };
         const now = ctx.clock.now_ms();
         var observed: records.Observed = .{
@@ -1331,9 +1401,17 @@ const Pass = struct {
             .reported_at_ms = now,
         };
         if (runtime.spec_problem(&spec) != null) return pass.unstartable(&observed, replica);
+        if (mesh == .no_port) {
+            const failure = try agent_mesh.no_port_failure(pass.agent, ctx);
+            try pass.apply_exit(&observed, .{ .start_failed = failure });
+            return pass.put_observed(observed);
+        }
         const outcome = try ctx.runtime.start(&spec, ctx.diag);
         switch (outcome) {
-            .started => {},
+            .started => if (given) |chosen| {
+                observed.endpoint = chosen.endpoint;
+                pass.agent.mesh_sent.note(replica.id, runtime.mesh_rules_hash(&chosen.rules));
+            },
             .failed => |failure| try pass.apply_exit(&observed, .{ .start_failed = failure }),
         }
         try pass.put_observed(observed);
@@ -1496,9 +1574,16 @@ pub fn is_running(listing: ?*const runtime.Listing) bool {
 }
 
 /// Whether two observed records say the same thing about the container.
+fn same_text(first: ?[]const u8, second: ?[]const u8) bool {
+    const left = first orelse return second == null;
+    const right = second orelse return false;
+    return std.mem.eql(u8, left, right);
+}
+
 fn same_state(first: *const records.Observed, second: *const records.Observed) bool {
     if (first.status != second.status) return false;
     if (first.generation != second.generation) return false;
+    if (!same_text(first.endpoint, second.endpoint)) return false;
     if ((first.exit == null) != (second.exit == null)) return false;
     if (first.exit) |left| {
         if (!left.equal(second.exit.?)) return false;

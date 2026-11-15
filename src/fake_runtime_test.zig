@@ -971,3 +971,155 @@ test "relay fail closed: a relay that stops while the job runs takes the command
     const log = try dir.readFile(testing.io, fake_files.file_relay_log, &buffer);
     try testing.expect(std.mem.find(u8, log, "ZC-E0702") != null);
 }
+
+// ---- C4 slice 4: the mesh seam ------------------------------------------------------------------
+
+const linux = std.os.linux;
+
+/// A port nothing listens on now: the kernel's pick for a socket bound to port 0, then closed.
+fn free_port() !u16 {
+    const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(made) != .SUCCESS) return error.SocketFailed;
+    const fd: linux.fd_t = @intCast(made);
+    defer _ = linux.close(fd);
+    var address: linux.sockaddr.in = .{ .port = 0, .addr = 0 };
+    var size: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.bind(fd, @ptrCast(&address), size)) != .SUCCESS) return error.BindFailed;
+    if (linux.errno(linux.getsockname(fd, @ptrCast(&address), &size)) != .SUCCESS) {
+        return error.BindFailed;
+    }
+    return std.mem.bigToNative(u16, address.port);
+}
+
+/// True if a connection to `address:port` (host order) is accepted.
+fn reaches(address: u32, port: u16) bool {
+    const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(made) != .SUCCESS) return false;
+    const fd: linux.fd_t = @intCast(made);
+    defer _ = linux.close(fd);
+    const target: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, address),
+    };
+    return linux.errno(linux.connect(fd, &target, @sizeOf(linux.sockaddr.in))) == .SUCCESS;
+}
+
+const mesh_db: u32 = 0x7f4d0009; // 127.77.0.9
+
+fn mesh_rules(listener_port: ?u16) runtime.MeshRules {
+    const destinations = struct {
+        const list = [_]runtime.MeshDestination{.{
+            .service = "db",
+            .address = "127.77.0.9",
+            .endpoints = &.{.{ .replica = "db-1", .endpoint = "10.0.0.2:41000" }},
+        }};
+    };
+    var rules: runtime.MeshRules = .{ .destinations = &destinations.list };
+    if (listener_port) |port| {
+        const listeners = struct {
+            var list = [_]runtime.MeshListener{.{ .destination = 0, .port = 1 }};
+        };
+        listeners.list[0].port = port;
+        rules.listeners = &listeners.list;
+    }
+    return rules;
+}
+
+fn launch_meshed(
+    rig: *Rig,
+    name: []const u8,
+    port: u16,
+    rules: runtime.MeshRules,
+) !runtime.StartOutcome {
+    const labels = [_]runtime.Label{.{ .key = runtime.label_replica, .value = name }};
+    const value: runtime.Spec = .{
+        .name = name,
+        .image = "b3:51aa9c03",
+        .command = &forever,
+        .labels = &labels,
+        .mesh = .{ .port = port, .rules = rules },
+    };
+    var local: Diag = undefined;
+    local.reset();
+    return rig.fake.interface().start(&value, &local);
+}
+
+/// Waits up to ten seconds for the supervisor to report `rules` applied in full.
+fn wait_applied(rig: *Rig, name: []const u8, rules: *const runtime.MeshRules) !void {
+    var wanted: [16]u8 = undefined;
+    _ = try std.fmt.bufPrint(&wanted, "{x:0>16}", .{runtime.mesh_rules_hash(rules)});
+    const dir = try rig.fake.containers.openDir(testing.io, name, .{});
+    defer dir.close(testing.io);
+    for (0..1000) |_| {
+        var buffer: [32]u8 = undefined;
+        const text = dir.readFile(testing.io, fake_files.file_mesh_applied, &buffer) catch "";
+        if (std.mem.eql(u8, text, &wanted)) return;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.NotApplied;
+}
+
+test "a replica's mesh port listens, and its listeners follow mesh_update both ways" {
+    // Goal: O2's seam on the fake runtime. Method: a replica started with a mesh port and a
+    // listener for `db` on 127.77.0.9; both accept. An update with no listener closes it (the
+    // port stays); one that grants it again opens it; stopping the replica closes the port.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const port = try free_port();
+    const listener_port = try free_port();
+    const granted = mesh_rules(listener_port);
+    const handle = (try launch_meshed(rig, "web-1", port, granted)).started;
+    try wait_applied(rig, "web-1", &granted);
+    try testing.expect(reaches(0x7f000001, port));
+    try testing.expect(reaches(mesh_db, listener_port));
+    var local: Diag = undefined;
+    local.reset();
+    const revoked = mesh_rules(null);
+    try rig.fake.interface().mesh_update(handle, &revoked, &local);
+    try wait_applied(rig, "web-1", &revoked);
+    try testing.expect(!reaches(mesh_db, listener_port));
+    try testing.expect(reaches(0x7f000001, port));
+    const again = mesh_rules(listener_port);
+    try rig.fake.interface().mesh_update(handle, &again, &local);
+    try wait_applied(rig, "web-1", &again);
+    try testing.expect(reaches(mesh_db, listener_port));
+    try rig.fake.interface().stop(handle, 2000, &local);
+    try testing.expect(!reaches(0x7f000001, port));
+    try testing.expect(!reaches(mesh_db, listener_port));
+}
+
+test "a mesh port another process holds is ZC-E0710 and starts nothing" {
+    // Goal: a replica nobody could reach does not run (E0710, blamed on the node). Method: the
+    // test holds a listening socket on the port; the start fails and no command pid exists.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(made));
+    const fd: linux.fd_t = @intCast(made);
+    defer _ = linux.close(fd);
+    var address: linux.sockaddr.in = .{ .port = 0, .addr = 0 };
+    var size: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(fd, @ptrCast(&address), size)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(fd, 1)));
+    _ = linux.getsockname(fd, @ptrCast(&address), &size);
+    const port = std.mem.bigToNative(u16, address.port);
+    const outcome = try launch_meshed(rig, "web-2", port, mesh_rules(null));
+    try testing.expectEqualStrings("ZC-E0710", outcome.failed.code.slice());
+    try testing.expectError(error.Absent, rig.pid_of("web-2", fake_files.file_child));
+}
+
+test "mesh_update: an unknown container is NotFound; one without a mesh ignores it" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    var local: Diag = undefined;
+    local.reset();
+    const rules = mesh_rules(null);
+    const missing = rig.fake.interface().mesh_update(runtime.Handle.init("gone"), &rules, &local);
+    try testing.expectError(error.NotFound, missing);
+    local.reset();
+    const handle = try rig.begin("plain-1", &forever);
+    try rig.fake.interface().mesh_update(handle, &rules, &local);
+    const dir = try rig.fake.containers.openDir(testing.io, "plain-1", .{});
+    defer dir.close(testing.io);
+    try testing.expect(!fake_files.exists(testing.io, dir, fake_files.file_mesh));
+}

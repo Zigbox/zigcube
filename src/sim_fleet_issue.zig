@@ -12,16 +12,19 @@ test {
 }
 
 /// The producers a round runs (ops/sim-fleet/README.md): `sim_cluster --seeds A..B <ops> --shrink`,
-/// the same with `--c1`, and `sim_swarm --seeds A..B <ops> --shrink`. The kind is part of a
-/// failure's fingerprint, so one check failing in two kinds is two issues.
+/// the same with `--c1` or `--c4`, and `sim_swarm --seeds A..B <ops> --shrink`. The kind is part
+/// of a failure's fingerprint, so one check failing in two kinds is two issues.
 pub const kind_sim_cluster = "sim-cluster";
 pub const kind_sim_c1 = "sim-c1";
+pub const kind_sim_c4 = "sim-c4";
 pub const kind_sim_swarm = "sim-swarm";
 /// Not a simulator: the teeth canary (`run.sh`, `canary_pick`). A batch of it is one fault-on
 /// runner's run over fresh seeds, read with its simulator kind's parser and judged by
 /// `canary_verdict`: a miss or a wrong symptom is a failure of this kind.
 pub const kind_sim_canary = "sim-canary";
-pub const kinds = [_][]const u8{ kind_sim_cluster, kind_sim_c1, kind_sim_swarm, kind_sim_canary };
+pub const kinds = [_][]const u8{
+    kind_sim_cluster, kind_sim_c1, kind_sim_c4, kind_sim_swarm, kind_sim_canary,
+};
 
 comptime {
     // The state file refuses more kinds per day than this (sim_fleet_state.zig).
@@ -43,13 +46,14 @@ fn exe_step(kind: []const u8) []const u8 {
 }
 
 /// The start of the summary line of the runner, "<name>: seeds A..B, N operations: F of T failed".
-/// Each kind has a name of its own: `sim_cluster --c1` prints "sim-cluster --c1", so a range
-/// that ran without `--c1` is refused for sim-c1 (it would be counted as covered) and the other
-/// way round.
+/// Each kind has a name of its own: `sim_cluster --c1` prints "sim-cluster --c1" and `--c4`
+/// "sim-cluster --c4", so a range that ran without its flag is refused for sim-c1 and sim-c4 (it
+/// would be counted as covered) and the other way round.
 fn summary_prefix(kind: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, kind_sim_swarm)) return "sim-swarm: seeds ";
     if (std.mem.eql(u8, kind, kind_sim_canary)) return "sim-canary: seeds ";
     if (std.mem.eql(u8, kind, kind_sim_c1)) return "sim-cluster --c1: seeds ";
+    if (std.mem.eql(u8, kind, kind_sim_c4)) return "sim-cluster --c4: seeds ";
     return "sim-cluster: seeds ";
 }
 
@@ -362,11 +366,13 @@ pub fn canary_verdict(
 
 /// The command that runs the canary's whole range again.
 fn canary_replay(arena: std.mem.Allocator, canary: Canary) error{OutOfMemory}![]const u8 {
-    const c1: []const u8 = if (std.mem.eql(u8, canary.kind, kind_sim_c1)) " --c1" else "";
+    const flag: []const u8 = if (std.mem.eql(u8, canary.kind, kind_sim_c1))
+        " --c1"
+    else if (std.mem.eql(u8, canary.kind, kind_sim_c4)) " --c4" else "";
     return std.fmt.allocPrint(
         arena,
         "zig-out/bin/{s} --seeds {d}..{d} auto --profile=auto{s}",
-        .{ canary.runner, canary.first, canary.last, c1 },
+        .{ canary.runner, canary.first, canary.last, flag },
     );
 }
 
@@ -836,6 +842,7 @@ const swarm_unshrunk =
 const swarm_clean = "sim-swarm: seeds 1..20, 60 operations: 0 of 20 failed\n";
 const c1_clean = "sim-cluster --c1: seeds 1..8, 60 operations: 0 of 8 failed\n";
 const plain_clean = "sim-cluster: seeds 1..8, 60 operations: 0 of 8 failed\n";
+const c4_clean = "sim-cluster --c4: seeds 1..8, 60 operations: 0 of 8 failed\n";
 
 const swarm_crash =
     \\seed 7: CRASHED: reached unreachable code
@@ -887,6 +894,13 @@ test "each kind's real output parses: failures, shrinks, clean runs and crashes"
     try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_cluster, c1_clean));
     const plain = try parse(arena, kind_sim_cluster, plain_clean);
     try std.testing.expectEqual(@as(u64, 8), plain.seeds);
+    // sim-c4 reads only `--c4` ranges, and sim-c1 and the plain kind refuse them.
+    const c4_ok = try parse(arena, kind_sim_c4, c4_clean);
+    try std.testing.expectEqual(@as(u64, 8), c4_ok.seeds);
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_c4, c1_clean));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_c4, plain_clean));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_c1, c4_clean));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_cluster, c4_clean));
 }
 
 test "a summary's failure count must match the seed records before it" {
@@ -916,6 +930,12 @@ test "one check failing in two kinds is two fingerprints, and one kind keeps one
     const a = fingerprint(kind_sim_cluster, cluster.failures[0]);
     const b = fingerprint(kind_sim_c1, c1.failures[0]);
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
+    // The same failure read as sim-c4 is a third issue.
+    const c4_text = try std.mem.replaceOwned(u8, arena, c1_failing, " --c1", " --c4");
+    const c4 = try parse(arena, kind_sim_c4, c4_text);
+    const d = fingerprint(kind_sim_c4, c4.failures[0]);
+    try std.testing.expect(!std.mem.eql(u8, &b, &d));
+    try std.testing.expect(!std.mem.eql(u8, &a, &d));
     // Seeds 1 and 2 failed alike in the same kind.
     try std.testing.expectEqualStrings(&b, &fingerprint(kind_sim_c1, c1.failures[1]));
     const swarm_crashed = try parse(arena, kind_sim_swarm, swarm_crash);

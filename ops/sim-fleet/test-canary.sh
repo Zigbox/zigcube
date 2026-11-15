@@ -46,6 +46,7 @@ fake() { # runner kind symptom
     case "$2" in
     sim-swarm) sim=sim_swarm prefix=sim-swarm step=fetch c1="" ;;
     sim-c1) sim=sim_cluster prefix="sim-cluster --c1" step=faults c1=" --c1" ;;
+    sim-c4) sim=sim_cluster prefix="sim-cluster --c4" step=faults c1=" --c4" ;;
     *) sim=sim_cluster prefix=sim-cluster step=faults c1="" ;;
     esac
     check=$3

@@ -37,6 +37,9 @@ pub const file_relay_log = agent_records.file_relay_log;
 pub const file_relay_public = agent_records.file_relay_public;
 pub const file_relay_fault = agent_records.file_relay_fault;
 pub const file_pull = agent_records.file_pull;
+pub const file_mesh = agent_records.file_mesh;
+pub const file_mesh_applied = agent_records.file_mesh_applied;
+pub const file_mesh_log = agent_records.file_mesh_log;
 pub const FetchFile = agent_records.FetchFile;
 
 pub const Pair = agent_records.Pair;

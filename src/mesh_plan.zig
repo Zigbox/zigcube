@@ -30,9 +30,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const c1_teeth = @import("c1_teeth.zig");
+const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
 const mesh_address = @import("mesh_address.zig");
+const runtime = @import("runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -172,7 +175,8 @@ pub const Faults = struct {
 
 /// The rules of `node`.
 pub fn plan(arena: Allocator, input: *const Input, node: []const u8) Allocator.Error!Plan {
-    return compile(arena, input, node, .{});
+    // sim-c4's M4 tooth (`c1_teeth.zig`): false in every shipped program and test.
+    return compile(arena, input, node, .{ .route_unready = c1_teeth.mesh_route_unready });
 }
 
 /// `plan` with test-only faults on (the fuzzer's teeth). It exists only in a test build: in any
@@ -364,6 +368,69 @@ pub fn find_service(input: *const Input, name: []const u8) ?*const Service {
     const index = std.sort.binarySearch(Service, input.services, name, Order.compare) orelse
         return null;
     return &input.services[index];
+}
+
+/// Why an input from elsewhere (the agent's reply from the server) is not one `plan` may take:
+/// what `assert_input` and the plan's own assertions hold, checked rather than assumed.
+pub fn input_problem(input: *const Input) ?[]const u8 {
+    if (input.services.len > constants.services_max) return "it holds too many services";
+    if (input.replicas.len > constants.replicas_max) return "it holds too many replicas";
+    for (input.services, 0..) |*service, index| {
+        if (service.name.len == 0) return "a service has no name";
+        if (service.name.len > constants.service_name_bytes_max) return "a service's name is long";
+        if (service.mesh_address) |address| {
+            if (address.len == 0 or address.len > constants.mesh_address_text_bytes_max) {
+                return "a service's mesh address is not one";
+            }
+        }
+        if (service.allow.len > constants.service_allow_max) return "a service has many grants";
+        if (endpoints_counted(input, service.name) > constants.replicas_per_service_max) {
+            return "a service has more endpoints than it may have replicas";
+        }
+        if (index > 0 and std.mem.order(u8, input.services[index - 1].name, service.name) != .lt) {
+            return "the services are not in order of name, each once";
+        }
+        for (service.allow, 0..) |grant, at| {
+            if (grant.from.len == 0) return "a grant has no source";
+            const long = grant.from.len > constants.service_name_bytes_max;
+            if (long) return "a grant's source is long";
+            if (std.mem.eql(u8, grant.from, service.name)) return "a service grants itself";
+            if (grant.port == 0 or grant.port > std.math.maxInt(u16)) {
+                return "a grant's port is not a port";
+            }
+            for (service.allow[0..at]) |before| {
+                if (std.mem.eql(u8, before.from, grant.from) and before.port == grant.port) {
+                    return "a service holds a grant twice";
+                }
+            }
+        }
+    }
+    for (input.replicas, 0..) |*replica, index| {
+        if (replica.id.len == 0) return "a replica has no id";
+        if (find_service(input, replica.service) == null) return "a replica's service is missing";
+        if (replica.node == null and replica.readiness != .not_assigned) {
+            return "a replica on no node is not unassigned";
+        }
+        if (replica.endpoint) |endpoint| {
+            if (endpoint.len == 0 or endpoint.len > constants.mesh_endpoint_bytes_max) {
+                return "a replica's endpoint is not one";
+            }
+        }
+        if (index > 0 and !replica_less({}, input.replicas[index - 1], replica.*)) {
+            return "the replicas are not in order, each once";
+        }
+    }
+    return null;
+}
+
+fn endpoints_counted(input: *const Input, service: []const u8) u32 {
+    var count: u32 = 0;
+    for (input.replicas) |*replica| {
+        if (!std.mem.eql(u8, replica.service, service)) continue;
+        if (replica.node == null) continue;
+        count += @intFromBool(exclusion_of(replica) == null);
+    }
+    return count;
 }
 
 fn assert_input(input: *const Input) void {
@@ -613,6 +680,176 @@ fn service_of_replica(services: []const Service, replica: []const u8) ?[]const u
 }
 
 // ---- Tests ----
+
+// ---- One node's view, and one replica's rules (C4 slice 4) ----
+
+/// The part of `input` that `plan(_, node)` reads: every service, the replicas on `node`, and
+/// every replica of a service that grants one of those replicas' services. So
+/// `plan(input_for(x, n), n)` equals `plan(x, n)` (the test below), and what the server sends an
+/// agent (`GET /v1/agent/nodes/{node}/mesh`) names no replica the node has no use for.
+pub fn input_for(arena: Allocator, input: *const Input, node: []const u8) Allocator.Error!Input {
+    assert(node.len > 0);
+    assert_input(input);
+    var replicas: std.ArrayList(Replica) = .empty;
+    for (input.replicas) |replica| {
+        if (on_node(&replica, node) or grants_a_local_source(input, replica.service, node)) {
+            try replicas.append(arena, replica);
+        }
+    }
+    const result: Input = .{ .services = input.services, .replicas = replicas.items };
+    assert_input(&result);
+    return result;
+}
+
+fn on_node(replica: *const Replica, node: []const u8) bool {
+    const replica_node = replica.node orelse return false;
+    return std.mem.eql(u8, replica_node, node);
+}
+
+fn grants_a_local_source(input: *const Input, service: []const u8, node: []const u8) bool {
+    const destination = find_service(input, service) orelse return false;
+    for (destination.allow) |grant| {
+        for (input.replicas) |*replica| {
+            if (std.mem.eql(u8, replica.service, grant.from) and on_node(replica, node)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The rules of one local replica, as `Runtime.mesh_update` takes them: the destinations its
+/// listeners forward to, each with its endpoints in the order the replica tries them
+/// (`Destination.pick` from its `order_hash`), its listeners, and what it accepts. A replica the
+/// plan names nowhere gets empty rules: nothing to listen for, nothing accepted.
+pub fn rules_of(
+    arena: Allocator,
+    result: *const Plan,
+    replica: []const u8,
+) Allocator.Error!runtime.MeshRules {
+    assert(replica.len > 0);
+    // Plan destination index to rules destination index, for those this replica listens for.
+    const index_of = try arena.alloc(?u32, result.destinations.len);
+    @memset(index_of, null);
+    var destinations: std.ArrayList(runtime.MeshDestination) = .empty;
+    var listeners: std.ArrayList(runtime.MeshListener) = .empty;
+    for (result.listeners) |listener| {
+        if (!std.mem.eql(u8, listener.source, replica)) continue;
+        const slot = &index_of[listener.destination];
+        if (slot.* == null) {
+            slot.* = @intCast(destinations.items.len);
+            const destination = &result.destinations[listener.destination];
+            try destinations.append(arena, .{
+                .service = destination.service,
+                .address = destination.address,
+                .endpoints = try endpoints_in_order(arena, destination, listener.hash),
+            });
+        }
+        try listeners.append(arena, .{ .destination = slot.*.?, .port = listener.port });
+    }
+    var accepts: std.ArrayList(runtime.MeshAccept) = .empty;
+    for (result.accepts) |accept| {
+        if (!std.mem.eql(u8, accept.replica, replica)) continue;
+        try accepts.append(arena, .{
+            .from = accept.from,
+            .port = accept.port,
+            .open = accept.open,
+        });
+    }
+    // sim-c4's stale-accept tooth (`c1_teeth.zig`): false in every shipped program and test.
+    if (c1_teeth.mesh_stale_accept) try stale.keep(arena, replica, &accepts);
+    const rules: runtime.MeshRules = .{
+        .destinations = destinations.items,
+        .listeners = listeners.items,
+        .accepts = accepts.items,
+    };
+    // The bounds hold from the input's (`input_problem`): services, grants, a service's
+    // endpoints and every text within what a supervisor takes.
+    assert(runtime.mesh_rules_problem(&rules) == null);
+    return rules;
+}
+
+/// The stale-accept tooth's memory: every accept `rules_of` ever gave a replica, given again
+/// (open) after its grant is gone. Test-only (`c1_teeth.mesh_stale_accept`); a full table keeps
+/// what it has.
+const stale = struct {
+    const Entry = struct {
+        replica: u64,
+        from_buf: [constants.service_name_bytes_max]u8,
+        from_len: u8,
+        port: u16,
+
+        fn from(entry: *const Entry) []const u8 {
+            return entry.from_buf[0..entry.from_len];
+        }
+    };
+    var entries: [1024]Entry = undefined;
+    var count: u32 = 0;
+
+    fn keep(
+        arena: Allocator,
+        replica: []const u8,
+        accepts: *std.ArrayList(runtime.MeshAccept),
+    ) Allocator.Error!void {
+        const key = std.hash.Wyhash.hash(0, replica);
+        for (accepts.items) |accept| {
+            if (find(key, accept.from, accept.port) != null) continue;
+            if (count == entries.len) break;
+            assert(accept.from.len <= constants.service_name_bytes_max);
+            const entry = &entries[count];
+            entry.* = .{
+                .replica = key,
+                .from_buf = undefined,
+                .from_len = @intCast(accept.from.len),
+                .port = accept.port,
+            };
+            @memcpy(entry.from_buf[0..accept.from.len], accept.from);
+            count += 1;
+        }
+        next: for (entries[0..count]) |*entry| {
+            if (entry.replica != key) continue;
+            for (accepts.items) |accept| {
+                if (accept.port == entry.port and std.mem.eql(u8, accept.from, entry.from())) {
+                    continue :next;
+                }
+            }
+            const from = try arena.dupe(u8, entry.from());
+            try accepts.append(arena, .{ .from = from, .port = entry.port, .open = true });
+        }
+        // A supervisor takes accepts in order of source and port (`mesh_rules_problem`).
+        std.mem.sort(runtime.MeshAccept, accepts.items, {}, before);
+    }
+
+    fn before(_: void, left: runtime.MeshAccept, right: runtime.MeshAccept) bool {
+        return switch (std.mem.order(u8, left.from, right.from)) {
+            .lt => true,
+            .gt => false,
+            .eq => left.port < right.port,
+        };
+    }
+
+    fn find(key: u64, from: []const u8, port: u16) ?*const Entry {
+        for (entries[0..count]) |*entry| {
+            if (entry.replica != key or entry.port != port) continue;
+            if (std.mem.eql(u8, entry.from(), from)) return entry;
+        }
+        return null;
+    }
+};
+
+fn endpoints_in_order(
+    arena: Allocator,
+    destination: *const Destination,
+    hash: u64,
+) Allocator.Error![]const runtime.MeshEndpoint {
+    const endpoints = try arena.alloc(runtime.MeshEndpoint, destination.count());
+    for (endpoints, 0..) |*slot, attempt| {
+        const picked = destination.pick(hash, @intCast(attempt)).?;
+        slot.* = .{ .replica = picked.replica, .endpoint = picked.endpoint };
+    }
+    assert(destination.pick(hash, @intCast(endpoints.len)) == null);
+    return endpoints;
+}
 
 const testing = std.testing;
 
@@ -1102,4 +1339,27 @@ test "mesh plan: input_of drains removed and moved copies, drops stopped ones an
     try testing.expectEqualStrings("n2", found.endpoints[0].node);
     try testing.expectEqual(@as(usize, 2), found.excluded.len);
     for (found.excluded) |item| try testing.expectEqual(Exclusion.draining, item.exclusion);
+}
+
+test "mesh plan: input_problem refuses what the plan would assert on" {
+    // Goal: each refusal once, from a good input broken one field at a time.
+    var services = demo_services();
+    const replicas = [_]Replica{ready("db-1", "db", "n1", "10.0.0.1:7000")};
+    const good: Input = .{ .services = &services, .replicas = &replicas };
+    try testing.expect(input_problem(&good) == null);
+    const unknown = [_]Replica{ready("x-1", "nope", "n1", "10.0.0.1:7000")};
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &unknown }) != null);
+    var nowhere = replicas;
+    nowhere[0].node = null;
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &nowhere }) != null);
+    const twice = [_]Replica{ replicas[0], replicas[0] };
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &twice }) != null);
+    const self_grant = [_]records.Grant{.{ .from = services[0].name, .port = 1 }};
+    services[0].allow = &self_grant;
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &replicas }) != null);
+    const big_port = [_]records.Grant{.{ .from = "web", .port = 70000 }};
+    services[0].allow = &big_port;
+    try testing.expect(input_problem(&.{ .services = &services, .replicas = &replicas }) != null);
+    const backwards = [_]Service{ services[1], services[0] };
+    try testing.expect(input_problem(&.{ .services = &backwards, .replicas = &.{} }) != null);
 }

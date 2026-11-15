@@ -25,9 +25,12 @@ pub const ClusterProfile = enum(u8) {
     crash_heavy,
     /// Store outages and lost acknowledgements, with slow links, only.
     slow_store,
+    /// C4 slice 5: the mesh world's own faults: partitions between supervisors, slow agents
+    /// (delayed links) and grant churn (`sim_mesh_conns.zig`). Implies `--mesh`.
+    mesh,
 
     /// Draw weights, in the order of the enum.
-    pub const weights = [_]u32{ 3, 2, 2, 2, 2 };
+    pub const weights = [_]u32{ 3, 2, 2, 2, 2, 2 };
 
     comptime {
         assert(weights.len == @typeInfo(ClusterProfile).@"enum".field_names.len);
@@ -269,5 +272,5 @@ test "the profiles are drawn by weight, each one comes up, and a draw is pure" {
     try testing.expect(cluster[0] > cluster[1]);
     try testing.expectEqual(ClusterProfile.crash_heavy, ClusterProfile.parse("crash_heavy").?);
     try testing.expect(ClusterProfile.parse("nope") == null);
-    try testing.expect(ClusterProfile.from_index(5) == null);
+    try testing.expect(ClusterProfile.from_index(6) == null);
 }

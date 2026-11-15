@@ -108,7 +108,26 @@ pub const ZigboxRuntime = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .mesh_update = mesh_update_impl,
     };
+
+    /// Zigbox v0.5.0 cannot make a socket inside a container (ZB-1, C4 slice 7), so no container
+    /// of this runtime has a mesh to update: the call fails closed, and `start` refuses a spec
+    /// with a mesh the same way.
+    fn mesh_update_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        rules: *const runtime.MeshRules,
+        diag: *Diag,
+    ) runtime.Error!void {
+        _ = context;
+        _ = rules;
+        diag.raise(.E0711);
+        diag.cause("Zigbox has no sockets in a container yet (ZB-1)", .{});
+        diag.fix(.{ .sentence = "upgrade the runtime and the agent together" });
+        diag.while_("updating the mesh of container {s}", .{handle.name()});
+        return error.RuntimeFailed;
+    }
 
     /// Initialises in place (the tables are large): opens the directories and takes the lock.
     pub fn init(
@@ -195,6 +214,7 @@ pub const ZigboxRuntime = struct {
     ) runtime.Error!runtime.StartOutcome {
         self.reap();
         if (map.refusal(spec)) |reason| return .{ .failed = refusal_diagnostic(reason, spec) };
+        if (spec.mesh != null) return .{ .failed = no_mesh_diagnostic(spec) };
         const spec_file = self.launch_spec(spec);
         launch.write_spec(self.io, self.root, &spec_file) catch
             return runtime_failed(diag, "write the container's launch record");
@@ -664,6 +684,19 @@ fn pending_listing(
 // ---- Diagnostics -------------------------------------------------------------------------------
 
 /// Why Zigcube refused a spec Zigbox would have refused too, blamed on the service's author.
+/// A spec with a mesh, which this runtime cannot give a container yet (`mesh_update_impl`).
+fn no_mesh_diagnostic(spec: *const runtime.Spec) Diagnostic {
+    var collector: Diag = undefined;
+    collector.reset();
+    collector.raise(.E0711);
+    collector.cause("Zigbox has no sockets in a container yet (ZB-1)", .{});
+    collector.fix(.{ .sentence = "upgrade the runtime and the agent together" });
+    collector.while_("starting container {s}", .{spec.name});
+    var out: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&out, &collector);
+    return out;
+}
+
 fn refusal_diagnostic(reason: map.Refusal, spec: *const runtime.Spec) Diagnostic {
     var collector: Diag = undefined;
     collector.reset();

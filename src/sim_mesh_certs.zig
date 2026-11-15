@@ -106,18 +106,41 @@ pub const State = struct {
     }
 };
 
-const refusal_names = @typeInfo(service_cert.Refusal).error_set.error_names.?;
-const reasons = refusal_names.len;
+/// The refusals in `service_cert.Refusal`'s declaration order: the order of `by_reason`'s
+/// slots and of the report's line. Not the type info's `error_names`, whose order is the
+/// compilation's own (error values are global to it): native and WASM printed the slots in
+/// different orders, and their reports differed (sim-c4 at seed 43724588188).
+const refusals = [_]service_cert.Refusal{
+    error.no_replica,
+    error.wrong_node,
+    error.stale_epoch,
+    error.wrong_image,
+    error.short_pin,
+};
+const reasons = refusals.len;
+
+comptime {
+    // Every member of the set exactly once: a new refusal must be added here.
+    const names = @typeInfo(service_cert.Refusal).error_set.error_names.?;
+    assert(names.len == reasons);
+    for (names) |name| {
+        var found: u32 = 0;
+        for (refusals) |refusal| {
+            if (std.mem.eql(u8, @errorName(refusal), name)) found += 1;
+        }
+        assert(found == 1);
+    }
+}
 
 fn reason_index(refusal: service_cert.Refusal) usize {
-    inline for (refusal_names, 0..) |name, index| {
-        if (refusal == @field(service_cert.Refusal, name)) return index;
+    for (refusals, 0..) |member, index| {
+        if (refusal == member) return index;
     }
-    unreachable;
+    unreachable; // `refusals` covers every member of the set (the comptime block above).
 }
 
 pub fn reason_name(index: usize) []const u8 {
-    return refusal_names[index];
+    return @errorName(refusals[index]);
 }
 
 pub const Outcome = union(enum) {
@@ -459,6 +482,23 @@ fn forge_one(state: *State, ctx: *const controller.Context, nodes: anytype) void
 // ---- Tests -----------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "mesh: the report's refusal slots are in declaration order, native and WASM alike" {
+    // sim-c4 at seed 43724588188: the slots followed the compilation's error-name order, and
+    // the native and WASM reports printed them in different orders. wasm-test runs this too.
+    const expected = [_][]const u8{
+        "no_replica",
+        "wrong_node",
+        "stale_epoch",
+        "wrong_image",
+        "short_pin",
+    };
+    try testing.expectEqual(expected.len, reasons);
+    for (expected, 0..) |name, index| {
+        try testing.expectEqualStrings(name, reason_name(index));
+        try testing.expectEqual(index, reason_index(refusals[index]));
+    }
+}
 
 test "M6: a key certified for one replica and digest is refused for another" {
     var state: State = .init(1);

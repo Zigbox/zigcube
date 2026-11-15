@@ -53,10 +53,11 @@ const symptom_spec = @import("symptom.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--trace-steps]\n" ++
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--mesh] [--c4] [--trace-steps]\n" ++
     "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--expect-fail] [--trace-steps]\n";
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--mesh] [--c4] [--expect-fail] " ++
+    "[--trace-steps]\n";
 
 /// What the command line asked for.
 const Args = struct {
@@ -157,6 +158,10 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.options.strong = true;
     } else if (std.mem.eql(u8, arg, "--c1")) {
         parsed.options.c1 = true;
+    } else if (std.mem.eql(u8, arg, "--mesh")) {
+        parsed.options.mesh = true;
+    } else if (std.mem.eql(u8, arg, "--c4")) {
+        parsed.options.c4 = true;
     } else if (std.mem.eql(u8, arg, "--expect-symptom-any")) {
         parsed.expect_symptom_any = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
@@ -296,10 +301,15 @@ fn print_replay(
         runner, seed, operations, options.nodes orelse 0,
     });
     if (!options.liveness) try out.writeAll(" --liveness=false");
-    if (options.c1) try out.writeAll(" --c1");
+    // `--c4` is `--c1 --strong --mesh`; the line names it alone.
+    if (options.c4) try out.writeAll(" --c4");
+    if (options.c1 and !options.c4) try out.writeAll(" --c1");
     if (!options.jobs) try out.writeAll(" --jobs=false");
     // A tooth that needs the strong world implies it; the line says so anyway.
-    if (options.strong or c1_teeth.strong_world) try out.writeAll(" --strong");
+    const strong = options.strong or c1_teeth.strong_world;
+    if (strong and !options.c4) try out.writeAll(" --strong");
+    const mesh = options.mesh or c1_teeth.mesh_world;
+    if (mesh and !options.c4) try out.writeAll(" --mesh");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
     if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});
     if (options.lease_ttl_ms) |ttl| try out.print(" --lease-ttl-ms={d}", .{ttl});
@@ -361,8 +371,7 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         return constants.exit_ok;
     }
     const total = parsed.last_seed - parsed.first_seed + 1;
-    // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
-    const run_name: []const u8 = if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
+    const run_name = run_name_of(parsed);
     if (parsed.operations) |operations| {
         out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
             run_name, parsed.first_seed, parsed.last_seed, operations, failures, total,
@@ -375,6 +384,14 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
     }
     if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;
     return if (failures == 0) constants.exit_ok else constants.exit_user;
+}
+
+/// `--c1` and `--c4` say so: the fleet must not take a plain run for sim-c1 or sim-c4
+/// (src/sim_fleet_issue.zig).
+fn run_name_of(parsed: *const Args) []const u8 {
+    if (parsed.options.c4) return "sim-cluster --c4";
+    if (parsed.options.c1) return "sim-cluster --c1";
+    return "sim-cluster";
 }
 
 fn report_failure(

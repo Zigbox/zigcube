@@ -68,6 +68,13 @@ pub const file_relay_fault = "relay.fault";
 /// Written by `zcube-agent fetch --report` when a fetch succeeds (C2 slice 7): a `records.Pull`
 /// the agent publishes under `/pulls/` and then removes.
 pub const file_pull = "pull.json";
+/// C4 slice 4, the fake runtime's mesh: the rules the supervisor is to hold (`MeshFile`, put by
+/// `start` and by each `mesh_update`, which then wakes the supervisor with `SIGUSR2`), the hash
+/// of the rules it holds now (`runtime.mesh_rules_hash`, 16 hex digits, written once they are
+/// applied) and its log of coded events.
+pub const file_mesh = "mesh.json";
+pub const file_mesh_applied = "mesh.applied";
+pub const file_mesh_log = "mesh.log";
 
 /// `fetch.json`.
 pub const FetchFile = struct {
@@ -103,13 +110,20 @@ pub const SpecFile = struct {
     relay_server_name: []const u8 = "",
     relay_server_anchor: []const u8 = "",
     relay_plain: bool = false,
+    /// C4: the container's mesh port (`runtime.Spec.mesh`); its rules are in `mesh.json`.
+    mesh_port: ?u16 = null,
     started_at_ms: u64,
+};
+
+/// `mesh.json`: the rules the container's supervisor is to hold.
+pub const MeshFile = struct {
+    rules: runtime.MeshRules,
 };
 
 pub const RunKind = enum { exited, signaled, oom, pid_limit, start_failed, lost };
 
 /// Whose fault a start that failed was, so that the agent can blame correctly.
-pub const Blame = enum { user, environment, fetch, relay };
+pub const Blame = enum { user, environment, fetch, relay, mesh };
 
 /// `run.json`.
 pub const RunFile = struct {
@@ -165,6 +179,9 @@ const stale_files = [_][]const u8{
     file_relay_certificate,
     file_relay_refused,
     file_relay_fault,
+    file_mesh,
+    file_mesh_applied,
+    file_mesh_log,
 };
 
 /// Starts the container's record: clears what an older container of the name left (a stopped
@@ -247,6 +264,40 @@ pub fn write_run(state: AgentState, name: []const u8, run: *const RunFile) agent
     const bytes = try json_bytes(&buffer, run.*);
     var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
     try state.put_atomic(path(&path_buffer, name, file_run), bytes);
+}
+
+/// Puts `mesh.json` whole (a reader never sees half of it). `TooBig` if the rules do not fit
+/// `agent_state.file_bytes_max`.
+pub fn write_mesh(
+    state: AgentState,
+    name: []const u8,
+    rules: *const runtime.MeshRules,
+) agent_state.Error!void {
+    const Buffer = struct {
+        // Not on the stack: the rules can be most of `file_bytes_max`. The agent is
+        // single-threaded, and so is each caller of this.
+        var bytes: [agent_state.file_bytes_max]u8 = undefined;
+    };
+    const file: MeshFile = .{ .rules = rules.* };
+    const bytes = try json_bytes(&Buffer.bytes, file);
+    var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
+    try state.put_atomic(path(&path_buffer, name, file_mesh), bytes);
+}
+
+/// `mesh.json`, null if absent or damaged.
+pub fn read_mesh(
+    state: AgentState,
+    arena: Allocator,
+    name: []const u8,
+) agent_state.Error!?MeshFile {
+    var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
+    const bytes = state.read(arena, path(&path_buffer, name, file_mesh)) catch |err| switch (err) {
+        error.Absent => return null,
+        else => |other| return other,
+    };
+    const file = (try parse(MeshFile, arena, bytes)) orelse return null;
+    if (runtime.mesh_rules_problem(&file.rules) != null) return null;
+    return file;
 }
 
 fn parse(comptime T: type, arena: Allocator, bytes: []const u8) agent_state.Error!?T {
@@ -335,8 +386,8 @@ fn exit_reason(name: []const u8, run: RunFile) runtime.ExitReason {
 pub const fix_e0702 = "do what the cause names: free file descriptors on the node, correct " ++
     "the relay in the server's `relays` setting, or resubmit a job from before B4";
 
-/// ZC-E0601 (the fetch), ZC-E0702 (the relay), ZC-E0508 (the user's command) or ZC-E0507 (the
-/// host), as the supervisor recorded.
+/// ZC-E0601 (the fetch), ZC-E0702 (the relay), ZC-E0710 (the mesh port), ZC-E0508 (the user's
+/// command) or ZC-E0507 (the host), as the supervisor recorded.
 pub fn start_failure(name: []const u8, run: RunFile) Diagnostic {
     var collector: Diag = undefined;
     collector.reset();
@@ -350,6 +401,11 @@ pub fn start_failure(name: []const u8, run: RunFile) Diagnostic {
         collector.raise(.E0702);
         collector.cause("{s}", .{cause});
         const sentence = fix_e0702;
+        collector.fix(.{ .sentence = sentence });
+    } else if ((run.blame orelse .environment) == .mesh) {
+        collector.raise(.E0710);
+        collector.cause("{s}", .{cause});
+        const sentence = "free ports in the range, or give the agent another range";
         collector.fix(.{ .sentence = sentence });
     } else if ((run.blame orelse .environment) == .user) {
         collector.raise(.E0508);
@@ -525,6 +581,37 @@ const UnreadableState = struct {
         return base(context).inner.interface().list(arena, prefix);
     }
 };
+
+test "mesh rules round-trip through mesh.json; damaged or ill-formed ones read as none" {
+    // Goal: what `mesh_update` puts is what the supervisor reads, hash for hash, and a file it
+    // cannot trust is no rules at all (the supervisor then keeps what it holds).
+    var state = agent_state.SimState.init(testing.allocator, 1);
+    defer state.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const agent = state.interface();
+    const rules: runtime.MeshRules = .{
+        .destinations = &.{.{
+            .service = "db",
+            .address = "127.77.0.3",
+            .endpoints = &.{.{ .replica = "db-1", .endpoint = "10.0.0.2:30000" }},
+        }},
+        .listeners = &.{.{ .destination = 0, .port = 5432 }},
+        .accepts = &.{.{ .from = "web", .port = 80, .open = true }},
+    };
+    try testing.expectEqual(@as(?MeshFile, null), try read_mesh(agent, arena, "web-1"));
+    try write_mesh(agent, "web-1", &rules);
+    const read = (try read_mesh(agent, arena, "web-1")).?;
+    try testing.expectEqual(runtime.mesh_rules_hash(&rules), runtime.mesh_rules_hash(&read.rules));
+    try agent.put_atomic("containers/web-1/mesh.json", "{not json");
+    try testing.expectEqual(@as(?MeshFile, null), try read_mesh(agent, arena, "web-1"));
+    const unordered =
+        \\{"rules":{"listeners":[{"destination":0,"port":5432}]}}
+    ;
+    try agent.put_atomic("containers/web-1/mesh.json", unordered);
+    try testing.expectEqual(@as(?MeshFile, null), try read_mesh(agent, arena, "web-1"));
+}
 
 test "a spec the host cannot read hides only its own container from a scan" {
     // Goal: one unreadable spec (Io, not damage) is skipped and the others are still found.

@@ -70,6 +70,11 @@ comptime {
     const longest = dir.len + constants.job_run_id_bytes_max + suffix.len;
     assert(longest <= agent_state.name_bytes_max);
     assert(constants.agent_node_runs_max * 2 <= agent_state.files_max);
+    // A failed store read always stops the stages (`Kept.fail`): `pass` asserts it.
+    for (@typeInfo(controller.Error).error_set.error_names.?) |name| {
+        assert(!std.mem.eql(u8, name, "RuntimeFailed"));
+        assert(!std.mem.eql(u8, name, "NotFound"));
+    }
 }
 
 const Found = union(enum) { absent, damaged, record: StartRecord };
@@ -241,19 +246,45 @@ pub fn pass(
         null,
         constants.agent_node_runs_max,
     )).items;
-    const prefix = records.job_observed_prefix(agent.config.node);
-    work.observed = (try controller.list_all(
-        records.JobObserved,
-        &cctx,
-        prefix.slice(),
-        null,
-        constants.job_admitted_window_max,
-    )).items;
+    // A stage before this one failed with a failure that is not the runtime's (the server): no
+    // report goes out, but every stop the runs' records already decide still does (#247). A
+    // failed read of the reports is kept the same way: the runs above already say which stops
+    // are committed, and a step that ended here withheld them while heartbeats went on, past
+    // J6's bound (#142, seed 2821617909).
+    if (!kept.stopped) {
+        const prefix = records.job_observed_prefix(agent.config.node);
+        if (controller.list_all(
+            records.JobObserved,
+            &cctx,
+            prefix.slice(),
+            null,
+            constants.job_admitted_window_max,
+        )) |observed| {
+            work.observed = observed.items;
+        } else |err| {
+            kept.stage(agent, ctx, "read the runs' reports", err);
+            // `Kept.fail`: only RuntimeFailed and NotFound do not stop, and a store read
+            // returns neither (checked at compile time below).
+            assert(kept.stopped);
+        }
+    }
     // One run's failing step must not starve the runs after it (#205): like a replica's, it is
-    // kept and the next run is looked at; only a failure that is not the runtime's ends the pass.
+    // kept and the next run is looked at. After a failure that is not the runtime's (the server:
+    // a lost answer to a committed write is one), each run whose stop needs no store call, this
+    // one included, is still stopped (#247, #248): a stop committed for a run later in name
+    // order is not held back a step by an earlier run's report. A failure in this loop ends the
+    // pass's store calls at once (`stop_only` makes none); one in an earlier stage (agent.zig
+    // `stages`), in the loading or in the image summary (`reconcile`) leaves the pass the one
+    // read of the runs above, and no write.
+    // `stop_only` follows a failed `one` on the same subject, which may already have stopped a
+    // stale container: the repeated grace-0 stop is harmless on a real host (`pending_stop`
+    // keeps one). In the simulation a state-directory crash in mid-step is folded into
+    // `node.sim.crashed` only after the step, so such a stop can still reach the runtime there.
     for (subjects) |subject| {
-        if (kept.stopped) break;
-        kept.stage(agent, ctx, "reconcile a run", work.one(subject));
+        // Test-only: the pass ends at the first failure that is not the runtime's (J6).
+        if (c1_teeth.job_pass_break and kept.stopped) break;
+        if (!kept.stopped) kept.stage(agent, ctx, "reconcile a run", work.one(subject));
+        if (kept.stopped) kept.stage(agent, ctx, "stop a run", work.stop_only(subject));
         if (agent.fence.active) break;
     }
     return work.commits;
@@ -411,6 +442,45 @@ const Work = struct {
                 return work.gone(subject, record, seen, run);
             },
         }
+    }
+
+    /// The part of `one` that needs no store call, for a pass that may make none (a failure that
+    /// is not the runtime's came before): a running container of this run is stopped if `one`
+    /// would stop it from what the pass already holds, its cause recorded first. Its report waits
+    /// for the next pass, which finds the cause in the start record.
+    fn stop_only(work: *Work, subject: Subject) Error!void {
+        const ctx = work.ctx;
+        try work.stop_stale(subject.id);
+        const listing = work.listing_of(subject.id) orelse return;
+        if (!is_running(listing)) return;
+        const run = work.run_of(subject.id);
+        const found = try read_record(ctx, work.state, subject.id);
+        const record = switch (found) {
+            .record => |held| held,
+            .absent, .damaged => {
+                // As `unknown`: no record says what was started, so it is stopped.
+                const grace = if (run) |entry| entry.rec.grace_ms else 0;
+                return work.stop(listing, grace);
+            },
+        };
+        // A start record of an earlier job of this name: `listing_of` only found a container of
+        // this one, which `one` judges as `unknown` when it has no record of its own.
+        if (work.is_stale_epoch(subject.id, record.epoch)) {
+            const grace = if (run) |entry| entry.rec.grace_ms else 0;
+            return work.stop(listing, grace);
+        }
+        var current = record;
+        if (current.stop_cause == null) {
+            current.stop_cause = work.cause_to_stop(current, run, ctx.mono_ms()) orelse
+                if (run == null) records.StopCause.@"unreachable" else null;
+            if (current.stop_cause == null) return;
+            // A container exists, so a claim was committed before it started (as `running`).
+            current.phase = .claimed;
+            try write_record(ctx, work.state, &current);
+        }
+        assert(current.stop_cause != null);
+        const grace = if (run) |entry| entry.rec.grace_ms else current.grace_ms;
+        try work.stop(listing, grace);
     }
 
     /// A container or a claim and no start record: the agent cannot tell what it started.
@@ -1264,6 +1334,7 @@ pub fn raise_spec(diag: *Diag, run: []const u8, problem: runtime.SpecProblem) vo
             "network: {s} has a relay, so its network must be loopback only",
             .{run},
         ),
+        .bad_mesh => diag.cause("mesh: {s} has a mesh port of 0 or ill-formed rules", .{run}),
     }
     diag.fix(.{ .sentence = "submit the job again with that field corrected, and report this " ++
         "with the diagnostic bundle: the API should have refused it" });

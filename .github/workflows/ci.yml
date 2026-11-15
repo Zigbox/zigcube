@@ -407,6 +407,16 @@ jobs:
       # the old ttl / 3 renewal rule must fail it.
       - name: Fencing negative test
         run: zig build sim-fencing-teeth --summary all
+      # sim-c4 (docs/core.md, "sim-c4"): the mesh's M1, M2 and M4, against each end's view and the
+      # store's grants, native against WASM; then its negative tests, each of which must fail.
+      - name: sim-c4, native and WASM, seed 1
+        run: zig build sim-c4 --summary all
+      - name: sim-c4, native and WASM, seed of this run
+        run: |
+          echo "seed ${{ github.run_id }}"
+          zig build sim-c4 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
+      - name: sim-c4 negative tests
+        run: zig build sim-c4-teeth --summary all
 
   # The sim-c1 negative tests (about 22 minutes), apart from the other simulations so that no job
   # nears its timeout (docs/decisions/2026-11-09-sim-job-split.md).

@@ -30,6 +30,10 @@ const Diag = diag_mod.Diag;
 
 pub const SimNode = struct {
     containers: sim_runtime.SimRuntime,
+    /// How long a started container reports `starting` (its supervisor up, the command not yet)
+    /// before `running`; 0: at once. sim-c4's mesh world sets it, so that views hold replicas
+    /// with an endpoint that are not yet ready (M4's tooth needs them).
+    warmup_ms: u64 = 0,
     files: agent_state.SimState,
     clock: Clock,
     /// A write point or step boundary fired: the agent is dead until `restart`.
@@ -46,7 +50,20 @@ pub const SimNode = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .mesh_update = mesh_update_impl,
     };
+
+    fn mesh_update_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        rules: *const runtime.MeshRules,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const node = from(context);
+        if (node.crashed) return node.dead(diag);
+        // No crash point: the agent's sends of mesh rules do not move a world's crashes.
+        return node.containers.interface().mesh_update(handle, rules, diag);
+    }
 
     pub fn init(
         node: *SimNode,
@@ -365,7 +382,8 @@ pub const SimNode = struct {
             .absent => {},
             .alive => {
                 facts.supervisor_alive = true;
-                facts.child_exists = true;
+                // The command is up once the warm-up has passed (at once, without one).
+                facts.child_exists = facts.age_ms >= node.warmup_ms;
             },
             .ended => |run| {
                 facts.supervisor_pid_exists = true;

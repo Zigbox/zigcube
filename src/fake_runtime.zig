@@ -114,6 +114,7 @@ pub const FakeRuntime = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .mesh_update = mesh_update_impl,
     };
 
     /// Initialises in place (the tables are large): creates the directories and takes the lock.
@@ -188,6 +189,7 @@ pub const FakeRuntime = struct {
         var path_buffer: [constants.state_path_bytes_max]u8 = undefined;
         const path = try self.container_path(&path_buffer, spec.name, diag);
         if (fetched) try self.write_fetch(dir, spec, diag);
+        if (spec.mesh) |*mesh| try self.write_mesh(spec.name, &mesh.rules, diag);
         self.fault_at_start(dir, spec.name);
         try self.spawn_supervisor(path, spec.name, diag);
         return self.await_start(dir, spec.name, diag);
@@ -281,6 +283,7 @@ pub const FakeRuntime = struct {
             .relay_server_name = spec.relay_server_name,
             .relay_server_anchor = spec.relay_server_anchor,
             .relay_plain = spec.relay_plain,
+            .mesh_port = if (spec.mesh) |mesh| mesh.port else null,
             .started_at_ms = self.clock.now_ms(),
         };
     }
@@ -446,6 +449,55 @@ pub const FakeRuntime = struct {
             return;
         };
         signal(child, if (number == runtime.signal_kill) .KILL else .TERM);
+    }
+
+    // ---- the mesh (C4 slice 4) ----
+
+    /// Puts the rules in `mesh.json` and wakes the supervisor with `SIGUSR2`; it does not wait
+    /// for them to be applied (`mesh.applied` says when). A supervisor that misses the signal
+    /// (it is not up yet, or the agent restarted) reads the file within `fake_mesh_poll_ms`.
+    fn mesh_update_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        rules: *const runtime.MeshRules,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const self = from(context);
+        const dir = self.containers.openDir(self.io, handle.name(), .{}) catch
+            return not_found(diag, handle);
+        defer dir.close(self.io);
+        var arena_state = std.heap.ArenaAllocator.init(self.options.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const read = agent_records.read_spec(self.state.interface(), arena, handle.name());
+        const record = read catch |err| return state_failed(diag, err, "read the record");
+        const spec = record orelse
+            return not_found(diag, handle);
+        if (spec.mesh_port == null) return;
+        const status = try self.status_of(arena, dir, handle.name(), diag);
+        if (status == .stopped) return;
+        try self.write_mesh(handle.name(), rules, diag);
+        const supervisor = files.read_pid(self.io, dir, files.file_supervisor) catch return;
+        if (self.is_our_supervisor(supervisor)) signal(supervisor, .USR2);
+    }
+
+    fn write_mesh(
+        self: *FakeRuntime,
+        name: []const u8,
+        rules: *const runtime.MeshRules,
+        diag: *Diag,
+    ) runtime.Error!void {
+        agent_records.write_mesh(self.state.interface(), name, rules) catch |err| switch (err) {
+            error.TooBig => {
+                diag.raise(.E0502);
+                diag.cause("the mesh rules of {s} are larger than the fake runtime's {d} bytes", .{
+                    name, agent_state.file_bytes_max,
+                });
+                diag.fix(.{ .sentence = "run fewer services or grants on the fake runtime" });
+                return error.RuntimeFailed;
+            },
+            else => |other| return state_failed(diag, other, "write the container's mesh rules"),
+        };
     }
 
     fn kill_and_wait(self: *FakeRuntime, dir: Dir, child: i32) void {

@@ -484,10 +484,10 @@ breaks I7; a node that registers again between a controller's read of a report a
 commit (as if the tenure were not compared) breaks I3; a scheduler that ranks locality ahead of
 spread breaks L1 (C2 slice 5: each placement is no worse on spread, among the nodes that fit, than an order of fit and
 spread alone would choose, `scheduler.placement_problem`; every node holds a seed-chosen subset of
-the images and advertises it as `/node-store/<node>`).  The job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late|deadline_offline|gap`, and the later `stale|refused_loop|unclaimed|wipe|evicted`): an
+the images and advertises it as `/node-store/<node>`).  The job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late|deadline_offline|gap`, and the later `stale|refused_loop|unclaimed|wipe|evicted|pass_break`): an
 agent that starts a stopped run again breaks J2; one that skips its claim breaks J7; a scheduler
 that leaves the run's compare out of a placement, with a `stop` committed between its read and its commit, breaks J5; a controller that rewrites a terminal status breaks J3; an
-agent that ignores a cancel breaks J6; one that ignores the deadline, enforces it 9 s late, or enforces it only when it can reach the server (with cuts of up to 33 s and short deadlines turned up, so that deadlines fall in them), breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
+agent that ignores a cancel breaks J6, and so does one whose job pass ends at the first failure of the server (`job_pass_break`, the agent before #247's fix: an orphan's committed stop waits for the next pass, seeds 225 and 5 of the `job_evicted` world), and so does a server that cuts a node's runs read while a stop is asked and answers its keepalives (`job_runs_unread`, not an agent fault but a gap, owner chose option B (not yet built), docs/decisions/2026-11-14-j6-runs-unread-gap.md; seeds 2, 4 and 7); one that ignores the deadline, enforces it 9 s late, or enforces it only when it can reach the server (with cuts of up to 33 s and short deadlines turned up, so that deadlines fall in them), breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
 `sim-c1-teeth-job_evicted`: a job controller that judges only the first 512 jobs of each sweep (test-only, `job_controller.zig`) never ends an unplaceable job past the 512th, which J8's second clause (read over `job_admitted_window_max` runs, and a refused list is a failure) catches in the burst world with `--strong`; seed 186 (seed 32 until B2.1 slice 6; the fleet canary runs 1..186; `docs/decisions/2026-11-11-job-evicted-tooth-sparse.md`). switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
 `zcube-agent` assert at compile time that none is on.
 
@@ -581,7 +581,64 @@ certificate was issued for a stale epoch"), `mesh_issue_any_node` (the issuer's 
 assignment of the id on any node; M3, "a certificate was issued for a replica not assigned to the
 node"), `mesh_reuse_key` (a new replica takes the key last made for its service on its node; M6,
 "a key was certified for two") and `mesh_renew_late` (supervisors renew only at expiry; M3r); all
-imply `strong` and are in the canary list until slice 5 brings sim-c4.
+imply `strong` and stay in `sim-c1-teeth` and its canaries (sim-c4 adds its own).
 `docs/decisions/2026-11-14-c4-service-certs.md`, `docs/decisions/2026-11-14-c4-service-cert-rulings.md`.
 
-`zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.
+### sim-c4: services that connect (C4 slice 5)
+
+`--mesh` turns the mesh on in the cluster simulation: each simulated node is an agent with a mesh
+host (`10.1.0.<index + 1>`, `sim_mesh_conns.host_of`), services are applied with grants drawn
+from the seed (`sim_mesh_conns.draw_allow`, per other service and port 8080 or 5432), and every
+supervisor's rules, with the view of the mesh the agent compiled them from, are kept as the
+simulated runtime receives them (`SimRuntime.on_mesh`). `src/sim_mesh_conns.zig` then models the
+supervisors' connections: each tick a supervisor with listeners may open one, trying its
+destination's endpoints in order; the destination accepts by its own rules; connections last
+10 ms to 10 s and close when an end stops, when a cut between two supervisors falls, or when
+either holding end's rules drop their grant (the destination's accepts, the source's listeners).
+One request in four is instead a direct dial: a workload that skips its own listeners and
+connects to a peer's mesh port, a peer its view holds ready, on a drawn port, which only the
+destination's grant check can refuse (M1's tooth needs it: listeners exist only for granted
+destinations). An accepted dial is kept as a connection the destination alone holds
+(`Conn.source_held = false`), so M2 is judged at that end only
+(docs/decisions/2026-11-15-c4-m2-each-end.md). In the mesh world a started container reports
+`starting` for 1 to 4 s (`SimNode.warmup_ms`, drawn from the seed), so views hold replicas with
+an endpoint that are not ready yet (M4's tooth needs them). Each tick the model also reads the
+store's grants (`observe`; a grant counts only when both services exist with a mesh address,
+ZC-W0704). Its checks, at every tick:
+
+- **M1**: an accepted connection's grant is in the destination's view. After the heal, it is also
+  not accepted more than `truth_bound_ms` after its grant left the store.
+- **M2**: an open connection whose grant either holding end's view dropped is closed within
+  `mesh_revoke_ms` (1,000 ms, owner answer O9) of that view's delivery. The sim closes it at the
+  next tick, 100 ms. After the heal, it is also closed within `truth_bound_ms` of its grant
+  leaving the store. That time counts from the latest of the commit, the heal and the moment the
+  holding end's agent was up and reachable again. `truth_bound_ms` is `server_retry_ms_max +
+  mesh_revoke_ms + 2 * agent_resync_ms` (8 s), because an agent cut off is backing off at the
+  heal. Before the heal there is no such bound: a cut-off agent keeps its last rules.
+- **M4**: a connection reaches only a replica the source's view held ready and not draining,
+  and is accepted only by one its own view held so. The destination's own `open` refuses an
+  unready one, so the source side is where `mesh_route_unready` shows.
+
+At rest, after the heal and convergence (J10's style), every running mesh replica on a live node
+has a supervisor whose accepts are exactly the store's grants into its service. This is what
+catches an agent that stops sending rules: with `agent_mesh.update` returning 0, every seed of 1
+to 10 fails it, where the per-view checks passed them all.
+
+M5 and `mesh_no_drain` come with slice 6 (docs/demos/c4.md, "Cuts"). `--c4` is `--c1 --strong
+--mesh`; `auto` operations turn `--mesh` on too, and the `mesh` fault profile (weight 2:
+supervisor cuts of 1 to 10 s, slow agents, more grant churn) implies it, so auto worlds drawn
+before slice 5 differ (docs/decisions/2026-11-15-c4-sim-c4-worlds.md), and so do mesh worlds drawn
+before the fixups of #263 (the model now keeps direct dials). The report adds three `mesh conns:`
+lines. The first counts grant draws, supervisor cuts, routes to unready and to draining replicas,
+deliveries left unjudged past the model's 512 supervisors, and supervisors judged at rest. The
+second gives the longest time from a grant's removal to the close, over the run and after the heal
+(against `truth_bound_ms`), and past a view's delivery (against `mesh_revoke_ms`). The third
+counts direct dials. `zig build sim-c4` runs it natively and as WASM. `sim-c4-teeth` runs four
+teeth:
+- `mesh_no_dst_check`: the destination skips its grant lookup (M1).
+- `mesh_revoke_late`: connections outlive a revocation (M2).
+- `mesh_route_unready`: the plan routes to unready replicas (M4).
+- `mesh_stale_accept`: `rules_of` keeps every accept it once gave a replica (M1, M2 or M4).
+
+`zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`, then
+`sim-c4` at 40 operations (`sim-c4: seed N`) and `sim-c4-teeth`.

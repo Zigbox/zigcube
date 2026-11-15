@@ -153,6 +153,9 @@ pub const mesh_endpoint_bytes_max: u32 = 256 + ":65535".len;
 /// renews at half of it with a fresh key; one not renewed by its `not_after` takes the replica
 /// off the mesh (ZC-W0703) but does not stop it.
 pub const workload_cert_ttl_ms: u64 = 60 * 60 * 1000;
+/// After a grant's removal, how long a supervisor may keep a connection on it open once it has
+/// received rules without the grant (M2; owner answer O9). sim-c4 judges it from C4 slice 5.
+pub const mesh_revoke_ms: u64 = 1000;
 
 comptime {
     assert(mesh_address_min > 0);
@@ -364,6 +367,10 @@ pub const fixtures_bytes_max: u32 = 16 * 1024;
 pub const fake_start_timeout_ms: u32 = 10 * 1000;
 /// The pause between looks while `start` waits and while `events` waits.
 pub const fake_poll_ms: u32 = 10;
+/// How often a fake runtime's supervisor reads its mesh rules again with no `SIGUSR2` (one
+/// that came before its handler stood, or after an agent restart), and tries again to bind a
+/// listener that failed (C4 slice 4). Internal to the fake runtime.
+pub const fake_mesh_poll_ms: u32 = 250;
 /// Containers kept in the state directory, running or not. A start past this drops the oldest
 /// stopped one first; with none to drop it is ZC-E0502.
 pub const fake_containers_max: u32 = runtime_handles_max;

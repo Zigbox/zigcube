@@ -59,6 +59,17 @@ pub const SwitchedStore = struct {
     /// be reached does (ZC-E0201), while every other call is answered; test-only, null in every
     /// simulation.
     down_write_prefix: ?[]const u8 = null,
+    /// A transaction that puts or deletes a key under this prefix is applied, and its answer is
+    /// then lost (ZC-E0201), as a store that committed and dropped the connection; test-only,
+    /// null in every simulation. `lost_answers` counts them.
+    lost_answer_prefix: ?[]const u8 = null,
+    lost_answers: u32 = 0,
+    /// The calls, and the transactions among them, made since the last `mark` (a lost answer
+    /// marks; so may a test); both 0 until the first. Test-only, to assert what follows a
+    /// failure.
+    marked: bool = false,
+    calls_since_mark: u32 = 0,
+    txns_since_mark: u32 = 0,
     /// A transaction that puts a key under this prefix is answered as a server answers a write
     /// under a tenure that has ended (ZC-E0510); test-only, null in every simulation.
     tenure_ended_put_prefix: ?[]const u8 = null,
@@ -72,6 +83,9 @@ pub const SwitchedStore = struct {
     /// A get of a key under this prefix fails as a server that cannot be reached does (ZC-E0201);
     /// test-only, null in every simulation.
     down_get_prefix: ?[]const u8 = null,
+    /// A list of keys under this prefix fails as a server that cannot be reached does (ZC-E0201);
+    /// test-only, null in every simulation.
+    down_list_prefix: ?[]const u8 = null,
     /// Runs once, just before the first transaction that puts a key under `prefix` is applied;
     /// it may write through the world's store (the transaction then meets that write). Test-only,
     /// null in every simulation.
@@ -126,6 +140,13 @@ pub const SwitchedStore = struct {
         return @ptrCast(@alignCast(context));
     }
 
+    /// Starts `calls_since_mark` and `txns_since_mark` again from 0.
+    pub fn mark(self: *SwitchedStore) void {
+        self.marked = true;
+        self.calls_since_mark = 0;
+        self.txns_since_mark = 0;
+    }
+
     /// Counts the call and fails it if the store is down.
     fn gate(self: *SwitchedStore, diag: *Diag) store.Error!void {
         if (self.fail_after) |left| {
@@ -137,6 +158,7 @@ pub const SwitchedStore = struct {
             }
         }
         self.calls += 1;
+        if (self.marked) self.calls_since_mark += 1;
         if (self.before_fn) |before| before(self.before_context.?);
         if (self.call_cost) |*cost| if (self.in_agent_step) {
             if (cost.clock.ms + cost.cost_ms > cost.cap_ms.*) {
@@ -191,6 +213,14 @@ pub const SwitchedStore = struct {
     ) store.Error!store.ListResult {
         const self = from(context);
         try self.gate(diag);
+        if (self.down_list_prefix) |prefix| {
+            if (std.mem.startsWith(u8, options.prefix, prefix)) {
+                diag.raise(.E0201);
+                diag.cause("connection refused", .{});
+                diag.fix(.{ .sentence = "switch it back on" });
+                return error.BackendFailed;
+            }
+        }
         return self.inner.list(arena, options, diag);
     }
 
@@ -201,6 +231,7 @@ pub const SwitchedStore = struct {
     ) store.Error!store.TxnResult {
         const self = from(context);
         try self.gate(diag);
+        if (self.marked) self.txns_since_mark += 1;
         if (self.refuse_put_prefix) |prefix| {
             for (request.on_success) |op| {
                 if (op != .put) continue;
@@ -241,7 +272,23 @@ pub const SwitchedStore = struct {
                 break;
             }
         }
-        return self.inner.txn(request, diag);
+        const result = try self.inner.txn(request, diag);
+        if (self.lost_answer_prefix) |prefix| {
+            for (request.on_success) |op| {
+                const key = switch (op) {
+                    .put => |put| put.key,
+                    .delete => |deleted| deleted,
+                };
+                if (!std.mem.startsWith(u8, key, prefix)) continue;
+                self.lost_answers += 1;
+                self.mark();
+                diag.raise(.E0201);
+                diag.cause("the store committed the write and the connection dropped", .{});
+                diag.fix(.{ .sentence = "none: the next read shows the write" });
+                return error.BackendFailed;
+            }
+        }
+        return result;
     }
 
     fn watch(
@@ -357,10 +404,16 @@ pub const World = struct {
     /// A runtime the agent uses instead of `sim` (a test's wrapper that watches the specs it is
     /// given and passes them on to `sim.interface()`); null in every simulation.
     runtime_override: ?runtime_mod.Runtime = null,
+    /// The agent's step arena as a test's wrapper of the world's own (one that fails an
+    /// allocation on cue); null in every simulation.
+    arena_override: ?Allocator = null,
     /// The agent's files as a wrapper of `files` that injects failures; null in every simulation.
     state_override: ?agent_state.AgentState = null,
     /// The agent's image store, for the summary it writes; null in every simulation but a test's.
     images: ?@import("node_store.zig").Images = null,
+    /// Where the agent reads its node's mesh view; null in every simulation but a test's (the
+    /// mesh is off unless the agent's `Config.mesh` is set too).
+    mesh_source: ?@import("agent_mesh.zig").Source = null,
     server: control_plane.ControlPlane,
     agent: *agent_mod.Agent,
     /// The agent's files (the kept lease), which a restart of the agent finds again.
@@ -421,6 +474,7 @@ pub const World = struct {
         world.boot_id = "";
         world.call_cap_ms = std.math.maxInt(u64);
         world.runtime_override = null;
+        world.arena_override = null;
         world.state_override = null;
         world.images = null;
         return world;
@@ -466,6 +520,11 @@ pub const World = struct {
         return world.arena_state.allocator();
     }
 
+    fn agent_arena(world: *World) Allocator {
+        const arena = world.fresh_arena();
+        return world.arena_override orelse arena;
+    }
+
     pub fn controller_context(world: *World) controller.Context {
         world.diag.reset();
         return .{
@@ -494,7 +553,7 @@ pub const World = struct {
             .store = world.store_handle(),
             .runtime = world.runtime_override orelse world.sim.interface(),
             .clock = world.manual.clock(),
-            .arena = world.fresh_arena(),
+            .arena = world.agent_arena(),
             .diag = &world.diag,
             .images = world.images,
             .state = world.state_override orelse world.files.interface(),
@@ -504,6 +563,7 @@ pub const World = struct {
                 .set_fn = World.set_call_cap,
                 .hook_fn = World.set_call_hook,
             },
+            .mesh = world.mesh_source,
         };
         world.stats.agent_steps += 1;
         world.switched.in_agent_step = true;
