@@ -433,6 +433,15 @@ pub const fleet_find_page_size: u32 = 100;
 /// honoured for.
 pub const fleet_hold_seconds_default: u32 = 3600;
 pub const fleet_hold_seconds_max: u32 = 24 * 3600;
+/// Lines of what each commit soaked (one per commit and run kind) the state file keeps per day;
+/// past it a round counts in the day's totals only. Sixteen commits of four kinds.
+pub const fleet_soak_per_day_max: u32 = 64;
+/// The tracker post warns of the token's expiry this long before it (owner, 2026-11-15).
+pub const fleet_token_warn_seconds: u32 = 14 * 86_400;
+/// The heartbeat URL's file (`/etc/sim-fleet/heartbeat-url`): one URL.
+pub const fleet_heartbeat_url_bytes_max: u32 = 2048;
+/// A branch name in `SIM_FLEET_SOAK_REFS` and in the state file's `soak` lines.
+pub const fleet_ref_bytes_max: u32 = 128;
 
 // ---- Swarm: the store summary and the fetch plan (docs/swarm.md, C2 slice 4) -------------------
 
@@ -807,6 +816,9 @@ comptime {
     assert(fleet_seen_per_day_max <= fleet_filed_max);
     assert(fleet_comments_per_failure_per_day_max > 0);
     assert(fleet_hold_seconds_default <= fleet_hold_seconds_max);
+    assert(fleet_soak_per_day_max >= fleet_kinds_max);
+    assert(fleet_heartbeat_url_bytes_max <= fleet_token_bytes_max);
+    assert(fleet_ref_bytes_max <= fleet_check_bytes_max);
     assert(fleet_find_page_size * fleet_find_pages_max >= 100);
     assert(fleet_state_bytes_max >= fleet_token_bytes_max);
     assert(diag_command_bytes_max <= diag_field_bytes_max);
