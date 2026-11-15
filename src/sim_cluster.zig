@@ -1502,7 +1502,7 @@ pub const Cluster = struct {
         return text catch unreachable; // "r-" and seven digits fit sixteen bytes.
     }
 
-    fn apply(c: *Cluster, name: []const u8, image: []const u8, replicas: u32) void {
+    fn apply(c: *Cluster, name: []const u8, image: []const u8, replicas: u32, spec: Spec) void {
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
         const ctx = c.controller_context();
@@ -1510,11 +1510,18 @@ pub const Cluster = struct {
             .name = name,
             .image = image,
             .replicas = replicas,
-            .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
+            .command = spec.command,
+            .env = spec.env,
+            .limits = spec.limits,
             .applied_by = "alex@laptop",
             .request_id = id,
             .health = if (c.health_on and checked(name)) sim_health else null,
         }) catch c.diag.reset();
+    }
+
+    fn spec_drawn(c: *Cluster) Spec {
+        if (!c.c3) return specs[0];
+        return specs[c.rollout_prng.random().uintLessThan(u32, specs.len)];
     }
 
     fn init_worlds(c: *Cluster, options: Options) void {
@@ -2291,10 +2298,13 @@ fn operation(c: *Cluster) void {
         .advance => {
             c.advance(100 + random.uintLessThan(u32, 6000));
         },
-        .apply => c.apply(name, images[random.uintLessThan(u32, 2)], c.replicas_for(random, 5)),
-        .scale => c.apply(name, hello_digest, c.replicas_for(random, 8)),
+        .apply => {
+            const image = images[random.uintLessThan(u32, 2)];
+            c.apply(name, image, c.replicas_for(random, 5), c.spec_drawn());
+        },
+        .scale => c.apply(name, hello_digest, c.replicas_for(random, 8), specs[0]),
         .delete => c.delete_service(name),
-        .broken => c.apply(name, broken_digest, 1 + c.replicas_for(random, 2)),
+        .broken => c.apply(name, broken_digest, 1 + c.replicas_for(random, 2), specs[0]),
         .runtime_fault => {
             const node = c.pick_node();
             const injected = node.sim.containers.random_fault();
@@ -2356,6 +2366,29 @@ fn job_create(c: *Cluster) void {
         }
     }
 }
+
+/// What an apply runs besides its image. Under `--c3` an apply draws one of these from
+/// `rollout_prng` (no draw otherwise, so other worlds are unchanged), so a rollback that fails to
+/// restore the command, the environment or the limits differs from the generation it names (R5).
+const Spec = struct {
+    command: []const []const u8,
+    env: []const records.Pair = &.{},
+    limits: records.Limits = .{},
+};
+
+const specs = [_]Spec{
+    .{ .command = &.{ "sh", "-c", "while true; do sleep 1; done" } },
+    .{
+        .command = &.{ "sh", "-c", "while true; do sleep 2; done" },
+        .env = &.{.{ "MODE", "v2" }},
+        .limits = .{ .cpu_millis = 200, .memory_bytes = 64 << 20 },
+    },
+    .{
+        .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
+        .env = &.{.{ "MODE", "v3" }},
+        .limits = .{ .cpu_millis = 100 },
+    },
+};
 
 /// Under `--c3`, before the heal, one operation in four also pauses or resumes the rollout of the
 /// service it drew (just applied, so most often one in progress) through the core's request, the
@@ -3602,7 +3635,10 @@ const rollout_settle_slack_ms: u64 = 30_000;
 /// service's current generation has settled: none is active past its deadline, and none ended
 /// `failed` owing a rollback the controller neither carried out nor recorded as refused. A
 /// rollout paused by a failure waits for an operator, which counts as settled; the heal resumed
-/// every rollout a user paused, and a resume moves the deadline by the time it was paused.
+/// every rollout a user paused, and a resume moves the deadline by the time it was paused. A
+/// service with no rollout record of its current generation (its first apply starts none, and a
+/// record of an earlier generation or service is not its own) is not R7's: `converged`, run just
+/// before, judges its replicas.
 fn rollouts_settle(c: *Cluster) Failure!void {
     var scratch = std.heap.ArenaAllocator.init(c.gpa);
     defer scratch.deinit();
@@ -4102,7 +4138,7 @@ test "the fencing check fires on a node that runs containers long after it lost 
     var report: Report = .{};
     const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
     defer c.destroy();
-    c.apply("hello", hello_digest, 2);
+    c.apply("hello", hello_digest, 2, specs[0]);
     c.advance(5_000);
     try testing.expect(!report.failed);
     const node = c.nodes[0];

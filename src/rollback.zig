@@ -276,7 +276,10 @@ pub fn raise_nothing(diag: *Diag, name: []const u8, generation: u64, to: ?u64) v
     diag.raise(.E0127);
     if (to != null) {
         diag.cause("service {s} runs generation {d} now", .{ name, generation });
-    } else if (generation == 1) {
+        diag.fix_with("name an older generation", "zcube history {s}", .{name});
+        return;
+    }
+    if (generation == 1) {
         diag.cause("service {s} has run only generation 1", .{name});
     } else {
         diag.cause("service {s} has no stored generation below {d}", .{ name, generation });
@@ -292,17 +295,31 @@ fn not_in_history(
 ) error{NotInHistory} {
     const low: u64 = if (usable.len > 0) usable[0].generation else 0;
     const high: u64 = if (usable.len > 0) usable[usable.len - 1].generation else 0;
-    raise_not_in_history(ctx.diag, current.name, to, low, high);
+    raise_not_in_history(ctx.diag, current.name, current.generation, to, low, high);
     return error.NotInHistory;
 }
 
-/// ZC-E0128: the named generation is not in the history (`low` to `high` are; 0 for none).
-/// Public so the CLI's golden shows the server's own text.
-pub fn raise_not_in_history(diag: *Diag, name: []const u8, to: u64, low: u64, high: u64) void {
+/// ZC-E0128: the named generation is not in the history (`low` to `high` are; 0 for none), or
+/// is newer than `generation`, the one the service runs. Public so the CLI's golden shows the
+/// server's own text.
+pub fn raise_not_in_history(
+    diag: *Diag,
+    name: []const u8,
+    generation: u64,
+    to: u64,
+    low: u64,
+    high: u64,
+) void {
     assert(diag.code == null);
     assert(low <= high);
+    assert(high <= generation);
+    assert(to != generation);
     diag.raise(.E0128);
-    if (high == 0) {
+    if (to > generation) {
+        diag.cause("generation {d} of {s} is newer than the one it runs ({d})", .{
+            to, name, generation,
+        });
+    } else if (high == 0) {
         diag.cause("generation {d} of {s} is not in its history (it keeps none)", .{ to, name });
     } else if (low == high) {
         diag.cause("generation {d} of {s} is not in its history (it keeps generation {d})", .{

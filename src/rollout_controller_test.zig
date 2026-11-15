@@ -11,6 +11,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const control_plane = @import("control_plane.zig");
+const rollback = @import("rollback.zig");
 const rollout_controller = @import("rollout_controller.zig");
 const sim_tap = @import("sim_tap.zig");
 const store = @import("store.zig");
@@ -31,11 +32,62 @@ const web: apply_mod.Input = .{
 
 const min_ready_ms = (records.RolloutPolicy{}).min_ready_ms;
 
+/// A generation 2 of `web` that differs from it in every field a rollback restores: image,
+/// command, env, limits and health.
+const broken: apply_mod.Input = .{
+    .name = "web",
+    .image = "b3:9d20c4f1",
+    .replicas = 3,
+    .command = &.{ "sh", "-c", "exec ./serve --v2" },
+    .env = &.{.{ "MODE", "v2" }},
+    .limits = .{ .cpu_millis = 200, .memory_bytes = 64 * 1024 * 1024 },
+    .source = "ghcr.io/zigbox/web@sha256:" ++
+        "9d20c4f19d20c4f19d20c4f19d20c4f19d20c4f19d20c4f19d20c4f19d20c4f1",
+    .health = .{
+        .command = &.{ "check", "--v2" },
+        .interval_ms = 5_000,
+        .timeout_ms = 1_000,
+        .failure_threshold = 2,
+        .success_threshold = 1,
+    },
+    .applied_by = "alex@laptop",
+    .request_id = "r-0002b11",
+};
+
 /// What the fixture's store does to the next transaction that deletes a replica record (a
 /// retirement), before it commits: the interleavings TLA+ gap 1 and the pause write race name.
 /// `pause_create` pauses before the next transaction that creates replicas and deletes none;
 /// `stop_last` stops the kept replica the floor counts last (the newest).
-const Interleave = enum { none, stop_kept, stop_last, pause, pause_create };
+/// `apply_rollback` and `pause_rollback` apply `third` or pause before the next transaction that
+/// writes the service (the automatic rollback's).
+const Interleave = enum {
+    none,
+    stop_kept,
+    stop_last,
+    pause,
+    pause_create,
+    apply_rollback,
+    pause_rollback,
+};
+
+/// A user's generation 3 of `web`.
+const third: apply_mod.Input = .{
+    .name = "web",
+    .image = "b3:77e0aa12",
+    .replicas = 3,
+    .command = web.command,
+    .applied_by = "alex@laptop",
+    .request_id = "r-0002b12",
+};
+
+/// The health check of the tests that roll a checked service.
+const checked_health: records.Health = .{
+    .command = &.{ "test", "-f", "/tmp/ready" },
+    .interval_ms = 1000,
+    .timeout_ms = 1000,
+    .failure_threshold = 2,
+    .success_threshold = 1,
+};
 
 const Fixture = struct {
     manual: ManualClock,
@@ -210,15 +262,20 @@ const Fixture = struct {
     /// Applies `web` at generation 1, runs its three replicas past `min_ready_ms`, then applies a
     /// new image (generation 2).
     fn roll(self: *Fixture) !void {
+        var next = web;
+        next.image = "b3:9d20c4f1";
+        next.request_id = "r-0002b11";
+        try self.roll_to(next);
+    }
+
+    /// `roll` with `next` as generation 2.
+    fn roll_to(self: *Fixture, next: apply_mod.Input) !void {
         try self.apply(web);
         try self.settle();
         try testing.expectEqual(@as(u32, 3), try self.report(1, .running));
         try self.settle();
         self.manual.advance(min_ready_ms);
         try self.settle();
-        var next = web;
-        next.image = "b3:9d20c4f1";
-        next.request_id = "r-0002b11";
         try self.apply(next);
         try self.settle();
     }
@@ -227,9 +284,25 @@ const Fixture = struct {
     /// (ZC-E0304). `.roll_back`: the controller then rolls back to generation 1 as generation 3.
     /// `.refuse`: generation 1's history record is deleted first, so the rollback is refused
     /// (ZC-E0128) and the rollout stays failed with three old replicas and the held new one.
+    /// With `.roll_back`, generation 2 is `broken`, which differs from `web` in every field a
+    /// rollback restores.
     fn fail(self: *Fixture, then: Then) !void {
-        try self.roll();
+        if (then == .roll_back) try self.roll_to(broken) else try self.roll();
         if (then == .refuse) try self.forget(1);
+        try self.fail_start(2);
+        switch (then) {
+            .refuse => {
+                const failed = try self.rollout();
+                try testing.expectEqual(records.RolloutPhase.failed, failed.phase);
+                try testing.expectEqual(@as(?bool, true), failed.rollback_refused);
+            },
+            .roll_back => try testing.expectEqual(@as(u64, 3), (try self.service()).generation),
+        }
+    }
+
+    /// Fails the start of the first replica of `generation` by the user's fault (ZC-E0304), and
+    /// steps past `min_ready_ms`.
+    fn fail_start(self: *Fixture, generation: u64) !void {
         var collector: Diag = undefined;
         collector.reset();
         collector.raise(.E0206);
@@ -240,14 +313,15 @@ const Fixture = struct {
         const raw = try records.diagnostic_raw(ctx.arena, &finished, &self.diag);
         const text = try testing.allocator.dupe(u8, raw.text);
         defer testing.allocator.free(text);
-        const new = (try self.replicas())[3];
-        try testing.expectEqual(@as(u64, 2), new.rec.generation);
+        const new = for (try self.replicas()) |replica| {
+            if (replica.rec.generation == generation) break replica;
+        } else return error.NoNewReplica;
         const id = try testing.allocator.dupe(u8, new.rec.id);
         defer testing.allocator.free(id);
         const observed: records.Observed = .{
             .replica = id,
             .node = "node1",
-            .generation = 2,
+            .generation = generation,
             .status = .stopped,
             .exit = .{ .kind = .start_failed },
             .diagnostic = .{ .text = text },
@@ -257,14 +331,6 @@ const Fixture = struct {
         try self.settle();
         self.manual.advance(min_ready_ms);
         try self.settle();
-        switch (then) {
-            .refuse => {
-                const failed = try self.rollout();
-                try testing.expectEqual(records.RolloutPhase.failed, failed.phase);
-                try testing.expectEqual(@as(?bool, true), failed.rollback_refused);
-            },
-            .roll_back => try testing.expectEqual(@as(u64, 3), (try self.service()).generation),
-        }
     }
 
     const Then = enum { roll_back, refuse };
@@ -357,10 +423,15 @@ const Fixture = struct {
             .none => unreachable,
             .stop_kept, .stop_last => stop_kept(&ctx, txn_request, what == .stop_last) catch
                 @panic("stop_kept failed"),
-            .pause, .pause_create => {
+            .pause, .pause_create, .pause_rollback => {
                 const outcome = rollout_controller.request(&ctx, &self.api, web.name, .pause) catch
                     @panic("pause failed");
                 assert(outcome == .done);
+            },
+            .apply_rollback => {
+                const result = apply_mod.apply(&ctx, &self.api, third) catch
+                    @panic("apply failed");
+                assert(result == .written);
             },
         }
     }
@@ -368,6 +439,13 @@ const Fixture = struct {
     /// Whether `what` interleaves before this transaction: one that deletes a replica of `web`,
     /// or for `pause_create` one that creates replicas of it and deletes none.
     fn interleaved_here(what: Interleave, txn_request: store.TxnRequest) bool {
+        if (what == .apply_rollback or what == .pause_rollback) {
+            const key = records.service_key(web.name);
+            for (txn_request.on_success) |op| {
+                if (op == .put and std.mem.eql(u8, op.put.key, key.slice())) return true;
+            }
+            return false;
+        }
         const prefix = records.replicas_prefix(web.name);
         var deletes = false;
         var creates = false;
@@ -585,6 +663,113 @@ test "an agent restart's unknown keeps old replicas ready and new ones not ready
     try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
 }
 
+test "a never-healthy replica of a failed rollout whose checks never settle is retired" {
+    // Goal: PR #261 re-review MUST. A release whose checks never settle (every probe refused,
+    // ZC-E0516) reports `unknown` forever. Its rollout fails at `ready_timeout_ms`, and the
+    // rollback must still end: the stale `unknown` replica is running to both controllers, so it
+    // is retired within `budget.retire` once the rollback's replicas are ready. Before the fix
+    // the rollout controller counted it unready (`retire_unready`) and the replica controller
+    // running (`retire` only), so the rollback stayed `rolling_back`. Method: as "an unhealthy
+    // replica of a failed rollout ...", with the new replica `unknown` instead of `unhealthy`.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = checked_health;
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b13";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .unknown));
+    try fixture.settle();
+    fixture.manual.advance((records.RolloutPolicy{}).ready_timeout_ms + 100);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+    for (0..40) |_| {
+        _ = try fixture.report_health(3, .running, .healthy);
+        try fixture.settle();
+        fixture.manual.advance(10_000);
+        try fixture.settle();
+    }
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(2));
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(3));
+    try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
+}
+
+test "a new replica unknown after healthy is not ready to the rollout controller" {
+    // Goal: PR #261 re-review SHOULD, the rollout controller's half of the `unknown` rule
+    // (`!(fresh and held_over)` in `view`). A new replica that ran healthy for `min_ready_ms`
+    // and is then `unknown` (an agent restart) is not counted ready by the rollout record, so
+    // the rollout does not complete on replicas nobody knows are healthy. Method: roll a checked
+    // service of one replica; the new replica runs healthy, then `unknown` for `min_ready_ms`.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.replicas = 1;
+    checked.health = checked_health;
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b14";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .healthy));
+    try fixture.settle();
+    _ = try fixture.report_health(2, .running, .unknown);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    const rollout = try fixture.rollout();
+    try testing.expectEqual(@as(u32, 0), rollout.ready_new);
+    try testing.expect(rollout.phase != .complete);
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(1));
+}
+
+test "an old replica unknown after an agent restart counts toward the replica floor" {
+    // Goal: PR #261 re-review SHOULD, the replica controller's half of the `unknown` rule
+    // (`running_healthy`: a stale `unknown` replica runs). A budget that retires one old replica
+    // was stored while the new replica was ready; the new replica then turns unhealthy and the
+    // agent restarts (old replicas `unknown`). The replica controller, run alone over that budget,
+    // must keep all three old replicas: they are running and the floor (3) allows none to go. If
+    // it counted them not running, it would retire one as unready, without the floor's check.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = checked_health;
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b15";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try rollouts_only(&fixture);
+    try testing.expectEqual(@as(u32, 1), (try fixture.rollout()).budget.retire);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    _ = try fixture.report_health(2, .running, .unhealthy);
+    _ = try fixture.report_health(1, .running, .unknown);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+}
+
 test "a kept replica that stops between the read and the commit fails the retirement" {
     // Goal: TLA+ gap 1. A retirement compares the reports of the replicas it counts toward the
     // floor (`replicas - max_unavailable`, 3 here), so one that stops after the controller read
@@ -682,9 +867,6 @@ test "an apply over a rollout still progressing starts from the generation that 
     defer fixture.stop();
     try fixture.roll();
     try testing.expectEqual(@as(u64, 1), (try fixture.rollout()).from);
-    var third = web;
-    third.image = "b3:77e0aa12";
-    third.request_id = "r-0002b12";
     try fixture.apply(third);
     try fixture.settle();
     const rollout = try fixture.rollout();
@@ -823,10 +1005,12 @@ test "C3 slice 8: a failed rollout rolls back through the API's handler (O3)" {
     try fixture.start();
     defer fixture.stop();
     try fixture.fail(.roll_back);
+    // Generation 2 (`broken`) differs from 1 in every restored field: each must be 1's again.
     const service = try fixture.service();
-    try testing.expectEqualStrings(web.image, service.image);
+    try expect_web_spec(service);
     try testing.expectEqualStrings("rollout-controller", service.applied_by);
     const record = try fixture.history(3);
+    try expect_web_spec(record);
     try testing.expectEqual(records.HistoryReason.auto_rollback, record.reason);
     try testing.expectEqual(@as(?u64, 1), record.restores);
     try testing.expectEqual(@as(u32, 1), try fixture.decisions("rollback", "ZC-W0305"));
@@ -842,6 +1026,9 @@ test "C3 slice 8: a failed rollout rolls back through the API's handler (O3)" {
         try fixture.settle();
     }
     try testing.expectEqual(@as(u32, 3), try fixture.count_of(3));
+    for (try fixture.replicas()) |replica| {
+        if (replica.rec.generation == 3) try expect_web_spec(replica.rec);
+    }
     try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
     try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
 }
@@ -870,6 +1057,108 @@ test "C3 slice 8: a refused automatic rollback is asked again after pause, resum
     try testing.expectEqual(@as(?bool, true), failed.rollback_refused);
     try testing.expectEqual(@as(u32, 2), try fixture.decisions("rollout_fail", refusal));
     try testing.expectEqual(@as(u64, 2), (try fixture.service()).generation);
+}
+
+test "C3 slice 8: an automatic rollback restores the generation that completed, not the newest" {
+    // Goal: `from` (docs/decisions/2026-11-14-c3-rollout-from-rule.md). Generation 2 never became
+    // ready when generation 3 was applied over it; 3 fails, and the rollback must restore 1, the
+    // newest generation whose rollout completed, never 2.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try fixture.apply(third);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 1), (try fixture.rollout()).from);
+    try fixture.fail_start(3);
+    const service = try fixture.service();
+    try testing.expectEqual(@as(u64, 4), service.generation);
+    try testing.expectEqualStrings(web.image, service.image);
+    const record = try fixture.history(4);
+    try testing.expectEqual(records.HistoryReason.auto_rollback, record.reason);
+    try testing.expectEqual(@as(?u64, 1), record.restores);
+}
+
+test "C3 slice 8: a user's apply before the automatic rollback commits wins (R8)" {
+    // Goal: the compare on the service key. Method: the user applies generation 3 inside the
+    // rollback's transaction, after the handler read the service: the rollback must write
+    // nothing, and generation 3 is the user's.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    fixture.interleave = .apply_rollback;
+    try fixture.fail_start(2);
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+    const service = try fixture.service();
+    try testing.expectEqual(@as(u64, 3), service.generation);
+    try testing.expectEqualStrings(third.image, service.image);
+    try testing.expectEqual(records.HistoryReason.apply, (try fixture.history(3)).reason);
+    try testing.expectEqual(@as(u32, 0), try fixture.decisions("rollback", "ZC-W0305"));
+}
+
+test "C3 slice 8: a user's pause before the automatic rollback commits wins (R8)" {
+    // Goal: the compare on the rollout record. Method: the user pauses the failed rollout inside
+    // the rollback's transaction: the rollback must write nothing, and the rollout stays paused.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    fixture.interleave = .pause_rollback;
+    try fixture.fail_start(2);
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+    fixture.manual.advance(10 * min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 2), (try fixture.service()).generation);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u32, 0), try fixture.decisions("rollback", "ZC-W0305"));
+}
+
+test "C3 slice 8: an automatic rollback whose pass read an older service writes nothing" {
+    // Goal: the handler's early compare of `Expect.service_revision`. The handler reads the
+    // service itself; an apply between the controller's snapshot and that read must still win,
+    // though the batch's compares (taken from the handler's read) would match.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    const ctx = fixture.context();
+    const service_key = records.service_key(web.name);
+    const read = (try ctx.store.get(ctx.arena, service_key.slice(), null, &fixture.diag)).kv.?;
+    const read_revision = read.mod_revision;
+    const rollout_key = records.rollout_key(web.name);
+    const rollout_kv =
+        (try ctx.store.get(ctx.arena, rollout_key.slice(), null, &fixture.diag)).kv.?;
+    const rollout_revision = rollout_kv.mod_revision;
+    try fixture.apply(third);
+    const after = fixture.context();
+    const result = try rollback.rollback(&after, &fixture.api, .{
+        .name = web.name,
+        .to = 1,
+        .reason = .auto_rollback,
+        .applied_by = rollback.controller_applied_by,
+        .request_id = "r-0002b13",
+        .expect = .{
+            .service_revision = read_revision,
+            .rollout_key = rollout_key.slice(),
+            .rollout_revision = rollout_revision,
+            .failed_decision = "",
+        },
+    });
+    try testing.expect(result == .conflict);
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+}
+
+/// Whether a record's spec is `web`'s (generation 1), not `broken`'s.
+fn expect_web_spec(record: anytype) !void {
+    try testing.expectEqualStrings(web.image, record.image);
+    try testing.expectEqualStrings(web.source, record.source);
+    try testing.expect(records.strings_equal(web.command, record.command));
+    try testing.expect(records.pairs_equal(web.env, record.env));
+    try testing.expectEqual(web.limits, record.limits);
+    try testing.expect(record.health == null);
 }
 
 /// Applies `web` again at generation 2's spec with `replicas` replicas (no new generation).

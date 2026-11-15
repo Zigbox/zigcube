@@ -152,7 +152,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "zcube local can't find or start the server or agent",
-    "explanation": "zcube local up starts zcube-server and zcube-agent, and looks for them in\nthe directory that holds the zcube command itself. One of them is not\nthere, is not an executable file, or the system refused to start it, so\nnothing was left running.\n\nBuild all three with zig build and run zcube from zig-out/bin, or keep the\nthree files together when you install them."
+    "explanation": "zcube local up starts zcube-server and zcube-agent, and looks for them in\nthe directory that holds the zcube command itself. One of them is not\nthere, is not an executable file, or the system refused to start it, so\nnothing was left running.\n\nBuild all three with zig build and run zcube from zig-out/bin, or keep the\nthree files together when you install them.\n\nzcube local runs only on Linux: the server and the agent are Linux programs.\nOn macOS, zcube talks to a server elsewhere (zcube --server HOST:PORT), and\nzcube local refuses with this code before it looks for either file."
   },
   {
     "code": "ZC-E0123",
@@ -187,14 +187,14 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "there is nothing to roll back to",
-    "explanation": "A rollback asks for a generation of the service other than the one it\nruns now, and the service's history holds none: it was created by one\napply and never changed what its replicas run, or its history was deleted\nwith an earlier service of the same name.\n\nNothing was changed. To run something else, apply the service file you\nwant; `zcube history <service>` lists the generations there are."
+    "explanation": "A rollback restores a generation of the service older than the one it\nruns now. Either the rollback named the generation the service runs now\n(`--to` with the current generation), or it named none and the history\nholds no older one: the service was created by one apply and never\nchanged what its replicas run, or its history was deleted with an\nearlier service of the same name.\n\nNothing was changed. `zcube history <service>` lists the generations\nthere are: name an older one with `--to`. To run something else, apply\nthe service file you want."
   },
   {
     "code": "ZC-E0128",
     "severity": "error",
     "blame": "user",
-    "summary": "the generation to roll back to is no longer in the history",
-    "explanation": "A service keeps the 16 newest generations it was applied with; an apply\nthat adds a 17th deletes the oldest. The generation the rollback named is\nolder than that, or was never one of this service's (a service deleted\nand applied again starts at generation 1 with no history).\n\nNothing was changed. `zcube history <service>` lists the generations that\ncan be restored. To run an older one, apply its service file again."
+    "summary": "the generation to roll back to is not in the history",
+    "explanation": "A service keeps the 16 newest generations it was applied with; an apply\nthat adds a 17th deletes the oldest. The generation the rollback named is\nolder than that, newer than the one the service runs now, or was never\none of this service's (a service deleted and applied again starts at\ngeneration 1 with no history).\n\nNothing was changed. `zcube history <service>` lists the generations that\ncan be restored. To run an older one, apply its service file again."
   },
   {
     "code": "ZC-E0129",

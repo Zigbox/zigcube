@@ -1214,7 +1214,9 @@ pub fn admissible_in(
 /// (old) replica whose health is `unknown` counts as running: an agent restart reports every
 /// replica `unknown` until it probes again, and that must not make old replicas free to retire
 /// (docs/decisions/2026-11-15-c3-rollout-health-gate.md). Counting it running is the cautious
-/// side here: it is retired only within `budget.retire` and above the floor.
+/// side here: it is retired only within `budget.retire` and above the floor. The rollout
+/// controller's `update` counts an old `unknown` replica running too, even one never healthy, so
+/// the two agree and a rollback over checks that never settle still ends.
 fn running_healthy(
     replica: *const records.Replica,
     observed: ?*const Entry(records.Observed),

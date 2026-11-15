@@ -76,8 +76,8 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">there is nothing to roll back to</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>A rollback asks for a generation of the service other than the one it runs now, and the service's history holds none: it was created by one apply and never changed what its replicas run, or its history was deleted with an earlier service of the same name.</p>
-<p>Nothing was changed. To run something else, apply the service file you want; `zcube history &lt;service&gt;` lists the generations there are.</p>
+<p>A rollback restores a generation of the service older than the one it runs now. Either the rollback named the generation the service runs now (`--to` with the current generation), or it named none and the history holds no older one: the service was created by one apply and never changed what its replicas run, or its history was deleted with an earlier service of the same name.</p>
+<p>Nothing was changed. `zcube history &lt;service&gt;` lists the generations there are: name an older one with `--to`. To run something else, apply the service file you want.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0127</pre>

@@ -43,7 +43,8 @@ pub const Tally = struct {
     rollbacks_judged: u64 = 0,
     /// Of them, automatic rollbacks judged against the head they landed on (R8).
     auto_rollbacks_judged: u64 = 0,
-    /// Rollbacks that completed, their live replicas compared with the restored spec (R5).
+    /// Rollbacks that completed, their live replicas compared with the restored spec (R5): each
+    /// counted once, though R5 judges every write of its complete rollout record.
     rollbacks_completed: u64 = 0,
     /// Rollouts of a current generation R7 judged at the end of a run with liveness on.
     rollouts_settled: u64 = 0,
@@ -461,6 +462,10 @@ fn rollback_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tall
         if (!auto_rollback_owed(ctx, &written)) {
             return "R8: an automatic rollback landed over a newer write of its service";
         }
+        if (!auto_rollback_answers(ctx, request, &written)) {
+            return "R8: an automatic rollback did not answer its failed rollout " ++
+                "(its from, its cause)";
+        }
     }
     return null;
 }
@@ -468,15 +473,57 @@ fn rollback_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tall
 /// Whether the head still shows what an automatic rollback to `written` answers: the service at
 /// the generation below it, whose rollout failed.
 fn auto_rollback_owed(ctx: *const Context, written: *const records.History) bool {
+    const rollout = failed_rollout(ctx, written) orelse return false;
+    return rollout.phase == .failed;
+}
+
+/// Whether an owed automatic rollback answers its failed rollout: it restores the rollout's
+/// `from` (the generation that last completed, not the newest older one), and its decision names
+/// the rollout's failure as its cause (`resync` when the rollout recorded none).
+fn auto_rollback_answers(
+    ctx: *const Context,
+    request: store.TxnRequest,
+    written: *const records.History,
+) bool {
+    const rollout = failed_rollout(ctx, written) orelse return false;
+    if (rollout.phase != .failed) return false;
+    if (written.restores != rollout.from) return false;
+    const cause = rollback_cause(ctx, request, written.service) orelse return false;
+    if (rollout.cause_decision.len == 0) return cause.kind == .resync;
+    if (cause.kind != .decision) return false;
+    return std.mem.eql(u8, cause.id orelse "", rollout.cause_decision);
+}
+
+/// The rollout of the service's generation just below `written`, the one the head holds now.
+fn failed_rollout(ctx: *const Context, written: *const records.History) ?records.Rollout {
     const key = records.service_key(written.service);
-    const kv = get(ctx, key.slice()) orelse return false;
+    const kv = get(ctx, key.slice()) orelse return null;
     const service: ServiceEntry = .{
         .kv = kv,
-        .rec = decode(records.Service, ctx, kv.key, kv.value) orelse return false,
+        .rec = decode(records.Service, ctx, kv.key, kv.value) orelse return null,
     };
-    if (service.rec.generation + 1 != written.generation) return false;
-    const rollout = rollout_of(ctx, &service) orelse return false;
-    return rollout.phase == .failed;
+    if (service.rec.generation + 1 != written.generation) return null;
+    return rollout_of(ctx, &service);
+}
+
+/// The cause of the `rollback` decision `request` writes for `service`, if it writes one.
+fn rollback_cause(
+    ctx: *const Context,
+    request: store.TxnRequest,
+    service: []const u8,
+) ?records.Cause {
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_decisions)) continue;
+        const decision = decode(records.Decision, ctx, put.key, put.value) orelse continue;
+        if (!std.mem.eql(u8, decision.action, "rollback")) continue;
+        if (!std.mem.eql(u8, decision.subject.name, service)) continue;
+        return decision.cause;
+    }
+    return null;
 }
 
 /// R5 at the end of a rollback: when `request` marks a rollout of a rollback complete, every
@@ -498,7 +545,7 @@ fn completion_problem(ctx: *const Context, request: store.TxnRequest, tally: *Ta
         const restored_kv = get(ctx, restored_key.slice()) orelse continue;
         const restored = decode(records.History, ctx, restored_kv.key, restored_kv.value) orelse
             continue;
-        tally.rollbacks_completed += 1;
+        if (!completed_before(ctx, put.key, &rollout)) tally.rollbacks_completed += 1;
         const snap = controller.read_snapshot(ctx) catch {
             ctx.diag.reset();
             return null;
@@ -512,6 +559,15 @@ fn completion_problem(ctx: *const Context, request: store.TxnRequest, tally: *Ta
         }
     }
     return null;
+}
+
+/// Whether the head already holds `rollout` complete: the controller rewrites a complete record
+/// (a step or a resync), and the tally counts each rollback once, at the write that completes it.
+fn completed_before(ctx: *const Context, key: []const u8, rollout: *const records.Rollout) bool {
+    const kv = get(ctx, key) orelse return false;
+    const head = decode(records.Rollout, ctx, kv.key, kv.value) orelse return false;
+    return head.phase == .complete and head.to == rollout.to and
+        head.service_created == rollout.service_created;
 }
 
 /// Whether two history records hold the same spec: what a rollback copies.
