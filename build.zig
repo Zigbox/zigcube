@@ -1116,6 +1116,11 @@ fn canary_manifest(b: *std.Build) []const u8 {
         text = b.fmt("{s}sim_c1_teeth_{s} sim-c1 {s} {s}\n", .{
             text, entry.name, seeds, entry.symptom,
         });
+        for (entry.also_seeds) |seed| {
+            text = b.fmt("{s}sim_c1_teeth_{s} sim-c1 {d}+1@{d} {s}\n", .{
+                text, entry.name, seed, entry.ops, entry.symptom,
+            });
+        }
     }
     return b.fmt("{s}sim_swarm_teeth sim-swarm {d} {s}\n", .{
         text, canary_seeds_swarm_teeth, canary_symptom_swarm_teeth,
@@ -1177,6 +1182,10 @@ const c1_teeth_roots = [_]struct {
     /// the runner's default profile (manifest `FIRST+COUNT@OPS`), not fresh seeds at drawn
     /// operations: ops/sim-fleet/README.md.
     canary_first: ?u32 = null,
+    /// More known hits of a sparse tooth, each pinned on its own: `sim-c1-teeth-NAME` also runs
+    /// each alone and it must fail with `symptom`, and the manifest gets a line `SEED+1@OPS` of
+    /// its own for each, so the canary rests on more than one seed (PR #250 review).
+    also_seeds: []const u32 = &.{},
     /// The first seed `sim-c1-teeth-NAME` runs. The test stops at the first failing seed and
     /// that one must show `symptom`, unless `any_symptom`: then seeds that fail otherwise (the
     /// skew world fails on convergence at some seeds since #177) are skipped, and some seed in
@@ -1334,7 +1343,12 @@ const c1_teeth_roots = [_]struct {
         .name = "job_ledger_small",
         .root = "src/sim_c1_teeth_job_ledger_small_main.zig",
         .symptom = "J8: the start ledger is full (16 runs)",
-        .canary_seeds = 10,
+        // A fixed range at 400 operations, not fresh seeds at drawn ones (#236): the drawn
+        // operations (52 to 329 in the ten seeds of the miss) start 9 to 16 runs, which never
+        // fill a ledger of 16. At 400 operations 8 of seeds 1..10 fail, so 15 seeds miss a
+        // working check with probability 0.2^15 = 3e-11.
+        .canary_seeds = 15,
+        .canary_first = 1,
         .plain_symptom = "J8: the start ledger is full (16 runs)",
         .ops = 400,
     },
@@ -1372,16 +1386,49 @@ const c1_teeth_roots = [_]struct {
         // With #202 fixed (agents arm a run's deadline when it starts), the second clause is hit
         // by about one seed in a hundred: seed 32 until B2.1 slice 6 (#205: a failing step no
         // longer aborts the pass) shifted the world, then seed 186 (1..2000 searched up to the
-        // first hit; docs/decisions/2026-11-11-job-evicted-tooth-sparse.md). CI's run ends
-        // there, and the fleet canary runs seed 186 alone at 300 operations (fresh seeds at
+        // first hit; docs/decisions/2026-11-11-job-evicted-tooth-sparse.md), then seed 241 after
+        // #225's fix (docs/decisions/2026-11-13-job-evicted-tooth-seed-241.md). CI's run ends
+        // there, and the fleet canary runs seed 241 alone at 300 operations (fresh seeds at
         // drawn operations would take hours for a one-in-a-hundred hit). A sparse tooth:
-        // widening its world so more seeds hit is B3 work. Seed 186 passes with the fault off.
+        // widening its world so more seeds hit is B3 work. Seed 241 passes with the fault off.
         .symptom = "J8: a run that no node started",
         .canary_seeds = 1,
-        .canary_first = 186,
-        .first_seed = 186,
-        .seeds = 186,
+        .canary_first = 241,
+        .first_seed = 241,
+        .seeds = 241,
         .ops = 300,
+    },
+    .{
+        .name = "job_pass_break",
+        .root = "src/sim_c1_teeth_job_pass_break_main.zig",
+        .symptom = "J6",
+        // Sparse: seeds 225 and 44 of the evict world are its known hits (J6 at 21,596 and
+        // 23,406 ms on the loop's `break`); seeds 1..40 have none. The unit tests in
+        // `agent_jobs_test.zig` (#247) are the real guard of both halves of the fix.
+        .canary_seeds = 1,
+        .canary_first = 225,
+        .also_seeds = &.{44},
+        .first_seed = 225,
+        .seeds = 225,
+        .ops = 300,
+    },
+    .{
+        .name = "job_runs_unread",
+        .root = "src/sim_c1_teeth_job_runs_unread_main.zig",
+        .symptom = "J6",
+        // A gap shown, not an agent fault (docs/decisions/2026-11-14-j6-runs-unread-gap.md): the
+        // server cuts a node's runs read while a stop is asked. Measured 2026-11-14 over seeds 1
+        // to 40 at 100 operations: J6 first at 11 seeds with `--c1` (2 4 7 14 17 18 22 23 25 30
+        // 32) and 13 plain; 6 others fail first on other checks (the cut also hides new runs and
+        // ended jobs), so the canary is pinned to known J6 hits, as a sparse tooth's is. Each
+        // passes with the fault off.
+        .canary_seeds = 1,
+        .canary_first = 2,
+        .also_seeds = &.{ 4, 7 },
+        .first_seed = 2,
+        .seeds = 2,
+        .plain_symptom = "J6",
+        .plain_seeds = 2,
     },
 };
 
@@ -1402,7 +1449,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 23 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the 26 negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1435,7 +1482,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 23 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 26 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1456,9 +1503,10 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
         teeth.dependOn(&teeth_run.step);
-        add_plain_tooth(b, teeth, teeth_exe, entry);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
+        add_also_seeds(b, &.{ teeth, own }, teeth_exe, entry);
+        add_plain_tooth(b, teeth, teeth_exe, entry);
         const own_install = b.addInstallArtifact(teeth_exe, .{});
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
@@ -1470,6 +1518,25 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// Each more known hit of a sparse tooth (`also_seeds`), run alone with `--c1`: it must fail
+/// with the tooth's symptom.
+fn add_also_seeds(
+    b: *std.Build,
+    steps: []const *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    entry: anytype,
+) void {
+    for (entry.also_seeds) |seed| {
+        const run = b.addRunArtifact(exe);
+        run.addArgs(&.{
+            "--seeds",                  b.fmt("{d}..{d}", .{ seed, seed }),
+            b.fmt("{d}", .{entry.ops}), "--c1",
+            "--expect-fail",            b.fmt("--expect-symptom={s}", .{entry.symptom}),
+        });
+        for (steps) |step| step.dependOn(&run.step);
+    }
 }
 
 /// The same fault in a plain run (no `--c1`): the job checks need no per-revision tap.
@@ -1705,7 +1772,8 @@ const worlds = [_][]const u8{
     "src/sim_c1_evict_world_main.zig",
 };
 
-/// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5 may fail.
+/// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5, nor seed 225
+/// (#248), may fail.
 fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
     const step = b.step("sim-c1-worlds", "Run sim-c1 in the job_evicted world");
     const only = b.step("sim-c1-worlds-exe", "Install the world runners");
@@ -1724,6 +1792,12 @@ fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
         run.addArgs(&.{ "--seeds", "1..5", "300", "--c1" });
         run.expectExitCode(0);
         step.dependOn(&run.step);
+        // #248: seed 225 broke J6 on fb385b2 (a server failure ended the job pass before an
+        // orphan's committed stop); the replay must pass.
+        const replay = b.addRunArtifact(exe);
+        replay.addArgs(&.{ "225", "300", "1", "--c1" });
+        replay.expectExitCode(0);
+        step.dependOn(&replay.step);
     }
 }
 
@@ -1792,6 +1866,55 @@ const c1_regressions = [_][]const []const u8{
         "--c1",                 "--strong",           "--profile=slow_store",
         "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=99",
     },
+    // #225: an agent that fenced after a restart waited with a watch that answered at once (no
+    // replica list, so no revision to watch from), and stepped in a hot loop until the fence
+    // ended: 52 steps in one millisecond. A wait while fencing is a pause now (`Wakeup.watch`).
+    &.{
+        "9739923",            "114",                   "4",
+        "--strong",           "--profile=crash_heavy", "--lease-ttl-ms=10000",
+        "--replicas-pct=200", "--heal-at=104",
+    },
+    &.{
+        "2764708423",         "69",                    "4",
+        "--strong",           "--profile=crash_heavy", "--lease-ttl-ms=8248",
+        "--replicas-pct=300", "--heal-at=58",
+    },
+    // #247: a lost answer (ZC-E0201) to a run's write ended the job pass, and a run whose
+    // cancel had committed kept running past J6's bound (137,767 ms) on f49041a. It records the
+    // issue and guards nothing: fb385b2 passes it by luck of timing, and so does the loop's
+    // `break` put back. The guards are the #247 unit tests (`agent_jobs_test.zig`) and the
+    // `job_pass_break` tooth (docs/decisions/2026-11-14-b3-soak-after-247.md).
+    &.{
+        "870682998",          "80",                   "3",
+        "--strong",           "--profile=slow_store", "--lease-ttl-ms=8488",
+        "--replicas-pct=100", "--heal-at=76",
+    },
+    // #96: an agent stepped in a busy loop in the fault phase (2,098 steps) on f49041a; #244's
+    // fence pause (`.watch = false`) fixed it on fb385b2 (1,492 steps).
+    &.{
+        "833885280",           "185",                "4",
+        "--c1",                "--strong",           "--profile=crash_heavy",
+        "--lease-ttl-ms=8226", "--replicas-pct=200", "--heal-at=390",
+    },
+    // #142 again on the b3 candidate ebfbac5: a run started in a long step, its cancel committed
+    // meanwhile; the next step read the runs (stop shown), then the read of the node's reports
+    // timed out and the pass ended with the stop withheld while keepalives went on (12,602 ms,
+    // bound 12,000). A failed reports read is kept now and the stops still go (`agent_jobs.pass`).
+    &.{
+        "2821617909",         "100",           "3",
+        "--c1",               "--strong",      "--lease-ttl-ms=10000",
+        "--replicas-pct=200", "--heal-at=130",
+    },
+    // The same shape at f49041a, where the step failed on `assigned`, in the loading before the
+    // job pass. A record of the issue, not a guard: it passes on ebfbac5 too, where that load
+    // still ended the step (#247 does not cover a failed load; the world the line draws
+    // changed). The guard of that half is the unit test of a failed assignments read
+    // (`agent_jobs_test.zig`, #142).
+    &.{
+        "4242675264",           "145",                "4",
+        "--c1",                 "--strong",           "--profile=partitions",
+        "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=176",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
@@ -1818,7 +1941,8 @@ fn add_regressions_step(b: *std.Build, sim: SimStepOptions) void {
 /// `zig build sim-fencing-teeth`: the negative test of `fencing_settles`. The simulator with
 /// the old `ttl / 3` renewal rule and the shortest-ttl bound lifted, at a ttl of 4,000 ms (the
 /// server refuses it now), must fail with that check's symptom. Not in `c1_teeth_roots`: the
-/// fleet's canary draws no ttl by hand.
+/// fleet's canary draws no ttl by hand. Seeds 2..4: seed 1's fence loop is caught first by
+/// `converged` since fence waits became pauses (docs/decisions/2026-11-13-fencing-teeth-seeds.md).
 fn add_fencing_teeth_step(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_c1_teeth_oldrule",
@@ -1831,7 +1955,7 @@ fn add_fencing_teeth_step(b: *std.Build, sim: SimStepOptions) void {
     });
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{
-        "--seeds",                              "1..3",                "100",
+        "--seeds",                              "2..4",                "100",
         "1",                                    "--lease-ttl-ms=4000", "--expect-fail",
         "--expect-symptom=agents kept fencing",
     });
