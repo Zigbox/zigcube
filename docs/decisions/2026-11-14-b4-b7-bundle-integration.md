@@ -234,5 +234,19 @@ to an untagged commit, so the pin moved to the tag's commit, 7901666:
    pre-B6 `auto` replay line no longer replays its old world.
 6. **Demos still pending.** demo-b4 lives on `claude/b4-slice4`, which this bundle does not have.
    demo-b6 came in with B6 slice 3. demo-b3 and demo-b5 need KVM and were not run in the cloud.
+7. **CI fixes after the first full run (run 43695032308).**
+   - **sim-c1, native against WASM.** `sim_certs` printed the R4 refusal counts in the order
+     `@typeInfo` gives an error set's names. The compiler picks that order, and it differs between
+     native and wasm32. The names are now written out in declaration order, and a comptime check
+     ties them to `job_cert.Refusal`.
+   - **demo-c2.** `zcube` (ReleaseSafe) panicked on its first mTLS call. `client.tls = undefined`
+     on an optional left its null tag undefined, so the `.?` that followed failed (Debug's fill
+     hid it). `cli_http.init_tls` now assigns an undefined payload.
+   - **zigbox-smoke.** The guest's server ran `--listen`, which B7 made TLS-only, while its
+     `curl` calls and agent spoke plain HTTP. Everything runs on the guest's loopback, so the server
+     now runs `--insecure-listen`, an addition to AGENTS.md's list of its users.
+   - **demo-b3.** The stripped Debug `zcube-agent` grew to about 18 MB with the bundle, over
+     the 8 MiB a zigbox_vm route may serve, and an assert in its HTTP server fired. build.zig now
+     gzips it (about 4 MB), and `Guests.agent_gzipped` unpacks it in the guest.
 
 Where: the merge commits' messages, `docs/releases/b4-b7.md`.

@@ -580,6 +580,12 @@ fn stripped(b: *std.Build, exe: *std.Build.Step.Compile) std.Build.LazyPath {
     return output;
 }
 
+fn gzipped(b: *std.Build, file: std.Build.LazyPath) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{ "gzip", "-9c" });
+    run.addFileArg(file);
+    return run.captureStdOut(.{ .basename = "zcube-agent.gz" });
+}
+
 /// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it;
 /// `pg-stop` stops it and keeps its data (demo-c0 stops and starts it mid-run). Returns the tool.
 fn add_pg_dev_steps(b: *std.Build) *std.Build.Step.Compile {
@@ -904,8 +910,10 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     run.addArtifactArg(built.cli);
     run.addArg("--server");
     run.addArtifactArg(debug.server);
+    // Gzipped: the stripped Debug agent (about 18 MB) is over the 8 MiB a zigbox_vm route may
+    // serve (`vm.limits.http_body_bytes_max`); the guest unpacks it (`Guests.agent_gzipped`).
     run.addArg("--agent");
-    run.addFileArg(stripped(b, debug.agent));
+    run.addFileArg(gzipped(b, stripped(b, debug.agent)));
     run.addArg("--zbx");
     run.addFileArg(stripped(b, zigbox.artifact("zbx")));
     run.addArg("--guest-script");

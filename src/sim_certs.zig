@@ -68,8 +68,26 @@ pub const State = struct {
     }
 };
 
-const refusal_names = @typeInfo(job_cert.Refusal).error_set.error_names.?;
+/// In declaration order, written out: `@typeInfo` of an error set lists its names in an order the
+/// compiler chooses, which differs between the native and the WASM build, so a report printed from
+/// it would differ too. The comptime block checks the list names each member exactly once.
+const refusal_names = [_][]const u8{
+    "no_relay",    "run_ended",   "wrong_image", "no_claim", "wrong_node",
+    "stale_epoch", "not_started", "lifetime",    "labels",
+};
 const reasons = refusal_names.len;
+
+comptime {
+    const members = @typeInfo(job_cert.Refusal).error_set.error_names.?;
+    assert(members.len == reasons);
+    for (members) |member| {
+        var found: u32 = 0;
+        for (refusal_names) |name| {
+            if (std.mem.eql(u8, member, name)) found += 1;
+        }
+        assert(found == 1);
+    }
+}
 
 fn reason_index(refusal: job_cert.Refusal) usize {
     inline for (refusal_names, 0..) |name, index| {

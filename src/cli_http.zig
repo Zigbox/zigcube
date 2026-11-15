@@ -93,7 +93,9 @@ pub const Client = struct {
         if (ca == null or cert == null or key == null) return tls_incomplete(report);
         const name = flags.tls_name orelse env.getenv("ZCUBE_TLS_NAME") orelse
             api_tls_client.server_name_default;
-        client.tls = undefined;
+        // A payload that is undefined, not an optional that is: `undefined` on `?T` leaves its
+        // null tag undefined too, and ReleaseSafe then fails the `.?` below (Debug's fill hid it).
+        client.tls = @as(api_tls_client.Credentials, undefined);
         const paths: api_tls_client.Paths = .{
             .ca = ca.?,
             .cert = cert.?,
