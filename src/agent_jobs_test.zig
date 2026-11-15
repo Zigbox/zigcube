@@ -1634,8 +1634,8 @@ test "a runs read that keeps failing while keepalives are answered stops the job
     try testing.expectEqual(fence_at, world.agent.deadline_wake_mono_ms);
     world.advance(200 + constants.fence_stop_ms);
     try testing.expectEqual(@as(u32, 1), world.sim.running_count());
-    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"),
-        (try rig.start_record()).?.stop_cause);
+    const fenced = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), fenced.stop_cause);
     try testing.expect(!world.agent.fence.active);
     try testing.expectEqual(@as(u32, 0), world.agent.fences);
     try testing.expectEqual(tenure, world.agent.tenure);

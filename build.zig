@@ -1416,12 +1416,11 @@ const c1_teeth_roots = [_]struct {
         .name = "job_runs_unread",
         .root = "src/sim_c1_teeth_job_runs_unread_main.zig",
         .symptom = "J6",
-        // A gap shown, not an agent fault (docs/decisions/2026-11-14-j6-runs-unread-gap.md): the
-        // server cuts a node's runs read while a stop is asked. Measured 2026-11-14 over seeds 1
-        // to 40 at 100 operations: J6 first at 11 seeds with `--c1` (2 4 7 14 17 18 22 23 25 30
-        // 32) and 13 plain; 6 others fail first on other checks (the cut also hides new runs and
-        // ended jobs), so the canary is pinned to known J6 hits, as a sparse tooth's is. Each
-        // passes with the fault off.
+        // The local job fence off (docs/decisions/2026-11-15-j6-jobs-local-fence.md) in a world
+        // whose server cuts a node's runs read for 60 s after a stop commits. Measured 2026-11-15
+        // over seeds 1 to 40 at 100 operations: J6 at 11 seeds with `--c1` (2 4 7 14 17 18 22 23
+        // 25 30 32) and 12 plain, no other check; the canary stays pinned to known J6 hits. With
+        // the fence on (`sim-c1-runs-unread`) all 40 pass.
         .canary_seeds = 1,
         .canary_first = 2,
         .also_seeds = &.{ 4, 7 },

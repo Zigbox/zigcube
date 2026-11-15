@@ -309,23 +309,7 @@ pub fn pass(
     // failed read of the reports is kept the same way: the runs above already say which stops
     // are committed, and a step that ended here withheld them while heartbeats went on, past
     // J6's bound (#142, seed 2821617909).
-    if (!kept.stopped) {
-        const prefix = records.job_observed_prefix(agent.config.node);
-        if (controller.list_all(
-            records.JobObserved,
-            &cctx,
-            prefix.slice(),
-            null,
-            constants.job_admitted_window_max,
-        )) |observed| {
-            work.observed = observed.items;
-        } else |err| {
-            kept.stage(agent, ctx, "read the runs' reports", err);
-            // `Kept.fail`: only RuntimeFailed and NotFound do not stop, and a store read
-            // returns neither (checked at compile time below).
-            assert(kept.stopped);
-        }
-    }
+    if (!kept.stopped) work.read_observed(kept);
     // One run's failing step must not starve the runs after it (#205): like a replica's, it is
     // kept and the next run is looked at. After a failure that is not the runtime's (the server:
     // a lost answer to a committed write is one), each run whose stop needs no store call, this
@@ -359,6 +343,27 @@ const Work = struct {
     runs: []const Entry(records.JobRun) = &.{},
     observed: []const Entry(records.JobObserved) = &.{},
     commits: u32 = 0,
+
+    /// The node's reports, into `observed`; a failure is kept and stops the pass's store calls.
+    fn read_observed(work: *Work, kept: *agent_mod.Kept) void {
+        const agent = work.agent;
+        const cctx = work.ctx.as_controller();
+        const prefix = records.job_observed_prefix(agent.config.node);
+        if (controller.list_all(
+            records.JobObserved,
+            &cctx,
+            prefix.slice(),
+            null,
+            constants.job_admitted_window_max,
+        )) |observed| {
+            work.observed = observed.items;
+        } else |err| {
+            kept.stage(agent, work.ctx, "read the runs' reports", err);
+            // `Kept.fail`: only RuntimeFailed and NotFound do not stop, and a store read
+            // returns neither (checked at compile time below).
+            assert(kept.stopped);
+        }
+    }
 
     /// Every assigned run, then the runs that have a container or a start record and no
     /// assignment (a run released, or one stopped by a fence), each once.
