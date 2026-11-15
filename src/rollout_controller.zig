@@ -13,8 +13,8 @@
 //!     live and stopping until the agent reports it stopped or deletes it;
 //!   - it is **ready** once the controller has seen it running for `min_ready_ms`; a replica
 //!     with a health check counts as running only while its report says `healthy` (`update`,
-//!     and the replica controller's `running_healthy`), except that an agent restart's `unknown`
-//!     after `healthy` keeps an old replica's time and keeps a new one not ready
+//!     and the replica controller's `running_healthy`), except that an old replica runs through
+//!     `unknown`, and a new one's `unknown` after `healthy` keeps its time but keeps it not ready
 //!     (`Track.unknown_after_healthy`, docs/decisions/2026-11-15-c3-rollout-health-gate.md);
 //!   - a new replica that is held (`hold_failed_replica`), that dies more than
 //!     `constants.rollout_restarts_max` times in all, or that is placed and not ready within
@@ -185,7 +185,9 @@ pub const RolloutController = struct {
         for (snap.replicas) |*replica| {
             const track = rc.track_of(replica.rec.id) orelse rc.track_add(replica.rec.id) orelse
                 continue;
-            update(track, snap, replica, now);
+            const service = snap.service_of(replica.rec.service);
+            const fresh = if (service) |found| is_new(&replica.rec, &found.rec) else true;
+            update(track, snap, replica, fresh, now);
         }
         assert(rc.tracks_count <= snap.replicas.len);
     }
@@ -261,6 +263,7 @@ fn update(
     track: *Track,
     snap: *const Snapshot,
     replica: *const Entry(records.Replica),
+    fresh: bool,
     now: u64,
 ) void {
     const placed = snap.assigned_of(replica.rec.id) != null;
@@ -270,17 +273,25 @@ fn update(
     const lost = node_lost(snap, replica.rec.id);
     const status: ?records.ObservedStatus = if (observed) |found| found.rec.status else null;
     // A replica with a health check is "running" for readiness only while its report says it
-    // is healthy. `unknown` straight after `healthy` (an agent restart) keeps the replica's
-    // time, and `ready_now` decides by age; any other `unknown` and `unhealthy` are not running.
+    // is healthy, with two exceptions for `unknown` (an agent restart, or checks that never
+    // settle, ZC-E0516). An old replica (`fresh` false) that runs counts as running through
+    // `unknown`, whether or not it was ever healthy: the replica controller's `running_healthy`
+    // counts every stale `unknown` as running, and the two must agree, or the rollout controller
+    // offers it to `budget.retire_unready` and the replica controller keeps it for
+    // `budget.retire`, and neither retires it. A new replica's `unknown` straight after `healthy`
+    // keeps its time (`view` keeps it not ready); any other `unknown` and `unhealthy` are not
+    // running (docs/decisions/2026-11-15-c3-rollout-health-gate.md).
     const health: records.HealthState = if (replica.rec.health == null)
         .healthy
     else if (observed) |found| records.observed_health(&found.rec) else .unknown;
+    const old_unknown = !fresh and health == .unknown and status == .running;
     const held_over = health == .unknown and status == .running and
         track.running_since_ms != null and
         (track.unknown_after_healthy or track.last_healthy);
     track.unknown_after_healthy = held_over;
     track.last_healthy = health == .healthy;
-    const running = status == .running and !lost and (health == .healthy or held_over);
+    const running = status == .running and !lost and
+        (health == .healthy or held_over or old_unknown);
     if (!running) track.running_since_ms = null;
     if (running and track.running_since_ms == null) track.running_since_ms = now;
     if (status != .stopped) return;

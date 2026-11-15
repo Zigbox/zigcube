@@ -80,6 +80,15 @@ const third: apply_mod.Input = .{
     .request_id = "r-0002b12",
 };
 
+/// The health check of the tests that roll a checked service.
+const checked_health: records.Health = .{
+    .command = &.{ "test", "-f", "/tmp/ready" },
+    .interval_ms = 1000,
+    .timeout_ms = 1000,
+    .failure_threshold = 2,
+    .success_threshold = 1,
+};
+
 const Fixture = struct {
     manual: ManualClock,
     memory: *MemoryStore,
@@ -652,6 +661,113 @@ test "an agent restart's unknown keeps old replicas ready and new ones not ready
     _ = try fixture.report_health(2, .running, .healthy);
     try fixture.settle();
     try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
+}
+
+test "a never-healthy replica of a failed rollout whose checks never settle is retired" {
+    // Goal: PR #261 re-review MUST. A release whose checks never settle (every probe refused,
+    // ZC-E0516) reports `unknown` forever. Its rollout fails at `ready_timeout_ms`, and the
+    // rollback must still end: the stale `unknown` replica is running to both controllers, so it
+    // is retired within `budget.retire` once the rollback's replicas are ready. Before the fix
+    // the rollout controller counted it unready (`retire_unready`) and the replica controller
+    // running (`retire` only), so the rollback stayed `rolling_back`. Method: as "an unhealthy
+    // replica of a failed rollout ...", with the new replica `unknown` instead of `unhealthy`.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = checked_health;
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b13";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .unknown));
+    try fixture.settle();
+    fixture.manual.advance((records.RolloutPolicy{}).ready_timeout_ms + 100);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+    for (0..40) |_| {
+        _ = try fixture.report_health(3, .running, .healthy);
+        try fixture.settle();
+        fixture.manual.advance(10_000);
+        try fixture.settle();
+    }
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(2));
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(3));
+    try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
+}
+
+test "a new replica unknown after healthy is not ready to the rollout controller" {
+    // Goal: PR #261 re-review SHOULD, the rollout controller's half of the `unknown` rule
+    // (`!(fresh and held_over)` in `view`). A new replica that ran healthy for `min_ready_ms`
+    // and is then `unknown` (an agent restart) is not counted ready by the rollout record, so
+    // the rollout does not complete on replicas nobody knows are healthy. Method: roll a checked
+    // service of one replica; the new replica runs healthy, then `unknown` for `min_ready_ms`.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.replicas = 1;
+    checked.health = checked_health;
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b14";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .healthy));
+    try fixture.settle();
+    _ = try fixture.report_health(2, .running, .unknown);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    const rollout = try fixture.rollout();
+    try testing.expectEqual(@as(u32, 0), rollout.ready_new);
+    try testing.expect(rollout.phase != .complete);
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(1));
+}
+
+test "an old replica unknown after an agent restart counts toward the replica floor" {
+    // Goal: PR #261 re-review SHOULD, the replica controller's half of the `unknown` rule
+    // (`running_healthy`: a stale `unknown` replica runs). A budget that retires one old replica
+    // was stored while the new replica was ready; the new replica then turns unhealthy and the
+    // agent restarts (old replicas `unknown`). The replica controller, run alone over that budget,
+    // must keep all three old replicas: they are running and the floor (3) allows none to go. If
+    // it counted them not running, it would retire one as unready, without the floor's check.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = checked_health;
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b15";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try rollouts_only(&fixture);
+    try testing.expectEqual(@as(u32, 1), (try fixture.rollout()).budget.retire);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    _ = try fixture.report_health(2, .running, .unhealthy);
+    _ = try fixture.report_health(1, .running, .unknown);
+    try replicas_only(&fixture);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
 }
 
 test "a kept replica that stops between the read and the commit fails the retirement" {
