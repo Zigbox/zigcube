@@ -1839,8 +1839,8 @@ test "an agent that restarts while the runs read fails keeps the local job fence
     // while the read fails still stops its job by the fence, and an agent restarted while the
     // read answers starts its clock afresh. Method: the runs' read fails for longer than a
     // renewal; the agent restarts; its fence is still the term after the last good read, and the
-    // container is stopped there. Then the read answers again, the agent restarts once more, and
-    // its fence is the term after its new first read.
+    // container is stopped there. Then the read answers once, and the agent restarts in that step
+    // with the read failing again: its fence is the term after its restart, not the old one.
     var rig = try Rig.start();
     defer rig.stop();
     const world = rig.world;
@@ -1854,8 +1854,14 @@ test "an agent that restarts while the runs read fails keeps the local job fence
     world.advance(fence_at - world.now_ms() + sim_world.tick_ms);
     try testing.expect(!rig.running());
     world.switched.down_list_prefix = null;
-    world.advance(2_000);
-    try testing.expect(!world.agent.runs_failing);
+    // Restart in the step the read recovers, before a keepalive rewrites the lease file: only
+    // `runs_read_ok`'s own write can have dropped the old clock by then.
+    var waited_ms: u64 = 0;
+    while (world.agent.runs_failing) : (waited_ms += sim_world.tick_ms) {
+        try testing.expect(waited_ms < 2_000);
+        world.advance(sim_world.tick_ms);
+    }
+    world.switched.down_list_prefix = records.prefix_job_runs;
     world.restart_agent();
     const restarted = world.now_ms();
     world.advance(sim_world.tick_ms);
