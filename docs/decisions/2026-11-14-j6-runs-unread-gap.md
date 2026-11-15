@@ -2,8 +2,9 @@
 
 *Recorded 2026-11-14, by the fix slice of #142 (claude/b3-j6-142). **Decided by the owner,
 2026-11-14: option B**, a jobs-only local fence from the last good runs read, with the same term
-as J6's fence. Not built yet: it is a named follow-up (below), and until it lands the tooth
-stays an expected failure.*
+as J6's fence. **Built 2026-11-15** (#143's recurrence on ad4c6ca was this gap):
+docs/decisions/2026-11-15-j6-143-job-fence.md; the tooth is now the positive run
+`sim-c1-runs-unread`.*
 
 ## The gap
 
