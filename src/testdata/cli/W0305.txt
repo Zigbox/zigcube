@@ -1,0 +1,6 @@
+warning[ZC-W0305]: a rollout was rolled back automatically
+  cause  replica hello-31 stayed unhealthy for 40 s; hello was rolled back to
+         generation 6 as generation 8
+  fix    fix the release and apply it again
+  more   zcube explain W0305 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0305.html

@@ -25,6 +25,8 @@ pub const modules = .{
     @import("auditor.zig"),
     @import("job_api.zig"),
     @import("apply.zig"),
+    @import("history.zig"),
+    @import("rollout_plan.zig"),
     @import("chunk_summary.zig"),
     @import("mtls_smoke.zig"),
     @import("node_store.zig"),
@@ -48,6 +50,7 @@ pub const modules = .{
     @import("peer_serve.zig"),
     @import("records.zig"),
     @import("replica_controller.zig"),
+    @import("rollout_controller.zig"),
     @import("runtime_codes.zig"),
     @import("retention.zig"),
     @import("pull_retention.zig"),
@@ -57,6 +60,7 @@ pub const modules = .{
     @import("runtime.zig"),
     @import("sim_c0.zig"),
     @import("sim_c1.zig"),
+    @import("sim_c3.zig"),
     @import("evidence.zig"),
     @import("why_acceptance.zig"),
     @import("c1_teeth.zig"),
@@ -170,6 +174,7 @@ test {
     _ = @import("tls_client_test.zig");
     _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
+    _ = @import("rollout_controller_test.zig");
     _ = @import("scheduler_test.zig");
     _ = @import("job_controller_test.zig");
     _ = @import("api_test.zig");

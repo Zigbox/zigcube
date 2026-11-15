@@ -43,9 +43,11 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const node_store = @import("node_store.zig");
 const records = @import("records.zig");
+const rollout_controller = @import("rollout_controller.zig");
 const agent_jobs = @import("agent_jobs.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
+const sim_c3 = @import("sim_c3.zig");
 const why_acceptance = @import("why_acceptance.zig");
 const sim_checks = @import("sim_checks.zig");
 const sim_clock = @import("sim_clock.zig");
@@ -315,6 +317,7 @@ pub const Swarm = struct {
                 swarm.net.request.delay_ms_max = 200 + r.uintLessThan(u32, 400);
                 swarm.net.reply.delay_ms_max = 200 + r.uintLessThan(u32, 400);
             },
+            .bad_release => swarm.w_broken = 6 + r.uintLessThan(u32, 10),
         }
     }
 
@@ -842,6 +845,8 @@ pub const Cluster = struct {
     /// Replaced replicas whose overlap was not watched because the table was full.
     overlaps_unwatched: u32,
     c1_tally: sim_c1.Tally,
+    /// What C3's rollout checks judged (`sim_c3`).
+    c3_tally: sim_c3.Tally,
     c1_violation_revision: store.Revision,
     c1_revisions: u64,
     /// Scratch for the per-revision checks, which run inside a store call.
@@ -862,6 +867,12 @@ pub const Cluster = struct {
     /// J4: the client that follows the job endings through the watch, and its own random stream.
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
+    /// C3's pauses and resumes (`--c3` only), from a stream of their own so that a world without
+    /// `--c3` draws as before.
+    rollout_prng: std.Random.DefaultPrng,
+    c3: bool,
+    rollout_pauses: u32,
+    rollout_resumes: u32,
     job_next: u32,
     /// The reuse world (B2.1 slice 4): retention run by a jump of time, so that a name is reused
     /// while a container of its earlier incarnation still stands. Its counters: jumps made,
@@ -938,9 +949,9 @@ pub const Cluster = struct {
         c.jobs_on = false;
         c.jobs = .{};
         c.jobs_watch = .{};
-        c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
         c.init_reuse();
+        c.init_rollouts(seed);
         c.strong = options.strong or c1_teeth.strong_world;
         c.host_crashes = 0;
         c.init_c1(gpa);
@@ -949,6 +960,26 @@ pub const Cluster = struct {
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// The C3 world (`--c3`) is off until `run` turns it on; the job world's watch draws too.
+    fn init_rollouts(c: *Cluster, seed: u64) void {
+        c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
+        c.rollout_prng = .init(seed ^ 0x9a05_e7e5_0c3);
+        c.c3 = false;
+        c.rollout_pauses = 0;
+        c.rollout_resumes = 0;
+    }
+
+    /// The sim-c3 line: how often each rollout check judged, and the pauses and resumes asked.
+    fn report_c3(c: *const Cluster, report: anytype) void {
+        report.print("sim-c3 R1 retirements={d} doubted={d} R2 surges={d} R3 versions={d} " ++
+            "R4 paused={d} R6 history={d}; pauses={d} resumes={d}\n", .{
+            c.c3_tally.retirements_judged, c.c3_tally.retirements_doubted,
+            c.c3_tally.surges_judged,      c.c3_tally.versions_judged,
+            c.c3_tally.paused_judged,      c.c3_tally.history_judged,
+            c.rollout_pauses,              c.rollout_resumes,
+        });
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -982,6 +1013,7 @@ pub const Cluster = struct {
         c.c1_pending = null;
         c.overlaps_unwatched = 0;
         c.c1_tally = .{};
+        c.c3_tally = .{};
         c.c1_violation_revision = 0;
         c.c1_revisions = 0;
         c.tap_arena = .init(gpa);
@@ -1427,6 +1459,21 @@ pub const Cluster = struct {
             c.diag.reset();
     }
 
+    fn request_rollout(c: *Cluster, name: []const u8, what: rollout_controller.Request) void {
+        const ctx = c.controller_context();
+        const outcome = rollout_controller.request(&ctx, &c.api_source, name, what) catch {
+            c.diag.reset();
+            return;
+        };
+        switch (outcome) {
+            .done => |phase| {
+                if (phase == .paused) c.rollout_pauses += 1 else c.rollout_resumes += 1;
+            },
+            .unchanged, .conflict => {},
+            .refused => c.diag.reset(),
+        }
+    }
+
     fn restart_server(c: *Cluster) void {
         c.dropped_before_restart += c.server.replicas.retention.dropped;
         c.server = control_plane.ControlPlane.init(c.take_instance());
@@ -1808,8 +1855,10 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
             return;
         }
     }
-    if (sim_c1.at_revision(&ctx, request, c.retention_running)) |found| {
-        c.c1_violation = found;
+    const found = sim_c1.at_revision(&ctx, request, c.retention_running) orelse
+        if (c.c3) sim_c3.at_revision(&ctx, request, &c.c3_tally) else null;
+    if (found) |problem| {
+        c.c1_violation = problem;
         c.c1_violation_revision = revision;
     }
 }
@@ -1833,7 +1882,8 @@ fn before_commit(context: *anyopaque, request: store.TxnRequest) void {
         .arena = c.tap_arena.allocator(),
         .diag = &c.tap_diag,
     };
-    c.c1_pending = sim_c1.before_commit(&ctx, request, &c.c1_tally);
+    c.c1_pending = sim_c1.before_commit(&ctx, request, &c.c1_tally) orelse
+        if (c.c3) sim_c3.before_commit(&ctx, request, &c.c3_tally) else null;
 }
 
 /// The injection of the two negative tests (compare skipped): just ahead of the scheduler's
@@ -2158,7 +2208,17 @@ fn operation(c: *Cluster) void {
         .job_cancel => c.cancel_job(),
         .job_end => c.end_job(),
     }
+    if (c.c3 and c.fault_totals == null) pause_or_resume(c, name);
     c.advance(100);
+}
+
+/// Under `--c3`, before the heal, one operation in four also pauses or resumes the rollout of the
+/// service it drew (just applied, so most often one in progress) through the core's request, the
+/// one slice 11's API calls, for R4.
+fn pause_or_resume(c: *Cluster, name: []const u8) void {
+    const random = c.rollout_prng.random();
+    if (random.uintLessThan(u32, 4) != 0) return;
+    c.request_rollout(name, if (random.uintLessThan(u32, 3) == 0) .resume_rollout else .pause);
 }
 
 // ---- Checks -------------------------------------------------------------------------------------
@@ -2856,6 +2916,8 @@ fn heal(c: *Cluster) void {
         node.fences_at_heal = node.fences;
         node.job_refusals_at_heal = node.job_refusals;
     }
+    // Every paused rollout is resumed, so that the liveness check sees each one finish or fail.
+    if (c.c3) for (service_names) |name| c.request_rollout(name, .resume_rollout);
 }
 
 /// Null if `node` has no container of `name` that is not stopped; else whether it is `running`
@@ -2913,9 +2975,22 @@ fn converged(c: *Cluster) Failure!void {
             null,
             constants.replicas_max,
         ) catch return check(c, false, "the replicas cannot be read");
-        try check(c, replicas.items.len == service.rec.replicas, "a service lacks replicas");
-        const good = !std.mem.eql(u8, service.rec.image, broken_digest);
+        // A halted rollout (failed or paused; C3, until slice 8 rolls back) keeps the old
+        // replicas beside the new, up to its surge: each replica then runs if its own image is
+        // good.
+        const halted = rollout_controller.halted(&ctx, &service) catch
+            return check(c, false, "the rollouts cannot be read");
+        const count = replicas.items.len;
+        const wanted = service.rec.replicas;
+        if (halted) {
+            try check(c, count >= wanted, "a service lacks replicas");
+            try check(c, count <= wanted + service.rec.rollout_policy().max_surge, "a halted " ++
+                "rollout holds more than its surge");
+        } else {
+            try check(c, count == wanted, "a service lacks replicas");
+        }
         for (replicas.items) |replica| {
+            const good = !std.mem.eql(u8, replica.rec.image, broken_digest);
             try replica_converged(c, observed.items, &homes, &replica.rec, good);
         }
     }
@@ -3076,6 +3151,9 @@ pub const Options = struct {
     on_step: ?*const fn (step: []const u8) void = null,
     /// sim-c1 (docs/core.md): the per-revision checks, the overlap bound, the extra faults.
     c1: bool = false,
+    /// sim-c3 (C3 slice 7; needs `c1`): the rollout checks R1 R2 R3 R4 R6 and the pauses and
+    /// resumes that R4 judges. Off, a `--c1` world is the one earlier builds drew.
+    c3: bool = false,
     /// Which fault classes are on (`sim_shape.zig`). `mixed` is the seed's own mix, as every
     /// build before profiles drew it.
     profile: sim_shape.ClusterProfile = .mixed,
@@ -3170,7 +3248,9 @@ pub fn simulate(
         c.swarm.replicas_pct,
     });
     c.liveness = options.liveness;
+    if (options.c3) assert(options.c1);
     c.c1 = options.c1;
+    c.c3 = options.c3;
     c.jobs_on = options.jobs;
     if (c.jobs_on) {
         c.swarm.add_jobs(seed);
@@ -3420,6 +3500,7 @@ fn print_summary(c: *Cluster) void {
             c.c1_tally.facts_other,
         });
         report.print("sim-c1 L1: placements judged={d}\n", .{c.c1_tally.placements_judged});
+        if (c.c3) c.report_c3(report);
         const n = c.recorder.counts;
         report.print("sim-c1 acceptance: decisions={d} complete={d} truncated={d} dropped={d} " ++
             "keys deleted={d} changed={d}\n", .{

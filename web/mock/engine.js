@@ -233,7 +233,24 @@ export class Engine {
       generation: existing ? existing.value.generation + (same ? 0 : 1) : 1,
       applied_by: actor, request_id: requestId, // proposed additions to /services/<name>, see docs/api.md
     };
-    this.commit([{ put: [key, value] }]);
+    const ops = [{ put: [key, value] }];
+    // docs/keys.md `/history/<service>/<generation>`: one record per new generation, written with
+    // the service; at most 16 per service, the lowest generation dropped in the same commit.
+    if (!existing || value.generation !== existing.value.generation) {
+      const { applied_by, request_id, name, generation, image, source, command, env, limits } = value;
+      ops.push({ put: [`/history/${name}/${generation}`, {
+        v: 1, service: name, generation, image, source, command, env, limits,
+        applied_by, request_id, applied_at_ms: this.now(), reason: "apply",
+      }] }); // `health` and `restores` are left out when there are none, as the server writes them
+      // A record of an earlier service of this name (any record when the service is new, or one
+      // at or above the generation written) is stale: the same commit deletes it, as the server does.
+      const all = this.list(`/history/${name}/`).kvs.map(kv => kv.value.generation);
+      const stale = all.filter(g => !existing || g >= generation);
+      for (const g of stale) if (g !== generation) ops.push({ del: `/history/${name}/${g}` });
+      const kept = all.filter(g => !stale.includes(g)).sort((a, b) => a - b);
+      while (kept.length >= 16) ops.push({ del: `/history/${name}/${kept.shift()}` });
+    }
+    this.commit(ops);
     return value;
   }
 

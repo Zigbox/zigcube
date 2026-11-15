@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a stored record can't be read</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
-<p>A controller, the agent or the API read a value from the store that is not a record of the kind its key says: not JSON, a field of the wrong type, or a name that breaks the naming rules. The API validates what it writes, so something else wrote this key, or the store was edited by hand.</p>
+<p>A controller, the agent or the API read a value from the store that is not a record of the kind its key says: not JSON, a field of the wrong type, a name that breaks the naming rules, or fields that contradict each other (a rollout back to generation 0). Zigcube validates what it writes, so something else wrote this key, or the store was edited by hand.</p>
 <p>The cause line names the key. Fix or delete that key (zcube get shows it); the controller skips nothing silently and tries again on its next pass.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

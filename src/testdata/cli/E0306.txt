@@ -1,0 +1,6 @@
+error[ZC-E0306]: a rollout passed its progress deadline
+  cause  the rollout of hello to generation 7 started 600000 ms ago; 2 of 3 new
+         replicas are ready
+  fix    raise progress_deadline_ms if the release is slow to start
+  more   zcube explain E0306 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0306.html

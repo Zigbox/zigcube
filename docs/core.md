@@ -520,3 +520,40 @@ the `strong` world makes relayed jobs, so a run without `--strong` makes no rela
 the ending and must fail R1, with or without `--c1`. The fleet's canary list gains `sim_c1_teeth_relay_leak`.
 
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.
+
+## sim-c3
+
+`sim_cluster ... --c3` (C3 slice 7, `src/sim_c3.zig`; it implies `--c1`) adds C3's rollout checks
+(docs/briefs/c3.md, "Simulation: checks and teeth") to sim-c1's, judged at the head of the store
+like them: R1 (a transaction of the replica controller that retires a running replica of a rolling
+rollout leaves at least `replicas - max_unavailable` running; a report the transaction did not
+compare and that changed after every key it did is counted as running, since the controller
+promises the floor on the state it read, `docs/decisions/2026-11-14-c3-rolling-floor-compares.md`),
+R2 (no more replicas
+than `replicas + max_surge` once a replica is created, in every phase of a rollout, paused and
+failed too), R3 (every replica created runs a
+generation in the service's history), R4 (a paused rollout starts and retires nothing; a scale
+down the user asked for is exempt, counted as the replica controller counts it: held replicas and
+replicas on a node not yet lost count, `docs/decisions/2026-11-14-c3-paused-scale-down.md`) and R6 (a history record never changes under its generation).
+R5 (auto-rollback) waits for slice 8. Each check is a little weaker than its sentence in the
+brief, never stronger. Readiness is observed `running`: slices 9 and 10 (probes, health) replace
+it in `rollout_controller.Track`.
+
+With `--c3` the world also pauses and resumes rollouts (`rollout_prng`, a stream of its own, so a
+run without `--c3` draws as before), and resumes any paused rollout at the heal. The report adds
+`sim-c3 R1 retirements=.. doubted=.. R2 surges=.. R3 versions=.. R4 paused=.. R6 history=..; pauses=..
+resumes=..` (`doubted` counts the replicas R1 gave that benefit; the simulator's controllers
+read and commit with nothing between, so it is 0 there, and the unit tests in
+`src/rollout_controller_test.zig` write between the read and the commit instead). The race the
+floor's compares close (a kept replica that stops between a retirement's read and its commit,
+`expect_floor`) is therefore proven only by those unit tests, the first and the last replica the
+floor counts; no world step interleaves an agent's report inside a server pass.
+`--profile=bad_release` turns the faults off and raises the share of applies whose
+image never starts (`w_broken`), so rollouts fail (ZC-E0304) and are paused and resumed failed.
+
+Teeth (`zig build sim-c3-teeth`, one step each, `src/c1_teeth.zig`): `rollout_budget` (the replica
+controller spends the budget on the plan it read, comparing neither the replica counter nor the
+rollout record, and ignores `max_unavailable`: R1), `rollout_pause` (the replica controller keeps
+a progressing budget while a rollout is paused or failed: R4) and
+`rollout_history` (`history.put` also writes the new record over the previous generation's key:
+R6). They are not yet in the canary manifest: the fleet has no `sim-c3` kind.

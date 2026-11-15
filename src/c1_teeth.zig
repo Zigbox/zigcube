@@ -162,3 +162,13 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_pass_break or job_runs_unread;
+
+/// The replica controller spends the rollout budget on the plan it read, without comparing the
+/// counter or the rollout record, and ignores `max_unavailable` (C3 slice 7; must break R1).
+pub const rollout_budget = declared("c1_teeth_rollout_budget");
+/// The rollout controller keeps a progressing budget while a rollout is paused or failed (C3 slice
+/// 7; must break R4).
+pub const rollout_pause = declared("c1_teeth_rollout_pause");
+/// An apply also writes its history record over the newest older generation's (C3 slice 7; must
+/// break R6).
+pub const rollout_history = declared("c1_teeth_rollout_history");

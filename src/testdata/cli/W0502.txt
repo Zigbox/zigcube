@@ -1,0 +1,5 @@
+warning[ZC-W0502]: a replica's health check timed out
+  cause  the health check of hello-1 ran longer than timeout_ms (1000 ms)
+  fix    make the check faster or raise timeout_ms
+  more   zcube explain W0502 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0502.html

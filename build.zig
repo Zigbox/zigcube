@@ -1068,7 +1068,7 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     var sim = options;
     sim.ops = b.option(u32, "ops", ops_help) orelse 100;
     const profile_help = "Fault profile of sim-cluster and sim-c1: mixed (default), partitions, " ++
-        "skew, crash_heavy, slow_store, auto";
+        "skew, crash_heavy, slow_store, bad_release, auto";
     sim.profile = b.option([]const u8, "profile", profile_help) orelse "mixed";
     const swarm_help = "Peer profile of sim-swarm: mixed (default), liars, silent, refusers, " ++
         "honest, auto";
@@ -1109,6 +1109,7 @@ fn canary_manifest(b: *std.Build) []const u8 {
         canary_seeds_teeth, canary_symptom_teeth,
     });
     for (c1_teeth_roots) |entry| {
+        if (entry.c3) continue;
         const seeds = if (entry.canary_first) |first|
             b.fmt("{d}+{d}@{d}", .{ first, entry.canary_seeds, entry.ops })
         else
@@ -1205,6 +1206,10 @@ const c1_teeth_roots = [_]struct {
     plain_seeds: u32 = teeth_seeds_max,
     /// Operations of a run; the worlds of the two teeth outside `c1_teeth_operations` need more.
     ops: u32 = c1_teeth_operations,
+    /// A sim-c3 tooth (C3 slice 7): run with `--c3`, under `sim-c3-teeth` and
+    /// `sim-c3-teeth-<name without "rollout_">`, and left out of the canary manifest until the
+    /// fleet has a sim-c3 kind.
+    c3: bool = false,
 }{
     .{
         .name = "allocation",
@@ -1430,6 +1435,32 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "J6",
         .plain_seeds = 2,
     },
+    // C3 slice 7: the rollout checks run only under `--c3` (they judge each transaction before
+    // it commits), so these teeth have no plain run. The symptoms are full text: B3's relay
+    // checks are also named R1 to R3. Measured 2026-11-14 over seeds 1 to 40: at 100 operations
+    // budget 40, pause 14 and history 40 fail; at 150, budget 40 (all R1), pause 20 (18 R4, two
+    // the halted-surge convergence check) and history 40 (all R6). Each is caught at seed 1.
+    .{
+        .name = "rollout_budget",
+        .root = "src/sim_c1_teeth_rollout_budget_main.zig",
+        .c3 = true,
+        .symptom = "R1: a retirement",
+        .canary_seeds = 10,
+    },
+    .{
+        .name = "rollout_pause",
+        .root = "src/sim_c1_teeth_rollout_pause_main.zig",
+        .c3 = true,
+        .symptom = "R4: a paused rollout",
+        .canary_seeds = 20,
+    },
+    .{
+        .name = "rollout_history",
+        .root = "src/sim_c1_teeth_rollout_history_main.zig",
+        .c3 = true,
+        .symptom = "R6: a history",
+        .canary_seeds = 10,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1449,7 +1480,8 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 26 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs 26 negative tests (`sim-c3-teeth` the other 3), each of which passes only
+/// if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1481,8 +1513,23 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(native_report);
         step.dependOn(&node.step);
     }
+    add_teeth_steps(b, sim);
+    add_offline_step(b, sim);
+    add_burst_step(b, sim);
+    add_worlds_step(b, sim);
+    add_reuse_step(b, sim);
+    add_regress_step(b, sim);
+    add_regressions_step(b, sim);
+    add_fencing_teeth_step(b, sim);
+}
+
+/// `sim-c1-teeth`, `sim-c3-teeth` and one step per tooth (`c1_teeth_roots`).
+fn add_teeth_steps(b: *std.Build, sim: SimStepOptions) void {
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 26 fault-on sim-c1 runners");
+    const c3_teeth = b.step("sim-c3-teeth", "Run the sim-c3 negative tests (budget, pause, " ++
+        "history); each must fire its check");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 29 fault-on sim-c1 and sim-c3 " ++
+        "runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1498,12 +1545,16 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         const symptom = b.fmt("--expect-symptom={s}", .{entry.symptom});
         teeth_run.addArgs(&.{
             "--seeds",                  seeds,
-            b.fmt("{d}", .{entry.ops}), "--c1",
+            b.fmt("{d}", .{entry.ops}), if (entry.c3) "--c3" else "--c1",
             "--expect-fail",            symptom,
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
-        teeth.dependOn(&teeth_run.step);
-        const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
+        (if (entry.c3) c3_teeth else teeth).dependOn(&teeth_run.step);
+        const own = if (entry.c3)
+            b.step(b.fmt("sim-c3-teeth-{s}", .{entry.name["rollout_".len..]}), "One sim-c3 " ++
+                "negative test")
+        else
+            b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
         add_also_seeds(b, &.{ teeth, own }, teeth_exe, entry);
         add_plain_tooth(b, teeth, teeth_exe, entry);
@@ -1511,13 +1562,6 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
     }
-    add_offline_step(b, sim);
-    add_burst_step(b, sim);
-    add_worlds_step(b, sim);
-    add_reuse_step(b, sim);
-    add_regress_step(b, sim);
-    add_regressions_step(b, sim);
-    add_fencing_teeth_step(b, sim);
 }
 
 /// Each more known hit of a sparse tooth (`also_seeds`), run alone with `--c1`: it must fail
@@ -1930,6 +1974,12 @@ const c1_regressions = [_][]const []const u8{
         "--c1",               "--strong",      "--lease-ttl-ms=10000",
         "--replicas-pct=300", "--heal-at=701",
     },
+    // C3 slice 7 review: R4's checker counted a user's scale-down while paused on fewer replicas
+    // than the controller keeps (held ones, and ones on a node not ready but within its lost
+    // grace), so it called the removal a retirement
+    // (docs/decisions/2026-11-14-c3-paused-scale-down.md).
+    &.{ "202", "150", "0", "--c3", "--heal-at=125" },
+    &.{ "207", "150", "0", "--c3", "--heal-at=127" },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
