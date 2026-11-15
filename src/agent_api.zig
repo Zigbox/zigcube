@@ -1129,6 +1129,9 @@ fn number_slot(numbers: *Numbers, name: []const u8) ?*?u64 {
 /// ttl (10 s): far past J6's bound with the fence off, and over well before the heal ends.
 const runs_unread_window_ms = 60_000;
 
+/// The cause `runs_unread` gives, by which the cluster simulation counts the cuts.
+pub const runs_unread_cause = "test-only: the read of the runs is cut after a stop committed";
+
 fn runs_unread_now(ctx: *const Context, stop: ?records.RunStop) bool {
     assert(c1_teeth.runs_unread_world);
     const asked = stop orelse return false;
@@ -1140,7 +1143,7 @@ fn runs_unread(ctx: *const Context) Failure {
     assert(c1_teeth.runs_unread_world);
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0201);
-    ctx.diag.cause("test-only: the read of a run whose stop is asked is cut", .{});
+    ctx.diag.cause(runs_unread_cause, .{});
     return error.Failed;
 }
 

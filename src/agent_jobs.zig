@@ -183,14 +183,14 @@ pub fn enforce_deadlines(
         if (fence_at) |at| if (!fenced) note_deadline_wake(agent, at);
         const read = read_record(ctx, state, id) catch {
             agent.note_enforce_failure(ctx, "read a run's start record");
-            if (fenced) stop_run(agent, ctx, listing, constants.fence_stop_ms);
+            if (fenced) stop_run(agent, ctx, listing, constants.fence_stop_ms, true);
             continue;
         };
         switch (read) {
             // No record to say when: `pass` stops it as `unknown`, with the server's word, unless
             // the local job fence has fallen, which needs no record.
             .absent, .damaged => if (fenced) {
-                stop_run(agent, ctx, listing, constants.fence_stop_ms);
+                stop_run(agent, ctx, listing, constants.fence_stop_ms, true);
             },
             .record => |found| enforce_one(agent, ctx, state, listing, found, fenced),
         }
@@ -226,9 +226,11 @@ fn enforce_one(
             agent.note_enforce_failure(ctx, "record a run's stop cause");
     }
     // Any recorded cause is a stop under way: send it, or the kill once the grace has passed.
-    // Under the local job fence the grace is the lease fence's at most, as J6's bound assumes.
+    // Under the local job fence the grace is at most the lease fence's (`fence_stop_ms`), a stop
+    // already under way included (`stop_run`): a policy, as the lease fence kills by then too.
+    // J6's bound does not need it (its stop branch allows the run's grace), J8's neither.
     const grace = if (fenced) @min(record.grace_ms, constants.fence_stop_ms) else record.grace_ms;
-    stop_run(agent, ctx, listing, grace);
+    stop_run(agent, ctx, listing, grace, fenced);
 }
 
 /// True if the run's deadline has come (`stop_cause` still null); else notes its wake. A
@@ -250,19 +252,32 @@ fn deadline_due(agent: *Agent, ctx: *const Context, record: *const StartRecord, 
 }
 
 /// Stops a run's container (`Agent.stop_listing`), or kills it once `grace_ms` has passed, and
-/// notes the kill as a wake. A failure is noted; the next step tries again (the loop's resync),
-/// not a busy retry.
+/// notes the kill as a wake. Under the local job fence (`fenced`) a stop already under way is
+/// killed `fence_stop_ms` from now at the latest, whatever grace it was sent with, and a new stop
+/// is counted (`Agent.job_fence_stops`). A failure is noted; the next step tries again (the
+/// loop's resync), not a busy retry.
 fn stop_run(
     agent: *Agent,
     ctx: *const Context,
     listing: *const runtime.Listing,
     grace_ms: u32,
+    fenced: bool,
 ) void {
+    if (fenced) assert(grace_ms <= constants.fence_stop_ms);
+    const name = listing.handle.name();
+    const pending_before = agent.pending_stop(name);
+    if (fenced) {
+        if (pending_before) |stop| {
+            const kill_at = ctx.clock.now_ms() + constants.fence_stop_ms;
+            stop.deadline_ms = @min(stop.deadline_ms, kill_at);
+        }
+    }
     agent.stop_listing(ctx, listing, grace_ms) catch {
         agent.note_enforce_failure(ctx, "stop a run's container");
         return;
     };
-    const pending = agent.pending_stop(listing.handle.name()) orelse return;
+    if (fenced and pending_before == null) agent.job_fence_stops += 1;
+    const pending = agent.pending_stop(name) orelse return;
     const now = ctx.clock.now_ms();
     if (pending.deadline_ms > now) {
         note_deadline_wake(agent, ctx.mono_ms() + (pending.deadline_ms - now));
@@ -285,25 +300,31 @@ pub fn pass(
     const state = ctx.state orelse return 0;
     var work: Work = .{ .agent = agent, .ctx = ctx, .state = state, .listings = listings };
     const sent = ctx.mono_ms();
+    agent.runs_reads +%= 1;
     const subjects = try work.subjects(assigned);
     // No run to read is as good as a read: nothing is running that the local job fence would
     // stop, and a run starts only from a read that succeeded.
     if (subjects.len == 0) {
-        agent.runs_read_mono_ms = sent;
+        try agent.runs_read_ok(ctx, sent);
         return 0;
     }
 
     const cctx = ctx.as_controller();
-    work.runs = (try controller.list_all(
+    const listed = controller.list_all(
         records.JobRun,
         &cctx,
         records.prefix_job_runs,
         null,
         constants.agent_node_runs_max,
-    )).items;
+    ) catch |err| {
+        // The lease file keeps the fence's clock from the next keepalive on (`Agent.persist`).
+        agent.runs_failing = true;
+        return err;
+    };
+    work.runs = listed.items;
     // The read answered as of no earlier than `sent`: every stop committed before then is in it,
     // and this pass acts on it. The local job fence counts from here (`Agent.job_fence_at_ms`).
-    agent.runs_read_mono_ms = @max(agent.runs_read_mono_ms, sent);
+    try agent.runs_read_ok(ctx, @max(agent.runs_read_mono_ms, sent));
     // A stage before this one failed with a failure that is not the runtime's (the server): no
     // report goes out, but every stop the runs' records already decide still does (#247). A
     // failed read of the reports is kept the same way: the runs above already say which stops

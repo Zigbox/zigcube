@@ -38,15 +38,17 @@ the term, and the fault's 60 s window below, on 2026-11-15, before either was fi
 ## Limits
 
 - It needs a lease (the ttl is the lease's); without one there is no fence of either kind.
-- It is not persisted. A restarted agent counts from its first step (`reconcile` sets it), so a
-  run outlives the agent's downtime plus one term; J6 already counts the downtime as wedged.
+- Across a restart on the same boot, the lease file keeps its clock while the reads fail
+  (docs/decisions/2026-11-15-job-fence-survives-restart.md). Otherwise a restarted agent counts
+  from its first step (`reconcile` sets it).
 - A node whose runs reads keep succeeding never meets it.
 - It overlaps #247's fix. A step whose job pass is skipped after a server failure also makes no
   runs read, so the fence bounds that case within J6's fenced bound too, and the
   `job_pass_break` tooth (the agent before #247) stopped breaking J6 at seeds 225 and 44 once the
   fence was on. That tooth now turns the fence off as well, as the agent before #247 had none.
   #247's fix still matters: it stops a committed run within a resync, not a fence term, and its
-  unit tests in `agent_jobs_test.zig` guard it.
+  unit tests in `agent_jobs_test.zig` guard it. The simulation's J12 now guards it with the fence
+  on (docs/decisions/2026-11-15-job-fence-survives-restart.md).
 
 ## The tooth and the world
 

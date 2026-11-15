@@ -421,7 +421,7 @@ jobs:
       - name: sim-c1 negative tests
         run: zig build sim-c1-teeth --summary all
 
-  # The offline-deadline, burst and evicted worlds, with the fix on (about 14 minutes).
+  # The offline-deadline, burst, evicted, reuse and runs-unread worlds, with the fix on.
   sim-worlds:
     name: simulations (sim-c1 worlds)
     needs: changes

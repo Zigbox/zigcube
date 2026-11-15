@@ -148,6 +148,11 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// J6's fenced bound (docs/decisions/2026-11-15-j6-jobs-local-fence.md).
 pub const job_pass_break = declared("c1_teeth_job_pass_break");
 
+/// With `job_pass_break`: the local job fence stays on, so it falls for the passes the tooth
+/// skips, though every runs read the node makes is answered (must break J12: the fence fell on a
+/// node that tried no runs read since its last good one; review of #262).
+pub const job_pass_break_fenced = declared("c1_teeth_job_pass_break_fenced");
+
 /// The local job fence is off (`Agent.job_fence_at_ms`), in the world of `runs_unread_world`:
 /// the server fails a node's read of its runs for 60 s after one of them has a stop committed
 /// (`agent_api.runs_unread_window_ms`), while its keepalives and every other call are answered.
@@ -171,4 +176,4 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
-    job_pass_break or job_runs_unread;
+    job_pass_break or job_pass_break_fenced or job_runs_unread;

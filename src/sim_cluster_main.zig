@@ -314,11 +314,15 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
     defer out.flush() catch {}; // Nowhere else to report it.
     var failures: u64 = 0;
     var matched = false;
+    var cuts: u64 = 0;
+    var fenced: u64 = 0;
     var seed = parsed.first_seed;
     while (true) : (seed += 1) {
         const resolved = sim_cluster.plan(seed, parsed.operations, parsed.options);
         if (parsed.trace_steps) trace_plan(init.io, seed, resolved);
         sim_cluster.simulate(init.gpa, seed, resolved.operations, resolved.options, report);
+        cuts += report.runs_unread_cuts;
+        fenced += report.job_fence_stops;
         if (report.failed) {
             failures += 1;
             report_failure(init, parsed, seed, resolved, report, out) catch
@@ -359,21 +363,42 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         }) catch return constants.exit_environment;
         return constants.exit_ok;
     }
+    print_range(out, parsed, failures) catch return constants.exit_environment;
+    if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;
+    if (c1_teeth.runs_unread_world and !c1_teeth.job_runs_unread) {
+        if (runs_unread_verdict(out, cuts, fenced)) |code| return code;
+    }
+    return if (failures == 0) constants.exit_ok else constants.exit_user;
+}
+
+/// The range's line, which the fleet parses (src/sim_fleet_issue.zig).
+fn print_range(out: *std.Io.Writer, parsed: *const Args, failures: u64) std.Io.Writer.Error!void {
     const total = parsed.last_seed - parsed.first_seed + 1;
-    // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
+    // `--c1` says so: the fleet must not take a plain run for sim-c1.
     const run_name: []const u8 = if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
     if (parsed.operations) |operations| {
-        out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
+        try out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
             run_name, parsed.first_seed, parsed.last_seed, operations, failures, total,
-        }) catch return constants.exit_environment;
+        });
     } else {
         // Not the fixed form above: the fleet's parser reads the drawn form separately.
-        out.print("{s}: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
+        try out.print("{s}: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
             run_name, parsed.first_seed, parsed.last_seed, failures, total,
-        }) catch return constants.exit_environment;
+        });
     }
-    if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;
-    return if (failures == 0) constants.exit_ok else constants.exit_user;
+}
+
+/// `sim-c1-runs-unread`'s own line, after the range's (which the fleet parses): how often the
+/// world cut a runs read, and how many job containers the local job fence began to stop. A range
+/// the cut never bit, or in which the fence never fell, tested nothing and fails (review of
+/// #262). Returns the exit code when the run must end with it.
+fn runs_unread_verdict(out: *std.Io.Writer, cuts: u64, fenced: u64) ?u8 {
+    out.print("sim-cluster: runs unread cuts={d} fenced={d}\n", .{ cuts, fenced }) catch
+        return constants.exit_environment;
+    if (cuts > 0 and fenced > 0) return null;
+    out.print("sim-cluster: the runs-unread world tested nothing\n", .{}) catch
+        return constants.exit_environment;
+    return constants.exit_user;
 }
 
 fn report_failure(
