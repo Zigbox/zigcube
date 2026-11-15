@@ -585,10 +585,16 @@ source, command, env, limits, health) of the generation it names, which must be 
 and a rollout of reason `rollback` that completes leaves no live replica (not stopped, not on a
 lost node) of its service running another spec. R8: an `auto_rollback` lands only over the
 service whose rollout failed (the service still at the generation after the failed one's, its
-rollout still `failed`), so it never overwrites a newer apply. R7 is judged at the liveness
+rollout still `failed`), so it never overwrites a newer apply; and it answers that rollout: it
+restores the rollout's `from` and its `rollback` decision names the rollout's `cause_decision`
+as its cause (`resync` when that is empty). R7 is judged at the liveness
 stage, after the heal (`rollouts_settle` in `src/sim_cluster.zig`): no service's rollout is still
 active past its deadline plus a slack of 30 s (the controller's resync), and no failed rollout
-still owes its automatic rollback. Each check is a little weaker than its sentence in the
+still owes its automatic rollback. A service with no rollout record of its current generation
+is not R7's (`converged`, judged just before, covers its replicas). Under `--c3` an apply also
+draws its command, env and limits from three specs (`rollout_prng`), so a rollback that fails to
+copy one of them fails R5; health stays the world's (`--health`). `completed=` counts each
+rollback once, though R5 judges every write of its complete rollout record. Each check is a little weaker than its sentence in the
 brief, never stronger. Readiness is observed `running`: slices 9 and 10 (probes, health) replace
 it in `rollout_controller.Track`.
 
