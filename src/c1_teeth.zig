@@ -143,7 +143,9 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// The agent's job pass ends at the first failure that is not the runtime's (a server call that
 /// failed, such as a committed write whose answer was lost), and a replica stage's such failure
 /// skips the job pass, as before #247: a stop committed for a run later in the pass waits for a
-/// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
+/// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248). The
+/// local job fence is off too, as it was then: its term would bound the skipped passes within
+/// J6's fenced bound (docs/decisions/2026-11-15-j6-jobs-local-fence.md).
 pub const job_pass_break = declared("c1_teeth_job_pass_break");
 
 /// The local job fence is off (`Agent.job_fence_at_ms`), in the world of `runs_unread_world`:

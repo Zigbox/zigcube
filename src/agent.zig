@@ -357,7 +357,9 @@ pub const Agent = struct {
     /// the lease fence cannot (docs/decisions/2026-11-15-j6-jobs-local-fence.md). Null with no
     /// lease, while the lease fence is on, and before the first step.
     pub fn job_fence_at_ms(agent: *const Agent) ?u64 {
-        if (c1_teeth.job_runs_unread) return null; // Test-only: the fence is off (J6).
+        // Test-only: the fence is off (J6). `job_pass_break` is the agent before #247, which
+        // had no local job fence: with it, the fence would bound the skipped passes too.
+        if (c1_teeth.job_runs_unread or c1_teeth.job_pass_break) return null;
         if (agent.lease == store.lease_none or agent.fence.active) return null;
         if (agent.runs_read_mono_ms == maxInt(u64)) return null;
         return fencing.fence_at_ms(agent.runs_read_mono_ms, agent.lease_ttl_ms);
