@@ -55,6 +55,9 @@ pub const uploads = [_]Upload{
     .{ .route = "/guest.sh", .guest_path = script, .mode = "644" },
 };
 
+const agent_upload = 0;
+const agent_gz_path = "/home/cube/bin/zcube-agent.gz";
+
 pub const Guests = struct {
     sessions: [count]vm.Session = undefined,
     started: [count]bool = @splat(false),
@@ -68,6 +71,9 @@ pub const Guests = struct {
     out: *std.Io.Writer,
     /// How many of the guests the demo boots, the first ones (demo-b3 boots one).
     limit: u8 = count,
+    /// Whether the agent's body is gzipped (demo-b3's Debug agent is over the 8 MiB a route may
+    /// serve, `vm.limits.http_body_bytes_max`): it is copied in as `<path>.gz` and unpacked.
+    agent_gzipped: bool = false,
 
     /// Boots all four guests at once, then provisions each and copies the files in.
     /// `bodies` are the files of `uploads`, in order; they must outlive the guests.
@@ -134,14 +140,21 @@ pub const Guests = struct {
         const timeout = vm.limits.command_timeout_kvm_s;
         const made = try session.run("runuser -u cube -- mkdir -p /home/cube/bin", timeout);
         if (made.status != 0) return error.GuestSetupFailed;
-        for (uploads) |upload| {
+        for (uploads, 0..) |upload, upload_index| {
+            const gzipped = upload_index == agent_upload and guests.agent_gzipped;
+            const guest_path = if (gzipped) agent_gz_path else upload.guest_path;
             const copied = try session.copy_in(.{
                 .route = upload.route,
-                .guest_path = upload.guest_path,
+                .guest_path = guest_path,
                 .owner = "cube:cube",
                 .mode = upload.mode,
             });
             if (copied.status != 0) return error.GuestSetupFailed;
+            if (gzipped) {
+                const unpacked = try session.run("runuser -u cube -- gunzip -f " ++
+                    agent_gz_path, timeout);
+                if (unpacked.status != 0) return error.GuestSetupFailed;
+            }
         }
     }
 
@@ -186,4 +199,6 @@ pub const Guests = struct {
 comptime {
     assert(uploads.len + vm.limits.seed_routes <= vm.limits.http_routes_max);
     assert(names.len == count);
+    assert(std.mem.eql(u8, uploads[agent_upload].route, "/zcube-agent"));
+    assert(std.mem.eql(u8, agent_gz_path, uploads[agent_upload].guest_path ++ ".gz"));
 }

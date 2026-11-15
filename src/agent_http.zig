@@ -17,6 +17,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const net = std.Io.net;
 const agent_api = @import("agent_api.zig");
+const api_tls_client = @import("api_tls_client.zig");
+const api_tls_guard = @import("api_tls_guard.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 
@@ -34,6 +36,12 @@ pub const Client = struct {
     address: net.IpAddress,
     /// How long a read waits for the next piece of a reply, on top of the request's own hold.
     io_timeout_ms: u32 = constants.agent_io_timeout_ms,
+    /// The API over TLS (docs/mtls.md): the CA pinned and the certificate presented, which the
+    /// agent switches to its own `node.crt` once it has one. Null: plain HTTP.
+    tls: ?*api_tls_client.Credentials = null,
+    /// Checks `tls`'s certificate before each connection (B7 slice 5): an expired one is not
+    /// presented (`--cert` takes its place, or the call fails with ZC-E0811).
+    guard: ?*api_tls_guard.Guard = null,
 
     /// Sends the request and returns the reply, whatever its status. `Unreachable` and `BadReply`
     /// leave a diagnostic in `diag`.
@@ -51,8 +59,12 @@ pub const Client = struct {
         }
         const io_ms = request.timeout_ms orelse client.io_timeout_ms;
         const end_ms = client.now_ms() + request.hold_ms + io_ms;
+        if (client.tls) |tls| if (client.guard) |guard| {
+            guard.check(tls, diag) catch return error.Unreachable;
+        };
         var stream = try client.connect(end_ms, diag);
         defer stream.close(client.io);
+        if (client.tls) |tls| return client.call_tls(tls, arena, &stream, request, end_ms, diag);
         try client.send(&stream, request, diag);
         return client.receive(arena, &stream, end_ms, diag);
     }
@@ -129,13 +141,64 @@ pub const Client = struct {
         }
     }
 
+    /// `call` over TLS: one exchange, then the same checks of the reply as `receive`.
+    fn call_tls(
+        client: *const Client,
+        tls: *api_tls_client.Credentials,
+        arena: Allocator,
+        stream: *net.Stream,
+        request: Request,
+        end_ms: u64,
+        diag: *Diag,
+    ) Error!Reply {
+        const head = std.fmt.allocPrint(arena, head_format, .{
+            request.method, request.target, client.address, request.body.len,
+        }) catch return error.OutOfMemory;
+        const limit = head_bytes_max + constants.agent_response_bytes_max;
+        const done = api_tls_client.exchange(
+            tls,
+            client.io,
+            stream.socket.handle,
+            arena,
+            &.{ head, request.body },
+            limit,
+            api_tls_client.reply_is_whole,
+            end_ms,
+            diag,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Failed => return error.Unreachable,
+        };
+        switch (done.ending) {
+            .done => {},
+            .silent => return unreachable_server(diag, client, "it did not answer in time"),
+            .failed => {
+                assert(diag.code != null);
+                return error.Unreachable;
+            },
+        }
+        const raw = done.reply;
+        const end = std.mem.find(u8, raw, "\r\n\r\n") orelse {
+            if (raw.len > head_bytes_max) {
+                return bad_reply(diag, "the reply's headers are longer than the agent reads");
+            }
+            return unreachable_server(diag, client, "the connection was lost");
+        };
+        const parsed = try parse_head(raw[0 .. end + 4], diag);
+        const promised = parsed.content_length orelse
+            return bad_reply(diag, "the reply has no Content-Length");
+        if (promised > constants.agent_response_bytes_max) {
+            return bad_reply(diag, "the reply is larger than the agent reads");
+        }
+        const body = raw[end + 4 ..];
+        if (body.len < promised) return unreachable_server(diag, client, "the connection was lost");
+        return .{ .status = parsed.status, .body = body[0..promised] };
+    }
+
     fn send(client: *const Client, stream: *net.Stream, request: Request, diag: *Diag) Error!void {
         var buffer: [4096]u8 = undefined;
         var writer = stream.writer(client.io, &buffer);
-        const head = "{s} {s} HTTP/1.1\r\nHost: {f}\r\n" ++
-            "Accept: application/json\r\nContent-Type: application/json\r\n" ++
-            "Content-Length: {d}\r\n\r\n";
-        writer.interface.print(head, .{
+        writer.interface.print(head_format, .{
             request.method, request.target, client.address, request.body.len,
         }) catch return unreachable_server(diag, client, "the request could not be sent");
         writer.interface.writeAll(request.body) catch
@@ -203,6 +266,10 @@ fn connect_reason(code: std.os.linux.E) []const u8 {
         else => "the connection could not be made",
     };
 }
+
+const head_format = "{s} {s} HTTP/1.1\r\nHost: {f}\r\n" ++
+    "Accept: application/json\r\nContent-Type: application/json\r\n" ++
+    "Content-Length: {d}\r\n\r\n";
 
 /// The status line and headers of a reply fit in this many bytes, or the reply is not the server's.
 const head_bytes_max: u32 = 16 * 1024;
@@ -301,4 +368,111 @@ test "a server that accepts and says nothing is ZC-E0503 after the wait, not a c
     try testing.expectError(error.Unreachable, result);
     try testing.expectEqual(@as(?@TypeOf(diag.code.?), .E0503), diag.code);
     try testing.expect(std.mem.endsWith(u8, diag.last_cause().?, "it did not answer in time"));
+}
+
+test "a TLS handshake that gets no answer ends by the call's wait, not the handshake's 10 s" {
+    // Goal: the B4-B7 bundle's demo-c1 fenced 6 s late when its partition cut node1's link
+    // mid-handshake: `exchange` left the handshake on `tls_handshake_timeout_ms` (10 s), not on
+    // the call's end, which the fence caps. Method: a listener that never accepts (the kernel
+    // completes the connection, nothing answers the ClientHello) and a client that waits 100 ms.
+    const io = testing.io;
+    const born_ms: u64 = 1_700_000_000_000;
+    const day_ms: u64 = 86_400_000;
+    var clock: @import("clock.zig").ManualClock = .{ .ms = born_ms };
+    const ca = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0xCA));
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(1));
+    const x509 = @import("x509.zig");
+    var cluster_buffer: [@import("peer_ca.zig").cluster_bytes]u8 = undefined;
+    var der: x509.Der = .{};
+    try x509.issue_node(&der, ca, &.{
+        .cluster = @import("peer_ca.zig").cluster_of(ca.public_key.toBytes(), &cluster_buffer),
+        .node = "node1",
+        .subject_key = key.public_key.toBytes(),
+        .lifetime = .{ .not_before_ms = born_ms, .not_after_ms = born_ms + day_ms },
+    });
+    var credentials: api_tls_client.Credentials = undefined;
+    credentials.anchor = ca.public_key.toBytes();
+    credentials.server_name = api_tls_client.server_name_default;
+    credentials.certificate = .{};
+    try testing.expectEqual(null, credentials.present(&der, key, "node1", born_ms));
+    var guard: api_tls_guard.Guard = .{
+        .io = io,
+        .wall = clock.clock(),
+        .fallback = null,
+        .silent = true,
+    };
+    const any = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try any.listen(io, .{});
+    defer listener.deinit(io);
+    const client: Client = .{
+        .io = io,
+        .address = listener.socket.address,
+        .io_timeout_ms = 100,
+        .tls = &credentials,
+        .guard = &guard,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const request: Request = .{ .method = "GET", .target = "/v1/status" };
+    const started_ms = client.now_ms();
+    const result = client.call(arena_state.allocator(), request, &diag);
+    const took_ms = client.now_ms() - started_ms;
+    try testing.expectError(error.Unreachable, result);
+    try testing.expectEqual(@as(u32, 0), guard.raised);
+    try testing.expect(took_ms < 2_000); // 10 s without the cap.
+}
+
+test "an expired certificate fails the call with ZC-E0811 before it connects" {
+    // Goal: review of slice 5, S2: `call` runs the guard before each connection. Method: a
+    // listener that never accepts (the kernel would complete a connection) and a manual clock
+    // two days past the end of the certificate presented. The call fails at once with the
+    // guard's ZC-E0811; without the check it would connect and wait out ZC-E0503 instead.
+    const io = testing.io;
+    const born_ms: u64 = 1_700_000_000_000;
+    const day_ms: u64 = 86_400_000;
+    var clock: @import("clock.zig").ManualClock = .{ .ms = born_ms };
+    const ca = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0xCA));
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(1));
+    const x509 = @import("x509.zig");
+    var cluster_buffer: [@import("peer_ca.zig").cluster_bytes]u8 = undefined;
+    var der: x509.Der = .{};
+    try x509.issue_node(&der, ca, &.{
+        .cluster = @import("peer_ca.zig").cluster_of(ca.public_key.toBytes(), &cluster_buffer),
+        .node = "node1",
+        .subject_key = key.public_key.toBytes(),
+        .lifetime = .{ .not_before_ms = born_ms, .not_after_ms = born_ms + day_ms },
+    });
+    var credentials: api_tls_client.Credentials = undefined;
+    credentials.anchor = ca.public_key.toBytes();
+    credentials.server_name = api_tls_client.server_name_default;
+    credentials.certificate = .{};
+    try testing.expectEqual(null, credentials.present(&der, key, "node1", born_ms));
+    var guard: api_tls_guard.Guard = .{
+        .io = io,
+        .wall = clock.clock(),
+        .fallback = null,
+        .silent = true,
+    };
+    const any = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try any.listen(io, .{});
+    defer listener.deinit(io);
+    const client: Client = .{
+        .io = io,
+        .address = listener.socket.address,
+        .io_timeout_ms = 100,
+        .tls = &credentials,
+        .guard = &guard,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    clock.ms = born_ms + 2 * day_ms;
+    const request: Request = .{ .method = "GET", .target = "/v1/status" };
+    const result = client.call(arena_state.allocator(), request, &diag);
+    try testing.expectError(error.Unreachable, result);
+    try testing.expectEqual(@as(?@TypeOf(diag.code.?), .E0811), diag.code);
+    try testing.expectEqual(@as(u32, 1), guard.raised);
 }

@@ -17,7 +17,7 @@ const Dir = std.Io.Dir;
 pub const Error = error{Failed};
 
 /// What `write` adds to a name for its temporary file: a dot, 16 hex digits and ".tmp".
-const temp_suffix_bytes = 1 + 16 + 4;
+pub const temp_suffix_bytes = 1 + 16 + 4;
 
 /// Who may touch a file we read: `secret` is ours alone (no group or other access); `anchor`
 /// is public but a trust anchor, so nobody else may write it; `plain` is not checked.
@@ -51,6 +51,13 @@ pub fn unusable_fix(
     return error.Failed;
 }
 
+/// Creates `path` and any missing parents with mode 0700, so the umask cannot leave a directory
+/// that `check_dir` refuses (docs/decisions/2026-11-13-state-dir-0700.md). A directory that
+/// already exists keeps its mode: `check_dir` still judges it.
+pub fn make_dir(io: std.Io, path: []const u8) Dir.CreateDirPathError!void {
+    _ = try Dir.cwd().createDirPathStatus(io, path, .fromMode(0o700));
+}
+
 /// Refuses a directory that group or others can write into: they could replace a trust anchor or
 /// a secret's temporary file. ZC-E0806.
 pub fn check_dir(
@@ -65,7 +72,8 @@ pub fn check_dir(
     };
     if (stat.permissions.toMode() & 0o022 != 0) {
         const why = "other users can write into the directory";
-        return unusable(diag, where, name, "use the directory of", why);
+        const fix = "remove group and other write from the directory (chmod 0700)";
+        return unusable_fix(diag, where, name, "use the directory of", why, fix);
     }
 }
 
@@ -164,33 +172,59 @@ pub fn write(
     mode: std.posix.mode_t,
     diag: *Diag,
 ) Error!void {
+    assert(name.len > 0);
+    assert(where.len > 0);
+    var temp: [temp_bytes_max]u8 = undefined;
+    const temp_name = try stage(io, dir, where, name, text, mode, &temp, diag);
+    errdefer dir.deleteFile(io, temp_name) catch {}; // Nothing more to do if this fails too.
+    dir.rename(temp_name, dir, name, io) catch |err| {
+        return unusable(diag, where, name, "write", @errorName(err));
+    };
+    try sync_dir(io, dir, where, name, diag);
+}
+
+pub const temp_bytes_max = 96;
+
+/// Writes `text` to a new temporary file beside `name`, synced, and returns its name: the caller
+/// renames it to `name` or deletes it. Every failure removes it again.
+pub fn stage(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    name: []const u8,
+    text: []const u8,
+    mode: std.posix.mode_t,
+    temp: *[temp_bytes_max]u8,
+    diag: *Diag,
+) Error![]const u8 {
     assert(mode & 0o600 == 0o600); // Ours to read and write, whatever else the mode allows.
     assert(mode & ~@as(std.posix.mode_t, 0o777) == 0);
     assert(name.len > 0);
-    assert(name.len + temp_suffix_bytes <= 96);
+    assert(name.len + temp_suffix_bytes <= temp_bytes_max);
     // A name of its own per write, so that two writers (two servers on one state directory) never
     // share a temporary file, and one that is planted or left by a killed run is never reused:
     // the file is made exclusively. Every failure removes ours again.
     var random: [8]u8 = undefined;
     io.random(&random);
-    var temp: [96]u8 = undefined;
-    const temp_name = std.fmt.bufPrint(&temp, "{s}.{x}.tmp", .{ name, &random }) catch
-        unreachable; // The name, a dot, 16 digits and ".tmp" fit 96 bytes (asserted above).
+    const temp_name = std.fmt.bufPrint(temp, "{s}.{x}.tmp", .{ name, &random }) catch
+        unreachable; // The name, a dot, 16 digits and ".tmp" fit (asserted above).
     errdefer dir.deleteFile(io, temp_name) catch {}; // Nothing more to do if this fails too.
-    {
-        const file = dir.createFile(io, temp_name, .{
-            .permissions = .fromMode(mode),
-            .exclusive = true,
-        }) catch |err| return unusable(diag, where, name, "write", @errorName(err));
-        defer file.close(io);
-        file.writeStreamingAll(io, text) catch |err| {
-            return unusable(diag, where, name, "write", @errorName(err));
-        };
-        file.sync(io) catch |err| return unusable(diag, where, name, "write", @errorName(err));
-    }
-    dir.rename(temp_name, dir, name, io) catch |err| {
+    const file = dir.createFile(io, temp_name, .{
+        .permissions = .fromMode(mode),
+        .exclusive = true,
+    }) catch |err| return unusable(diag, where, name, "write", @errorName(err));
+    defer file.close(io);
+    file.writeStreamingAll(io, text) catch |err| {
         return unusable(diag, where, name, "write", @errorName(err));
     };
+    file.sync(io) catch |err| return unusable(diag, where, name, "write", @errorName(err));
+    return temp_name;
+}
+
+/// Syncs `dir` after a rename into it, so that the new name survives a crash.
+pub fn sync_dir(io: std.Io, dir: Dir, where: []const u8, name: []const u8, diag: *Diag) Error!void {
+    assert(name.len > 0);
+    assert(where.len > 0);
     // The directory is synced through a read-only handle, which POSIX allows.
     const handle = dir.openFile(io, ".", .{}) catch |err| {
         return unusable(diag, where, name, "write", @errorName(err));

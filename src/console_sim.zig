@@ -150,6 +150,7 @@ pub const Console = struct {
             return console.response;
         };
         console.response = console.api.handle(&ctx, .{
+            .caller = .local,
             .method = frame.method,
             .path = frame.path,
             .query = frame.query,

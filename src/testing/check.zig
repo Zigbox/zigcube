@@ -15,8 +15,9 @@
 //!     `sim-teeth`: the same simulator with the agent's test-only fault on, which must fail
 //!     (docs/core.md, "The cluster simulation"). A failure prints the seed in the
 //!     `sim-cluster: seed N` line above it.
-//!   - `sim-c1` (docs/authority.md §4 and §5) with a fresh seed, native against WASM, and
-//!     `sim-c1-teeth`, the four negative tests, each of which must fire. A failure prints the
+//!   - `sim-c1` (docs/authority.md §4 and §5) with a fresh seed, native against WASM, the same
+//!     in B6's tenant world (`-Dtenants`, P1) on a seed of its own (`sim-c1 tenants: seed N`),
+//!     and `sim-c1-teeth`, the negative tests, each of which must fire. A failure prints the
 //!     seed in the `sim-c1: seed N` line above it.
 //!   - The one gate a root build container cannot see: CI runs `zig build test` as an ordinary
 //!     user. When this runs as root and <user> is not "-", the committed tree is checked out into
@@ -194,7 +195,8 @@ fn sim_cluster_gates(
     };
 }
 
-/// `sim-c1` on a fresh seed (native against WASM), then its four negative tests.
+/// `sim-c1` on a fresh seed (native against WASM), the tenant world on another, then its
+/// negative tests.
 fn sim_c1_gates(
     gpa: std.mem.Allocator,
     io: Io,
@@ -212,6 +214,18 @@ fn sim_c1_gates(
         try err.print("check: FAIL {s} (zig build sim-c1: its seed is the line above)\n", .{
             label,
         });
+        return error.CommandFailed;
+    };
+    // The tenant world (B6, `-Dtenants`): node labels, operator relabels and P1, on a seed of
+    // its own.
+    io.random(&seed_bytes);
+    const tenants_seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-c1 tenants: seed {d}\n", .{tenants_seed});
+    try err.flush();
+    const tenants_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{tenants_seed});
+    run(io, &.{ zig, "build", "sim-c1", tenants_option, "-Dtenants" }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-c1 -Dtenants: its seed is the line " ++
+            "above)\n", .{label});
         return error.CommandFailed;
     };
     run(io, &.{ zig, "build", "sim-c1-teeth" }, null) catch {

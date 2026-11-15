@@ -1,7 +1,7 @@
 request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
-error[ZC-E0702]: a job's relay could not listen
+error[ZC-E0702]: a job's relay could not be served
   cause  listen on 127.0.0.1 failed: ProcessFdQuotaExceeded
   reqid  r-0000001
-  fix    check the step in the cause: free file descriptors on the node, or correct the relay's address in the server's `relays` setting, then submit the job again
+  fix    do what the cause names: free file descriptors on the node, correct the relay in the server's `relays` setting, or resubmit a job from before B4
   more   zcube explain E0702
   docs   https://zigbox.github.io/zigcube/errors/E0702.html

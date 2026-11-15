@@ -134,7 +134,12 @@ const Run = struct {
 
     fn api_get(run: *Run, path: []const u8, query: []const u8) api_mod.Response {
         const ctx = run.world.controller_context();
-        return run.api.handle(&ctx, .{ .method = "GET", .path = path, .query = query });
+        return run.api.handle(&ctx, .{
+            .caller = .local,
+            .method = "GET",
+            .path = path,
+            .query = query,
+        });
     }
 };
 

@@ -36,6 +36,8 @@ zcube help | version
 | `-v`, `--verbose` | the full cause chain and context of a failure; every request made, with its id |
 | `-o`, `--output text\|wide\|json` | `wide` adds columns to `get` and `stats pull`; `json` is for scripts (below) |
 | `--server HOST:PORT` | where `zcube-server` listens: this flag, else `$ZCUBE_SERVER`, else `127.0.0.1:7070`. An IP address (or `localhost`) and a port |
+| `--ca FILE`, `--cert FILE`, `--key FILE` | speak TLS to `--listen` with this CA pinned and this certificate and key (`$ZCUBE_CA`, `$ZCUBE_CERT`, `$ZCUBE_KEY`); all three or none. Without them `zcube` speaks plain HTTP, to `--insecure-listen` ([mtls.md](mtls.md), "The API over TLS") |
+| `--tls-name NAME` | the DNS name the server's certificate must carry (`$ZCUBE_TLS_NAME`, default `zcube-server`) |
 | `-y`, `--yes` | `apply`, `delete`: do not ask first |
 | `--dry-run` | `apply`: show the change and stop |
 | `--no-redact` | `bundle`: keep secrets in the bundle (prints a warning) |
@@ -152,7 +154,11 @@ and a last line on whether the chain reaches its cause: `completeness: complete`
 
 `zcube why node node3` starts from the state line, which names the judgement and the load
 (`node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
-8.0Gi memory in use`), then the node's newest decision. A `ready` node that holds fewer
+8.0Gi memory in use; registered with --trust-policy /etc/zcube/trust.zon: job runs (not replicas)
+are judged under the policy the agent read at its start`, or `registered without a --trust-policy
+that checks: no job run is judged`, which covers a policy that asks for nothing), then the node's newest decision. The store holds the path the agent registered
+with, not what the policy asks nor a flag given at a later restart (`docs/agent.md`, "Known
+limits"), so the line claims no more. A `ready` node that holds fewer
 replicas than another gets one more line, a note and not a reading of the store: replicas already
 running elsewhere are not moved back, because the scheduler places a replica when it is created or
 its node is lost and does not rebalance.

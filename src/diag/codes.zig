@@ -110,6 +110,7 @@ pub const Code = enum(u8) {
     E0703,
     E0704,
     E0705,
+    E0706,
     W0701,
     W0702,
     E0801,
@@ -133,6 +134,7 @@ pub const Code = enum(u8) {
     E0819,
     E0820,
     E0821,
+    E0822,
     B0001,
     B0002,
     B0003,
@@ -231,8 +233,13 @@ pub const registry = [_]Entry{
         .explanation =
         \\zcube-server read its configuration file and flags and found a setting
         \\it cannot use: a file that is not valid ZON, an unknown setting, a store
-        \\that is not memory, sqlite:<path> or postgres:<settings>, or a listen
-        \\address that is not host:port. The cause line names the setting.
+        \\that is not memory, sqlite:<path> or postgres:<settings>, a listen
+        \\address that is not host:port, or a `trust` entry whose policy file
+        \\cannot be read, is not a policy zbx reads (the cause names its line,
+        \\column and what is wrong), or could be rewritten by someone other than
+        \\root or the server's user (it must be a regular file owned by one of
+        \\them, writable by neither group nor others). The cause line names the
+        \\setting.
         \\
         \\Nothing was started. Correct the setting and start the server again.
         ,
@@ -530,13 +537,22 @@ pub const registry = [_]Entry{
         \\`limits` member outside its range (`cpu_millis` 10 to 1,024,000,
         \\`memory_bytes` 4 MiB to 2^40, `pids` 1 to 4,194,304).
         \\
-        \\Two fields are refused because they are not built yet, and the cause says
-        \\so: retries above 0 (a job runs at most once), and placement. Accepting a
-        \\field and ignoring it would say something false about where the job runs.
+        \\Retries above 0 are refused because they are not built yet, and the cause
+        \\says so (a job runs at most once). Accepting a field and ignoring it would
+        \\say something false about what the job does.
+        \\
+        \\A `placement` must be `{"require": {"key": "value"}}` with at most 4 pairs,
+        \\each key and value within a label's bounds, no key twice and no other
+        \\member; the cause names what is wrong.
         \\
         \\A relay must be the name of one of the relays in the server's `relays`
         \\setting; an unknown name is refused, and a job may not set ZCUBE_RELAY in
         \\its own env, because the relay's supervisor sets it.
+        \\
+        \\`signatures` holds at most 4 envelopes, each 1 to 2048 bytes of printable
+        \\ASCII: one line of `zbx trust export` each. Under the server's trust
+        \\policy, a line zbx cannot read as a DSSE envelope is refused too; a job
+        \\no trusted line covers is ZBX-E0905, not this code.
         \\
         \\Fix the field it names and submit again.
         ,
@@ -1114,8 +1130,12 @@ pub const registry = [_]Entry{
         .summary = "the agent's configuration can't be used",
         .explanation =
         \\A flag or a setting in the agent's ZON file is missing, unknown or out of
-        \\range, or the image fixtures file it names cannot be read. The cause
-        \\line names the setting. The agent did not start and changed nothing.
+        \\range, the node's labels are malformed or given by --label and by the
+        \\file's .labels differently, the labels differ from those the node
+        \\registered with while its lease in --state-dir is live, or a file it
+        \\names (the image fixtures, the --trust-policy file) cannot be read or
+        \\used. The cause line names the setting. The agent did not start and
+        \\changed nothing.
         \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,
@@ -1466,21 +1486,29 @@ pub const registry = [_]Entry{
         .code = .E0702,
         .severity = .@"error",
         .blame = .environment,
-        .summary = "a job's relay could not listen",
+        .summary = "a job's relay could not be served",
         .explanation =
-        \\The supervisor of a job could not set up the relay the job asked for, so the
+        \\A job asked for a relay, and the job's supervisor could not serve it, so the
         \\job does not run without the route it was promised. The cause line says
-        \\which step failed (the socket, the bind, the listen, the relay's address).
+        \\which of three things happened:
         \\
-        \\On the fake runtime the job is not started and ends as a start failure. On
-        \\the real runtime the container has already started, so the supervisor kills
-        \\it: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in
-        \\the job's `relay.log`.
+        \\- The relay could not be set up: the socket, the bind, the listen or the
+        \\  relay's address failed. If the cause is a socket or file descriptor error,
+        \\  the host may be out of descriptors: check `ulimit -n` and the node's load.
+        \\  If it names the relay's address, correct it in the server's `relays`
+        \\  setting.
+        \\- The relay stopped while the job ran, and the job's command was killed with
+        \\  it. Look in the node agent's log for why, around the time of the ending.
+        \\- The relay cannot be served as the job names it: a job submitted before B4
+        \\  carries no upstream server name and CA, a release build serves no plain
+        \\  relay, and the zigbox runtime does not speak TLS to an upstream until B4
+        \\  slice 4. Run the job on the fake runtime, or wait for that release.
         \\
-        \\If the cause is a socket or file descriptor error, the host may be out of
-        \\descriptors: check `ulimit -n` and the node's load. If it names the relay's
-        \\address, correct the relay's address in the server's `relays` setting. Then
-        \\submit the job again.
+        \\On the fake runtime a relay that cannot be set up stops the job before it
+        \\starts, and it ends as a start failure. Otherwise the container has already
+        \\started, so the supervisor kills it: it ends as killed by signal 9 and the
+        \\cause is the line `ZC-E0702` in the job's `relay.log`. In each case, fix
+        \\what the cause names, then submit the job again.
         ,
     },
     .{
@@ -1526,6 +1554,31 @@ pub const registry = [_]Entry{
         \\
         \\A reset by the job or the upstream is ordinary and needs no action. If it
         \\repeats on every connection, check the node's network and the upstream.
+        ,
+    },
+    .{
+        .code = .E0706,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the server refused a relayed run's certificate",
+        .explanation =
+        \\A relayed job's supervisor made a key for the run, and the agent asked the
+        \\server to sign it. The server signs only for the node that holds the job's
+        \\current claim, at the claim's placement epoch, for an image that matches
+        \\the job's, while the run has not ended. It refused: the cause says which
+        \\check failed (not this node's claim, a stale epoch, the run has ended, a
+        \\different image).
+        \\
+        \\The relay stays closed: the job's connections to it are closed without
+        \\reaching the upstream, and the line is in the job's `relay.log`. This is
+        \\what a run that lost its claim (the node was cut off, the job was placed
+        \\elsewhere, or it was cancelled) should see, and needs no action. If it
+        \\repeats for a run that is still this node's, check `zcube job status` for
+        \\the claim and compare the agent's and the server's versions.
+        \\
+        \\Two causes are not final: no node has claimed the run yet, or the claim has
+        \\not started it. The server then answers 503, not 409, and the agent asks
+        \\again by itself; it marks the run refused only on a 409.
         ,
     },
     .{
@@ -1645,39 +1698,52 @@ pub const registry = [_]Entry{
         .code = .E0806,
         .severity = .@"error",
         .blame = .user,
-        .summary = "a peer key or trust file can't be used",
+        .summary = "a peer key, certificate or trust file can't be used",
         .explanation =
         \\The server's CA key (ca*.key in its state directory), the list of removed
-        \\nodes (revoked), or an agent's node key (peer.key), credential (peer.cred)
-        \\or trusted CA key (ca.pub) could not be read, created, written or parsed,
-        \\or its file or directory has permissions that let other users read a secret
-        \\or write a trust file. Key files must be owned by the process, mode 0600,
-        \\and hold one line of 64 hex digits; the state directory must not be
-        \\writable by group or others. A revoked line must be a node name.
+        \\names (revoked), an agent's node key (peer.key), credential (peer.cred),
+        \\node certificate (node.crt) or trusted CA key (ca.pub), or a file that
+        \\zcube-server ca issue-client or issue-node writes (NAME.key, NAME.crt)
+        \\could not be read, created, written or parsed, or its file or directory has
+        \\permissions that let other users read a secret or write a trust file. Key
+        \\files must be owned by the process, mode 0600; the CA key and peer.key hold
+        \\one line of 64 hex digits. The state directory must not be writable by
+        \\group or others (the server and the agent create it with mode 0700). A
+        \\revoked line must be a node or client name.
         \\
         \\The secret is never printed. If the file is damaged and there is a backup,
-        \\put it back. An agent's files are caches: it ignores a damaged peer.cred
-        \\or ca.pub and joins again by itself; delete peer.key to get a new node key.
-        \\A server whose CA key is missing although its store has run refuses to
-        \\start: put the key back, or start once with --new-ca to make a new CA on
-        \\purpose (every agent then joins again by itself).
+        \\put it back. An agent's files are caches: it ignores a damaged peer.cred,
+        \\node.crt or ca.pub and joins or renews again by itself; delete peer.key to
+        \\get a new node key. A server whose CA key is missing although its store has
+        \\run refuses to start: put the key back, or start once with --new-ca to make
+        \\a new CA on purpose (every agent then joins again by itself).
+        \\
+        \\ca issue-client and ca issue-node never make a CA: if the store has none,
+        \\give the --store and --state-dir the server runs with, or start the server
+        \\with this --store first. They never replace an existing NAME.key or NAME.crt
+        \\unless run with --replace, which is how a certificate is re-issued.
         ,
     },
     .{
         .code = .E0807,
         .severity = .@"error",
         .blame = .user,
-        .summary = "a node was refused a credential: it was removed",
+        .summary = "a name on the removed list was refused a certificate",
         .explanation =
-        \\The server will not issue or renew a peer credential for this node,
-        \\because its name is on the server's list of removed nodes (the revoked
-        \\file in its state directory). The node's current credential stays valid
-        \\until it expires, within a day, and then its peers refuse it.
+        \\The server will not issue or renew a credential or certificate for this
+        \\name, because it is on the server's list of removed names (the revoked file
+        \\in its state directory), which holds node and client names alike. A node's
+        \\current credential stays valid until it expires, within a day, and then its
+        \\peers refuse it; a certificate already issued stays valid until it expires.
         \\
-        \\If the node should be in the cluster, remove its name from the revoked
-        \\file and restart zcube-server; the agent asks again by itself. The API is
-        \\unauthenticated, so this binds an honest node only: until the API has auth,
-        \\anyone who can reach it can register a name and ask for a credential.
+        \\For a node that should be in the cluster: remove its name from the revoked
+        \\file; the server rereads it within 5 seconds and the agent asks again by
+        \\itself.
+        \\For a client: remove its name from the revoked file and run
+        \\zcube-server ca issue-client again, or choose another name.
+        \\
+        \\Over --listen only a node's own certificate may ask for its credential;
+        \\the loopback --insecure-listen caller is trusted, as anyone on the host.
         ,
     },
     .{
@@ -1757,6 +1823,10 @@ pub const registry = [_]Entry{
         \\on each side. The signature was checked first, so the certificate is
         \\genuine. The cause shows notBefore, notAfter and this machine's time.
         \\
+        \\The API server checks the client's certificate again before each request,
+        \\so a connection outlives its certificate by at most one request; the agent
+        \\checks its own node.crt before each connection.
+        \\
         \\Check the clocks on both machines. A workload certificate lives for the
         \\service's deadline, at most x509_leaf_ttl_ms_max: ask for a new one.
         ,
@@ -1815,6 +1885,14 @@ pub const registry = [_]Entry{
         \\a refused certificate is expired, issued by another CA, or for a
         \\different workload than the server allows. A signer that fails is a
         \\different error (ZC-E0820).
+        \\
+        \\On a zcube server, this is a client that came without a certificate: it
+        \\sent an empty Certificate, and the server answered certificate_required.
+        \\The server takes no connection without one. Give the client a
+        \\certificate from this cluster's CA. A browser (a client that offers
+        \\no Ed25519) is told so by name: it needs a certificate from the
+        \\cluster's browser CA, imported from the .p12 that zcube-server ca
+        \\issue-client NAME --scope admin --p12 FILE writes (docs/mtls.md).
         ,
     },
     .{
@@ -1865,12 +1943,13 @@ pub const registry = [_]Entry{
         .blame = .user,
         .summary = "an identity could not be issued",
         .explanation =
-        \\A workload or server certificate was not made because its request breaks a
-        \\bound: more labels than x509_labels_max, a label key or value over its limit
-        \\or with a character that is not allowed, label keys not sorted and unique,
-        \\labels together over x509_labels_bytes_max, a cluster or service name that
-        \\does not make a SPIFFE ID spiffe://<cluster>/service/<name>, a DNS name that
-        \\is not lowercase, has a wildcard or an all-digit label, or a lifetime that
+        \\A workload, server, node or client certificate was not made because its
+        \\request breaks a bound: more labels than x509_labels_max, a label key or
+        \\value over its limit or with a character that is not allowed, label keys not
+        \\sorted and unique, labels together over x509_labels_bytes_max, a cluster,
+        \\service, node or client name that does not make a SPIFFE ID
+        \\spiffe://<cluster>/<service|node|client>/<name>, a DNS name that is not
+        \\lowercase, has a wildcard or an all-digit label, or a lifetime that
         \\is empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA), or a
         \\subject key that is not a valid Ed25519 public key (off the curve, or in a
         \\small subgroup), which no honest holder has.
@@ -1901,19 +1980,26 @@ pub const registry = [_]Entry{
         .summary = "a certificate is of another kind than this use needs",
         .explanation =
         \\The certificate is genuine and well formed, but it is not for this use: a
-        \\workload's client certificate presented as a server's, a CA certificate
-        \\presented as a leaf, or, under a foreign anchor, a certificate whose
-        \\extended key usage lacks serverAuth or whose basic constraints say CA.
+        \\workload's, node's or client's certificate presented as a server's, one of
+        \\those three where another of them is needed (a workload's where the API
+        \\needs a node's or a client's), a CA certificate presented as a leaf, or,
+        \\under a foreign anchor, a certificate whose extended key usage lacks
+        \\serverAuth or whose basic constraints say CA.
         \\
-        \\The cause names the kind found and the kind needed. Give the peer a
-        \\certificate issued for its role: a server certificate for a server.
+        \\The server also refuses, with this code, a node or client certificate whose
+        \\name is in its revoked file: at the handshake, and before each request on
+        \\a connection opened before the name was revoked, which is then closed.
+        \\
+        \\The cause names the kind found and the kind needed, or the revoked name.
+        \\Give the peer a certificate issued for its role: a server certificate for
+        \\a server.
         ,
     },
     .{
         .code = .E0820,
         .severity = .@"error",
         .blame = .environment,
-        .summary = "the key behind the client certificate did not sign",
+        .summary = "the key behind a client's or this server's certificate did not sign",
         .explanation =
         \\The server asked for a client certificate and the client has one, but the
         \\signer that holds its private key returned no signature, so the proof of
@@ -1924,6 +2010,10 @@ pub const registry = [_]Entry{
         \\process or in another. This is that signer failing, not the server or the
         \\certificate. Check that the process or device holding the key is running
         \\and reachable, then reconnect.
+        \\
+        \\On a zcube server, this is the server's own signer: it could not sign its
+        \\CertificateVerify, so it sent the client an internal_error alert in the
+        \\clear (the client held no keys yet) and let no client in.
         ,
     },
     .{
@@ -1938,6 +2028,28 @@ pub const registry = [_]Entry{
         \\
         \\Check that getrandom works where this runs: the kernel, the seccomp profile
         \\and the container sandbox must allow it. Then run the command again.
+        ,
+    },
+    .{
+        .code = .E0822,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the caller's certificate does not allow this request",
+        .explanation =
+        \\The server refused a request because the client certificate it came with
+        \\does not give the scope the request needs. The diagnostic names the caller
+        \\and the scope it would need. The answer is HTTP 403, and nothing was read
+        \\or written.
+        \\
+        \\A node's certificate (an agent) may call only the agent API under its own
+        \\node's name: /v1/agent/nodes/<its name>/. A client certificate of scope
+        \\`jobs` may submit, list, watch and cancel jobs (/v1/jobs) and ask why about
+        \\a job. Everything else needs a client certificate of scope `admin`, but
+        \\no client may call /v1/agent/nodes/<name>/credential: it signs a node's
+        \\own certificate, so only that node's certificate may ask.
+        \\
+        \\Use a certificate with the scope the request needs: an operator issues one
+        \\with `zcube-server ca issue-client NAME --scope admin`.
         ,
     },
     .{

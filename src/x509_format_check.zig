@@ -133,7 +133,7 @@ fn make_certificates(check: *Check) !void {
     const workload_key = try Ed25519.KeyPair.generateDeterministic(@splat(1));
     const workload_request: x509.WorkloadRequest = .{
         .cluster = "prod.example",
-        .service = "broker-1",
+        .name = "broker-1",
         .subject_key = workload_key.public_key.toBytes(),
         .identity = .{ .image_digest = @splat(0x5A), .placement_epoch = 42, .labels = &labels },
         .lifetime = window,

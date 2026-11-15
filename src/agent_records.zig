@@ -56,6 +56,15 @@ pub const file_fetch_log = "fetch.log";
 /// and the relay's log of coded events.
 pub const file_relay_port = "relay.port";
 pub const file_relay_log = "relay.log";
+/// The run's relay key (B4): the supervisor writes the public half with the run's job, epoch and
+/// image digest; the agent asks the server for a certificate and writes it as `relay.crt` (DER),
+/// or writes `relay.refused` when the server said ZC-E0706.
+pub const file_relay_public = "relay.pub";
+pub const file_relay_certificate = "relay.crt";
+pub const file_relay_refused = "relay.refused";
+/// A fake-runtime test fault for the relay (B4 slice 2): `open` makes the supervisor fail to
+/// open the relay. Written by `FakeRuntime.start` from `<state>/faults/<name>` = `relay_open`.
+pub const file_relay_fault = "relay.fault";
 /// Written by `zcube-agent fetch --report` when a fetch succeeds (C2 slice 7): a `records.Pull`
 /// the agent publishes under `/pulls/` and then removes.
 pub const file_pull = "pull.json";
@@ -90,6 +99,10 @@ pub const SpecFile = struct {
     /// The relay's upstream (`HOST:PORT`) if the container has one: its supervisor listens on a
     /// loopback port of its own and tells the command in `ZCUBE_RELAY`.
     relay: ?[]const u8 = null,
+    /// B4: the upstream's TLS (`runtime.Spec`'s fields of the same names).
+    relay_server_name: []const u8 = "",
+    relay_server_anchor: []const u8 = "",
+    relay_plain: bool = false,
     started_at_ms: u64,
 };
 
@@ -138,16 +151,28 @@ pub fn has_image(fixtures: []const []const u8, image: []const u8) bool {
     return false;
 }
 
+/// The files of an older container of the name that a start removes before it puts the spec.
+const stale_files = [_][]const u8{
+    file_run,
+    file_child,
+    file_supervisor,
+    file_forced,
+    file_fetch,
+    file_fetch_log,
+    file_relay_port,
+    file_relay_log,
+    file_relay_public,
+    file_relay_certificate,
+    file_relay_refused,
+    file_relay_fault,
+};
+
 /// Starts the container's record: clears what an older container of the name left (a stopped
 /// container's directory has no spec by now, see `remove_container`), then puts the spec.
 pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!void {
     assert(runtime.name_problem(spec.name) == null);
     var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
-    const files = [_][]const u8{
-        file_run,        file_child,     file_supervisor, file_forced, file_fetch, file_fetch_log,
-        file_relay_port, file_relay_log,
-    };
-    for (files) |stale| {
+    for (stale_files) |stale| {
         state.remove(path(&path_buffer, spec.name, stale)) catch |err| switch (err) {
             error.Absent => {}, // The usual case.
             else => |other| return other,
@@ -305,9 +330,10 @@ fn exit_reason(name: []const u8, run: RunFile) runtime.ExitReason {
     };
 }
 
-/// The fix of ZC-E0702: right for either kind of cause (a descriptor, or the relay's address).
-pub const fix_e0702 = "check the step in the cause: free file descriptors on the node, " ++
-    "or correct the relay's address in the server's `relays` setting, then submit the job again";
+/// The fix of ZC-E0702: right for each kind of cause (a descriptor, the relay's address, a job
+/// from before B4).
+pub const fix_e0702 = "do what the cause names: free file descriptors on the node, correct " ++
+    "the relay in the server's `relays` setting, or resubmit a job from before B4";
 
 /// ZC-E0601 (the fetch), ZC-E0702 (the relay), ZC-E0508 (the user's command) or ZC-E0507 (the
 /// host), as the supervisor recorded.
@@ -601,7 +627,8 @@ test "a crash at every write point leaves records a restart reads" {
     // asserted so the loop cannot silently stop covering a case.
     var counts: Counts = .{};
     for ([_]agent_state.CrashKind{ .process, .host }) |kind| {
-        for (1..11) |point| {
+        // A start's write points are one per stale file, then the spec's: reach past them.
+        for (1..stale_files.len + 4) |point| {
             for (0..64) |seed| {
                 var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
                 defer arena_state.deinit();

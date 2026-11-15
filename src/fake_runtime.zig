@@ -44,6 +44,7 @@ const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
 const diag_mod = @import("diag.zig");
 const files = @import("fake_files.zig");
+const process_session = @import("process_session.zig");
 const runtime = @import("runtime.zig");
 const sim_runtime = @import("sim_runtime.zig");
 
@@ -81,10 +82,120 @@ pub const Fetch = struct {
     server: []const u8 = "",
     /// `NAME=HOST:PORT`, fixed peers.
     peers: []const []const u8 = &.{},
+    /// The agent's `--ca`, `--tls-name`, `--cert` and `--key`, by path (B7 slice 7): the fetch
+    /// reads `server` over TLS with them when `ca` is set. Empty: not given.
+    ca: []const u8 = "",
+    tls_name: []const u8 = "",
+    cert: []const u8 = "",
+    key: []const u8 = "",
     /// The wait after one failed fetch on the node, doubling to the cap (`fetch_backoff.zig`).
     backoff_base_ms: u32 = constants.fetch_backoff_base_ms,
     backoff_cap_ms: u32 = constants.fetch_backoff_cap_ms,
 };
+
+/// The fetch's words: the head, `--report`, `--server` and the four TLS flags with their values,
+/// and `--peer` with each fixed peer.
+const fetch_argv_head = 12;
+const fetch_argv_tls = 8;
+const fetch_argv_max = fetch_argv_head + 2 + 2 + fetch_argv_tls + 2 * constants.fetch_peers_max;
+
+comptime {
+    assert(fetch_argv_max == 24 + 2 * constants.fetch_peers_max);
+}
+
+/// What a fetch is of, beside `Fetch`: the supervisor's executable, the state directory, the
+/// image and where its pull record goes.
+const FetchOf = struct {
+    exe: []const u8,
+    state_dir: []const u8,
+    image: []const u8,
+    report: []const u8,
+};
+
+/// The words of `fetch.json`'s fetch: `words` holds them. The TLS flags go only with a server and
+/// a CA, each before its value.
+fn fetch_argv(
+    fetch: Fetch,
+    of: FetchOf,
+    words: *[fetch_argv_max][]const u8,
+) []const []const u8 {
+    assert(fetch.peers.len <= constants.fetch_peers_max);
+    var count: usize = 0;
+    const head = [_][]const u8{
+        of.exe,        "fetch",      "--node",       fetch.node,
+        "--state-dir", of.state_dir, "--images-dir", fetch.images_dir,
+        "--digest",    of.image,     "--registry",   fetch.registry,
+    };
+    comptime assert(head.len == fetch_argv_head);
+    for (head) |word| {
+        words[count] = word;
+        count += 1;
+    }
+    words[count] = "--report";
+    words[count + 1] = of.report;
+    count += 2;
+    if (fetch.server.len > 0) {
+        words[count] = "--server";
+        words[count + 1] = fetch.server;
+        count += 2;
+    }
+    const tls = [_][2][]const u8{
+        .{ "--ca", fetch.ca },     .{ "--tls-name", fetch.tls_name },
+        .{ "--cert", fetch.cert }, .{ "--key", fetch.key },
+    };
+    comptime assert(tls.len * 2 == fetch_argv_tls);
+    for (tls) |pair| {
+        if (pair[1].len == 0 or fetch.server.len == 0 or fetch.ca.len == 0) continue;
+        words[count] = pair[0];
+        words[count + 1] = pair[1];
+        count += 2;
+    }
+    for (fetch.peers) |peer| {
+        words[count] = "--peer";
+        words[count + 1] = peer;
+        count += 2;
+    }
+    return words[0..count];
+}
+
+test "over TLS the fake's fetch is given every word, in order, and none without --ca (B7)" {
+    // Goal: the fetch child reads the server with the agent's own CA, name, certificate and
+    // key, each flag before its value; without a CA it gets no TLS word. Method: the whole
+    // argv, word for word, with one fixed peer; then the same without the CA.
+    var fetch: Fetch = .{
+        .node = "n1",
+        .images_dir = "/images",
+        .registry = "r:1",
+        .server = "s:2",
+        .peers = &.{"n2=10.0.0.2:7"},
+        .ca = "/etc/ca.crt",
+        .tls_name = "api.x",
+        .cert = "/etc/n1.crt",
+        .key = "/etc/n1.key",
+    };
+    const of: FetchOf = .{ .exe = "/bin/a", .state_dir = "/s", .image = "b3:aa", .report = "p" };
+    const want = [_][]const u8{
+        "/bin/a",      "fetch",         "--node",       "n1",
+        "--state-dir", "/s",            "--images-dir", "/images",
+        "--digest",    "b3:aa",         "--registry",   "r:1",
+        "--report",    "p",             "--server",     "s:2",
+        "--ca",        "/etc/ca.crt",   "--tls-name",   "api.x",
+        "--cert",      "/etc/n1.crt",   "--key",        "/etc/n1.key",
+        "--peer",      "n2=10.0.0.2:7",
+    };
+    comptime assert(want.len == 26);
+    var words: [fetch_argv_max][]const u8 = undefined;
+    const argv = fetch_argv(fetch, of, &words);
+    try std.testing.expectEqual(want.len, argv.len);
+    for (want, argv) |expected, got| try std.testing.expectEqualStrings(expected, got);
+    fetch.ca = "";
+    const plain = fetch_argv(fetch, of, &words);
+    try std.testing.expectEqual(@as(usize, 18), plain.len);
+    for (want[0..16], plain[0..16]) |expected, got| {
+        try std.testing.expectEqualStrings(expected, got);
+    }
+    try std.testing.expectEqualStrings("--peer", plain[16]);
+}
 
 const Tag = enum(u8) { starting, running, stopped };
 
@@ -188,6 +299,7 @@ pub const FakeRuntime = struct {
         var path_buffer: [constants.state_path_bytes_max]u8 = undefined;
         const path = try self.container_path(&path_buffer, spec.name, diag);
         if (fetched) try self.write_fetch(dir, spec, diag);
+        self.fault_at_start(dir, spec.name);
         try self.spawn_supervisor(path, spec.name, diag);
         return self.await_start(dir, spec.name, diag);
     }
@@ -223,37 +335,20 @@ pub const FakeRuntime = struct {
         diag: *Diag,
     ) runtime.Error!void {
         const fetch = self.options.fetch.?;
-        var argv: [12 + 2 + 2 + 2 * constants.fetch_peers_max][]const u8 = undefined;
-        var count: usize = 0;
+        var words: [fetch_argv_max][]const u8 = undefined;
         var report_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const report = std.fmt.bufPrint(&report_buffer, "{s}/containers/{s}/{s}", .{
             self.options.state_dir, spec.name, files.file_pull,
         }) catch return runtime_failed(diag, "build the pull report's path");
-        const head = [_][]const u8{
-            self.options.supervisor_exe, "fetch",                "--node",       fetch.node,
-            "--state-dir",               self.options.state_dir, "--images-dir", fetch.images_dir,
-            "--digest",                  spec.image,             "--registry",   fetch.registry,
-        };
-        for (head) |word| {
-            argv[count] = word;
-            count += 1;
-        }
-        argv[count] = "--report";
-        argv[count + 1] = report;
-        count += 2;
-        if (fetch.server.len > 0) {
-            argv[count] = "--server";
-            argv[count + 1] = fetch.server;
-            count += 2;
-        }
-        for (fetch.peers) |peer| {
-            argv[count] = "--peer";
-            argv[count + 1] = peer;
-            count += 2;
-        }
+        const argv = fetch_argv(fetch, .{
+            .exe = self.options.supervisor_exe,
+            .state_dir = self.options.state_dir,
+            .image = spec.image,
+            .report = report,
+        }, &words);
         const record: files.FetchFile = .{
             .digest = spec.image,
-            .argv = argv[0..count],
+            .argv = argv,
             .state_dir = self.options.state_dir,
             .backoff_base_ms = fetch.backoff_base_ms,
             .backoff_cap_ms = fetch.backoff_cap_ms,
@@ -277,6 +372,9 @@ pub const FakeRuntime = struct {
             .env = Pairs.env[0..spec.env.len],
             .labels = Pairs.labels[0..spec.labels.len],
             .relay = if (spec.relay.len > 0) spec.relay else null,
+            .relay_server_name = spec.relay_server_name,
+            .relay_server_anchor = spec.relay_server_anchor,
+            .relay_plain = spec.relay_plain,
             .started_at_ms = self.clock.now_ms(),
         };
     }
@@ -415,7 +513,7 @@ pub const FakeRuntime = struct {
             return;
         };
         if (grace_ms == 0) return self.kill_and_wait(dir, child);
-        signal(child, .TERM);
+        signal_command(child, .TERM);
         const waited = @min(grace_ms, stop_wait_ms);
         if (self.wait_ended(dir, waited)) return;
         if (grace_ms <= stop_wait_ms) self.kill_and_wait(dir, child);
@@ -441,11 +539,11 @@ pub const FakeRuntime = struct {
             self.kill_group(dir);
             return;
         };
-        signal(child, if (number == runtime.signal_kill) .KILL else .TERM);
+        signal_command(child, if (number == runtime.signal_kill) .KILL else .TERM);
     }
 
     fn kill_and_wait(self: *FakeRuntime, dir: Dir, child: i32) void {
-        signal(child, .KILL);
+        signal_command(child, .KILL);
         _ = self.wait_ended(dir, constants.fake_reap_ms);
     }
 
@@ -599,19 +697,21 @@ pub const FakeRuntime = struct {
         agent_records.write_run(self.state.interface(), name, &lost) catch {};
     }
 
-    /// Kills the supervisor's process group: the supervisor, the command, what the command
-    /// started. Only what is provably ours is signalled, because the pids come from files that may
-    /// be old (after a host restart a recycled pid belongs to someone else): the supervisor must
-    /// still be a `supervise` of this state directory, or the command must still be in the
-    /// session the supervisor led, which no new process can have as its id while a member lives.
+    /// Kills the supervisor's session: the supervisor, the command (in a group of its own), what
+    /// the command started. Only what is provably ours is signalled, because the pids come from
+    /// files that may be old (after a host restart a recycled pid belongs to someone else): the
+    /// supervisor must still be a `supervise` of this state directory, or the command must still
+    /// be in the session the supervisor led, which no new process can have as its id while a
+    /// member lives.
     pub fn kill_group(self: *FakeRuntime, dir: Dir) void {
         const supervisor = files.read_pid(self.io, dir, files.file_supervisor) catch return;
+        if (supervisor <= 1) return;
         var ours = self.is_our_supervisor(supervisor);
         if (!ours) {
             const command = files.read_pid(self.io, dir, files.file_child) catch return;
             ours = self.session_of(command) == supervisor;
         }
-        if (ours) signal(-supervisor, .KILL);
+        if (ours) process_session.kill_all(self.io, supervisor);
     }
 
     /// True if `pid` is a `zcube-agent supervise` of a container under our state directory.
@@ -767,6 +867,16 @@ pub const FakeRuntime = struct {
         }
     }
 
+    /// `relay_open` must be in place before the supervisor runs: it moves into the container's
+    /// directory, where the supervisor reads it. Other words wait for `list`.
+    fn fault_at_start(self: *FakeRuntime, dir: Dir, name: []const u8) void {
+        var buffer: [32]u8 = undefined;
+        const word = self.faults.readFile(self.io, name, &buffer) catch return;
+        if (!std.mem.eql(u8, std.mem.trim(u8, word, "\n "), "relay_open")) return;
+        files.write_atomic(self.io, dir, files.file_relay_fault, "open\n") catch return;
+        self.faults.deleteFile(self.io, name) catch {}; // Applied: the supervisor reads it.
+    }
+
     /// True if the fault is done with: applied, meaningless or too late.
     fn inject(self: *FakeRuntime, arena: Allocator, name: []const u8, word: []const u8) bool {
         const dir = self.containers.openDir(self.io, name, .{}) catch return false;
@@ -778,7 +888,14 @@ pub const FakeRuntime = struct {
         _ = arena;
         if (is_limit_word(word)) {
             files.write_atomic(self.io, dir, files.file_forced, word) catch return false;
-            signal(child, .KILL);
+            signal_command(child, .KILL);
+            return true;
+        }
+        if (std.mem.eql(u8, word, "relay_stop")) {
+            // The supervisor shuts its relay's listener down, as if the relay had died.
+            const supervisor = files.read_pid(self.io, dir, files.file_supervisor) catch
+                return false;
+            signal(supervisor, .USR1);
             return true;
         }
         if (std.mem.eql(u8, word, "lost")) {
@@ -796,6 +913,16 @@ pub const FakeRuntime = struct {
 fn is_limit_word(word: []const u8) bool {
     if (std.mem.eql(u8, word, "oom")) return true;
     return std.mem.eql(u8, word, "pid_limit");
+}
+
+/// A signal to a container's command and what it started: the command leads a process group of
+/// its own (`fake_supervisor.run_command`). A command an older supervisor started shares its
+/// supervisor's group and gets the signal alone, as before.
+fn signal_command(pid: i32, sig: std.posix.SIG) void {
+    assert(pid > 1);
+    std.posix.kill(-pid, sig) catch {
+        signal(pid, sig);
+    };
 }
 
 fn signal(pid: i32, sig: std.posix.SIG) void {

@@ -1,4 +1,4 @@
-error[ZC-E0820]: the key behind the client certificate did not sign
+error[ZC-E0820]: the key behind a client's or this server's certificate did not sign
   cause  the signer holding the client certificate's key did not sign
   fix    Check that the process or device holding this workload's key is running and reachable, then reconnect.
   more   zcube explain E0820 · rerun with --verbose for the full cause chain

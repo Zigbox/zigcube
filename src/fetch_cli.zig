@@ -21,6 +21,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const agent_config = @import("agent_config.zig");
 const agent_peer = @import("agent_peer.zig");
+const api_tls_client = @import("api_tls_client.zig");
 const constants = @import("constants.zig");
 const chunk_summary = @import("chunk_summary.zig");
 const dir_images = @import("dir_images.zig");
@@ -37,6 +38,8 @@ const zigbox = @import("zigbox");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const zigbox_image = @import("zigbox_image.zig");
 const pull_report = @import("pull_report.zig");
+const x509 = @import("x509.zig");
+const api_tls_test = @import("api_tls_test.zig");
 
 const Zsha256 = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
 const IpAddress = std.Io.net.IpAddress;
@@ -104,6 +107,8 @@ pub const Net = struct {
     progress_lines: u32 = 0,
     /// Tests only: a clock the fetch reads instead of `boot_ms`, and no write to fetch.log.
     test_clock_ms: ?*u64 = null,
+    /// The server is read over TLS (B7 slice 7); null: plain HTTP.
+    server_tls: ?*ServerTls = null,
 
     fn clock_ms(net: *const Net) u64 {
         if (net.test_clock_ms) |fake| return fake.*;
@@ -309,6 +314,57 @@ pub const Net = struct {
         diag.reset();
         fetch_worker.raise_bad_tree(&diag, net.peers[index].name, net.digest);
         emit(net.io, &diag);
+    }
+
+    /// The answer to `GET path` from the server over TLS (B7 slice 7), as `http_get` gives it.
+    /// A connection the TLS layer refused or broke says its code once, in one line
+    /// (`ServerTls.say`): the fetch then goes on with the peers it was named and the registry.
+    fn https_get(net: *Net, tls: *ServerTls, path: []const u8, out: []u8) PeerReply {
+        const end = peer_stream.boot_ms(net.io) + constants.fetch_request_timeout_ms;
+        const fd = peer_stream.connect(net.io, tls.address, end) catch return .timeout;
+        defer _ = std.os.linux.close(fd);
+        var arena_state = std.heap.ArenaAllocator.init(tls.gpa);
+        defer arena_state.deinit();
+        assert(path.len <= server_path_bytes_max);
+        const name = tls.credentials.server_name;
+        assert(name.len <= constants.tls_server_name_bytes_max);
+        var request: [https_request_bytes_max]u8 = undefined;
+        // Cannot overflow: the path and the name are bounded above, and the buffer is sized by
+        // `https_request_bytes_max` for both.
+        const text = std.fmt.bufPrint(&request, https_request_form, .{ path, name }) catch
+            unreachable;
+        var diag: diag_mod.Diag = undefined;
+        diag.reset();
+        const done = api_tls_client.exchange(
+            &tls.credentials,
+            net.io,
+            fd,
+            arena_state.allocator(),
+            &.{text},
+            net.reply.len,
+            api_tls_client.reply_is_whole,
+            end,
+            &diag,
+        ) catch return .timeout; // Out of memory: as a server that did not answer.
+        switch (done.ending) {
+            .done => {},
+            .silent => return .timeout,
+            .failed => {
+                tls.say(net.io, &diag);
+                return .timeout;
+            },
+        }
+        if (done.reply.len > net.reply.len) {
+            net.oversize = true;
+            return .refused;
+        }
+        const body = http_body(done.reply) orelse {
+            if (http_status(done.reply) == null) return .timeout;
+            return tls.refused(net.io, done.reply);
+        };
+        if (body.len > out.len) return .timeout;
+        @memcpy(out[0..body.len], body);
+        return .{ .bytes = out[0..body.len] };
     }
 
     /// The answer to a plain-HTTP `GET path` from `address`, copied into `out`: the body of a
@@ -743,6 +799,13 @@ pub const Args = struct {
     first_skipped: []const u8 = "",
     /// Where a successful fetch writes its `records.Pull` (the agent publishes it); empty: none.
     report: []const u8 = "",
+    /// The server is read over TLS (B7 slice 7) when `ca` is given: the CA certificate it pins,
+    /// the DNS name the server's certificate must carry, and the agent's `--cert`/`--key` (by
+    /// path), presented when the node's own `node.crt` in `state_dir` cannot be.
+    ca: []const u8 = "",
+    tls_name: []const u8 = "",
+    cert: []const u8 = "",
+    key: []const u8 = "",
 };
 
 pub fn parse(args: []const []const u8) ?Args {
@@ -772,10 +835,11 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.server = parse_address(value) orelse return null;
         } else if (std.mem.eql(u8, flag, "--peer")) {
             if (!parse_peer(&parsed, value)) return null;
-        } else return null;
+        } else if (!parse_tls(&parsed, flag, value)) return null;
     }
     const complete = parsed.node.len > 0 and parsed.state_dir.len > 0;
     if (!complete or !digest_valid(parsed.digest)) return null;
+    if (!tls_complete(&parsed)) return null;
     if (parsed.zigbox_store.len > 0) {
         // Zigbox mode: the store and the manifest come together; the digest is a full one.
         if (parsed.images_dir.len > 0 or parsed.digest.len != constants.tree_digest_bytes) {
@@ -789,6 +853,31 @@ pub fn parse(args: []const []const u8) ?Args {
         return null;
     }
     return parsed;
+}
+
+/// `--ca`, `--tls-name`, `--cert` and `--key`: false for any other flag or an empty value.
+fn parse_tls(parsed: *Args, flag: []const u8, value: []const u8) bool {
+    const field: *[]const u8 = if (std.mem.eql(u8, flag, "--ca"))
+        &parsed.ca
+    else if (std.mem.eql(u8, flag, "--tls-name"))
+        &parsed.tls_name
+    else if (std.mem.eql(u8, flag, "--cert"))
+        &parsed.cert
+    else if (std.mem.eql(u8, flag, "--key"))
+        &parsed.key
+    else
+        return false;
+    if (value.len == 0) return false;
+    field.* = value;
+    return true;
+}
+
+/// The TLS flags go with `--server` and `--ca`, and `--cert` with `--key`.
+fn tls_complete(parsed: *const Args) bool {
+    if ((parsed.cert.len > 0) != (parsed.key.len > 0)) return false;
+    const any = parsed.ca.len > 0 or parsed.tls_name.len > 0 or parsed.cert.len > 0;
+    if (!any) return true;
+    return parsed.ca.len > 0 and parsed.server != null;
 }
 
 /// `b3:` and 8 to 64 lower-case hex digits. The digest goes into request lines (the registry's
@@ -844,7 +933,7 @@ fn parse_address(text: []const u8) ?IpAddress {
 pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
     "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX) " ++
     "--digest b3:HEX [--registry HOST:PORT] [--server HOST:PORT] [--report FILE] " ++
-    "[--peer NAME=HOST:PORT]...";
+    "[--ca FILE [--tls-name NAME] [--cert FILE --key FILE]] [--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
 /// memory), 3 is that no source had the tree (the supervisor says ZC-W0603 and pulls from the
@@ -887,6 +976,66 @@ fn identity_or_say(io: std.Io, parsed: *const Args, diag: *diag_mod.Diag) ?peer.
     return loaded;
 }
 
+/// `identity_or_say`, but a node that has not joined yet (no `peer.cred` or `ca.pub`, which the
+/// agent's join writes after it registers, so after it may have started this fetch) is waited
+/// for: re-read every `fetch_peer_poll_ms` for up to `wait_ms` when there are peers to ask
+/// (`--server` or `--peer`). Still none, it is ZC-E0806 in `diag`, "no peer identity", and the
+/// fetch goes on from the registry: the peers are never asked without one.
+fn identity_or_wait(
+    io: std.Io,
+    parsed: *const Args,
+    wait_ms: u32,
+    diag: *diag_mod.Diag,
+) ?peer.Identity {
+    assert(diag.code == null);
+    assert(wait_ms <= constants.fetch_peer_wait_ms);
+    if (parsed.server == null and parsed.peer_count == 0) return identity_or_say(io, parsed, diag);
+    const started = peer_stream.boot_ms(io);
+    // Bounded twice: by the clock, and by the number of reads the wait can hold.
+    const reads_max = wait_ms / constants.fetch_peer_poll_ms + 1;
+    var reads: u32 = 0;
+    while (reads < reads_max) {
+        reads += 1;
+        if (identity_or_say(io, parsed, diag)) |held| return held;
+        if (diag.code != null) return null; // Files that cannot be used: said by the reader.
+        if (peer_stream.boot_ms(io) -| started >= wait_ms) break;
+        io.sleep(.fromMilliseconds(constants.fetch_peer_poll_ms), .awake) catch break;
+    }
+    assert(reads >= 1);
+    assert(reads <= reads_max);
+    diag.raise(.E0806);
+    diag.cause("no peer identity: node {s} has not joined the cluster CA yet ({s} or {s} " ++
+        "is missing in {s}) after {d} ms", .{
+        parsed.node,      agent_peer.credential_file, agent_peer.ca_file,
+        parsed.state_dir, wait_ms,
+    });
+    diag.fix(.{ .sentence = "the fetch goes on from the registry; the agent joins by itself, " ++
+        "and the next fetch asks the peers" });
+    return null;
+}
+
+/// The server's TLS client when `--ca` is given, else null (plain HTTP). Credentials that cannot
+/// be used are one line in the fetch's log (their code and cause), and the server is then not
+/// read at all: plain HTTP to a TLS listener would only be refused (ZC-E0815).
+fn server_tls_or_say(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    parsed: *Args,
+    identity: ?peer.Identity,
+    tls: *ServerTls,
+) ?*ServerTls {
+    if (parsed.ca.len == 0) return null;
+    tls.* = .{ .gpa = gpa, .address = parsed.server.?, .credentials = undefined };
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    tls.load(io, parsed, identity, &diag) catch {
+        tls.say(io, &diag);
+        parsed.server = null;
+        return null;
+    };
+    return tls;
+}
+
 pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     // Not `init.io`: that is a threaded Io. A Zigbox store is written in Zigbox's store
     // namespace, which only a process of one thread may make, and this Io never starts another.
@@ -894,18 +1043,21 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     const io = threaded.io();
     var diag: diag_mod.Diag = undefined;
     diag.reset();
-    const parsed = parse(args) orelse {
+    var parsed = parse(args) orelse {
         diag.raise(.E0505);
         diag.cause("the arguments of zcube-agent fetch are not complete or not valid", .{});
         diag.fix(.{ .sentence = usage });
         return finish(io, &diag, constants.exit_user);
     };
     const gpa = init.gpa;
-    const identity = identity_or_say(io, &parsed, &diag);
+    const identity = identity_or_wait(io, &parsed, constants.fetch_peer_wait_ms, &diag);
     if (diag.code != null) {
         emit(io, &diag); // The peers will not be asked; the registry may still answer.
         diag.reset();
     }
+    var server_tls: ServerTls = undefined;
+    defer if (parsed.ca.len > 0) server_tls.credentials.deinit();
+    const tls = server_tls_or_say(io, gpa, &parsed, identity, &server_tls);
     const reply = gpa.alloc(u8, reply_bytes) catch
         return no_memory(io, &diag);
     defer gpa.free(reply);
@@ -922,6 +1074,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         .digest = parsed.digest,
         .conns = conns,
         .environ = init.minimal.environ,
+        .server_tls = tls,
     };
     defer net.close_peers();
     if (parsed.zigbox_store.len > 0) return fetch_in_namespace(gpa, &net, &parsed, &diag);
@@ -1368,10 +1521,6 @@ const node_store_listing: Listing = .{
     .limit = discover_page_nodes,
     .pages_max = discover_pages_max,
 };
-/// The assignments and replicas, read once per fetch to know which nodes fetch the tree (O5).
-/// Their records are well under a kilobyte, so a page of this many fits `discover_page_bytes_max`.
-const assigned_listing: Listing = .{ .prefix = "/assigned/", .limit = 128, .pages_max = 8 };
-const replicas_listing: Listing = .{ .prefix = "/replicas/", .limit = 128, .pages_max = 8 };
 
 /// Reads the server's `/node-store/` list, a page at a time (`discover_page_nodes` each, at most
 /// `discover_pages_max`); what was read when a later page fails is kept, and null if none was.
@@ -1391,7 +1540,7 @@ fn collect_list(
     var first_revision: u64 = 0;
     var after: ?[]const u8 = null;
     for (0..listing.pages_max) |at| {
-        var target: [400]u8 = undefined;
+        var target: [server_path_bytes_max]u8 = undefined;
         const form = "/v1/list?prefix={s}&limit={d}";
         const path = if (after) |key|
             std.fmt.bufPrint(&target, form ++ "&at={d}&continue={s}", .{
@@ -1428,13 +1577,120 @@ fn continue_key_valid_in(prefix: []const u8, key: []const u8) bool {
     return true;
 }
 
+/// The server read over TLS (B7 slice 7): the node's credentials, loaded once, and whether the
+/// one line on a failure was said.
+pub const ServerTls = struct {
+    gpa: std.mem.Allocator,
+    address: IpAddress,
+    credentials: api_tls_client.Credentials,
+    said: bool = false,
+
+    /// One line in the fetch's log, once per fetch: the server's node list could not be read
+    /// over TLS, with the code and cause `diag` holds. The fetch goes on without it.
+    /// A failure with no code is a cancelled read (`tls_conn.Error.Canceled`, which raises
+    /// none): it is said too, as cancelled, so the log never drops a failed read.
+    fn say(tls: *ServerTls, io: std.Io, diag: *const diag_mod.Diag) void {
+        if (tls.said) return;
+        tls.said = true;
+        const code = diag.code orelse {
+            note(io, "zcube-agent fetch: the server's node list over TLS: the read was " ++
+                "cancelled; peers: only those named\n");
+            return;
+        };
+        var buffer: [400]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "zcube-agent fetch: ZC-{t}: the server's node " ++
+            "list could not be read over TLS: {s}; peers: only those named\n", .{
+            code, diag.last_cause() orelse "no cause given",
+        }) catch "zcube-agent fetch: the server's node list could not be read over TLS\n";
+        note(io, text);
+    }
+
+    /// The server answered with a status other than 200: said once with the first line of its
+    /// body (the server's diagnostic, ZC-E0822 for a scope), and `.refused`.
+    fn refused(tls: *ServerTls, io: std.Io, reply: []const u8) PeerReply {
+        if (tls.said) return .refused;
+        tls.said = true;
+        const split = std.mem.find(u8, reply, "\r\n\r\n") orelse reply.len;
+        const status = reply[0..(std.mem.findScalar(u8, reply, '\r') orelse 0)];
+        const body = if (split + 4 <= reply.len) reply[split + 4 ..] else "";
+        const first = body[0..(std.mem.findScalar(u8, body, '\n') orelse body.len)];
+        var buffer: [400]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "zcube-agent fetch: the server refused its node " ++
+            "list over TLS: {s}: {s}; peers: only those named\n", .{
+            status[0..@min(status.len, 64)], first[0..@min(first.len, 240)],
+        }) catch "zcube-agent fetch: the server refused its node list over TLS\n";
+        note(io, text);
+        return .refused;
+    }
+
+    /// Loads what the node presents (`api_tls_client.present_node`, the agent's own choice and
+    /// checks): its stored `node.crt` over `peer.key` when usable now, else `--cert`/`--key`.
+    /// ZC-E0806 or ZC-E0811 in `diag` when neither can be.
+    fn load(
+        tls: *ServerTls,
+        io: std.Io,
+        parsed: *const Args,
+        identity: ?peer.Identity,
+        diag: *diag_mod.Diag,
+    ) api_tls_client.LoadError!void {
+        assert(parsed.ca.len > 0);
+        const name = if (parsed.tls_name.len > 0)
+            parsed.tls_name
+        else
+            api_tls_client.server_name_default;
+        const c = &tls.credentials;
+        try c.load_ca(io, parsed.ca, name, diag);
+        var stored: x509.Der = .{};
+        var stored_found = false;
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{
+            parsed.state_dir, agent_peer.node_certificate_file,
+        })) |path| {
+            var ignored: diag_mod.Diag = undefined;
+            ignored.reset();
+            // Absent or damaged is said below as why `--cert` was needed.
+            api_tls_client.read_certificate_file(io, path, &stored, &ignored) catch {};
+            stored_found = ignored.code == null;
+        } else |_| {}
+        const node_identity: api_tls_client.NodeIdentity = .{
+            .where = parsed.state_dir,
+            .node = parsed.node,
+            .stored = if (stored_found) &stored else null,
+            .key_pair = if (identity) |held| held.key else null,
+            .cert = if (parsed.cert.len > 0) parsed.cert else null,
+            .key = if (parsed.key.len > 0) parsed.key else null,
+        };
+        _ = try api_tls_client.present_node(c, io, node_identity, real_ms(io), diag);
+    }
+};
+
+/// The longest path the fetch asks the server for: a `/v1/list` page with its `continue` key,
+/// or the fetchers of a tree (`fetchers_path_bytes_max`).
+const server_path_bytes_max = 400;
+
+const https_request_form = "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\n" ++
+    "Content-Length: 0\r\n\r\n";
+
+/// `https_get`'s request: the form with its longest path and the longest server name.
+const https_request_bytes_max = https_request_form.len + server_path_bytes_max +
+    constants.tls_server_name_bytes_max;
+
+comptime {
+    assert(fetchers_path_bytes_max <= server_path_bytes_max);
+    assert(https_request_bytes_max <= 1024);
+}
+
 /// `collect_pages` over the control plane's HTTP.
 const HttpGetter = struct {
     net: *Net,
     server: IpAddress,
 
     fn get(getter: HttpGetter, path: []const u8, out: []u8) ?[]const u8 {
-        return switch (getter.net.http_get(getter.server, path, out)) {
+        const reply = if (getter.net.server_tls) |tls|
+            getter.net.https_get(tls, path, out)
+        else
+            getter.net.http_get(getter.server, path, out);
+        return switch (reply) {
             .bytes => |body| body,
             .refused, .timeout, .busy => null,
         };
@@ -1507,10 +1763,11 @@ const Begun = struct {
     waited_ms: u64,
 };
 
-/// O5 (docs/briefs/c2.md, owner 2026-11-03): before the peers are chosen, reads which nodes fetch
-/// the tree and, unless a peer holds it or this node ranks lowest among them, re-reads
-/// `/node-store/` every `fetch_peer_poll_ms` for up to `fetch_peer_wait_ms` until a peer holds
-/// it. `arena` holds the fetchers; `poll` is reset before each read and holds the last.
+/// O5 (docs/briefs/c2.md, owner 2026-11-03): before the peers are chosen, asks the server which
+/// nodes fetch the tree (over plain HTTP and TLS alike) and, unless a peer holds it or this node
+/// ranks lowest among them, re-reads `/node-store/` every `fetch_peer_poll_ms` for up to
+/// `fetch_peer_wait_ms` until a peer holds it. `arena` holds the fetchers; `poll` is reset before
+/// each read and holds the last.
 fn begin(
     arena: std.mem.Allocator,
     poll: *std.heap.ArenaAllocator,
@@ -1520,7 +1777,7 @@ fn begin(
 ) Begun {
     const scratch = arena.alloc(u8, discover_page_bytes_max) catch
         return .{ .stores = null, .start = .peers, .fetchers = 0, .waited_ms = 0 };
-    const fetchers = fetching_nodes(arena, getter, scratch, parsed.digest);
+    const fetchers = fetching_nodes(arena, getter, scratch, parsed.node, parsed.digest);
     const started = net.clock_ms();
     while (true) {
         _ = poll.reset(.retain_capacity);
@@ -1547,45 +1804,40 @@ fn begin(
     }
 }
 
-/// The nodes with an assignment of a replica whose image is `digest` (`/assigned/<node>/<id>`
-/// joined to `/replicas/<service>/<id>`), each once. Empty if either list cannot be read: the
-/// fetch then ranks itself alone and does not wait, as before O5.
+/// The nodes the server names as fetching `digest`, each once: those assigned a replica of it,
+/// `GET /v1/agent/nodes/<self>/fetchers/<digest>` (`agent_api.zig`), which a node's certificate
+/// may call (decisions/2026-11-14-b7-slice7-o5-over-tls.md). Copied into `arena`, since
+/// `scratch` serves the next request. Empty if it cannot be read: the fetch then ranks itself
+/// alone and does not wait, as before O5. A name that is not a node name is left out.
 fn fetching_nodes(
     arena: std.mem.Allocator,
     getter: anytype,
     scratch: []u8,
+    self: []const u8,
     digest: []const u8,
 ) []const []const u8 {
-    const replicas = collect_list(arena, getter, scratch, replicas_listing) orelse return &.{};
-    var ids: std.ArrayList([]const u8) = .empty;
-    for (replicas) |kv| {
-        const image = string_field(kv.value, "image") orelse continue;
-        if (!std.mem.eql(u8, image, digest)) continue;
-        const id = string_field(kv.value, "id") orelse continue;
-        ids.append(arena, id) catch return &.{};
-    }
-    if (ids.items.len == 0) return &.{};
-    const assigned = collect_list(arena, getter, scratch, assigned_listing) orelse return &.{};
-    return assigned_nodes(arena, assigned, ids.items);
-}
-
-/// The nodes of `/assigned/<node>/<id>` keys whose `id` is in `ids`, each once.
-fn assigned_nodes(
-    arena: std.mem.Allocator,
-    assigned: []const Kv,
-    ids: []const []const u8,
-) []const []const u8 {
+    assert(digest_valid(digest));
+    var target: [fetchers_path_bytes_max]u8 = undefined;
+    const form = "/v1/agent/nodes/{s}/fetchers/{s}";
+    const path = std.fmt.bufPrint(&target, form, .{ self, digest }) catch return &.{};
+    const body = getter.get(path, scratch) orelse return &.{};
+    const Reply = struct { nodes: []const []const u8 };
+    const parsed = std.json.parseFromSliceLeaky(Reply, arena, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return &.{};
     var nodes: std.ArrayList([]const u8) = .empty;
-    for (assigned) |kv| {
-        const rest = strip_prefix(kv.key, "/assigned/") orelse continue;
-        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
-        const node = rest[0..slash];
-        const id = rest[slash + 1 ..];
-        if (!contains(ids, id) or contains(nodes.items, node)) continue;
+    for (parsed.nodes) |node| {
+        if (nodes.items.len == constants.nodes_max) break;
+        if (records.name_problem(node, constants.node_name_bytes_max) != null) continue;
+        if (contains(nodes.items, node)) continue;
         nodes.append(arena, node) catch return nodes.items;
     }
     return nodes.items;
 }
+
+const fetchers_path_bytes_max = "/v1/agent/nodes//fetchers/".len +
+    constants.node_name_bytes_max + "b3:".len + 64;
 
 fn strip_prefix(text: []const u8, prefix: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, text, prefix)) return null;
@@ -1741,6 +1993,153 @@ test "an HTTP reply gives its body only for 200" {
     try std.testing.expect(http_body("HTTP/1.0 200 OK\r\n") == null);
 }
 
+test "a fetch with peers to ask and no peer identity yet says so (ZC-E0806), and goes on" {
+    // Goal: the swarm-smoke flake: a fetch that started before the node joined asked no peer
+    // and said nothing. Method: an empty state directory and a peer to ask, waited for 0 ms:
+    // no identity, and ZC-E0806 naming the missing files; with nothing to ask, nothing is said.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const state = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    const with_peer = [_][]const u8{
+        "--node",       "node1",          "--state-dir", state,
+        "--images-dir", "/i",             "--digest",    "b3:00000000",
+        "--registry",   "127.0.0.1:9000", "--peer",      "node2=127.0.0.1:9001",
+    };
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const parsed = parse(&with_peer).?;
+    try std.testing.expect(identity_or_wait(std.testing.io, &parsed, 0, &diag) == null);
+    try std.testing.expectEqual(@as(?@TypeOf(diag.code.?), .E0806), diag.code);
+    const cause = diag.last_cause().?;
+    try std.testing.expect(std.mem.find(u8, cause, "no peer identity") != null);
+    try std.testing.expect(std.mem.find(u8, cause, agent_peer.credential_file) != null);
+    diag.reset();
+    const alone = parse(with_peer[0..10]).?;
+    try std.testing.expect(identity_or_wait(std.testing.io, &alone, 0, &diag) == null);
+    try std.testing.expect(diag.code == null);
+}
+
+test "a peer identity that appears during the wait is used, and nothing is said" {
+    // Goal: the supervisor's ruling on SHOULD b: the wait ends as soon as the join writes the
+    // identity. Method: a key and a held credential in an empty state directory; another thread
+    // stores the set after 1.5 s while the fetch waits up to 10 s: the identity is returned
+    // before the bound, and no diagnostic is raised (so no ZC-E0806 line).
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const state = path[0..try tmp.dir.realPath(io, &path)];
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    var opened = try agent_peer.Peer.open(io, state, "node1", &diag);
+    defer opened.close();
+    const ca = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const now = peer_stream.wall_ms(io);
+    try opened.hold_for_test(ca, now - 1000, now + 100_000);
+    const later = struct {
+        fn store(held: *agent_peer.Peer) void {
+            var stored: diag_mod.Diag = undefined;
+            stored.reset();
+            std.testing.io.sleep(.fromMilliseconds(1500), .awake) catch {};
+            held.store(&stored) catch {};
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, later.store, .{&opened});
+    const words = [_][]const u8{
+        "--node",       "node1",          "--state-dir", state,
+        "--images-dir", "/i",             "--digest",    "b3:00000000",
+        "--registry",   "127.0.0.1:9000", "--peer",      "node2=127.0.0.1:9001",
+    };
+    const parsed = parse(&words).?;
+    const started = peer_stream.boot_ms(io);
+    const held = identity_or_wait(io, &parsed, 10_000, &diag);
+    const waited = peer_stream.boot_ms(io) -| started;
+    writer.join();
+    try std.testing.expect(held != null);
+    try std.testing.expect(diag.code == null);
+    try std.testing.expect(waited >= 1000);
+    try std.testing.expect(waited < 10_000);
+}
+
+/// The arguments of a fetch that reads `rig`'s server over TLS as node1 with `--ca`, `--cert`
+/// and `--key` of the rig's directory (`cert_file`, `key_file`, `ca_file` override them).
+fn tls_args(
+    arena: std.mem.Allocator,
+    rig: *api_tls_test.Rig,
+    ca_file: ?[]const u8,
+    key_file: ?[]const u8,
+) !Args {
+    const dir = rig.dir();
+    var address: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&address);
+    try writer.print("{f}", .{rig.server.tls_address()});
+    const words = [_][]const u8{
+        "--node",       "node1",
+        "--state-dir",  dir,
+        "--images-dir", "/i",
+        "--digest",     "b3:00000000",
+        "--registry",   "127.0.0.1:9000",
+        "--server",     try arena.dupe(u8, writer.buffered()),
+        "--ca",         ca_file orelse try std.fs.path.join(arena, &.{ dir, try rig.ca_file() }),
+        "--cert",       try std.fs.path.join(arena, &.{ dir, "node1.crt" }),
+        "--key",        key_file orelse try std.fs.path.join(arena, &.{ dir, "node1.key" }),
+    };
+    return parse(&words) orelse error.TestUnexpectedResult;
+}
+
+test "over TLS a refused read is said once, and the fetch goes on without it (B7 slice 7)" {
+    // Goal: review of slice 7, SHOULD d (ii): `https_get`'s refused path against a real server.
+    // Method: node1's credentials ask for `/services/` (403, ZC-E0822): `.refused`, said once;
+    // `/node-store/` then answers 200 with the list.
+    var rig: api_tls_test.Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const arena = rig.arena.allocator();
+    var parsed = try tls_args(arena, &rig, null, null);
+    var server_tls: ServerTls = undefined;
+    const tls = server_tls_or_say(rig.io, std.testing.allocator, &parsed, null, &server_tls).?;
+    defer server_tls.credentials.deinit();
+    const reply = try arena.alloc(u8, reply_bytes);
+    var net: Net = .{
+        .io = rig.io,
+        .registry = null,
+        .peers = &.{},
+        .identity = null,
+        .reply = reply,
+        .conns = &.{},
+        .server_tls = tls,
+    };
+    var out: [4096]u8 = undefined;
+    const refused = net.https_get(tls, "/v1/list?prefix=/services/", &out);
+    try std.testing.expect(refused == .refused);
+    try std.testing.expect(tls.said);
+    const listed = net.https_get(tls, "/v1/list?prefix=/node-store/&limit=65", &out);
+    try std.testing.expect(listed == .bytes);
+    try std.testing.expect(std.mem.find(u8, listed.bytes, "\"revision\"") != null);
+}
+
+test "over TLS a CA or key that cannot be loaded leaves the server unread (B7 slice 7)" {
+    // Goal: review of slice 7, SHOULD d (ii): `ServerTls.load`'s refusals. Method: a `--ca`
+    // that does not exist, then a `--key` that does not exist: no TLS client, and `--server`
+    // dropped, so the fetch never reads the server in the clear.
+    var rig: api_tls_test.Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const arena = rig.arena.allocator();
+    const missing = try std.fs.path.join(arena, &.{ rig.dir(), "absent.pem" });
+    const cases = [_][2]?[]const u8{ .{ missing, null }, .{ null, missing } };
+    for (cases) |case| {
+        var parsed = try tls_args(arena, &rig, case[0], case[1]);
+        try std.testing.expect(parsed.server != null);
+        var server_tls: ServerTls = undefined;
+        const got = server_tls_or_say(rig.io, std.testing.allocator, &parsed, null, &server_tls);
+        try std.testing.expect(got == null);
+        try std.testing.expect(parsed.server == null);
+        try std.testing.expect(server_tls.said);
+    }
+}
+
 test "the fetch arguments need a node, directories, a digest and a registry" {
     // Goal: a partial command line is refused (usage), a complete one is parsed with its peers.
     const good = [_][]const u8{
@@ -1770,6 +2169,34 @@ test "the fetch arguments need a node, directories, a digest and a registry" {
     long[7] = "b3:" ++ a64;
     try std.testing.expect(parse(&long) != null);
     try std.testing.expect(parse(&.{ "--node", "n", "--bogus", "x" }) == null);
+}
+
+test "the TLS flags go with --server and --ca, and --cert with --key" {
+    // Goal: the fetch reads the server over TLS only with a CA it can check the server by, and
+    // presents --cert only with its key; anything less is refused (usage), never plain HTTP.
+    const base = [_][]const u8{
+        "--node",       "node1",          "--state-dir", "/s",
+        "--images-dir", "/i",             "--digest",    "b3:00000000",
+        "--registry",   "127.0.0.1:9000", "--server",    "127.0.0.1:9100",
+    };
+    const tls = [_][]const u8{ "--ca", "/ca.crt", "--tls-name", "zc", "--cert", "/n.crt" } ++
+        [_][]const u8{ "--key", "/n.key" };
+    const full = parse(&(base ++ tls)).?;
+    try std.testing.expectEqualStrings("/ca.crt", full.ca);
+    try std.testing.expectEqualStrings("zc", full.tls_name);
+    try std.testing.expectEqualStrings("/n.crt", full.cert);
+    try std.testing.expectEqualStrings("/n.key", full.key);
+    try std.testing.expect(parse(&(base ++ tls[0..2].*)) != null);
+    // --cert without --key, --key without --cert, TLS without --ca, an empty value.
+    try std.testing.expect(parse(&(base ++ tls[0..6].*)) == null);
+    try std.testing.expect(parse(&(base ++ tls[0..2].* ++ tls[4..8].*)) != null);
+    try std.testing.expect(parse(&(base ++ tls[0..4].* ++ tls[6..8].*)) == null);
+    try std.testing.expect(parse(&(base ++ tls[0..2].* ++ tls[6..8].*)) == null);
+    try std.testing.expect(parse(&(base ++ tls[2..4].*)) == null);
+    try std.testing.expect(parse(&(base ++ tls[4..8].*)) == null);
+    try std.testing.expect(parse(&(base ++ [_][]const u8{ "--ca", "" })) == null);
+    // TLS without --server has nothing to read.
+    try std.testing.expect(parse(&(base[0..10].* ++ tls[0..2].*)) == null);
 }
 
 const test_filter = "00ff00ff00ff00ff";
@@ -2115,37 +2542,43 @@ test "without a registry the sources a failed fetch names are the peers alone" {
     );
 }
 
-test "the nodes fetching a tree are those assigned a replica of it, each once" {
-    // Goal: O5's set of fetchers from `/assigned/` and `/replicas/`. Method: two replicas of the
-    // tree on node1 and one on node3, one of another image on node2.
+test "the nodes fetching a tree are those the server names, each once, node names only" {
+    // Goal: O5's set of fetchers from the server's `fetchers` endpoint, asked under this node's
+    // own path with the digest. Method: a reply that names node1 twice, a name that is not a
+    // node name and node3; then the path the request named.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const assigned = parse_kvs(arena,
-        \\{"kvs":[{"key":"/assigned/node1/app-1","value":{"replica":"app-1"}},
-        \\{"key":"/assigned/node1/app-2","value":{}},{"key":"/assigned/node2/web-1","value":{}},
-        \\{"key":"/assigned/node3/app-3","value":{}},{"key":"/assigned/bad","value":{}}]}
-    ).?;
-    const ids = [_][]const u8{ "app-1", "app-2", "app-3" };
-    const nodes = assigned_nodes(arena, assigned, &ids);
+    const pages = [_][]const u8{
+        \\{"revision":7,"nodes":["node1","node1","Bad Name","node3"],"chain":{}}
+        ,
+    };
+    var calls: u32 = 0;
+    var last_path: [160]u8 = undefined;
+    const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &last_path };
+    const scratch = try arena.alloc(u8, 4096);
+    const nodes = fetching_nodes(arena, getter, scratch, "node2", "b3:aaaaaaaa");
     try std.testing.expectEqual(@as(usize, 2), nodes.len);
     try std.testing.expectEqualStrings("node1", nodes[0]);
     try std.testing.expectEqualStrings("node3", nodes[1]);
+    try std.testing.expectEqual(@as(u32, 1), calls);
+    // A reply that is not the endpoint's: no fetchers, so no wait.
+    calls = 0;
+    const wrong = [_][]const u8{"{\"kvs\":[]}"};
+    const other: PagedGetter = .{ .pages = &wrong, .calls = &calls, .last_path = &last_path };
+    const none = fetching_nodes(arena, other, scratch, "node2", "b3:aaaaaaaa");
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "the fetching nodes stay as read when the same buffer serves the next request" {
     // Goal: the demo-c2 run 41965968058 bug: the names pointed into the reply buffer, so the next
     // `/node-store/` read changed them and no node ranked lowest. Method: read the fetchers, then
-    // a node-store page through the same buffer; the names and the ids they came from hold.
+    // a node-store page through the same buffer; the names hold.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const pages = [_][]const u8{
-        \\{"kvs":[{"key":"/replicas/app/app-1","value":{"id":"app-1","image":"b3:aa"}},
-        \\{"key":"/replicas/app/app-2","value":{"id":"app-2","image":"b3:aa"}}]}
-        ,
-        \\{"kvs":[{"key":"/assigned/node1/app-1","value":{}},
-        \\{"key":"/assigned/node3/app-2","value":{}}]}
+        \\{"revision":3,"nodes":["node1","node3"]}
         ,
         \\{"kvs":[{"key":"/node-store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","value":{
         \\"peer":"10.0.0.9:7700","trees":[]}}]}
@@ -2156,24 +2589,24 @@ test "the fetching nodes stay as read when the same buffer serves the next reque
     const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &last_path };
     const scratch = try arena.alloc(u8, 4096);
     @memset(scratch, 'x');
-    const nodes = fetching_nodes(arena, getter, scratch, "b3:aa");
+    const nodes = fetching_nodes(arena, getter, scratch, "node2", "b3:aaaaaaaa");
     _ = collect_pages(arena, getter, scratch).?;
     try std.testing.expectEqual(@as(usize, 2), nodes.len);
     try std.testing.expectEqualStrings("node1", nodes[0]);
     try std.testing.expectEqualStrings("node3", nodes[1]);
 }
 
-/// A server that has two fetchers of "b3:aa" and no node-store entry, whatever the path.
+/// A server that names two fetchers of the tree and has no node-store entry. It answers the
+/// fetchers path of `digest` only, so a request that names another path or digest finds none.
 const FetchersGetter = struct {
-    fn get(_: FetchersGetter, path: []const u8, out: []u8) ?[]const u8 {
-        const body: []const u8 = if (std.mem.indexOf(u8, path, "/replicas/") != null)
-            \\{"kvs":[{"key":"/replicas/app/a1","value":{"id":"a1","image":"b3:aa"}},
-            \\{"key":"/replicas/app/a2","value":{"id":"a2","image":"b3:aa"}}]}
-        else if (std.mem.indexOf(u8, path, "/assigned/") != null)
-            \\{"kvs":[{"key":"/assigned/node1/a1","value":{}},
-            \\{"key":"/assigned/node2/a2","value":{}}]}
-        else
-            return null;
+    digest: []const u8,
+
+    fn get(getter: FetchersGetter, path: []const u8, out: []u8) ?[]const u8 {
+        const tail = "/fetchers/";
+        const at = std.mem.indexOf(u8, path, tail) orelse return null;
+        if (!std.mem.startsWith(u8, path, "/v1/agent/nodes/")) return null;
+        if (!std.mem.eql(u8, path[at + tail.len ..], getter.digest)) return null;
+        const body = "{\"revision\":1,\"nodes\":[\"node1\",\"node2\"]}";
         @memcpy(out[0..body.len], body);
         return out[0..body.len];
     }
@@ -2190,7 +2623,8 @@ test "the O5 wait says where it is: begin writes progress lines while no peer ho
     var poll: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer poll.deinit();
     const fetchers = [_][]const u8{ "node1", "node2" };
-    const self: []const u8 = if (fetch_plan.registry_first("node1", "b3:aa", &fetchers))
+    const tree = "b3:aaaaaaaa";
+    const self: []const u8 = if (fetch_plan.registry_first("node1", tree, &fetchers))
         "node2"
     else
         "node1";
@@ -2204,13 +2638,53 @@ test "the O5 wait says where it is: begin writes progress lines while no peer ho
         .reply = &scratch,
         .test_clock_ms = &fake,
     };
-    const parsed: Args = .{ .node = self, .digest = "b3:aa" };
-    const begun = begin(arena, &poll, &net, FetchersGetter{}, &parsed);
+    const parsed: Args = .{ .node = self, .digest = tree };
+    const begun = begin(arena, &poll, &net, FetchersGetter{ .digest = tree }, &parsed);
     try std.testing.expect(begun.start == .waited);
     try std.testing.expect(begun.waited_ms >= constants.fetch_peer_wait_ms);
     const lines: u32 = constants.fetch_peer_wait_ms / constants.fetch_progress_ms;
     try std.testing.expect(net.progress_lines >= lines - 1 and net.progress_lines <= lines + 1);
     try std.testing.expect(net.progress_lines > 0);
+}
+
+test "over TLS too, a node that another fetcher outranks waits for a peer (O5)" {
+    // Goal: B7 slice 7's MUST: with the server read over TLS, O5 holds, so only the elected node
+    // reads the registry first (demo-c2's registry_once). Method: as above, with `server_tls`
+    // set (the getter answers in its place); then the elected node, which does not wait.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var poll: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer poll.deinit();
+    const fetchers = [_][]const u8{ "node1", "node2" };
+    const tree = "b3:aaaaaaaa";
+    const elected: []const u8 = if (fetch_plan.registry_first("node1", tree, &fetchers))
+        "node1"
+    else
+        "node2";
+    const other: []const u8 = if (elected[4] == '1') "node2" else "node1";
+    var fake: u64 = 5_000;
+    var scratch: [8]u8 = undefined;
+    var server_tls: ServerTls = undefined; // Never read: the getter answers.
+    var net: Net = .{
+        .io = std.testing.io,
+        .registry = null,
+        .peers = &.{},
+        .identity = null,
+        .reply = &scratch,
+        .test_clock_ms = &fake,
+        .server_tls = &server_tls,
+    };
+    const getter: FetchersGetter = .{ .digest = tree };
+    const waiting: Args = .{ .node = other, .digest = tree };
+    const begun = begin(arena, &poll, &net, getter, &waiting);
+    try std.testing.expect(begun.start == .waited);
+    try std.testing.expectEqual(@as(u32, 2), begun.fetchers);
+    try std.testing.expect(begun.waited_ms >= constants.fetch_peer_wait_ms);
+    const first: Args = .{ .node = elected, .digest = tree };
+    const chosen = begin(arena, &poll, &net, getter, &first);
+    try std.testing.expect(chosen.start == .registry_first);
+    try std.testing.expectEqual(@as(u64, 0), chosen.waited_ms);
 }
 
 test "a peer holds a tree when its summary lists it and it can be reached" {

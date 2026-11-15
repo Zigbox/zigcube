@@ -85,6 +85,9 @@ pub fn run(demo: *Demo) !void {
 fn start(demo: *Demo) !void {
     const host = demo.host;
     host.section("0. Start: zcube-server with the relay botpike, one guest, a test upstream");
+    host.say("  Debug builds of zcube-server and zcube-agent until B4 slice 4: the zigbox " ++
+        "runtime speaks no TLS to a relay's upstream yet, so botpike is a plain-TCP test " ++
+        "upstream (`.plain = true`), which release builds refuse", .{});
     _ = try host.zcube(&.{"version"});
     try host.start_server(30 * 1000);
     host.say("  zcube-server is up on 127.0.0.1:{d} (SQLite); the guest reaches it at {s}", .{
@@ -99,7 +102,10 @@ fn start(demo: *Demo) !void {
     if (learned.len < at + "tree ".len + length) return host.fail("a short tree", .{});
     demo.v1_tree = learned[at + "tree ".len ..][0..length];
     _ = try demo.guest(0, "images {s} {s}", .{ demo.v1_tree, image_ref });
-    _ = try demo.guest(0, "agent {s} {s}", .{ vms.names[0], demo.server });
+    try steps.put_tls(demo, 0);
+    _ = try demo.guest(0, "agent {s} {s} {s}", .{
+        vms.names[0], demo.server, steps.guest_tls_dir,
+    });
     try demo.wait_hard({}, node_joined, "the node to join", steps.join_ms);
     _ = try host.zcube(&.{ "get", "nodes" });
 }

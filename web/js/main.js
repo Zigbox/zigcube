@@ -111,8 +111,8 @@ async function boot() {
   const pillEl = $("#conn");
   const connLog = $("#conn-log");
   const banner = $("#banner");
-  const LABEL = { connecting: "Connecting", live: "Live", reconnecting: "Reconnecting", stale: "Stale", relisting: "Resyncing" };
-  const GLYPH = { connecting: "◌", live: "●", reconnecting: "◐", stale: "▲", relisting: "◐" };
+  const LABEL = { connecting: "Connecting", live: "Live", reconnecting: "Reconnecting", stale: "Stale", relisting: "Resyncing", forbidden: "Not allowed" };
+  const GLYPH = { connecting: "◌", live: "●", reconnecting: "◐", stale: "▲", relisting: "◐", forbidden: "✕" };
   let lastConn = "";
   function renderConn() {
     const s = model.connState;
@@ -124,7 +124,7 @@ async function boot() {
     if (s !== lastConn) { if (lastConn) announce(`Connection: ${LABEL[s]}`); lastConn = s; }
     const err = model.error;
     const sig = err ? JSON.stringify([err.diagnostics, err.requestId]) : "";
-    const note = err?.diagnostics[0].severity === "bug" && sim ? "The simulation stopped and its in-browser store is lost. What you see is the last data received; reload to start again." : err ? (s === "stale" ? `The console is showing data from ${ago(model.lastOkAt)}. It keeps trying and will update itself.` : "Trying again. What you see is the last data received.") : "";
+    const note = err?.diagnostics[0].severity === "bug" && sim ? "The simulation stopped and its in-browser store is lost. What you see is the last data received; reload to start again." : err ? (s === "forbidden" ? "This browser's client certificate may not read the cluster: its scope is too narrow. The console needs a certificate of scope admin (zcube-server ca issue-client NAME --scope admin --p12 FILE); import it and reload." : s === "stale" ? `The console is showing data from ${ago(model.lastOkAt)}. It keeps trying and will update itself.` : "Trying again. What you see is the last data received.") : "";
     if (banner._sig !== sig) {
       banner._sig = sig;
       banner.hidden = !err;
