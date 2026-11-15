@@ -1,8 +1,10 @@
-# The mesh view may go stale while its read fails (awaiting owner)
+# The mesh view may go stale while its read fails (owner chose C)
 
-Date: 2026-11-15. C4 fixups of #263 (Review A, `src/agent_mesh.zig`, `plan_now`). Status: a
-recorded gap (option A), approved by the supervisor for #263. The fix is **awaiting the owner**,
-who chooses among B, C and D below. It lands in its own pull request.
+Date: 2026-11-15. C4 fixups of #263 (Review A, `src/agent_mesh.zig`, `plan_now`). Status: in
+#263 the gap is recorded and nothing is built (option A for now, approved by the supervisor).
+**The owner chose C (2026-11-15).** After S = `node_lease_ttl_ms` (10 s) with no fresh view,
+the agent fails closed on inbound only, and warns with a new ZC-W05xx code, which the owner
+approved with C. C is built in its own pull request, a follow-up to #263.
 
 ## What the agent does now
 
@@ -47,7 +49,7 @@ Each of B, C and D changes behaviour users can see. Each adds a bound to `consta
 The code also needs the owner's approval; without it the change would reuse the existing
 enforce-failure note.
 
-**Recommendation: C with S = `node_lease_ttl_ms`.** It matches the I3 bound the system already
+**Recommendation, which the owner took: C with S = `node_lease_ttl_ms`.** It matches the I3 bound the system already
 accepts, it bounds the half that matters for security, and it does not cut outbound traffic to
 healthy destinations. B comes next, if the owner wants the same behaviour in both directions.
 
