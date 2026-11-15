@@ -33,6 +33,10 @@ pub const State = struct {
     ledger_full: u32 = 0,
     /// The first of J2 and J7 to fail; the cluster's safety check reports it.
     violation: ?[]const u8 = null,
+    /// J12's first failure: the local job fence fell on a node whose steps skipped the job pass
+    /// since its last good runs read, or within a term of that read
+    /// (`sim_cluster.Node.judge_job_fence`).
+    fence_violation: ?[]const u8 = null,
     /// Starts judged against a committed claim (J7).
     starts_judged: u64 = 0,
     /// Workload counters: what the report shows so that a run that never made a job shows.

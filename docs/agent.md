@@ -278,7 +278,13 @@ is one pass of `reconcile`, after the replicas. It wants a run when the node hol
    deadline or kill is a wake, and every call and backoff is capped at it as at the fence, so a cut
    link, a hung call or a run whose report keeps failing delays no run's stop. The pass reports the
    ending once the server answers.
-4. **`stop_cause`** (`cancel`, `deadline`, `fence`, `not_started`) is written to the start record
+   **The local job fence** (J6 option B, docs/decisions/2026-11-15-j6-jobs-local-fence.md) is
+   enforced the same way: `s + ttl − fence_margin` after `s`, the send time of the last read of the
+   runs that succeeded, every job container still running gets `stop_cause` `unreachable`, TERM
+   (grace at most `fence_stop_ms`) and the kill. A stop the server committed is seen by the next
+   good read, so a server that answers the keepalives and fails that read still cannot keep a
+   stopped run executing. Replicas, the lease and the tenure are untouched.
+4. **`stop_cause`** (`cancel`, `deadline`, `fence`, `unreachable`, `not_started`) is written to the start record
    before the container is signalled and reported with the exit. An exit the agent saw first
    carries none. A fence under a replaced tenure is reported under the next tenure, once it holds.
 5. **Adoption.** After `kill -9` the new agent lists the runtime, reads the start records, and adopts
@@ -325,6 +331,7 @@ The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a
 | agent stopped or killed | keep running | a new agent adopts them |
 | server down or restarted | keep running | the agent backs off, reports `ZC-E0503` once, carries on when it returns |
 | the lease cannot be kept (the server is away, or the lease is gone) | stopped at `s + ttl − fence_margin` (the agent fences itself; `s` is the send time of the last acknowledged keepalive, on `CLOCK_BOOTTIME`), or at once if the server says the lease is gone | grants a new lease, registers again empty under a new tenure, prints `ZC-W0501` |
+| the runs cannot be read, though keepalives are answered | job containers stopped at `s + ttl − fence_margin` (`s` is the send time of the last runs read that succeeded), cause `unreachable`; replicas keep running | reports the endings once the server answers; the node keeps its lease and tenure |
 | an observed write is refused (`ZC-E0510`: its tenure was replaced) | stopped at once | as above |
 | a command is killed | the supervisor records it | reported; the controller replaces the replica |
 | a supervisor is killed | the command is killed by the agent | reported `lost` with `ZC-E0509`; replaced |

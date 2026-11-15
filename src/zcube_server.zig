@@ -51,6 +51,7 @@ fn on_signal(_: std.posix.SIG) callconv(.c) void {
 // The sim-c1 negative tests (c1_teeth.zig) must be unreachable from the shipped program.
 comptime {
     std.debug.assert(!c1_teeth.any);
+    std.debug.assert(!c1_teeth.runs_unread_world);
 }
 
 pub fn main(init: std.process.Init) u8 {

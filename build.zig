@@ -1413,15 +1413,29 @@ const c1_teeth_roots = [_]struct {
         .ops = 300,
     },
     .{
+        .name = "job_pass_break_fenced",
+        .root = "src/sim_c1_teeth_job_pass_break_fenced_main.zig",
+        .symptom = "J12",
+        // The `job_pass_break` loop with the local job fence on: the fence falls on a node whose
+        // steps skipped the job pass since its last good runs read, and J12 must say so. Sparse:
+        // J12 fails at seeds 2, 15, 44 and 48 of the evict world (measured 2026-11-15 over seeds
+        // 1..15, 41..48 and 225; seed 225 fails J6 first). The tooth runs 2 and 44.
+        .canary_seeds = 1,
+        .canary_first = 2,
+        .also_seeds = &.{44},
+        .first_seed = 2,
+        .seeds = 2,
+        .ops = 300,
+    },
+    .{
         .name = "job_runs_unread",
         .root = "src/sim_c1_teeth_job_runs_unread_main.zig",
         .symptom = "J6",
-        // A gap shown, not an agent fault (docs/decisions/2026-11-14-j6-runs-unread-gap.md): the
-        // server cuts a node's runs read while a stop is asked. Measured 2026-11-14 over seeds 1
-        // to 40 at 100 operations: J6 first at 11 seeds with `--c1` (2 4 7 14 17 18 22 23 25 30
-        // 32) and 13 plain; 6 others fail first on other checks (the cut also hides new runs and
-        // ended jobs), so the canary is pinned to known J6 hits, as a sparse tooth's is. Each
-        // passes with the fault off.
+        // The local job fence off (docs/decisions/2026-11-15-j6-jobs-local-fence.md) in a world
+        // whose server cuts a node's runs read for 60 s after a stop commits. Measured 2026-11-15
+        // over seeds 1 to 40 at 100 operations: J6 at 11 seeds with `--c1` (2 4 7 14 17 18 22 23
+        // 25 30 32) and 12 plain, no other check; the canary stays pinned to known J6 hits. With
+        // the fence on (`sim-c1-runs-unread`) all 40 pass.
         .canary_seeds = 1,
         .canary_first = 2,
         .also_seeds = &.{ 4, 7 },
@@ -1512,6 +1526,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
+    add_runs_unread_step(b, sim);
     add_burst_step(b, sim);
     add_worlds_step(b, sim);
     add_reuse_step(b, sim);
@@ -1845,6 +1860,33 @@ fn add_offline_step(b: *std.Build, sim: SimStepOptions) void {
     });
     b.step("sim-c1-offline", "Run sim-c1 in the offline-deadline world with the fix on (J8 holds)")
         .dependOn(&run.step);
+}
+
+/// Seeds of `sim-c1-runs-unread`.
+const runs_unread_seeds_max = 40;
+
+/// `zig build sim-c1-runs-unread`: the positive run of the `job_runs_unread` tooth's world (the
+/// server cuts a node's runs read for 60 s after a stop commits) with the local job fence on. It
+/// passes only if no seed fails (J6 and the rest, J12 among them), and the run prints the world's
+/// cuts and fence stops and fails when either is 0
+/// (docs/decisions/2026-11-15-job-fence-survives-restart.md).
+fn add_runs_unread_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_runs_unread",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c1_runs_unread_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                            b.fmt("1..{d}", .{runs_unread_seeds_max}),
+        b.fmt("{d}", .{c1_teeth_operations}), "--c1",
+    });
+    b.step("sim-c1-runs-unread", "Run sim-c1 in the runs-unread world with the job fence on " ++
+        "(J6 holds)").dependOn(&run.step);
 }
 
 /// Replays of sim-c1 runs that once failed, each a fixed command line; each must pass.

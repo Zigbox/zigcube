@@ -44,6 +44,7 @@ const diag_mod = @import("diag.zig");
 const node_store = @import("node_store.zig");
 const records = @import("records.zig");
 const agent_jobs = @import("agent_jobs.zig");
+const agent_api = @import("agent_api.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
 const why_acceptance = @import("why_acceptance.zig");
@@ -160,6 +161,11 @@ pub const Report = struct {
     failed: bool = false,
     /// Calls a crashed agent's step tried to make, which the simulation refused (#167).
     dead_calls: u32 = 0,
+    /// The runs-unread world (`c1_teeth.runs_unread_world`): runs reads the server cut, and job
+    /// containers the agents' local job fence began to stop. `sim-c1-runs-unread` fails a range
+    /// in which either is 0, as it then tested nothing.
+    runs_unread_cuts: u32 = 0,
+    job_fence_stops: u32 = 0,
     bytes: [report_bytes_max]u8 = undefined,
     len: u32 = 0,
 
@@ -451,6 +457,21 @@ const Node = struct {
     /// that count when the heal began (J10).
     job_refusals: u64,
     job_refusals_at_heal: u64,
+    /// J12, over all agent lives: job containers the local job fence began to stop
+    /// (`Agent.job_fence_stops`); the latest runs read the agent sent that the server answered,
+    /// on the node's clock (null before the first); and the steps since then that skipped the
+    /// job pass (`note_job_pass`).
+    job_fence_stops: u32,
+    runs_ok_sent_ms: ?u64,
+    passes_skipped_since_ok: u32,
+    /// `runs_ok_sent_ms` and `passes_skipped_since_ok` before the first page of the read in
+    /// progress answered: a later page that fails makes the whole read fail, so they go back.
+    runs_ok_before_ms: ?u64,
+    passes_skipped_before: u32,
+    /// The agent's `job_fence_stops` J12 has judged, this step; and whether this step read the
+    /// replicas (the loading began).
+    fence_stops_seen: u32,
+    step_loaded: bool,
     /// Every agent step (failed ones too) and the virtual time with the agent up, over the
     /// whole run: the work ceiling's measure.
     all_steps: u32,
@@ -486,12 +507,80 @@ const Node = struct {
         const net = &node.cluster.net;
         assert(!node.sim.crashed);
         assert(!node.sim.files.crashed);
+        const sent_ms = node.nclock.clock().now_ms();
+        node.observe_job_fence(sent_ms);
         const result = net.transport(node.index).call(arena, request, diag);
+        if (agent_read(request, "/replicas") != null) node.step_loaded = true;
+        if (agent_read(request, "/runs")) |first| node.note_runs_read(sent_ms, first, result);
         node.spent_ms += net.last_call_ms;
         // The call took that long on the agent's clock too, so a cap on its calls (the fence,
         // a run's deadline) is reached inside one step as it is in a real agent's.
         node.nclock.spend_until(node.cluster.manual.ms + node.spent_ms);
         return result;
+    }
+
+    /// J12's record of the node's runs reads (`GET /v1/agent/nodes/{node}/runs`), by the time
+    /// the agent sent them.
+    /// A read in pages counts from its first page's send, and fails if any page does.
+    fn note_runs_read(
+        node: *Node,
+        sent_ms: u64,
+        first_page: bool,
+        result: agent_client.Error!agent_client.Reply,
+    ) void {
+        const answered = if (result) |reply| reply.status == 200 else |_| false;
+        if (answered) {
+            if (!first_page) return;
+            node.runs_ok_before_ms = node.runs_ok_sent_ms;
+            node.passes_skipped_before = node.passes_skipped_since_ok;
+            node.runs_ok_sent_ms = sent_ms;
+            node.passes_skipped_since_ok = 0;
+        } else if (!first_page) {
+            node.runs_ok_sent_ms = node.runs_ok_before_ms;
+            node.passes_skipped_since_ok = node.passes_skipped_before;
+        }
+    }
+
+    /// After a step: one that began the loading (read the replicas) and ended with the agent up
+    /// and unfenced must have tried to read the runs (`Agent.runs_reads`), or found none to read.
+    /// The job pass runs after any server failure of the loading or a stage (#142, #247); a step
+    /// that skipped it is counted for J12.
+    fn note_job_pass(node: *Node, reads_before: u64) void {
+        if (!node.step_loaded) return;
+        if (node.sim.crashed or node.sim.files.crashed or node.agent.fence.active) return;
+        if (node.agent.runs_reads != reads_before) return;
+        node.passes_skipped_since_ok +|= 1;
+    }
+
+    /// Judges the job fence stops the agent made since the last look (J12), before the node's
+    /// next call can change its record of runs reads: a stop and a good read in one step.
+    fn observe_job_fence(node: *Node, now_ms: u64) void {
+        const stops = node.agent.job_fence_stops;
+        assert(stops >= node.fence_stops_seen);
+        if (stops == node.fence_stops_seen) return;
+        node.job_fence_stops +|= stops - node.fence_stops_seen;
+        node.fence_stops_seen = stops;
+        node.judge_job_fence(now_ms);
+    }
+
+    /// J12: the local job fence began to stop job containers on this node by `now_ms` (node
+    /// clock). It may fall only a whole term after the last runs read the server answered was
+    /// sent, and only for a node whose steps since then all ran the job pass: a fence that falls
+    /// for passes that never read (#247) would hide the stops they withheld from J6.
+    fn judge_job_fence(node: *Node, now_ms: u64) void {
+        const c = node.cluster;
+        if (c.jobs.fence_violation != null) return;
+        const term_passed = if (node.runs_ok_sent_ms) |sent|
+            fencing.fence_at_ms(sent, c.api.lease_ttl_ms) <= now_ms
+        else
+            true;
+        if (node.passes_skipped_since_ok > 0) {
+            c.jobs.fence_violation = "J12: the local job fence fell on a node whose steps " ++
+                "skipped the job pass since its last good runs read";
+        } else if (!term_passed) {
+            c.jobs.fence_violation = "J12: the local job fence fell within a term of a " ++
+                "runs read the server answered";
+        }
     }
 
     /// The call of an agent that crashed: the server never hears of it (ZC-E0503).
@@ -614,9 +703,14 @@ const Node = struct {
         node.all_steps += 1;
         const fences_before = node.agent.fences;
         const refusals_before = node.agent.job_reports_refused;
+        node.fence_stops_seen = node.agent.job_fence_stops;
+        node.step_loaded = false;
+        const reads_before = node.agent.runs_reads;
         const result = node.agent.reconcile(&ctx);
         node.fences += node.agent.fences - fences_before;
         node.job_refusals += node.agent.job_reports_refused - refusals_before;
+        node.observe_job_fence(clock.now_ms());
+        node.note_job_pass(reads_before);
         node.resume_ms = c.manual.ms + node.spent_ms;
         if (!node.sim.crashed) node.save_pair(clock.now_ms());
         node.check_crashed();
@@ -876,6 +970,8 @@ pub const Cluster = struct {
     reuse_jumps: u32,
     reuse_made: u32,
     reuse_met: u32,
+    /// The runs-unread world: runs reads the server cut (`agent_api.runs_unread_cause`).
+    runs_unread_cuts: u32,
     /// True while `retention_jump` runs retention: I4 lets its sweep span nodes
     /// (`writers.foreign_key`).
     retention_running: bool = false,
@@ -963,6 +1059,7 @@ pub const Cluster = struct {
         c.reuse_jumps = 0;
         c.reuse_made = 0;
         c.reuse_met = 0;
+        c.runs_unread_cuts = 0;
     }
 
     /// The per-tick trackers start empty.
@@ -1051,6 +1148,13 @@ pub const Cluster = struct {
         node.fences_at_heal = 0;
         node.job_refusals = 0;
         node.job_refusals_at_heal = 0;
+        node.job_fence_stops = 0;
+        node.fence_stops_seen = 0;
+        node.runs_ok_sent_ms = null;
+        node.passes_skipped_since_ok = 0;
+        node.runs_ok_before_ms = null;
+        node.passes_skipped_before = 0;
+        node.step_loaded = false;
         node.up_ms = 0;
         node.all_steps = 0;
         node.all_up_ms = 0;
@@ -1133,6 +1237,11 @@ pub const Cluster = struct {
             .body = request.body,
             .hold = false,
         });
+        if (c1_teeth.runs_unread_world) {
+            if (c.net_diag.last_cause()) |cause| {
+                if (std.mem.eql(u8, cause, agent_api.runs_unread_cause)) c.runs_unread_cuts += 1;
+            }
+        }
         return .{ .status = response.status, .body = response.body };
     }
 
@@ -2573,6 +2682,7 @@ fn watch_of(c: *const Cluster, node: u32, name_hash: u64) ?sim_jobs.Watch {
 fn track_jobs(c: *Cluster) Failure!void {
     if (!c.jobs_on) return;
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
+    try check(c, c.jobs.fence_violation == null, c.jobs.fence_violation orelse "");
     try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
     try track_relays(c);
     const ledger_found = sim_jobs.ledger_problem(&c.jobs);
@@ -3164,6 +3274,8 @@ pub fn simulate(
     };
     defer c.destroy();
     defer report.dead_calls = c.stats.dead_calls;
+    defer report.runs_unread_cuts = c.runs_unread_cuts;
+    defer report.job_fence_stops = job_fence_stops(c);
     c.on_step = options.on_step;
     c.enter("faults");
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
@@ -3444,6 +3556,27 @@ fn print_summary(c: *Cluster) void {
     report.print("world hash: {x:0>16}\n", .{world_hash(c)});
 }
 
+/// Whether `request` is the agent's read of `what` (`GET /v1/agent/nodes/{node}<what>`, such
+/// as `/runs`): true for its first page, false for a later one (`after=`), null for any other
+/// request.
+fn agent_read(request: agent_client.Request, what: []const u8) ?bool {
+    if (!std.mem.eql(u8, request.method, "GET")) return null;
+    const cut = std.mem.indexOfScalar(u8, request.target, '?');
+    const path = request.target[0 .. cut orelse request.target.len];
+    if (!std.mem.startsWith(u8, path, "/v1/agent/nodes/")) return null;
+    if (!std.mem.endsWith(u8, path, what)) return null;
+    // The client adds `known=` to every target; only a later page carries `after=`.
+    const query = if (cut) |at| request.target[at..] else "";
+    return std.mem.indexOf(u8, query, "after=") == null;
+}
+
+/// Job containers the local job fence began to stop, over every node and agent life.
+fn job_fence_stops(c: *const Cluster) u32 {
+    var sum: u32 = 0;
+    for (c.nodes) |node| sum +|= node.job_fence_stops;
+    return sum;
+}
+
 fn print_jobs(c: *Cluster) void {
     const j = &c.jobs;
     c.report.print("jobs: created={d} cancelled={d} ended={d}; starts judged={d} ledger={d} " ++
@@ -3466,6 +3599,11 @@ fn print_jobs(c: *Cluster) void {
         c.report.print("jobs: reuse jumps={d} dropped={d} reused creates={d} met a " ++
             "container={d}\n", .{
             c.reuse_jumps, c.reuse_cursor.dropped, c.reuse_made, c.reuse_met,
+        });
+    }
+    if (c1_teeth.runs_unread_world) {
+        c.report.print("jobs: runs unread cuts={d} fenced={d}\n", .{
+            c.runs_unread_cuts, job_fence_stops(c),
         });
     }
     if (c.strong) {

@@ -86,6 +86,9 @@ pub const SwitchedStore = struct {
     /// A list of keys under this prefix fails as a server that cannot be reached does (ZC-E0201);
     /// test-only, null in every simulation.
     down_list_prefix: ?[]const u8 = null,
+    /// A list of keys under `prefix` takes `cost_ms` of the clock before it answers, as a slow
+    /// server does; test-only, null in every simulation.
+    list_cost: ?ListCost = null,
     /// Runs once, just before the first transaction that puts a key under `prefix` is applied;
     /// it may write through the world's store (the transaction then meets that write). Test-only,
     /// null in every simulation.
@@ -109,6 +112,12 @@ pub const SwitchedStore = struct {
         cap_ms: *const u64,
         /// Keepalives cut by the cap.
         cut: u32 = 0,
+    };
+
+    pub const ListCost = struct {
+        clock: *ManualClock,
+        prefix: []const u8,
+        cost_ms: u32,
     };
 
     pub const BeforePut = struct {
@@ -220,6 +229,10 @@ pub const SwitchedStore = struct {
                 diag.fix(.{ .sentence = "switch it back on" });
                 return error.BackendFailed;
             }
+        }
+        if (self.list_cost) |cost| {
+            const costly = std.mem.startsWith(u8, options.prefix, cost.prefix);
+            if (costly) cost.clock.advance(cost.cost_ms);
         }
         return self.inner.list(arena, options, diag);
     }

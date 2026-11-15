@@ -609,7 +609,9 @@ fn leave_claim(rig: *Rig, epoch: store.Revision, tenure: u64) !void {
     var buffer: [96]u8 = undefined;
     const name = agent_jobs.record_name(&buffer, run_id);
     const record: agent_jobs.StartRecord = .{ .run = run_id, .epoch = epoch, .phase = .claiming };
-    const bytes = try std.json.Stringify.valueAlloc(rig.world.fresh_arena(), record, .{});
+    // Not the world's arena: `record`'s strings may live in it.
+    const bytes = try std.json.Stringify.valueAlloc(testing.allocator, record, .{});
+    defer testing.allocator.free(bytes);
     try rig.world.files.interface().put_atomic(name, bytes);
     const claimed: records.JobObserved = .{
         .run = run_id,
@@ -672,7 +674,9 @@ test "a claiming record of a run that is not assigned and not claimed is removed
     var buffer: [96]u8 = undefined;
     const name = agent_jobs.record_name(&buffer, run_id);
     const record: agent_jobs.StartRecord = .{ .run = run_id, .epoch = 7, .phase = .claiming };
-    const bytes = try std.json.Stringify.valueAlloc(rig.world.fresh_arena(), record, .{});
+    // Not the world's arena: `record`'s strings may live in it.
+    const bytes = try std.json.Stringify.valueAlloc(testing.allocator, record, .{});
+    defer testing.allocator.free(bytes);
     try rig.world.files.interface().put_atomic(name, bytes);
     rig.step();
     try testing.expectEqual(@as(?agent_jobs.StartRecord, null), try rig.start_record());
@@ -1026,7 +1030,9 @@ test "a leftover of an earlier job of the same name is not this job's claim, sta
         .epoch = old_epoch,
         .phase = .claimed,
     };
-    const bytes = try std.json.Stringify.valueAlloc(rig.world.fresh_arena(), record, .{});
+    // Not the world's arena: `record`'s strings may live in it.
+    const bytes = try std.json.Stringify.valueAlloc(testing.allocator, record, .{});
+    defer testing.allocator.free(bytes);
     try rig.world.files.interface().put_atomic(name, bytes);
 
     const epoch = try rig.assign(60_000);
@@ -1236,6 +1242,9 @@ const FailingPut = struct {
     poisoned: []const u8,
     armed: bool = false,
     refused: u32 = 0,
+    /// A read of the poisoned name fails with `error.Crashed`, a state directory that cannot be
+    /// read (`error.Io` would read as a damaged record, `agent_jobs.read_record`).
+    read_failing: bool = false,
 
     const vtable: agent_state.AgentState.VTable = .{
         .put_atomic = put_atomic,
@@ -1271,7 +1280,11 @@ const FailingPut = struct {
         arena: std.mem.Allocator,
         name: []const u8,
     ) agent_state.Error![]const u8 {
-        return from(context).inner.read(arena, name);
+        const self = from(context);
+        if (self.read_failing and std.mem.indexOf(u8, name, self.poisoned) != null) {
+            return error.Crashed;
+        }
+        return self.inner.read(arena, name);
     }
 
     fn remove(context: *anyopaque, name: []const u8) agent_state.Error!void {
@@ -1583,6 +1596,277 @@ test "a runtime failure kept first does not hide the server failure that stopped
     const noted = world.agent.enforce_failure();
     try testing.expect(std.mem.startsWith(u8, noted, "reconcile a replica"));
     try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+}
+
+/// A replica "web-1" assigned to this node and started, beside the run.
+fn add_replica(rig: *Rig) !void {
+    const replica: records.Replica = .{
+        .id = "web-1",
+        .service = "web",
+        .generation = 1,
+        .image = image,
+        .command = &.{"true"},
+    };
+    _ = try rig.put(.replica_controller, records.replica_key("web", "web-1").slice(), replica);
+    const assigned = records.assigned_replica(
+        "web-1",
+        "web",
+        .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        "test",
+    );
+    const key = records.assigned_key(sim_world.node_name, "web-1");
+    _ = try rig.put(.scheduler, key.slice(), assigned);
+}
+
+test "a runs read that keeps failing while keepalives are answered stops the job, not the node" {
+    // Goal: the local job fence (docs/decisions/2026-11-15-j6-jobs-local-fence.md). A store that
+    // answers the keepalive and fails the read of the runs on every step hides a committed stop
+    // from the agent, and the lease fence never comes (docs/decisions/
+    // 2026-11-14-j6-runs-unread-gap.md). The agent stops its job containers itself, cause
+    // `unreachable`, the lease fence's term after the last good read; the replica, the lease and
+    // the tenure are left alone, and the ending is reported once the read answers. Method: a run
+    // and a replica running; the runs' list fails from then on; the run is cancelled.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    try add_replica(&rig);
+    rig.step();
+    try testing.expectEqual(@as(u32, 2), world.sim.running_count());
+    const tenure = world.agent.tenure;
+    const read_at = world.agent.runs_read_mono_ms;
+    const fence_at = world.agent.job_fence_at_ms().?;
+    const term = world.agent.lease_ttl_ms - constants.fence_margin_ms;
+    try testing.expectEqual(read_at + term, fence_at);
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    try rig.ask_stop(.cancel, 600_000);
+    // Just before the fence: the run still executes, and the fence is the agent's next wake.
+    world.advance(fence_at - world.now_ms() - 200);
+    try testing.expectEqual(@as(u32, 2), world.sim.running_count());
+    try testing.expectEqual(read_at, world.agent.runs_read_mono_ms);
+    try testing.expectEqual(fence_at, world.agent.deadline_wake_mono_ms);
+    world.advance(200 + constants.fence_stop_ms);
+    try testing.expectEqual(@as(u32, 1), world.sim.running_count());
+    const fenced = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), fenced.stop_cause);
+    try testing.expect(!world.agent.fence.active);
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    try testing.expectEqual(tenure, world.agent.tenure);
+    // Long after: still no lease fence, and the replica still runs.
+    world.advance(@as(u64, world.agent.lease_ttl_ms) * 3);
+    try testing.expectEqual(@as(u32, 1), world.sim.running_count());
+    try testing.expectEqual(tenure, world.agent.tenure);
+    world.switched.down_list_prefix = null;
+    world.advance(2_000);
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), seen.stop_cause);
+}
+
+test "a runs read that answers moves the local job fence on: a steady node never meets it" {
+    // Goal: the fence counts from the last good read, not from the run's start: a run that
+    // outlives many fence terms on a node whose reads answer is never stopped by it. And a
+    // read that fails for less than the term costs nothing. Method: a run with a long deadline;
+    // three fence terms pass; then the runs' list fails for most of a term and answers again.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const term = world.agent.lease_ttl_ms - constants.fence_margin_ms;
+    world.advance(term * 3);
+    try testing.expect(rig.running());
+    try testing.expect(world.agent.job_fence_at_ms().? > world.now_ms());
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    world.advance(term - 1_000);
+    try testing.expect(rig.running());
+    world.switched.down_list_prefix = null;
+    world.advance(term);
+    try testing.expect(rig.running());
+    try testing.expectEqual(@as(?records.StopCause, null), (try rig.start_record()).?.stop_cause);
+}
+
+/// A job container running from `run`, and from now on every read of the runs failing while
+/// keepalives are answered. Returns when the local job fence falls.
+fn fence_setup(rig: *Rig, run: records.JobRun) !u64 {
+    _ = try rig.assign_run(run);
+    rig.step();
+    try testing.expect(rig.running());
+    rig.world.switched.down_list_prefix = records.prefix_job_runs;
+    return rig.world.agent.job_fence_at_ms().?;
+}
+
+/// Writes `record` over the run's start record in the agent's state directory.
+fn rewrite_record(rig: *Rig, record: agent_jobs.StartRecord) !void {
+    var buffer: [96]u8 = undefined;
+    const name = agent_jobs.record_name(&buffer, run_id);
+    // Not the world's arena: `record`'s strings may live in it.
+    const bytes = try std.json.Stringify.valueAlloc(testing.allocator, record, .{});
+    defer testing.allocator.free(bytes);
+    try rig.world.files.interface().put_atomic(name, bytes);
+}
+
+test "the local job fence stops a job container whose start record is absent, damaged, unreadable" {
+    // Goal: the fence needs no start record (review of #262): with none to read, one that does
+    // not parse, or a state directory that cannot read it, the container is stopped all the same
+    // once the fence falls, and counted once (`Agent.job_fence_stops`). Method: per case, a run
+    // running and the runs' read failing; the record removed, damaged, or its read failing; the
+    // container still runs just before the fence and is stopped just after it.
+    const Case = enum { absent, damaged, unreadable };
+    for ([_]Case{ .absent, .damaged, .unreadable }) |case| {
+        var rig = try Rig.start();
+        defer rig.stop();
+        const world = rig.world;
+        const fence_at = try fence_setup(&rig, rig.run_record(null, 600_000));
+        var buffer: [96]u8 = undefined;
+        const name = agent_jobs.record_name(&buffer, run_id);
+        var failing: FailingPut = .{ .inner = world.files.interface(), .poisoned = run_id };
+        switch (case) {
+            .absent => try world.files.interface().remove(name),
+            .damaged => try world.files.interface().put_atomic(name, "{not"),
+            .unreadable => {
+                failing.read_failing = true;
+                world.state_override = failing.interface();
+            },
+        }
+        world.advance(fence_at - world.now_ms() - sim_world.tick_ms);
+        try testing.expect(rig.running());
+        try testing.expectEqual(@as(u32, 0), world.agent.job_fence_stops);
+        world.advance(sim_world.tick_ms * 2);
+        try testing.expect(!rig.running());
+        try testing.expectEqual(@as(u32, 1), world.agent.job_fence_stops);
+        world.advance(@as(u64, world.agent.lease_ttl_ms));
+        try testing.expectEqual(@as(u32, 1), world.agent.job_fence_stops);
+    }
+}
+
+test "the local job fence stops a claiming run, or one of another boot, as unreachable" {
+    // Goal: before the fence, the server-free enforcement leaves a `claiming` record, or one of
+    // another boot, to the pass (`enforce_one`); once the fence falls it stops them too, cause
+    // `unreachable` recorded first (review of #262). Method: per case, a run running and the
+    // runs' read failing; its start record rewritten as claiming, or of another boot; past the
+    // fence the container is stopped and the record carries the cause.
+    const Case = enum { claiming, other_boot };
+    for ([_]Case{ .claiming, .other_boot }) |case| {
+        var rig = try Rig.start();
+        defer rig.stop();
+        const world = rig.world;
+        const fence_at = try fence_setup(&rig, rig.run_record(null, 600_000));
+        var record = (try rig.start_record()).?;
+        switch (case) {
+            .claiming => record.phase = .claiming,
+            .other_boot => record.boot_id = "another-boot",
+        }
+        try rewrite_record(&rig, record);
+        world.advance(fence_at - world.now_ms() - sim_world.tick_ms);
+        try testing.expect(rig.running());
+        world.advance(sim_world.tick_ms * 2);
+        try testing.expect(!rig.running());
+        const stopped = (try rig.start_record()).?;
+        try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), stopped.stop_cause);
+    }
+}
+
+test "the local job fence kills a job container fence_stop_ms after it falls, whatever its grace" {
+    // Goal: the grace under the fence is at most `fence_stop_ms`, for a new stop and for a stop
+    // already under way with a longer grace (review of #262). Method: a run with a 30 s grace
+    // whose container ignores the polite stop. Case `fresh`: the fence makes the first stop.
+    // Case `pending`: the run's deadline falls first, so its stop is under way with the 30 s
+    // grace when the fence falls. Either way the container still runs just before the fence's
+    // kill and is gone just after it.
+    const Case = enum { fresh, pending };
+    for ([_]Case{ .fresh, .pending }) |case| {
+        var rig = try Rig.start();
+        defer rig.stop();
+        const world = rig.world;
+        const deadline_ms: u64 = if (case == .pending) 2_000 else 600_000;
+        var run = rig.run_record(null, deadline_ms);
+        run.grace_ms = 30_000;
+        const fence_at = try fence_setup(&rig, run);
+        try world.sim.inject(run_id, .slow_stop);
+        if (case == .pending) {
+            world.advance(deadline_ms + sim_world.tick_ms);
+            try testing.expect(rig.running());
+            try testing.expect(world.agent.pending_stop(run_id) != null);
+            try testing.expect(fence_at > world.now_ms());
+        }
+        if (case == .fresh) {
+            // The fence's first stop already carries the short grace: not left to a later step.
+            world.advance(fence_at - world.now_ms());
+            var waited: u32 = 0;
+            while (world.agent.pending_stop(run_id) == null) : (waited += 1) {
+                try testing.expect(waited < sim_world.tick_ms * 2);
+                world.advance(1);
+            }
+            const stop = world.agent.pending_stop(run_id).?;
+            try testing.expect(stop.deadline_ms <= world.now_ms() + constants.fence_stop_ms);
+        }
+        const kill_at = fence_at + constants.fence_stop_ms;
+        world.advance(kill_at - world.now_ms() - sim_world.tick_ms);
+        try testing.expect(rig.running());
+        world.advance(sim_world.tick_ms * 2);
+        try testing.expect(!rig.running());
+    }
+}
+
+test "the local job fence counts from when the runs read was sent, not when it answered" {
+    // Goal: a read is as of no earlier than its send, so the fence's term starts there: a slow
+    // answer must not push the fence later (review of #262). Method: the runs' list takes 1.5 s
+    // of the clock; after one step the fence is the term after the step's start, where the read
+    // was sent, and the clock has moved past it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    world.switched.list_cost = .{
+        .clock = &world.manual,
+        .prefix = records.prefix_job_runs,
+        .cost_ms = 1_500,
+    };
+    const sent = world.now_ms();
+    rig.step();
+    try testing.expect(world.now_ms() >= sent + 1_500);
+    const term = world.agent.lease_ttl_ms - constants.fence_margin_ms;
+    try testing.expectEqual(sent + term, world.agent.job_fence_at_ms().?);
+}
+
+test "an agent that restarts while the runs read fails keeps the local job fence's clock" {
+    // Goal: the fence's clock survives a restart of the agent (`LeaseFile.runs_unread_since_ms`,
+    // docs/decisions/2026-11-15-job-fence-survives-restart.md): an agent that crashes in a loop
+    // while the read fails still stops its job by the fence, and an agent restarted while the
+    // read answers starts its clock afresh. Method: the runs' read fails for longer than a
+    // renewal; the agent restarts; its fence is still the term after the last good read, and the
+    // container is stopped there. Then the read answers once, and the agent restarts in that step
+    // with the read failing again: its fence is the term after its restart, not the old one.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    const fence_at = try fence_setup(&rig, rig.run_record(null, 600_000));
+    world.advance(world.agent.lease_ttl_ms / 2);
+    try testing.expect(world.agent.runs_failing);
+    world.restart_agent();
+    world.advance(sim_world.tick_ms);
+    try testing.expectEqual(fence_at, world.agent.job_fence_at_ms().?);
+    try testing.expect(world.agent.runs_failing);
+    world.advance(fence_at - world.now_ms() + sim_world.tick_ms);
+    try testing.expect(!rig.running());
+    world.switched.down_list_prefix = null;
+    // Restart in the step the read recovers, before a keepalive rewrites the lease file: only
+    // `runs_read_ok`'s own write can have dropped the old clock by then.
+    var waited_ms: u64 = 0;
+    while (world.agent.runs_failing) : (waited_ms += sim_world.tick_ms) {
+        try testing.expect(waited_ms < 2_000);
+        world.advance(sim_world.tick_ms);
+    }
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    world.restart_agent();
+    const restarted = world.now_ms();
+    world.advance(sim_world.tick_ms);
+    const term = world.agent.lease_ttl_ms - constants.fence_margin_ms;
+    try testing.expect(world.agent.job_fence_at_ms().? >= restarted + term);
 }
 
 const Failing = struct {

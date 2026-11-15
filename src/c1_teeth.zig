@@ -143,14 +143,29 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// The agent's job pass ends at the first failure that is not the runtime's (a server call that
 /// failed, such as a committed write whose answer was lost), and a replica stage's such failure
 /// skips the job pass, as before #247: a stop committed for a run later in the pass waits for a
-/// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
+/// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248). The
+/// local job fence is off too, as it was then: its term would bound the skipped passes within
+/// J6's fenced bound (docs/decisions/2026-11-15-j6-jobs-local-fence.md).
 pub const job_pass_break = declared("c1_teeth_job_pass_break");
 
-/// Not an agent fault but a gap shown (pending the owner, docs/decisions/
-/// 2026-11-14-j6-runs-unread-gap.md): the server fails a node's read of its runs whenever one of
-/// them has a stop asked, while its keepalives and every other call are answered. The agent
-/// never learns of the stop and keeps renewing, so the fence never comes either (must break J6).
+/// With `job_pass_break`: the local job fence stays on, so it falls for the passes the tooth
+/// skips, though every runs read the node makes is answered (must break J12: the fence fell on a
+/// node whose steps skipped the job pass since its last good runs read; review of #262).
+pub const job_pass_break_fenced = declared("c1_teeth_job_pass_break_fenced");
+
+/// The local job fence is off (`Agent.job_fence_at_ms`), in the world of `runs_unread_world`:
+/// the server fails a node's read of its runs for 60 s after one of them has a stop committed
+/// (`agent_api.runs_unread_window_ms`), while its keepalives and every other call are answered.
+/// The agent does not learn of the stop and keeps renewing, so the lease fence never comes
+/// either (must break J6). The gap was
+/// docs/decisions/2026-11-14-j6-runs-unread-gap.md; the fence that closes it,
+/// docs/decisions/2026-11-15-j6-jobs-local-fence.md.
 pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
+
+/// Not a fault: the world of `job_runs_unread` (the server cuts a node's runs read for 60 s after
+/// a stop commits) with the local job fence on, for the positive run `sim-c1-runs-unread`, where J6
+/// must hold. Not in `any`.
+pub const runs_unread_world = declared("c1_runs_unread_world") or job_runs_unread;
 
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
@@ -161,4 +176,4 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
-    job_pass_break or job_runs_unread;
+    job_pass_break or job_pass_break_fenced or job_runs_unread;

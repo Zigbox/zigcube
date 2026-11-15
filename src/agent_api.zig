@@ -429,8 +429,11 @@ const Call = struct {
             const run = records.read(records.JobRun, ctx.arena, kv, ctx.diag) catch
                 return propagate(ctx);
             if (!std.mem.eql(u8, run.id, entry.rec.replica)) continue;
-            // Test-only (`c1_teeth.job_runs_unread`): the whole read fails while a stop is asked.
-            if (c1_teeth.job_runs_unread and run.stop != null) return runs_unread(ctx);
+            // Test-only (`c1_teeth.runs_unread_world`): the whole read fails for a while after a
+            // stop is asked (`runs_unread_window_ms`).
+            if (c1_teeth.runs_unread_world and runs_unread_now(ctx, run.stop)) {
+                return runs_unread(ctx);
+            }
             if (try call.job_ended(job, given.revision)) continue;
             const run_entry: controller.Entry(records.JobRun) = .{ .kv = kv, .rec = run };
             mine.append(ctx.arena, item_of(records.JobRun, run_entry)) catch
@@ -1119,12 +1122,28 @@ fn number_slot(numbers: *Numbers, name: []const u8) ?*?u64 {
 
 // ---- Failures ----------------------------------------------------------------------------------
 
-/// Test-only (`c1_teeth.job_runs_unread`): the store did not answer the read of the runs.
+/// Test-only (`c1_teeth.runs_unread_world`): how long after a run's stop commits the read of the
+/// runs keeps failing. An outage that never ends would also withhold the agent's reports and
+/// orphan stops for good (a failed job pass ends the step's stages), so the world would fail
+/// checks that are not J6's; a bounded one is the fault J6 is about. Six times the world's lease
+/// ttl (10 s): far past J6's bound with the fence off, and over well before the heal ends.
+const runs_unread_window_ms = 60_000;
+
+/// The cause `runs_unread` gives, by which the cluster simulation counts the cuts.
+pub const runs_unread_cause = "test-only: the read of the runs is cut after a stop committed";
+
+fn runs_unread_now(ctx: *const Context, stop: ?records.RunStop) bool {
+    assert(c1_teeth.runs_unread_world);
+    const asked = stop orelse return false;
+    return ctx.clock.now_ms() < asked.at_ms + runs_unread_window_ms;
+}
+
+/// Test-only (`c1_teeth.runs_unread_world`): the store did not answer the read of the runs.
 fn runs_unread(ctx: *const Context) Failure {
-    assert(c1_teeth.job_runs_unread);
+    assert(c1_teeth.runs_unread_world);
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0201);
-    ctx.diag.cause("test-only: the read of a run whose stop is asked is cut", .{});
+    ctx.diag.cause(runs_unread_cause, .{});
     return error.Failed;
 }
 
