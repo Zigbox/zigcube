@@ -42,13 +42,15 @@ the term, and the fault's 60 s window below, on 2026-11-15, before either was fi
   (docs/decisions/2026-11-15-job-fence-survives-restart.md). Otherwise a restarted agent counts
   from its first step (`reconcile` sets it).
 - A node whose runs reads keep succeeding never meets it.
-- It overlaps #247's fix. A step whose job pass is skipped after a server failure also makes no
-  runs read, so the fence bounds that case within J6's fenced bound too, and the
-  `job_pass_break` tooth (the agent before #247) stopped breaking J6 at seeds 225 and 44 once the
-  fence was on. That tooth now turns the fence off as well, as the agent before #247 had none.
-  #247's fix still matters: it stops a committed run within a resync, not a fence term, and its
-  unit tests in `agent_jobs_test.zig` guard it. The simulation's J12 now guards it with the fence
-  on (docs/decisions/2026-11-15-job-fence-survives-restart.md).
+- It overlaps #247's fix only in part. A step whose job pass is skipped after a server failure
+  before the runs read makes no runs read, so the fence bounds it within J6's fenced bound. A
+  pass that reads the runs and then breaks moves the fence on with that read, so the fence never
+  bounds it: with the fence kept on, the agent before #247 (`job_pass_break_fenced`) still fails
+  J6 at seed 225 of the evict world, at the same time as with it off (21,596 ms). #247's fix is
+  what stops a committed run within a resync, and its unit tests in `agent_jobs_test.zig` guard
+  it. The `job_pass_break` tooth turns the fence off, as the agent before #247 had none; the
+  simulation's J12 guards #247 with the fence on
+  (docs/decisions/2026-11-15-job-fence-survives-restart.md).
 
 ## The tooth and the world
 

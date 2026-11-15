@@ -150,7 +150,7 @@ pub const job_pass_break = declared("c1_teeth_job_pass_break");
 
 /// With `job_pass_break`: the local job fence stays on, so it falls for the passes the tooth
 /// skips, though every runs read the node makes is answered (must break J12: the fence fell on a
-/// node that tried no runs read since its last good one; review of #262).
+/// node whose steps skipped the job pass since its last good runs read; review of #262).
 pub const job_pass_break_fenced = declared("c1_teeth_job_pass_break_fenced");
 
 /// The local job fence is off (`Agent.job_fence_at_ms`), in the world of `runs_unread_world`:

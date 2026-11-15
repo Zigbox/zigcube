@@ -46,8 +46,9 @@ from the fence. The comment in `enforce_one` says so.
 ## J12 and the `job_pass_break_fenced` tooth
 
 Review A (agent.zig:362): with the fence on, the agent before #247's fix (a job pass skipped
-after a server failure) no longer breaks J6, because the fence covers it within J6's bound. So a
-regression of #247 would pass the simulation. J12 (`sim_cluster.zig`, `judge_job_fence`) catches
+after a server failure) breaks J6 less often, because the fence covers the passes that skipped
+the runs read within J6's bound (a pass that read them and then broke it does not cover: seed 225
+still fails J6). So a regression of #247 could pass the simulation. J12 (`sim_cluster.zig`, `judge_job_fence`) catches
 it: whenever the local job fence starts to stop a job container on a node,
 
 - no step since the node's last answered runs read may have skipped the job pass (it sent the
@@ -60,8 +61,8 @@ A hung or slow call that uses up the term is a legitimate fence (seed 30 of the 
 showed one), which is why the first clause counts skipped passes rather than reads not tried.
 
 `sim-c1-teeth-job_pass_break_fenced` is the `job_pass_break` agent with the fence kept on: J12
-must fail it. It is sparse: seeds 2 and 44 of the evict world fail J12 (measured over seeds 1..80,
-225 and 44; seed 225 fails J6 first). The `job_pass_break` tooth itself (fence off, J6) is
+must fail it. It is sparse: seeds 2 and 44 of the evict world fail J12, and seed 225 fails J6
+first (see the measurement in the handoff of PR #262). The `job_pass_break` tooth itself (fence off, J6) is
 unchanged.
 
 ## The runs-unread world reports what it tested
