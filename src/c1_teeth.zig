@@ -172,6 +172,18 @@ pub const mesh_issue_any_node = declared("c1_teeth_mesh_issue_any_node");
 /// not at half-life (must break M3r).
 pub const mesh_renew_late = declared("c1_teeth_mesh_renew_late");
 
+/// The agent's job pass ends at the first failure that is not the runtime's (a server call that
+/// failed, such as a committed write whose answer was lost), and a replica stage's such failure
+/// skips the job pass, as before #247: a stop committed for a run later in the pass waits for a
+/// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
+pub const job_pass_break = declared("c1_teeth_job_pass_break");
+
+/// Not an agent fault but a gap shown (pending the owner, docs/decisions/
+/// 2026-11-14-j6-runs-unread-gap.md): the server fails a node's read of its runs whenever one of
+/// them has a stop asked, while its keepalives and every other call are answered. The agent
+/// never learns of the stop and keeps renewing, so the fence never comes either (must break J6).
+pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
@@ -184,12 +196,15 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
-    mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late;
+    mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late or
+    job_pass_break or job_runs_unread;
 
 /// The runner a replay line names: the fault-on runner whose root switched a tooth on
 /// (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe` installs it), the burst world's own runner, or
 /// `sim_cluster`. Without it a failing tooth's replay ran the shipped code and passed.
+/// A root may name its own installed runner (`sim_runner`) instead.
 pub const runner: []const u8 = blk: {
+    if (@hasDecl(root, "sim_runner")) break :blk root.sim_runner;
     // A tooth's root names its runner before a world's: `job_evicted` runs in the burst world.
     for (runners) |pair| {
         if (declared(pair[0])) break :blk pair[1];

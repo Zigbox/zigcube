@@ -1214,6 +1214,11 @@ fn canary_manifest(b: *std.Build) []const u8 {
         text = b.fmt("{s}sim_c1_teeth_{s} sim-c1 {s} {s}\n", .{
             text, entry.name, seeds, entry.symptom,
         });
+        for (entry.also_seeds) |seed| {
+            text = b.fmt("{s}sim_c1_teeth_{s} sim-c1 {d}+1@{d} {s}\n", .{
+                text, entry.name, seed, entry.ops, entry.symptom,
+            });
+        }
     }
     return b.fmt("{s}sim_swarm_teeth sim-swarm {d} {s}\n", .{
         text, canary_seeds_swarm_teeth, canary_symptom_swarm_teeth,
@@ -1275,6 +1280,10 @@ const c1_teeth_roots = [_]struct {
     /// the runner's default profile (manifest `FIRST+COUNT@OPS`), not fresh seeds at drawn
     /// operations: ops/sim-fleet/README.md.
     canary_first: ?u32 = null,
+    /// More known hits of a sparse tooth, each pinned on its own: `sim-c1-teeth-NAME` also runs
+    /// each alone and it must fail with `symptom`, and the manifest gets a line `SEED+1@OPS` of
+    /// its own for each, so the canary rests on more than one seed (PR #250 review).
+    also_seeds: []const u32 = &.{},
     /// The first seed `sim-c1-teeth-NAME` runs. The test stops at the first failing seed and
     /// that one must show `symptom`, unless `any_symptom`: then seeds that fail otherwise (the
     /// skew world fails on convergence at some seeds since #177) are skipped, and some seed in
@@ -1564,6 +1573,38 @@ const c1_teeth_roots = [_]struct {
         .seeds = 241,
         .ops = 300,
     },
+    .{
+        .name = "job_pass_break",
+        .root = "src/sim_c1_teeth_job_pass_break_main.zig",
+        .symptom = "J6",
+        // Sparse: seeds 225 and 44 of the evict world are its known hits (J6 at 21,596 and
+        // 23,406 ms on the loop's `break`); seeds 1..40 have none. The unit tests in
+        // `agent_jobs_test.zig` (#247) are the real guard of both halves of the fix.
+        .canary_seeds = 1,
+        .canary_first = 225,
+        .also_seeds = &.{44},
+        .first_seed = 225,
+        .seeds = 225,
+        .ops = 300,
+    },
+    .{
+        .name = "job_runs_unread",
+        .root = "src/sim_c1_teeth_job_runs_unread_main.zig",
+        .symptom = "J6",
+        // A gap shown, not an agent fault (docs/decisions/2026-11-14-j6-runs-unread-gap.md): the
+        // server cuts a node's runs read while a stop is asked. Measured 2026-11-14 over seeds 1
+        // to 40 at 100 operations: J6 first at 11 seeds with `--c1` (2 4 7 14 17 18 22 23 25 30
+        // 32) and 13 plain; 6 others fail first on other checks (the cut also hides new runs and
+        // ended jobs), so the canary is pinned to known J6 hits, as a sparse tooth's is. Each
+        // passes with the fault off.
+        .canary_seeds = 1,
+        .canary_first = 2,
+        .also_seeds = &.{ 4, 7 },
+        .first_seed = 2,
+        .seeds = 2,
+        .plain_symptom = "J6",
+        .plain_seeds = 2,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1583,7 +1624,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 28 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the 31 negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1616,7 +1657,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 28 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 31 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1637,9 +1678,10 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
         teeth.dependOn(&teeth_run.step);
-        add_plain_tooth(b, teeth, teeth_exe, entry);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
+        add_also_seeds(b, &.{ teeth, own }, teeth_exe, entry);
+        add_plain_tooth(b, teeth, teeth_exe, entry);
         const own_install = b.addInstallArtifact(teeth_exe, .{});
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
@@ -1651,6 +1693,25 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// Each more known hit of a sparse tooth (`also_seeds`), run alone with `--c1`: it must fail
+/// with the tooth's symptom.
+fn add_also_seeds(
+    b: *std.Build,
+    steps: []const *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    entry: anytype,
+) void {
+    for (entry.also_seeds) |seed| {
+        const run = b.addRunArtifact(exe);
+        run.addArgs(&.{
+            "--seeds",                  b.fmt("{d}..{d}", .{ seed, seed }),
+            b.fmt("{d}", .{entry.ops}), "--c1",
+            "--expect-fail",            b.fmt("--expect-symptom={s}", .{entry.symptom}),
+        });
+        for (steps) |step| step.dependOn(&run.step);
+    }
 }
 
 /// The same fault in a plain run (no `--c1`): the job checks need no per-revision tap.
@@ -1886,7 +1947,8 @@ const worlds = [_][]const u8{
     "src/sim_c1_evict_world_main.zig",
 };
 
-/// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5 may fail.
+/// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5, nor seed 225
+/// (#248), may fail.
 fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
     const step = b.step("sim-c1-worlds", "Run sim-c1 in the job_evicted world");
     const only = b.step("sim-c1-worlds-exe", "Install the world runners");
@@ -1905,6 +1967,12 @@ fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
         run.addArgs(&.{ "--seeds", "1..5", "300", "--c1" });
         run.expectExitCode(0);
         step.dependOn(&run.step);
+        // #248: seed 225 broke J6 on fb385b2 (a server failure ended the job pass before an
+        // orphan's committed stop); the replay must pass.
+        const replay = b.addRunArtifact(exe);
+        replay.addArgs(&.{ "225", "300", "1", "--c1" });
+        replay.expectExitCode(0);
+        step.dependOn(&replay.step);
     }
 }
 
@@ -1985,6 +2053,57 @@ const c1_regressions = [_][]const []const u8{
         "2764708423",         "69",                    "4",
         "--strong",           "--profile=crash_heavy", "--lease-ttl-ms=8248",
         "--replicas-pct=300", "--heal-at=58",
+    },
+    // #247: a lost answer (ZC-E0201) to a run's write ended the job pass, and a run whose
+    // cancel had committed kept running past J6's bound (137,767 ms) on f49041a. It records the
+    // issue and guards nothing: fb385b2 passes it by luck of timing, and so does the loop's
+    // `break` put back. The guards are the #247 unit tests (`agent_jobs_test.zig`) and the
+    // `job_pass_break` tooth (docs/decisions/2026-11-14-b3-soak-after-247.md).
+    &.{
+        "870682998",          "80",                   "3",
+        "--strong",           "--profile=slow_store", "--lease-ttl-ms=8488",
+        "--replicas-pct=100", "--heal-at=76",
+    },
+    // #96: an agent stepped in a busy loop in the fault phase (2,098 steps) on f49041a; #244's
+    // fence pause (`.watch = false`) fixed it on fb385b2 (1,492 steps).
+    &.{
+        "833885280",           "185",                "4",
+        "--c1",                "--strong",           "--profile=crash_heavy",
+        "--lease-ttl-ms=8226", "--replicas-pct=200", "--heal-at=390",
+    },
+    // #142 again on the b3 candidate ebfbac5: a run started in a long step, its cancel committed
+    // meanwhile; the next step read the runs (stop shown), then the read of the node's reports
+    // timed out and the pass ended with the stop withheld while keepalives went on (12,602 ms,
+    // bound 12,000). A failed reports read is kept now and the stops still go (`agent_jobs.pass`).
+    &.{
+        "2821617909",         "100",           "3",
+        "--c1",               "--strong",      "--lease-ttl-ms=10000",
+        "--replicas-pct=200", "--heal-at=130",
+    },
+    // The same shape at f49041a, where the step failed on `assigned`, in the loading before the
+    // job pass. A record of the issue, not a guard: it passes on ebfbac5 too, where that load
+    // still ended the step (#247 does not cover a failed load; the world the line draws
+    // changed). The guard of that half is the unit test of a failed assignments read
+    // (`agent_jobs_test.zig`, #142).
+    &.{
+        "4242675264",           "145",                "4",
+        "--c1",                 "--strong",           "--profile=partitions",
+        "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=176",
+    },
+    // #151 again on f49041a and on the b3 candidate 00f35c1: a checker false positive. The node
+    // was frozen across the run's deadline while the store was out, so the tracker took J8's
+    // wedge mark at its next look, seconds late, and dropped the frozen time between (129 ms
+    // and 340 ms over the bound). The mark is placed back at the deadline now
+    // (`sim_jobs.note_marks`).
+    &.{
+        "966942719",          "17",           "3",
+        "--c1",               "--strong",     "--lease-ttl-ms=10000",
+        "--replicas-pct=300", "--heal-at=57",
+    },
+    &.{
+        "2344280920",         "430",           "3",
+        "--c1",               "--strong",      "--lease-ttl-ms=10000",
+        "--replicas-pct=300", "--heal-at=701",
     },
 };
 
