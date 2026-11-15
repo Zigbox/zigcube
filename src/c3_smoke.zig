@@ -20,6 +20,7 @@ const assert = std.debug.assert;
 const demo_host = @import("demo_host.zig");
 const diag_mod = @import("diag.zig");
 const fleet_mod = @import("demo_c1_fleet.zig");
+const host_procs = @import("host_procs.zig");
 const pq = @import("pq.zig");
 const steps = @import("c3_smoke_steps.zig");
 const witness_mod = @import("c3_witness.zig");
@@ -74,12 +75,60 @@ pub fn main(init: std.process.Init) u8 {
     var witness: witness_mod.Witness = .{ .host = &host };
     var demo: Demo = .{
         .host = &host,
-        .fleet = &fleet,
+        .nodes = .{
+            .context = &fleet,
+            .pass = pass,
+            .restart_agent = restart_agent,
+            .names = &fleet_mod.names,
+        },
         .witness = &witness,
         .backend = options.backend,
         .postgres = options.postgres,
     };
     return run(&demo);
+}
+
+fn fleet_of(demo: *Demo) *fleet_mod.Fleet {
+    return @ptrCast(@alignCast(demo.nodes.context));
+}
+
+/// FakeRuntime's nodes are host processes that run without help: time passes in a sleep.
+fn pass(context: *anyopaque, ms: u32) !void {
+    const fleet: *fleet_mod.Fleet = @ptrCast(@alignCast(context));
+    try fleet.host.io.sleep(.fromMilliseconds(ms), .awake);
+}
+
+/// SIGKILL of one agent (not its containers), then a start on the same state directory: every
+/// container it ran runs on, under the same supervisor, and the new agent adopts them.
+fn restart_agent(context: *anyopaque, index: u32) !void {
+    const fleet: *fleet_mod.Fleet = @ptrCast(@alignCast(context));
+    const host = fleet.host;
+    const name = fleet_mod.names[index];
+    const before = try fleet.procs(index).running_containers();
+    try host.check_quiet(before.len > 0, "{s} runs no container", .{name});
+    var child = fleet.agents[index] orelse return host.fail("{s} has no agent", .{name});
+    std.posix.kill(child.id.?, .KILL) catch {}; // Already gone is fine; wait says how.
+    _ = try child.wait(host.io);
+    fleet.agents[index] = null;
+    host.say("  kill -9 of {s}'s agent; its containers are left running ({d})", .{
+        name, before.len,
+    });
+    try fleet.start_agent(index);
+    const after = try fleet.procs(index).running_containers();
+    try host.check(same_containers(before, after), "{s}'s agent restarted; the same {d} " ++
+        "containers run, under the same supervisors", .{ name, after.len });
+}
+
+fn same_containers(before: []const host_procs.Pids, after: []const host_procs.Pids) bool {
+    if (before.len != after.len) return false;
+    for (before) |old| {
+        for (after) |new| {
+            if (!std.mem.eql(u8, old.name(), new.name())) continue;
+            if (old.supervisor == new.supervisor and old.command == new.command) break;
+            return false;
+        } else return false;
+    }
+    return true;
 }
 
 fn usage_error(io: std.Io) u8 {
@@ -143,14 +192,14 @@ fn run(demo: *Demo) u8 {
         if (err != error.DemoFailed) host.say("FAILED: {s}", .{@errorName(err)});
         diagnose(host);
         host.dump_logs();
-        demo.fleet.dump_logs();
+        fleet_of(demo).dump_logs();
         ok = false;
     };
     const started = pids_started(demo);
     host.cleanup();
-    demo.fleet.cleanup();
+    fleet_of(demo).cleanup();
     host.section("Cleanup");
-    const left = (demo.fleet.survivors() catch 1) + still_running(demo, started);
+    const left = (fleet_of(demo).survivors() catch 1) + still_running(demo, started);
     if (left == 0) {
         host.say("  ok: every process the demo started is gone (agents, supervisors, ...)", .{});
     } else {
@@ -179,7 +228,7 @@ const Started = struct { pids: [1 + fleet_mod.count]i32 = @splat(0) };
 fn pids_started(demo: *Demo) Started {
     var started: Started = .{};
     if (demo.host.server) |child| started.pids[0] = child.id orelse 0;
-    for (demo.fleet.agents, 0..) |agent, index| {
+    for (fleet_of(demo).agents, 0..) |agent, index| {
         if (agent) |child| started.pids[1 + index] = child.id orelse 0;
     }
     return started;
@@ -230,7 +279,7 @@ fn script(demo: *Demo) !void {
 fn write_images(host: *Host) ![]const u8 {
     const path = try host.path_in_work("images.zon");
     const text = try std.fmt.allocPrint(host.arena(), ".{{ .images = .{{ \"{s}\", \"{s}\", " ++
-        "\"{s}\" }} }}\n", .{ steps.images[0], steps.images[1], steps.images[2] });
+        "\"{s}\" }} }}\n", .{ steps.fake_images[0], steps.fake_images[1], steps.fake_images[2] });
     try std.Io.Dir.cwd().writeFile(host.io, .{ .sub_path = path, .data = text });
     return path;
 }
@@ -247,17 +296,17 @@ fn step_start(demo: *Demo) !void {
     host.say("  zcube-server is up on 127.0.0.1:{d}, store {s}, lease ttl {s} ms", .{
         host.port, demo.backend, steps.ttl_text,
     });
-    try demo.fleet.start_proxy();
+    try fleet_of(demo).start_proxy();
     var fault_dirs: [fleet_mod.count][]const u8 = undefined;
     for (0..fleet_mod.count) |index| {
-        try demo.fleet.start_agent(index);
+        try fleet_of(demo).start_agent(index);
         fault_dirs[index] = try std.fmt.allocPrint(host.arena(), "{s}/faults", .{
-            try demo.fleet.state_dir(index),
+            try fleet_of(demo).state_dir(index),
         });
     }
     demo.witness.fault_dirs = try host.arena().dupe([]const u8, &fault_dirs);
     host.say("  three zcube-agents (FakeRuntime) started; images {s} (v1), {s} (v2), {s} (v3)", .{
-        steps.images[0], steps.images[1], steps.images[2],
+        steps.fake_images[0], steps.fake_images[1], steps.fake_images[2],
     });
     try demo.witness.start();
 }

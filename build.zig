@@ -728,6 +728,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     add_demo_b1_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
+    add_demo_c3_step(b, step_options, transcript);
 }
 
 /// `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: HANDOFF's C1 demo, run for
@@ -803,6 +804,7 @@ fn add_c3_smoke_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?
     run.addArg("--agent");
     run.addArtifactArg(built.agent);
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    b.step("c3-smoke-build", "Compile c3-smoke, no run").dependOn(&exe.step);
     const help = "Run C3's demo script with FakeRuntime, not demo-c3 (-Dbackend=, -Dtranscript=)";
     b.step("c3-smoke", help).dependOn(&run.step);
 }
@@ -931,6 +933,45 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run B3's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
     b.step("demo-b3", help).dependOn(&run.step);
+}
+
+/// `zig build demo-c3 [-Dtranscript=FILE]`: C3's demo for real (src/demo_c3.zig,
+/// docs/demos/c3.md): three QEMU guests, each with `zcube-agent --runtime zigbox`, the server on
+/// SQLite on the host, three digest-pinned Alpine images, judged at every revision by
+/// `c3_witness.zig`. Skips unless `ZCUBE_REAL_HOST=1` (KVM).
+fn add_demo_c3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
+    const exe = b.addExecutable(.{
+        .name = "demo_c3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_c3.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+            },
+        }),
+    });
+    // demo-c3 runs only on KVM hosts, so `check` compiles it (no run), as demo-b3's.
+    const build_step = b.step("demo-c3-build", "Compile demo-c3, no run");
+    build_step.dependOn(&exe.step);
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addFileArg(stripped(b, built.agent));
+    run.addArg("--zbx");
+    run.addFileArg(stripped(b, zigbox.artifact("zbx")));
+    run.addArg("--guest-script");
+    run.addFileArg(b.path("ops/demo-c3/guest.sh"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run C3's demo for real in three QEMU guests (needs ZCUBE_REAL_HOST=1)";
+    b.step("demo-c3", help).dependOn(&run.step);
 }
 
 /// The settings of the Postgres the demo runs against, and the commands that stop and start it.
@@ -2588,7 +2629,8 @@ fn add_check_step(b: *std.Build) void {
     const gates = [_][]const u8{
         "install",            "test",       "tidy",          "errors-site-check",
         "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
-        "check-store-sqlite", "mtls-teeth", "demo-b3-build", "mac-cross",
+        "check-store-sqlite", "mtls-teeth", "demo-b3-build", "demo-c3-build",
+        "c3-smoke-build",     "mac-cross",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);
