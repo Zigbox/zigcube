@@ -52,6 +52,8 @@ const shell_allowlist = [_][]const u8{
     // Sources run.sh to test its soak branches and heartbeat against a local git remote, a
     // fake build and the built `sim_fleet` against a local fake server.
     "ops/sim-fleet/test-soak.sh",
+    // test-soak.sh's fake `zig`: lists and "builds" a commit's steps into its --prefix.
+    "ops/sim-fleet/test-soak-zig.sh",
     // Runs demo-b3's guest.sh (a shell script already, below) against fake state directories.
     "ops/demo-b3/test-guest.sh",
     // The demo's three-node start, stop and kill (c1-7 brief): a handful of long-lived processes

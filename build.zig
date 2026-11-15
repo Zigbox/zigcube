@@ -2455,6 +2455,7 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     soak.addFileArg(b.path("ops/sim-fleet/test-soak.sh"));
     soak.addArtifactArg(exe);
     soak.addFileInput(b.path("ops/sim-fleet/run.sh"));
+    soak.addFileInput(b.path("ops/sim-fleet/test-soak-zig.sh"));
     soak.expectExitCode(0);
     test_step.dependOn(&soak.step);
     // demo-b3's guest script reads the relay logs of the Zigbox runtime's layout and fails on none.

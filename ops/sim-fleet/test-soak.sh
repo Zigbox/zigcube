@@ -1,12 +1,21 @@
 #!/bin/sh
 # Checks run.sh's soak branches and heartbeat (follow_refs, pick_ref, prune_bin, heartbeat)
-# against a local bare repository as the remote, a fake build and fake producers:
+# against a local bare repository as the remote, a fake `zig` (test-soak-zig.sh) and fake
+# producers:
+# - each branch is built in a worktree of its own; the service checkout's HEAD and files never
+#   change;
+# - only the producers a commit lists are built, never its sim_fleet: the fleet's own reporter
+#   (build_reporter) runs every ingest and heartbeat, and a soaked commit's sim_fleet (one that
+#   rejects --ref, state v4 and heartbeat) is never run; a kind a commit lacks is skipped and
+#   logged once;
 # - the branches with a build take turns, one round each, SIM_FLEET_BRANCH first;
-# - a branch deleted from the remote is dropped with one log line, its binaries pruned, and is
-#   back in the rotation when it comes back; a branch whose build fails is not run;
+# - a branch deleted from the remote is dropped with one log line, its binaries and worktree
+#   pruned, and is back in the rotation when it comes back; a branch whose build fails is not run;
 # - every ingest gets `--ref` and `--round-started`;
-# - `sim_fleet heartbeat` gets `--clean` only after a round whose every ingest succeeded, and the
-#   heartbeat URL is never on a command line;
+# - `sim_fleet heartbeat` gets `--clean` only after a clean round: some seed counted and every
+#   ingest succeeded (not after an ingest that failed or was held, exit 3, nor after a round
+#   whose producers all exited 2 or timed out, nor one with no producer), and the heartbeat URL
+#   is never on a command line;
 # - the real `sim_fleet heartbeat` sends one GET to a local fake server after a clean round and
 #   none otherwise, and logs "heartbeat sent" without the URL.
 # Usage: test-soak.sh PATH-TO-sim_fleet. Exits 1 on a failure.
@@ -40,6 +49,13 @@ commit_on rel/2.0
 git clone --quiet "$work/remote.git" "$work/checkout"
 cd "$work/checkout"
 tip() { git --git-dir="$work/remote.git" rev-parse "refs/heads/$1"; }
+service_head=$(git rev-parse HEAD)
+service_files() { git status --porcelain --ignored; ls -A; cat f; }
+service_was=$(service_files)
+service_same() {
+    [ "$(git rev-parse HEAD)" = "$service_head" ] || fail "the service checkout moved"
+    [ "$(service_files)" = "$service_was" ] || fail "the service checkout's files changed"
+}
 
 STATE=$work/state
 mkdir -p "$STATE/bin" "$STATE/crashes"
@@ -57,28 +73,25 @@ SIM_FLEET_BATCH_CLUSTER=3
 SIM_FLEET_WORKERS_CLUSTER=1
 KINDS=sim-cluster
 
-# The build: a commit listed in $work/broken fails; any other gets a fake sim_swarm, a fake
-# sim_cluster that prints a passing batch and a fake sim_fleet that records its arguments and
-# exits with the code in $work/ingest-code.
+# The build: test-soak-zig.sh as `zig`.
+mkdir -p "$work/fakebin"
+cp "$here/test-soak-zig.sh" "$work/fakebin/zig"
+chmod +x "$work/fakebin/zig"
+WORK=$work
+export WORK
+PATH=$work/fakebin:$PATH
 : >"$work/broken"
-build_commit() {
-    if grep -qx "$1" "$work/broken"; then return 1; fi
-    b=$STATE/bin/$1/bin
-    mkdir -p "$b"
-    printf '#!/bin/sh\nexit 0\n' >"$b/sim_swarm"
-    cat >"$b/sim_cluster" <<'EOF'
-#!/bin/sh
-range=$2
-printf 'sim-cluster: seeds %s, drawn operations: 0 of 3 failed\n' "$range"
-EOF
-    cat >"$b/sim_fleet" <<EOF
-#!/bin/sh
-echo "\$*" >>"$work/fleet-args"
-if [ "\$1" = ingest ]; then cat >/dev/null; exit \$(cat "$work/ingest-code"); fi
-exit 0
-EOF
-    chmod +x "$b/sim_swarm" "$b/sim_cluster" "$b/sim_fleet"
-}
+: >"$work/no-cluster"
+: >"$work/builds"
+echo 0 >"$work/ingest-code"
+SIM_FLEET_BUILD_TIMEOUT=60
+SIM_FLEET_CACHE_MB=100000
+
+case_name="the fleet's own reporter"
+build_reporter >/dev/null 2>&1 || fail "build_reporter: $(cat "$STATE/build-fleet.log")"
+[ "$reporter" = "$STATE/fleet/bin/sim_fleet" ] || fail "reporter is $reporter"
+[ -x "$reporter" ] || fail "no reporter built"
+[ "$(cut -d' ' -f1 "$work/builds")" = "$work/checkout" ] || fail "built in $(cat "$work/builds")"
 
 # Rounds of pick_ref; prints the branch each picked.
 picks() { # rounds
@@ -97,6 +110,16 @@ out=$(follow_refs 2>&1)
 expect "built $(tip main) (main)"
 expect "built $(tip rel/2.0) (rel/2.0)"
 expect "branch rel/never is gone from the remote"
+service_same
+[ "$(git -C "$(ref_src rel/2.0)" rev-parse HEAD)" = "$(tip rel/2.0)" ] ||
+    fail "rel/2.0's worktree is not at its tip"
+[ "$(git -C "$(ref_src main)" rev-parse HEAD)" = "$(tip main)" ] ||
+    fail "main's worktree is not at its tip"
+out=$(tail -n +2 "$work/builds" | cut -d' ' -f1 | grep -v "^$STATE/refs/" || true)
+[ -z "$out" ] || fail "built outside the worktrees: $out"
+[ "$(grep -c 'sim-fleet-exe' "$work/builds")" -eq 1 ] || fail "a soaked sim_fleet was built"
+expect_steps="--prefix $STATE/bin/$(tip main) sim-cluster-exe sim-swarm-exe"
+grep -q -- "$expect_steps" "$work/builds" || fail "steps: $(cat "$work/builds")"
 out=$(follow_refs 2>&1)
 refuse "building"
 refuse "rel/never"
@@ -119,6 +142,8 @@ git --git-dir="$work/remote.git" update-ref -d refs/heads/rel/1.0
 out=$(follow_refs 2>&1)
 expect "branch rel/1.0 is gone from the remote; dropped until it comes back"
 [ ! -d "$STATE/bin/$old" ] || fail "the binaries of $old were kept"
+[ ! -e "$(ref_src rel/1.0)" ] || fail "the worktree of rel/1.0 was kept"
+service_same
 out=$(follow_refs 2>&1)
 refuse "rel/1.0"
 echo 0 >"$STATE/ref-next"
@@ -156,6 +181,61 @@ out=$(cat "$work/fleet-args")
 expect "--ref rel/1.0"
 expect "heartbeat --repo"
 refuse "--clean"
+
+case_name="a held ingest (exit 3): counted, not kept as failed, no heartbeat"
+rm -f "$STATE"/last-failed-round-*
+echo 3 >"$work/ingest-code"
+pick_ref
+: >"$work/fleet-args"
+out=$(run_round 2>&1)
+expect "counted, but GitHub kept part of it from being written"
+refuse "not a clean round"
+[ ! -e "$STATE/last-failed-round-sim-cluster.txt" ] || fail "a held round was kept as failed"
+out=$(cat "$work/fleet-args")
+expect "ingest --kind sim-cluster"
+expect "heartbeat --repo"
+refuse "--clean"
+
+case_name="no seed counted: every producer exited 2, then timed out"
+echo 0 >"$work/ingest-code"
+for code in 2 124; do
+    echo "$code" >"$work/producer-code"
+    pick_ref
+    : >"$work/fleet-args"
+    out=$(run_round 2>&1)
+    expect "not counted"
+    expect "no seed of this round was counted at $built: not a clean round"
+    out=$(cat "$work/fleet-args")
+    refuse "ingest"
+    expect "heartbeat --repo"
+    refuse "--clean"
+done
+rm -f "$work/producer-code"
+
+case_name="a commit without a producer: skipped, logged once, no heartbeat"
+commit_on rel/2.0
+tip rel/2.0 >>"$work/no-cluster"
+out=$(follow_refs 2>&1)
+expect "built $(tip rel/2.0) (rel/2.0)"
+pick_ref
+while [ "$ref" != rel/2.0 ]; do pick_ref; done
+: >"$work/fleet-args"
+out=$(run_round 2>&1)
+expect "$(tip rel/2.0) has no sim_cluster: sim-cluster is skipped on it"
+expect "not a clean round"
+out=$(cat "$work/fleet-args")
+refuse "ingest"
+refuse "--clean"
+pick_ref
+while [ "$ref" != rel/2.0 ]; do pick_ref; done
+out=$(run_round 2>&1)
+refuse "is skipped on it"
+expect "not a clean round"
+
+case_name="a soaked commit's own sim_fleet is never run"
+[ -x "$STATE/bin/$(tip main)/bin/sim_fleet" ] || fail "the fake build left no soaked sim_fleet"
+[ ! -e "$work/soaked-fleet-ran" ] || fail "it ran: $(cat "$work/soaked-fleet-ran")"
+service_same
 
 case_name="no heartbeat file, dry run: no heartbeat call"
 SIM_FLEET_DRY_RUN=1

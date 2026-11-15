@@ -6,8 +6,14 @@
 # (every batch, plus a record of each crashed seed) to `sim_fleet ingest`, once per kind. Every
 # SIM_FLEET_CANARY_ONE_IN rounds a fourth worker runs the teeth canary, a fault-on runner that
 # must fail. Settings come from the environment (the unit reads /etc/sim-fleet/fleet.env). The
-# token is a file; this script never prints it. So is the heartbeat URL (send_heartbeat): it is
+# token is a file; this script never prints it. So is the heartbeat URL (heartbeat): it is
 # read only by `sim_fleet heartbeat`, from its file, and never printed or put on a command line.
+#
+# The checkout this script runs from (the service checkout) never moves: each branch is built in
+# a git worktree of its own ($STATE/refs/<id>/src, build_commit), and a soaked commit contributes
+# only its producers. The reporter (`sim_fleet`: ingest, heartbeat, token check, state file) is
+# always the fleet's own, built at start from the service checkout (build_reporter), so a commit
+# from before a reporter change soaks as well as main; to update the reporter, redeploy.
 set -eu
 
 main() {
@@ -122,6 +128,7 @@ main() {
             git clone --quiet "$SIM_FLEET_REMOTE" "$SIM_FLEET_REPO_DIR"
     fi
     cd "$SIM_FLEET_REPO_DIR"
+    if ! build_reporter; then exit 2; fi
     rounds=0
     while [ "$SIM_FLEET_ROUNDS" -eq 0 ] || [ "$rounds" -lt "$SIM_FLEET_ROUNDS" ]; do
         rounds=$((rounds + 1))
@@ -140,6 +147,21 @@ log() {
     printf '%s sim-fleet: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 }
 
+# Builds the fleet's own `sim_fleet` from the service checkout, as it is, into $STATE/fleet, and
+# sets reporter. Every ingest and heartbeat uses it, whatever commit a round runs. A failure is
+# logged and the service stops (exit 2; the unit restarts it).
+build_reporter() {
+    reporter=$STATE/fleet/bin/sim_fleet
+    log "building the fleet's own sim_fleet at $(git rev-parse --short HEAD) (the service checkout)"
+    if timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build -Doptimize=ReleaseSafe \
+        --cache-dir "$STATE/zig-cache" --prefix "$STATE/fleet" sim-fleet-exe \
+        >"$STATE/build-fleet.log" 2>&1 && [ -x "$reporter" ]; then
+        return 0
+    fi
+    log "the fleet's own sim_fleet did not build (see $STATE/build-fleet.log); stopping"
+    return 1
+}
+
 # A branch name run.sh accepts: the same rule as `sim_fleet ingest --ref`.
 ref_valid() {
     case "$1" in
@@ -155,14 +177,38 @@ ref_dir() {
     if [ "$1" = "$SIM_FLEET_BRANCH" ]; then
         echo "$STATE"
     else
-        echo "$STATE/refs/$(printf '%s' "$1" | sha256sum | cut -c1-16)"
+        echo "$STATE/refs/$(ref_id "$1")"
     fi
+}
+
+ref_id() {
+    printf '%s' "$1" | sha256sum | cut -c1-16
+}
+
+# The worktree branch $1 is built in (every branch, SIM_FLEET_BRANCH too).
+ref_src() {
+    echo "$STATE/refs/$(ref_id "$1")/src"
+}
+
+# Whether commit $1 has a complete build: build_commit's mark, or a build of an earlier run.sh
+# (it built sim_swarm last).
+commit_built() {
+    [ -e "$STATE/bin/$1/complete" ] || [ -x "$STATE/bin/$1/bin/sim_swarm" ]
 }
 
 # The commit branch $1 runs on: its `built`, if that commit's binaries are still there.
 ref_built() {
     b=$(cat "$(ref_dir "$1")/built" 2>/dev/null || true)
-    if [ -n "$b" ] && [ -x "$STATE/bin/$b/bin/sim_swarm" ]; then echo "$b"; fi
+    if [ -n "$b" ] && commit_built "$b"; then echo "$b"; fi
+}
+
+# Removes branch $1's worktree, if it has one.
+drop_src() {
+    src=$(ref_src "$1")
+    if [ -e "$src" ]; then
+        git worktree remove --force "$src" >/dev/null 2>&1 || rm -rf "$src"
+        git worktree prune
+    fi
 }
 
 # Writes $2 to file $1 at once.
@@ -193,6 +239,7 @@ follow_refs() {
                 log "branch $name is gone from the remote; dropped until it comes back"
                 : >"$dir/gone"
                 rm -f "$dir/built" "$dir/broken"
+                drop_src "$name"
             fi
             continue
         fi
@@ -214,7 +261,7 @@ follow_ref() {
     built=$(ref_built "$1")
     broken=$(cat "$dir/broken" 2>/dev/null || true)
     if [ "$2" = "$built" ] || [ "$2" = "$broken" ]; then return 0; fi
-    if [ -x "$STATE/bin/$2/bin/sim_swarm" ]; then
+    if commit_built "$2"; then
         put "$dir/built" "$2"
         log "$1 is at $2, already built"
         return 0
@@ -226,7 +273,7 @@ follow_ref() {
     head=$(git rev-parse FETCH_HEAD)
     if [ "$head" = "$built" ] || [ "$head" = "$broken" ]; then return 0; fi
     log "building $head ($1)"
-    if build_commit "$head"; then
+    if build_commit "$head" "$1"; then
         put "$dir/built" "$head"
         log "built $head ($1)"
     else
@@ -236,18 +283,50 @@ follow_ref() {
     fi
 }
 
-# Builds commit $1 into $STATE/bin/$1; exit code 0 when it built.
+# Builds commit $1, the tip of branch $2, into $STATE/bin/$1, in the branch's own worktree
+# (ref_src); the service checkout is never checked out or detached. Only the producers the
+# commit has are built (sim-cluster-exe, sim-swarm-exe, sim-canary-exe, as `zig build -l` lists
+# them; it must have one of the first two): never its sim_fleet, since the fleet's own reporter
+# runs every round (build_reporter). Exit code 0 when it built.
 build_commit() {
     prune_cache
-    git checkout --quiet --detach "$1"
+    src=$(ref_src "$2")
     rm -rf "$STATE/bin/$1"
-    if timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build -Doptimize=ReleaseSafe \
-        --prefix "$STATE/bin/$1" sim-cluster-exe sim-swarm-exe sim-fleet-exe \
-        sim-canary-exe >"$STATE/build.log" 2>&1; then
+    if ! worktree_at "$src" "$1" >"$STATE/build.log" 2>&1; then return 1; fi
+    steps=$(cd "$src" && timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build -l \
+        --cache-dir "$STATE/zig-cache" 2>>"$STATE/build.log" |
+        awk '$1 == "sim-cluster-exe" || $1 == "sim-swarm-exe" || $1 == "sim-canary-exe" {
+            printf "%s ", $1 }')
+    case " $steps" in
+    *" sim-cluster-exe "* | *" sim-swarm-exe "*) ;;
+    *)
+        echo "$1 lists neither sim-cluster-exe nor sim-swarm-exe" >>"$STATE/build.log"
+        return 1
+        ;;
+    esac
+    # shellcheck disable=SC2086 # $steps is a list of step names.
+    if (cd "$src" && timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build -Doptimize=ReleaseSafe \
+        --cache-dir "$STATE/zig-cache" --prefix "$STATE/bin/$1" $steps) \
+        >>"$STATE/build.log" 2>&1; then
+        : >"$STATE/bin/$1/complete"
         return 0
     fi
     rm -rf "$STATE/bin/$1"
     return 1
+}
+
+# Checks out commit $1 in worktree $2 of the service checkout's repository, making the worktree
+# when it is missing or broken.
+worktree_at() {
+    if [ -e "$1/.git" ] &&
+        timeout "$SIM_FLEET_GIT_TIMEOUT" git -C "$1" checkout --quiet --detach --force "$2"; then
+        return 0
+    fi
+    git worktree remove --force "$1" 2>/dev/null || true
+    rm -rf "$1"
+    git worktree prune
+    mkdir -p "$(dirname "$1")"
+    timeout "$SIM_FLEET_GIT_TIMEOUT" git worktree add --quiet --detach "$1" "$2"
 }
 
 # Picks the branch this round runs on: the branches with a build take turns, one round each, in
@@ -277,23 +356,39 @@ pick_ref() {
     put "$STATE/ref-next" "$((want + 1))"
 }
 
-# The binaries of every commit no branch uses.
+# The binaries of every commit no branch uses, and the worktree of every branch not soaked.
 prune_bin() {
     keep=" "
-    for name in $REFS; do keep="$keep$(cat "$(ref_dir "$name")/built" 2>/dev/null || true) "; done
+    ids=" "
+    for name in $REFS; do
+        keep="$keep$(cat "$(ref_dir "$name")/built" 2>/dev/null || true) "
+        ids="$ids$(ref_id "$name") "
+    done
     for dir in "$STATE"/bin/*; do
         [ -d "$dir" ] || continue
         case "$keep" in *" $(basename "$dir") "*) ;; *) rm -rf "$dir" ;; esac
     done
+    for src in "$STATE"/refs/*/src; do
+        [ -d "$src" ] || continue
+        case "$ids" in
+        *" $(basename "$(dirname "$src")") "*) ;;
+        *)
+            git worktree remove --force "$src" >/dev/null 2>&1 || rm -rf "$src"
+            git worktree prune
+            ;;
+        esac
+    done
 }
 
 # The build caches grow with every commit; past the limit they are emptied and the next build
-# starts cold (and fetches its packages again).
+# starts cold (and fetches its packages again). The service checkout's own `.zig-cache` is
+# setup.sh's (and an earlier run.sh's); its zig-pkg stays, for build_reporter.
 prune_cache() {
-    used=$(du -smc .zig-cache zig-pkg "$HOME/.cache/zig" 2>/dev/null | tail -n1 | cut -f1)
+    used=$(du -smc "$STATE/zig-cache" "$STATE"/refs/*/src/zig-pkg .zig-cache \
+        "$HOME/.cache/zig" 2>/dev/null | tail -n1 | cut -f1)
     if [ "${used:-0}" -gt "$SIM_FLEET_CACHE_MB" ]; then
         log "build caches are ${used} MB (limit $SIM_FLEET_CACHE_MB); emptying them"
-        rm -rf .zig-cache zig-pkg "$HOME/.cache/zig"
+        rm -rf "$STATE/zig-cache" "$STATE"/refs/*/src/zig-pkg .zig-cache "$HOME/.cache/zig"
     fi
 }
 
@@ -387,17 +482,21 @@ kind_workers() {
 # core each; the default 1 + 1 + 1 leaves a core of a 4 vCPU host for the reporter, git and the
 # build), then one `sim_fleet ingest --kind K` per kind of what the round found. A producer exits
 # 1 when seeds failed (that is the point); a run killed by a signal crashed, and its range is
-# replayed seed by seed. Workers are numbered across kinds; `$round/kind-W` names worker W's.
+# replayed seed by seed. Workers are numbered across kinds; `$round/kind-W` names worker W's. A
+# kind whose producer the commit does not have is skipped (kind_built). The round is clean, and
+# the heartbeat sent, only when some kind's seeds were counted and every ingest succeeded.
 run_round() {
     bin="$STATE/bin/$built/bin"
     round_started=$(date +%s)
     round_clean=1
+    seeds_counted=""
     round="$STATE/round"
     rm -rf "$round"
     mkdir -p "$round"
     canary_pick
     workers=0
     for kind in $KINDS; do
+        if ! kind_built "$kind"; then continue; fi
         n=$(kind_workers "$kind")
         i=0
         while [ "$i" -lt "$n" ]; do
@@ -421,16 +520,36 @@ run_round() {
             fi
             w=$((w + 1))
         done
-        if [ -s "$round/all-$kind" ]; then ingest "$kind" "$round/all-$kind" || round_clean=""; fi
+        if [ -s "$round/all-$kind" ]; then
+            ic=0
+            ingest "$kind" "$round/all-$kind" || ic=$?
+            # 3: counted, but GitHub kept part of it from being written (ingest).
+            if [ "$ic" -eq 0 ] || [ "$ic" -eq 3 ]; then seeds_counted=1; fi
+            if [ "$ic" -ne 0 ]; then round_clean=""; fi
+        fi
     done
     if [ -n "$canary_runner" ]; then canary_report "$canary_worker"; fi
+    if [ -z "$seeds_counted" ]; then
+        log "no seed of this round was counted at $built: not a clean round"
+        round_clean=""
+    fi
     heartbeat
 }
 
+# Whether this round's commit has kind $1's producer; the first round without it says so once.
+kind_built() {
+    if [ -x "$bin/$(kind_exe "$1")" ]; then return 0; fi
+    if [ ! -e "$STATE/bin/$built/skipped-$1" ]; then
+        log "$built has no $(kind_exe "$1"): $1 is skipped on it"
+        : >"$STATE/bin/$built/skipped-$1"
+    fi
+    return 1
+}
+
 # After the round: `sim_fleet heartbeat` checks the token (its expiry is kept in the state and
-# a warning logged under 14 days; a refusal logged) and, when every ingest of the round
-# succeeded and the heartbeat file holds a URL, sends one GET to it. sim_fleet logs the outcome;
-# the URL stays in its file. A dry run checks no token.
+# a warning logged under 14 days; a refusal logged) and, after a clean round (run_round) when
+# the heartbeat file holds a URL, sends one GET to it. sim_fleet logs the outcome; the URL
+# stays in its file. A dry run checks no token.
 heartbeat() {
     set -- heartbeat
     if [ -z "$SIM_FLEET_DRY_RUN" ]; then
@@ -442,7 +561,7 @@ heartbeat() {
     if [ -n "${heartbeat_file:-}" ]; then set -- "$@" --url-file "$heartbeat_file"; fi
     if [ -n "${round_clean:-}" ]; then set -- "$@" --clean; fi
     hc=0
-    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$bin/sim_fleet" "$@" || hc=$?
+    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$reporter" "$@" || hc=$?
     if [ "$hc" -ne 0 ]; then log "sim_fleet heartbeat exited $hc"; fi
 }
 
@@ -572,7 +691,9 @@ canary_report() {
     ic=0
     ingest sim-canary "$round/all-sim-canary" "$base..$last" || ic=$?
     if [ "$ic" -ne 0 ]; then round_clean=""; fi
-    if [ "$ic" -eq 0 ]; then
+    # Exit 3: counted and judged, but GitHub kept part of it from being written (a hold, the
+    # tracker, a locked issue); the cycle goes on as after 0, and the round is not clean.
+    if [ "$ic" -eq 0 ] || [ "$ic" -eq 3 ]; then
         word=$(sed -n "s/^sim-fleet: canary $canary_runner: //p" "$round/ingest-sim-canary")
         if [ "$word" != caught ]; then keep_crash "$1" "canary-$canary_runner"; fi
         log "canary $canary_runner on seeds $base..$last: $word"
@@ -758,7 +879,8 @@ crash_record() {
 }
 
 # Hands kind $1's file $2 to the reporter; for the canary, $3 is the seeds it ran. What the
-# reporter prints is also kept in $round/ingest-$1. Returns its exit code.
+# reporter prints is also kept in $round/ingest-$1. Returns its exit code: 3 is a round counted
+# that GitHub kept part of from being written (not ingested again, so not kept as failed).
 ingest() {
     kind=$1
     input=$2
@@ -776,10 +898,15 @@ ingest() {
     fi
     if [ -n "$SIM_FLEET_TRACKER" ]; then set -- "$@" --tracker "$SIM_FLEET_TRACKER"; fi
     code=0
-    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$bin/sim_fleet" "$@" <"$input" \
+    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$reporter" "$@" <"$input" \
         >"$round/ingest-$kind" || code=$?
     cat "$round/ingest-$kind"
     if [ "$code" -eq 0 ]; then return 0; fi
+    if [ "$code" -eq 3 ]; then
+        log "sim_fleet ingest of $kind: counted, but GitHub kept part of it from being written" \
+            "(see above); no heartbeat this round"
+        return 3
+    fi
     cp "$input" "$STATE/last-failed-round-$kind.txt"
     if [ "$code" -eq 124 ]; then
         log "sim_fleet ingest timed out; the round is in $STATE/last-failed-round-$kind.txt"

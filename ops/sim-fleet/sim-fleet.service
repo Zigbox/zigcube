@@ -12,9 +12,12 @@ EnvironmentFile=-/etc/sim-fleet/fleet.env
 # systemd reads the token as root and hands the service a private copy under
 # $CREDENTIALS_DIRECTORY; the service user cannot read /etc/sim-fleet/token itself.
 LoadCredential=token:/etc/sim-fleet/token
-# The heartbeat URL (README.md, "Heartbeat"), a secret like the token. setup.sh creates the file
-# empty when there is none (an empty file: no heartbeat), since a missing one stops the unit.
+# The heartbeat URL (README.md, "Heartbeat"), a secret like the token. When the file is missing,
+# SetCredential's empty value stands in (systemd uses it when LoadCredential finds no file), so
+# the unit still starts; run.sh logs once at start that no heartbeat is sent. An empty file does
+# the same.
 LoadCredential=heartbeat-url:/etc/sim-fleet/heartbeat-url
+SetCredential=heartbeat-url:
 ExecStart=/var/lib/sim-fleet/zigcube/ops/sim-fleet/run.sh
 Restart=always
 RestartSec=30

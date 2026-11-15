@@ -11,15 +11,19 @@
 //!     kind <YYYY-MM-DD> <run kind> <seeds> <failed seeds>
 //!     reported <YYYY-MM-DD>
 //!     soak <YYYY-MM-DD> <commit> <run kind> <seeds> <failed> <first unix> <last unix> <ref>
+//!         <seconds>
 //!     token-expires <unix seconds>
 //!     token-noted <YYYY-MM-DD>
 //!
-//! Version 4 added the `soak` lines, what each commit ran on a day by kind, from the start of its
-//! first round to the end of its last (ref `-` when the runner named none), and `token-expires`,
-//! when GitHub says the token expires (`sim_fleet heartbeat`), and `token-noted`, the last day the
-//! log said GitHub sent no expiry it could read (once a day). A version 3 file is read as it
-//! is. A release that writes only version 3 refuses a version 4 file; to roll back, delete those
-//! lines and write `version 3` (ops/sim-fleet/README.md, "Rolling back").
+//! Version 4 added the `soak` lines (one line, written here on two), what each commit ran on a
+//! day by kind and branch (ref `-` when the runner named none): the start of its first round and
+//! the end of its last, and the seconds its rounds ran, each instant counted once per commit
+//! (State.soak), so a gap between rounds is not soak; a line without `<seconds>` (the first form
+//! of version 4, never released) has 0. And `token-expires`, when GitHub says the token expires
+//! (`sim_fleet heartbeat`), and `token-noted`, the last day the log said GitHub sent no expiry it
+//! could read (once a day). A version 3 file is read as it is. A release that writes only
+//! version 3 refuses a version 4 file; to roll back, delete those lines and write `version 3`
+//! (ops/sim-fleet/README.md, "Rolling back").
 //!
 //! Version 3 added the `kind` lines: a day's seeds and failures split by the run that produced them
 //! (`sim-cluster`, `sim-c1`, `sim-swarm`). A version 2 file, which only ever ran `sim-cluster`,
@@ -90,6 +94,9 @@ pub const Soak = struct {
     last: i64,
     /// The branch it was the tip of, `-` if the runner did not say.
     ref: []const u8,
+    /// The seconds of that day its rounds ran that no earlier line of its commit had counted:
+    /// summed over a commit's lines, the union of its rounds (State.soak sets it).
+    seconds: u64 = 0,
 };
 
 /// What one round adds to its day.
@@ -208,8 +215,11 @@ pub const State = struct {
         });
     }
 
-    /// Adds a round of `commit` (as `kind`, from `ref`) that ran from `started` to `ended` to
-    /// day `ymd`'s soak lines. Past the day's most lines it is in the day's totals only.
+    /// Adds a round of `item.commit` (as `item.kind`, from `item.ref`) that ran from
+    /// `item.first` to `item.last` to day `ymd`'s soak lines. Its seconds are only those after
+    /// the end of the commit's last round counted that day: the kinds of one round, ingested one
+    /// after another, count that round once, and a gap between rounds counts for nothing. Past
+    /// the day's most lines it is in the day's totals only.
     pub fn soak(
         state: *State,
         arena: std.mem.Allocator,
@@ -220,22 +230,31 @@ pub const State = struct {
         assert(item.failed <= item.seeds);
         assert(item.commit.len > 0);
         assert(item.ref.len > 0);
+        assert(item.seconds == 0);
         var on_day: u32 = 0;
+        var covered = item.first;
+        var line: ?*Soak = null;
         for (state.soaks.items) |*known| {
             if (!std.mem.eql(u8, &known.ymd, &ymd)) continue;
             on_day += 1;
             if (!std.mem.eql(u8, known.commit, item.commit)) continue;
+            covered = @max(covered, known.last);
             if (!std.mem.eql(u8, known.kind, item.kind)) continue;
+            if (std.mem.eql(u8, known.ref, item.ref)) line = known;
+        }
+        const seconds: u64 = @intCast(@max(0, item.last - covered));
+        if (line) |known| {
             known.seeds += item.seeds;
             known.failed += item.failed;
             known.first = @min(known.first, item.first);
             known.last = @max(known.last, item.last);
-            known.ref = item.ref;
+            known.seconds += seconds;
             return;
         }
         if (on_day >= constants.fleet_soak_per_day_max) return;
         var added = item;
         added.ymd = ymd;
+        added.seconds = seconds;
         try state.soaks.append(arena, added);
     }
 
@@ -373,9 +392,9 @@ pub const State = struct {
         }
         if (state.reported.len > 0) try out.print("reported {s}\n", .{state.reported});
         for (state.soaks.items) |item| {
-            try out.print("soak {s} {s} {s} {d} {d} {d} {d} {s}\n", .{
-                &item.ymd,  item.commit, item.kind, item.seeds, item.failed,
-                item.first, item.last,   item.ref,
+            try out.print("soak {s} {s} {s} {d} {d} {d} {d} {s} {d}\n", .{
+                &item.ymd,  item.commit, item.kind, item.seeds,   item.failed,
+                item.first, item.last,   item.ref,  item.seconds,
             });
         }
         if (state.token_expires > 0) {
@@ -385,15 +404,20 @@ pub const State = struct {
     }
 };
 
-/// One commit's soak on one day, its kinds together.
+/// One commit's soak on one day, its kinds and branches together.
 pub const Soaked = struct {
     commit: []const u8,
-    ref: []const u8,
-    /// That day's first round start and last round end.
+    /// The branches it ran as that day, `, `-separated.
+    refs: []const u8,
+    /// That day's first round start.
     first: i64,
-    last: i64,
-    /// The start of its first round on any day kept.
+    /// The seconds its rounds ran that day (each instant once).
+    seconds: u64,
+    /// The start of its first round on the earliest day of the unbroken run of days, ending on
+    /// this one, on each of which it ran: a day without a round breaks the run.
     since: i64,
+    /// The seconds its rounds ran over those days.
+    since_seconds: u64,
 };
 
 /// The commits soaked on day `ymd`, in the order they started.
@@ -410,26 +434,54 @@ pub fn soaked_on(
         } else null;
         if (known) |soaked| {
             soaked.first = @min(soaked.first, item.first);
-            soaked.last = @max(soaked.last, item.last);
+            soaked.seconds += item.seconds;
+            if (!ref_listed(soaked.refs, item.ref)) {
+                soaked.refs = try std.fmt.allocPrint(arena, "{s}, {s}", .{
+                    soaked.refs, item.ref,
+                });
+            }
         } else {
             try out.append(arena, .{
                 .commit = item.commit,
-                .ref = item.ref,
+                .refs = item.ref,
                 .first = item.first,
-                .last = item.last,
+                .seconds = item.seconds,
                 .since = item.first,
+                .since_seconds = 0,
             });
         }
     }
-    for (out.items) |*soaked| {
-        for (state.soaks.items) |item| {
-            if (!std.mem.eql(u8, item.commit, soaked.commit)) continue;
-            soaked.since = @min(soaked.since, item.first);
-        }
-        assert(soaked.since <= soaked.first);
-    }
+    for (out.items) |*soaked| soaked_since(state, soaked);
     std.mem.sort(Soaked, out.items, {}, started_earlier);
     return out.items;
+}
+
+fn ref_listed(refs: []const u8, ref: []const u8) bool {
+    var names = std.mem.splitSequence(u8, refs, ", ");
+    while (names.next()) |name| {
+        if (std.mem.eql(u8, name, ref)) return true;
+    }
+    return false;
+}
+
+/// Walks back from `soaked`'s day while the day before has a round of its commit.
+fn soaked_since(state: *const State, soaked: *Soaked) void {
+    soaked.since_seconds = soaked.seconds;
+    var day_start = soaked.first - @mod(soaked.first, 86_400);
+    for (0..constants.fleet_days_kept) |_| {
+        day_start -= 86_400;
+        const ymd = ymd_of(day_start);
+        var found = false;
+        for (state.soaks.items) |item| {
+            if (!std.mem.eql(u8, &item.ymd, &ymd)) continue;
+            if (!std.mem.eql(u8, item.commit, soaked.commit)) continue;
+            found = true;
+            soaked.since = @min(soaked.since, item.first);
+            soaked.since_seconds += item.seconds;
+        }
+        if (!found) break;
+    }
+    assert(soaked.since <= soaked.first);
 }
 
 fn started_earlier(_: void, a: Soaked, b: Soaked) bool {
@@ -572,6 +624,8 @@ fn parse_soak(words: *Words) ParseError!Soak {
         .first = try parse_number(i64, words),
         .last = try parse_number(i64, words),
         .ref = words.next() orelse return error.BadState,
+        // The first form of version 4 (never released) had no seconds.
+        .seconds = if (words.peek() == null) 0 else try parse_number(u64, words),
     };
     if (item.failed > item.seeds) return error.BadState;
     if (item.first < 0 or item.first > item.last) return error.BadState;
@@ -857,37 +911,87 @@ test "soak lines add up per commit and kind, are bounded per day, and go with th
     const arena = arena_state.allocator();
     var state: State = .{};
     const day = "2026-11-14".*;
+    const midnight: i64 = 1_794_614_400;
+    try std.testing.expectEqualStrings(&day, &ymd_of(midnight));
     const round: Soak = .{
         .ymd = day,
         .commit = "aaa",
         .kind = "sim-cluster",
         .seeds = 10,
         .failed = 1,
-        .first = 1000,
-        .last = 1600,
+        .first = midnight + 1000,
+        .last = midnight + 1600,
         .ref = "main",
     };
     try state.soak(arena, day, round);
-    var later = round;
-    later.first = 5000;
-    later.last = 8200;
-    try state.soak(arena, day, later);
+    // The same round's other kind, ingested after it: only the seconds after the first ingest.
     var other = round;
     other.kind = "sim-swarm";
-    other.first = 900;
+    other.last = midnight + 1610;
     try state.soak(arena, day, other);
+    // A later round after an idle gap: the gap is not soak.
+    var later = round;
+    later.first = midnight + 5000;
+    later.last = midnight + 5600;
+    try state.soak(arena, day, later);
     try std.testing.expectEqual(@as(usize, 2), state.soaks.items.len);
     try std.testing.expectEqual(@as(u64, 20), state.soaks.items[0].seeds);
-    try std.testing.expectEqual(@as(i64, 8200), state.soaks.items[0].last);
+    try std.testing.expectEqual(@as(u64, 1200), state.soaks.items[0].seconds);
+    try std.testing.expectEqual(@as(u64, 10), state.soaks.items[1].seconds);
+    // The same commit as another branch: a line of its own, its time still counted once.
+    var branch = later;
+    branch.ref = "release/0.6";
+    branch.first = midnight + 5500;
+    branch.last = midnight + 5700;
+    try state.soak(arena, day, branch);
+    try std.testing.expectEqual(@as(u64, 100), state.soaks.items[2].seconds);
+    // Yesterday, with a day of no rounds before it, and three days ago.
     var yesterday = round;
-    yesterday.first = 10;
-    yesterday.last = 20;
+    yesterday.first = midnight - 600;
+    yesterday.last = midnight - 300;
     try state.soak(arena, "2026-11-13".*, yesterday);
+    var long_ago = round;
+    long_ago.first = midnight - 3 * 86_400 + 10;
+    long_ago.last = midnight - 3 * 86_400 + 20;
+    try state.soak(arena, "2026-11-11".*, long_ago);
     const soaked = try soaked_on(&state, arena, day);
     try std.testing.expectEqual(@as(usize, 1), soaked.len);
-    try std.testing.expectEqual(@as(i64, 900), soaked[0].first);
-    try std.testing.expectEqual(@as(i64, 8200), soaked[0].last);
-    try std.testing.expectEqual(@as(i64, 10), soaked[0].since);
+    try std.testing.expectEqualStrings("main, release/0.6", soaked[0].refs);
+    try std.testing.expectEqual(midnight + 1000, soaked[0].first);
+    try std.testing.expectEqual(@as(u64, 1310), soaked[0].seconds);
+    try std.testing.expectEqual(midnight - 600, soaked[0].since);
+    try std.testing.expectEqual(@as(u64, 1610), soaked[0].since_seconds);
+    // Written and read back, the seconds stay; a line of the first form of version 4 has none.
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try state.render(&out.writer);
+    const again = try parse(arena, out.written());
+    try std.testing.expectEqual(@as(u64, 1200), again.soaks.items[0].seconds);
+    const first_form = try parse(arena, "version 4\nsoak 2026-11-14 c sim-c1 1 0 1 2 main\n");
+    try std.testing.expectEqual(@as(u64, 0), first_form.soaks.items[0].seconds);
+}
+
+test "soak lines are bounded per day and go with their day" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var state: State = .{};
+    const day = "2026-11-14".*;
+    const midnight: i64 = 1_794_614_400;
+    const round: Soak = .{
+        .ymd = day,
+        .commit = "aaa",
+        .kind = "sim-cluster",
+        .seeds = 10,
+        .failed = 1,
+        .first = midnight + 1000,
+        .last = midnight + 1600,
+        .ref = "main",
+    };
+    try state.soak(arena, day, round);
+    var yesterday = round;
+    yesterday.first = midnight - 600;
+    yesterday.last = midnight - 300;
+    try state.soak(arena, "2026-11-13".*, yesterday);
     // Past the day's bound a new commit is not kept; a known one still adds up.
     for (0..constants.fleet_soak_per_day_max) |index| {
         var commit = round;
@@ -899,7 +1003,7 @@ test "soak lines add up per commit and kind, are bounded per day, and go with th
         state.soaks.items.len,
     );
     try state.soak(arena, day, round);
-    try std.testing.expectEqual(@as(u64, 30), state.soaks.items[0].seeds);
+    try std.testing.expectEqual(@as(u64, 20), state.soaks.items[0].seeds);
     // A day dropped past the days kept takes its soak lines with it.
     try state.count(arena, "2026-11-13".*, "sim-cluster", .{ .seeds = 1, .failed = 0 }, "c");
     for (0..constants.fleet_days_kept) |index| {
