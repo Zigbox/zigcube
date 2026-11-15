@@ -50,6 +50,7 @@ const sim_c1 = @import("sim_c1.zig");
 const sim_c3 = @import("sim_c3.zig");
 const why_acceptance = @import("why_acceptance.zig");
 const sim_checks = @import("sim_checks.zig");
+const sim_coverage = @import("sim_coverage.zig");
 const sim_clock = @import("sim_clock.zig");
 const sim_net = @import("sim_net.zig");
 const sim_node = @import("sim_node.zig");
@@ -177,6 +178,12 @@ pub const Report = struct {
     dead_calls: u32 = 0,
     bytes: [report_bytes_max]u8 = undefined,
     len: u32 = 0,
+    /// What the run reached (`sim_coverage.zig`), filled at its end, passed or failed; printed
+    /// after `world hash` on a pass, so every other line is what it was without it.
+    coverage: sim_coverage.Table = .{},
+    /// Operations the run drew, the failing one included: a soak that stopped or failed after
+    /// it replays as a run of exactly this many (`Options.on_epoch`).
+    operations_run: u32 = 0,
 
     pub fn text(report: *const Report) []const u8 {
         assert(report.len <= report_bytes_max);
@@ -843,6 +850,11 @@ pub const Cluster = struct {
     second_ms: u64,
     check_ms: u64,
     stats: Stats,
+    /// Coverage counted as the run goes: the checks evaluated, the operations drawn, the most
+    /// decisions of each action one listing held. Read only by `record_coverage`.
+    check_ids: sim_coverage.CheckIds,
+    ops_drawn: [op_count]u64,
+    decision_actions: sim_coverage.Actions,
     /// The totals when the faults ended and the heal began.
     fault_totals: ?PhaseTotals,
     /// Where in the run a check is made: "faults", "healed", "convergence" or "end". A failure
@@ -913,6 +925,26 @@ pub const Cluster = struct {
     health_scripts: u32,
     /// The host crashes injected so far (the wipe takes every other one, from the first).
     host_crashes: u32,
+    /// The last operations, printed after a failure (`OpTrace`).
+    trace: OpTrace = .{},
+    /// Operations drawn so far, the one running included; the soak's stop point
+    /// (`Options.on_epoch`) and the length of a run that replays this one.
+    operations_done: u32 = 0,
+    on_epoch: ?*const fn (epoch: *const Epoch) bool = null,
+    epoch_operations: u32 = 1000,
+    /// Decisions the last complete decisions check listed (the soak's history size). The check
+    /// is skipped while the store is faulty (`store_faulty`) and when the revision has not
+    /// moved, so an epoch reports the count of the last pass, which may be a little stale.
+    decisions_listed: u32 = 0,
+
+    /// The trace and the soak's fields (`OpTrace`, `Options.on_epoch`), as a run starts.
+    fn init_soak(c: *Cluster) void {
+        c.trace = .{};
+        c.operations_done = 0;
+        c.on_epoch = null;
+        c.epoch_operations = 1000;
+        c.decisions_listed = 0;
+    }
 
     pub fn create(
         gpa: Allocator,
@@ -962,8 +994,7 @@ pub const Cluster = struct {
         c.init_trackers();
         c.second_ms = 0;
         c.check_ms = 0;
-        c.stats = .{};
-        c.fault_totals = null;
+        c.init_counts();
         c.step = "faults";
         c.on_step = null;
         c.liveness = true;
@@ -975,6 +1006,7 @@ pub const Cluster = struct {
         c.init_reuse();
         c.init_rollouts(seed);
         c.init_worlds(options);
+        c.init_soak();
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
         c.server.check_i6 = true;
@@ -1001,6 +1033,15 @@ pub const Cluster = struct {
             c.c3_tally.paused_judged,      c.c3_tally.history_judged,
             c.rollout_pauses,              c.rollout_resumes,
         });
+    }
+
+    /// The run's tallies and coverage counters start at zero.
+    fn init_counts(c: *Cluster) void {
+        c.stats = .{};
+        c.check_ids = .{};
+        c.ops_drawn = @splat(0);
+        c.decision_actions = .{};
+        c.fault_totals = null;
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -2162,6 +2203,50 @@ const Op = enum {
     job_end,
 };
 
+const op_count = @typeInfo(Op).@"enum".field_names.len;
+
+/// The last `trace_ops_max` operations of a run, oldest first when printed: what a failure's
+/// report (and the fleet's issue, `src/sim_fleet_issue.zig`) shows of how the world got there
+/// (C3 fleet 7). It draws nothing and is not hashed, so it changes no world.
+pub const trace_ops_max: u32 = 24;
+
+const OpTrace = struct {
+    entries: [trace_ops_max]Entry = undefined,
+    /// Operations added, of which the last `@min(count, trace_ops_max)` are kept.
+    count: u32 = 0,
+
+    const Entry = struct { index: u32, at_ms: u64, op: Op, service: u8 };
+
+    fn add(trace: *OpTrace, index: u32, at_ms: u64, op: Op, service: u32) void {
+        assert(service < service_names.len);
+        trace.entries[trace.count % trace_ops_max] = .{
+            .index = index,
+            .at_ms = at_ms,
+            .op = op,
+            .service = @intCast(service),
+        };
+        assert(trace.count < std.math.maxInt(u32)); // One per operation, a `u32`.
+        trace.count += 1;
+    }
+
+    /// `trace: op <index> at <ms> ms: <op> [<service>]`, one line per operation kept. A service
+    /// is named only for the operations that act on one.
+    fn print(trace: *const OpTrace, report: *Report) void {
+        const kept = @min(trace.count, trace_ops_max);
+        for (trace.count - kept..trace.count) |n| {
+            const entry = trace.entries[n % trace_ops_max];
+            const service = switch (entry.op) {
+                .apply, .scale, .delete, .broken => service_names[entry.service],
+                else => "",
+            };
+            const gap: []const u8 = if (service.len > 0) " " else "";
+            report.print("trace: op {d} at {d} ms: {s}{s}{s}\n", .{
+                entry.index, entry.at_ms, @tagName(entry.op), gap, service,
+            });
+        }
+    }
+};
+
 /// With `faults_on` false (after the heal) the fault operations get no weight.
 fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
     const f: u32 = @intFromBool(faults_on);
@@ -2183,10 +2268,23 @@ fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
     unreachable; // `pick` is below the total.
 }
 
+/// The soak's leak tooth (`src/sim_soak_teeth_main.zig`): memory taken every operation and never
+/// given back, which the soak's teardown check must catch. A full allocator only skips it.
+fn soak_leak_tooth(c: *Cluster) void {
+    comptime assert(c1_teeth.soak_leak);
+    const leaked = c.gpa.alloc(u8, c1_teeth.soak_leak_bytes) catch return;
+    @memset(leaked, 0x5a);
+}
+
 fn operation(c: *Cluster) void {
     const random = c.prng.random();
-    const name = service_names[random.uintLessThan(u32, service_names.len)];
-    switch (pick_op(&c.swarm, random, c.fault_totals == null)) {
+    const service = random.uintLessThan(u32, service_names.len);
+    const name = service_names[service];
+    const op = pick_op(&c.swarm, random, c.fault_totals == null);
+    c.ops_drawn[@backingInt(op)] += 1;
+    c.trace.add(c.operations_done - 1, c.manual.ms - epoch_ms, op, service);
+    if (c1_teeth.soak_leak) soak_leak_tooth(c);
+    switch (op) {
         .advance => {
             c.advance(100 + random.uintLessThan(u32, 6000));
         },
@@ -2226,30 +2324,34 @@ fn operation(c: *Cluster) void {
                 node.frozen_until_ms = c.manual.ms + span;
             }
         },
-        .job_create => {
-            // The burst world (#198): a burst, so that one node starts dozens of runs in a step.
-            const burst: u32 = if (c1_teeth.burst_world) 12 else 1;
-            for (0..burst) |_| c.create_job();
-            if (c1_teeth.reuse_world) {
-                c.reuse_ops += 1;
-                // Reuse follows the jump at once: no agent step lies between, so a container of
-                // the deleted incarnation still stands when its name is made again.
-                if (c.reuse_ops % 3 == 0) c.retention_jump();
-                // A few tries: most names are still held by their job, and are refused.
-                if (c.reuse_ops % 3 == 0) {
-                    var made: u32 = 0;
-                    for (0..16) |_| {
-                        if (c.reuse_job()) made += 1;
-                        if (made == 4) break;
-                    }
-                }
-            }
-        },
+        .job_create => job_create(c),
         .job_cancel => c.cancel_job(),
         .job_end => c.end_job(),
     }
     if (c.c3 and c.fault_totals == null) pause_or_resume(c, name);
     c.advance(100);
+}
+
+/// One job operation: a job, a burst of them in the burst world (#198), and in the reuse world a
+/// retention jump and reused names now and then.
+fn job_create(c: *Cluster) void {
+    // The burst world (#198): a burst, so that one node starts dozens of runs in a step.
+    const burst: u32 = if (c1_teeth.burst_world) 12 else 1;
+    for (0..burst) |_| c.create_job();
+    if (c1_teeth.reuse_world) {
+        c.reuse_ops += 1;
+        // Reuse follows the jump at once: no agent step lies between, so a container of
+        // the deleted incarnation still stands when its name is made again.
+        if (c.reuse_ops % 3 == 0) c.retention_jump();
+        // A few tries: most names are still held by their job, and are refused.
+        if (c.reuse_ops % 3 == 0) {
+            var made: u32 = 0;
+            for (0..16) |_| {
+                if (c.reuse_job()) made += 1;
+                if (made == 4) break;
+            }
+        }
+    }
 }
 
 /// Under `--c3`, before the heal, one operation in four also pauses or resumes the rollout of the
@@ -2266,12 +2368,14 @@ fn pause_or_resume(c: *Cluster, name: []const u8) void {
 const Failure = error{StepFailed};
 
 fn check(c: *Cluster, ok: bool, what: []const u8) Failure!void {
+    c.check_ids.note(what);
     if (ok) return;
     c.report.failed = true;
     c.report.print("FAILED: {s} (seed {d}, at {d} ms)\n", .{
         what, c.seed, c.manual.ms - epoch_ms,
     });
     c.report.print("step: {s}\n", .{c.step});
+    c.trace.print(c.report);
     return error.StepFailed;
 }
 
@@ -2319,6 +2423,16 @@ fn why_terminates(
     try check(c, last.type != .decision, "a why chain ends in a decision, not a cause");
 }
 
+/// Pages of decisions the decisions check reads, and so the decisions a world may hold before
+/// it fails with "there are more decisions than the check reads". A soak (src/sim_soak.zig) holds
+/// about three per operation and retention keeps a week, so the bound is a soak's, not a
+/// fleet run's (800 operations at most): 64 pages lasted about 10,000 operations. The check reads
+/// every decision whenever the revision moved, so a soak's cost per operation grows with its
+/// history; reading only the new ones would make the soak a different check from the plain run
+/// it must replay as (docs/decisions/2026-11-14-c3-soak-leak-judge.md).
+pub const decision_pages_max: u32 = 1024;
+pub const decisions_read_max: u32 = decision_pages_max * constants.store_list_limit_max;
+
 /// Every decision has a reason and a cause that exists; a replica of a lost node is replaced no
 /// earlier than the grace after its node's `mark_lost`; and, while retention has dropped nothing,
 /// every summary's `count` is the number of decisions written for its subject, action and kind
@@ -2329,7 +2443,9 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
     var at: ?store.Revision = null;
     var nodes_lost: u32 = 0;
     var replicas_lost: u32 = 0;
-    for (0..64) |_| {
+    var actions: sim_coverage.Table = .{};
+    var decisions: u32 = 0;
+    for (0..decision_pages_max) |_| {
         const page = ctx.store.list(ctx.arena, .{
             .prefix = records.prefix_decisions,
             .at_revision = at,
@@ -2340,8 +2456,10 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
         for (page.kvs) |kv| {
             const decision = records.read(records.Decision, ctx.arena, kv, ctx.diag) catch
                 return check(c, false, "a decision cannot be read");
+            decisions += 1;
             try decision_has_cause(c, ctx, &decision);
             try verdict(c, sim_checks.count(ctx, &counts, &decision));
+            if (decision.action.len > 0) actions.add(decision.action, 1);
             if (std.mem.eql(u8, decision.action, "mark_lost")) nodes_lost += 1;
             // A `mark_replica_lost` caused by a decision is the grace's end (the others are
             // caused by an observed record).
@@ -2354,6 +2472,8 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
         if (after != null) continue;
         c.stats.nodes_marked_lost = @max(c.stats.nodes_marked_lost, nodes_lost);
         c.stats.replicas_marked_lost = @max(c.stats.replicas_marked_lost, replicas_lost);
+        c.decision_actions.merge(&actions);
+        c.decisions_listed = decisions;
         if (c.dropped_total() > 0) return;
         return verdict(c, sim_checks.summaries(ctx, &counts, at.?));
     }
@@ -3215,6 +3335,34 @@ pub const Options = struct {
     /// runtime fault also scripts how one running container's checks come out (pass, fail, hang,
     /// refused at poll or at begin), in turn, with no draw. Off, a run is the world it was before.
     health: bool = false,
+    /// The long soak (C3 fleet 6, `sim_cluster --soak`): called after every `epoch_operations`
+    /// operations with what the run has grown to; false ends the run there, and the end checks
+    /// run as for a run of that many operations, so `sim_cluster <seed> <operations>
+    /// --liveness=false` replays it. Liveness off only (a heal point needs the run's length).
+    /// It must not touch the run.
+    on_epoch: ?*const fn (epoch: *const Epoch) bool = null,
+    epoch_operations: u32 = 1000,
+};
+
+/// What a soak's run has grown to after an epoch (`Options.on_epoch`): the history and the
+/// fixed-width counters a long run could leak, overflow or drift on.
+pub const Epoch = struct {
+    operations: u32,
+    virtual_ms: u64,
+    revision: u64,
+    transactions: u32,
+    agent_steps: u32,
+    server_steps: u32,
+    /// Decisions the last decisions check listed, and those retention has dropped so far.
+    decisions: u32,
+    decisions_dropped: u64,
+    /// The memory store's live keys, history entries not yet compacted, and leases.
+    store_keys: u64,
+    store_log: u64,
+    store_leases: u64,
+    /// Jobs created so far, and the start ledger's runs.
+    jobs_created: u32,
+    job_ledger: u32,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -3281,7 +3429,11 @@ pub fn simulate(
     };
     defer c.destroy();
     defer report.dead_calls = c.stats.dead_calls;
+    defer report.operations_run = c.operations_done;
     c.on_step = options.on_step;
+    if (options.on_epoch != null) assert(!options.liveness);
+    c.on_epoch = options.on_epoch;
+    c.epoch_operations = options.epoch_operations;
     c.enter("faults");
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
     c.swarm.print(report);
@@ -3295,18 +3447,7 @@ pub fn simulate(
     if (options.c3) assert(options.c1);
     c.c1 = options.c1;
     c.c3 = options.c3;
-    c.jobs_on = options.jobs;
-    if (c.jobs_on) {
-        c.swarm.add_jobs(seed);
-        report.print("jobs: on; weights create={d} cancel={d} end={d}\n", .{
-            c.swarm.w_job_create, c.swarm.w_job_cancel, c.swarm.w_job_end,
-        });
-    }
-    if (c.c1) {
-        c.swarm.add_c1_faults(seed);
-        report.print("sim-c1: every revision checked (I1a I2 I3 I4 I6 I7), overlaps bounded " ++
-            "(I1b), then every decision re-explained after its cited keys changed (I5, §5)\n", .{});
-    }
+    start_worlds(c, seed, options, report);
     const heal_at = if (!options.liveness)
         operations
     else
@@ -3323,9 +3464,30 @@ pub fn simulate(
     run_steps(c, operations, heal_at) catch {
         assert(report.failed);
         if (c.fault_totals != null) print_phases(c);
+        record_coverage(c);
         return;
     };
     print_summary(c);
+    record_coverage(c);
+    var writer = std.Io.Writer.fixed(report.bytes[report.len..]);
+    report.coverage.print(&writer) catch {}; // What does not fit is dropped.
+    report.len += @intCast(writer.buffered().len);
+}
+
+/// The job workload and C1's faults join the run when their options ask, each with a line.
+fn start_worlds(c: *Cluster, seed: u64, options: Options, report: *Report) void {
+    c.jobs_on = options.jobs;
+    if (c.jobs_on) {
+        c.swarm.add_jobs(seed);
+        report.print("jobs: on; weights create={d} cancel={d} end={d}\n", .{
+            c.swarm.w_job_create, c.swarm.w_job_cancel, c.swarm.w_job_end,
+        });
+    }
+    if (c.c1) {
+        c.swarm.add_c1_faults(seed);
+        report.print("sim-c1: every revision checked (I1a I2 I3 I4 I6 I7), overlaps bounded " ++
+            "(I1b), then every decision re-explained after its cited keys changed (I5, §5)\n", .{});
+    }
 }
 
 fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
@@ -3334,9 +3496,11 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
             heal(c);
             c.enter("healed");
         }
+        c.operations_done = @intCast(index + 1);
         operation(c);
         if (c.report.failed) return error.StepFailed;
         try safety(c);
+        if (!soak_goes_on(c)) break;
     }
     if (c.liveness) {
         if (c.fault_totals == null) heal(c);
@@ -3351,9 +3515,32 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
     }
     c.enter("end");
     try safety(c);
-    try enough_work_under_faults(c, @min(heal_at, operations));
+    try enough_work_under_faults(c, @min(heal_at, c.operations_done));
     try work_under_ceiling(c);
     try acceptance(c);
+}
+
+/// The soak's hook after each epoch (`Options.on_epoch`); true without one.
+fn soak_goes_on(c: *Cluster) bool {
+    const hook = c.on_epoch orelse return true;
+    assert(c.epoch_operations > 0);
+    if (c.operations_done % c.epoch_operations != 0) return true;
+    const epoch: Epoch = .{
+        .operations = c.operations_done,
+        .virtual_ms = c.manual.ms - epoch_ms,
+        .revision = c.memory.revision,
+        .transactions = c.stats.transactions,
+        .agent_steps = c.stats.agent_steps,
+        .server_steps = c.stats.server_steps,
+        .decisions = c.decisions_listed,
+        .decisions_dropped = c.dropped_total(),
+        .store_keys = c.memory.live.items.len,
+        .store_log = c.memory.log.items.len,
+        .store_leases = c.memory.leases.items.len,
+        .jobs_created = c.job_next - 1,
+        .job_ledger = c.jobs.ledger_count,
+    };
+    return hook(&epoch);
 }
 
 /// sim-c1, docs/authority.md §5: every cited key is changed or deleted and the history compacted
@@ -3508,17 +3695,7 @@ fn print_summary(c: *Cluster) void {
     report.print("lost nodes: mark_lost={d} replicas replaced after the grace={d}\n", .{
         s.nodes_marked_lost, s.replicas_marked_lost,
     });
-    var total: sim_net.Stats = .{};
-    for (c.nodes) |node| {
-        const link = c.net.stats(node.index);
-        total.delivered += link.delivered;
-        total.requests_dropped += link.requests_dropped;
-        total.replies_lost += link.replies_lost;
-        total.duplicated += link.duplicated;
-        total.parked += link.parked;
-        total.delivered_late += link.delivered_late;
-        total.partitioned += link.partitioned;
-    }
+    const total = net_total(c);
     report.print("net: delivered={d} requests_dropped={d} replies_lost={d} duplicated={d} " ++
         "parked={d} delivered_late={d} partitioned={d}\n", .{
         total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
@@ -3606,6 +3783,88 @@ fn print_jobs(c: *Cluster) void {
             opened, closed, open_now, by[0], by[1], by[2], by[3],
         });
     }
+}
+
+fn net_total(c: *const Cluster) sim_net.Stats {
+    var total: sim_net.Stats = .{};
+    for (c.nodes) |node| {
+        const link = c.net.stats(node.index);
+        total.delivered += link.delivered;
+        total.requests_dropped += link.requests_dropped;
+        total.replies_lost += link.replies_lost;
+        total.duplicated += link.duplicated;
+        total.parked += link.parked;
+        total.delivered_late += link.delivered_late;
+        total.partitioned += link.partitioned;
+    }
+    return total;
+}
+
+/// The run's coverage into `report.coverage`: only counters the run already kept, read once at
+/// its end (no draw, no store call), so the world is the same with or without it.
+fn record_coverage(c: *Cluster) void {
+    const t = &c.report.coverage;
+    c.check_ids.add_to(t);
+    for (c.ops_drawn, 0..) |count, index| {
+        t.add_joined("op.", @tagName(@as(Op, @fromBackingInt(@intCast(index)))), count);
+    }
+    c.decision_actions.add_to(t);
+    const s = c.stats;
+    const net = net_total(c);
+    t.add("fault.crash", s.crashes_injected);
+    t.add("fault.wipe", s.wipes);
+    t.add("fault.partition", s.partitions);
+    t.add("fault.outage", s.outages);
+    t.add("fault.suspend", s.suspends);
+    t.add("fault.runtime", s.runtime_faults);
+    t.add("fault.server_restart", s.server_restarts);
+    t.add("fault.ack_lost", c.ack_loss.lost_count);
+    t.add("fault.request_dropped", net.requests_dropped);
+    t.add("fault.reply_lost", net.replies_lost);
+    t.add("fault.duplicated", net.duplicated);
+    t.add("fault.parked", net.parked);
+    t.add("fault.delivered_late", net.delivered_late);
+    t.add("fault.partitioned", net.partitioned);
+    t.add("path.fence", total_fences(c));
+    t.add("path.dead_call", s.dead_calls);
+    t.add("path.server_failure", s.server_failures);
+    t.add("path.agent_failure", s.agent_failures);
+    t.add("path.node_lost", s.nodes_marked_lost);
+    t.add("path.replica_lost_after_grace", s.replicas_marked_lost);
+    t.add("path.duplicate_second", s.duplicate_seconds);
+    if (c.c1) record_coverage_c1(c, t);
+    if (c.jobs_on) record_coverage_jobs(c, t);
+}
+
+fn record_coverage_c1(c: *Cluster, t: *sim_coverage.Table) void {
+    t.add("check.revision", c.c1_revisions);
+    t.add("check.guarded_write", c.c1_tally.guarded_writes);
+    t.add("check.observation_judged", c.c1_tally.observations_judged);
+    t.add("check.placement_judged", c.c1_tally.placements_judged);
+    t.add("check.decision_recorded", c.recorder.counts.recorded);
+    t.add("check.decision_key_changed", c.recorder.counts.keys_changed);
+    t.add("check.decision_key_deleted", c.recorder.counts.keys_deleted);
+    t.add("path.overlap_worst_ms", c.overlap_worst_ms);
+    t.add("path.overlap_unwatched", c.overlaps_unwatched);
+}
+
+fn record_coverage_jobs(c: *Cluster, t: *sim_coverage.Table) void {
+    const j = &c.jobs;
+    t.add("check.job_start_judged", j.starts_judged);
+    t.add("check.job_status_judged", c.c1_tally.job_statuses_judged);
+    t.add("check.job_run_placed_judged", c.c1_tally.runs_placed_judged);
+    t.add("check.job_report_judged", c.c1_tally.job_reports_judged);
+    t.add("check.job_ending_handled", c.jobs_watch.handled_count);
+    t.add("path.job_created", j.created);
+    t.add("path.job_cancelled", j.cancelled);
+    t.add("path.job_ended", j.ended);
+    t.add("path.job_ledger_full", j.ledger_full);
+    t.add("path.job_report_refused", job_refusals(c));
+    t.add("path.job_watch_relist", c.jobs_watch.relists);
+    t.add("path.job_watch_restart", c.jobs_watch.restarts);
+    var opened: u64 = 0;
+    for (c.nodes) |node| opened += node.sim.containers.relays_opened;
+    t.add("path.relay_opened", opened);
 }
 
 fn print_phases(c: *Cluster) void {
@@ -3714,6 +3973,74 @@ test "a node count can be asked for" {
     simulate(testing.allocator, 5, 10, .{ .nodes = 3 }, &report);
     try testing.expect(!report.failed);
     try testing.expect(std.mem.indexOf(u8, report.text(), "swarm: nodes=3 ") != null);
+}
+
+test "the trace keeps the last operations, oldest first, and all of a short run" {
+    // Goal: `OpTrace` prints what it was given in order, wraps after `trace_ops_max`, and names a
+    // service only for the operations that act on one.
+    var report: Report = .{};
+    var trace: OpTrace = .{};
+    for (0..5) |n| trace.add(@intCast(n), n * 10, .advance, 0);
+    trace.print(&report);
+    try testing.expectEqualStrings(
+        \\trace: op 0 at 0 ms: advance
+        \\trace: op 1 at 10 ms: advance
+        \\trace: op 2 at 20 ms: advance
+        \\trace: op 3 at 30 ms: advance
+        \\trace: op 4 at 40 ms: advance
+        \\
+    , report.text());
+
+    report = .{};
+    trace = .{};
+    const operations = 30;
+    for (0..operations) |n| trace.add(@intCast(n), n * 10, if (n % 2 == 0) .apply else .advance, 2);
+    trace.print(&report);
+    var expected: [trace_ops_max * 48]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&expected);
+    for (operations - trace_ops_max..operations) |n| {
+        const what = if (n % 2 == 0) "apply gamma" else "advance";
+        try writer.print("trace: op {d} at {d} ms: {s}\n", .{ n, n * 10, what });
+    }
+    try testing.expectEqualStrings(writer.buffered(), report.text());
+}
+
+test "a failure's trace is the run's last operations, numbered and timed as they ran" {
+    // Goal: each `trace:` line names the operation's index in the run (from 0), the virtual time
+    // it began at and what it drew. Method: run 30 operations as `run_steps` does, noting each
+    // one's start and draw, then fail a check and read the trace it printed.
+    var report: Report = .{};
+    const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
+    defer c.destroy();
+    const operations = 30;
+    var started: [operations]u64 = undefined;
+    var drawn: [operations]Op = undefined;
+    for (0..operations) |index| {
+        c.operations_done = @intCast(index + 1);
+        started[index] = c.manual.ms - epoch_ms;
+        const before = c.ops_drawn;
+        operation(c);
+        try testing.expect(!report.failed);
+        const op = for (0..op_count) |o| {
+            if (c.ops_drawn[o] != before[o]) break o;
+        } else return error.TestUnexpectedResult;
+        drawn[index] = @fromBackingInt(@intCast(op));
+    }
+    try testing.expectError(error.StepFailed, check(c, false, "the trace's own test"));
+    var lines = std.mem.splitScalar(u8, report.text(), '\n');
+    var index: usize = operations - trace_ops_max;
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "trace: ")) continue;
+        try testing.expect(index < operations);
+        var buffer: [96]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&buffer, "trace: op {d} at {d} ms: {s}", .{
+            index, started[index], @tagName(drawn[index]),
+        });
+        try testing.expect(std.mem.startsWith(u8, line, prefix));
+        try testing.expect(line.len == prefix.len or line[prefix.len] == ' ');
+        index += 1;
+    }
+    try testing.expectEqual(@as(usize, operations), index);
 }
 
 test "the fencing check fires on a node that runs containers long after it lost its lease" {

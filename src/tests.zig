@@ -77,6 +77,7 @@ test {
     _ = @import("probe_scheduler.zig");
     _ = @import("agent_health.zig");
     _ = @import("agent_health_test.zig");
+    _ = @import("sim_fleet_coverage.zig");
     _ = @import("tidy.zig");
 }
 

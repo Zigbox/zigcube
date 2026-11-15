@@ -39,7 +39,12 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 apt-get update -q
-apt-get install -y -q git curl xz-utils ca-certificates libpq-dev libsqlite3-dev
+apt-get install -y -q git curl xz-utils ca-certificates libpq-dev libsqlite3-dev \
+    postgresql-16
+# `zig build test-store-faults` (once a day, run.sh) starts throwaway Postgres servers of its own
+# as the service user, from the programs in /usr/lib/postgresql/16/bin. The packaged cluster is
+# not wanted: it would idle on 5432 and hold memory.
+systemctl disable --now postgresql.service postgresql@16-main.service >/dev/null 2>&1 || true
 
 if [ ! -x "$ZIG_DIR/zig" ]; then
     tmp=$(mktemp -d)

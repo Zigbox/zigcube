@@ -533,10 +533,7 @@ test "state round trips through its text" {
         error.BadState,
         parse(arena, "version 3\nkind 2026-11-02 sim-bogus 5 1\n"),
     );
-    try std.testing.expectError(
-        error.BadState,
-        parse(arena, "version 3\nkind 2026-11-02 store-faults 5 1\n"),
-    );
+    _ = try parse(arena, "version 3\nkind 2026-11-02 store-faults 5 1\n");
 }
 
 test "a version 1 state file, as the first release wrote it, is read" {

@@ -350,6 +350,21 @@ its `  step:` line; the fleet's parser ignores them. The `auto` range summary re
 (`docs/decisions/2026-11-06-renewal-before-fence.md`). Every draw has its
 own generator (the seed xor a salt); the
 decision is `docs/decisions/2026-11-04-fleet-profiles-and-shapes.md`.
+**Coverage (C3 fleet 5).** A passing report ends, after `world hash`, in `coverage:` lines, one
+per group, each `name=count`: `check.<id>` (checks evaluated through `check()`, by the id before
+its `:`, `c0` for the C0 checks; `check.revision`, `check.job_*_judged` and the like for the
+per-revision and job checks), `fault.*` (crashes, wipes, partitions, outages, suspends, runtime
+faults, server restarts, lost acks, dropped, lost, duplicated, parked and late messages), `op.*`
+(operations drawn), and `path.*` (decisions by action, fences, failed calls, nodes and replicas
+lost, jobs created, cancelled and ended, a full ledger, refused reports, watch relists and
+restarts, relays opened). The counters only read what the world already does: they add no draw
+and change no earlier line, so the report without them is a prefix of the report with them, and
+native and WASM still compare equal (`zig build sim-cluster`, `sim-c1`). At most 128 names; more
+print `coverage: dropped=N`. A failing report prints none. `--seeds` prints, before its summary,
+one line per profile run, `coverage: profile=P seeds=N name=R ...`, R the seeds that reached the
+name; `sim_fleet coverage` keeps those per commit and `sim_fleet bias` steers the fleet toward the
+least reached (`ops/sim-fleet/README.md`, item 6; the decision is
+`docs/decisions/2026-11-13-coverage-feedback.md`).
 **Crashes:** the range form flushes each failing seed's report as it is printed, so a later seed
 that panics loses no earlier one. `--trace-steps` (either form) writes `step: <name>` to stderr,
 unbuffered, as the run enters each step (`faults`, `healed`, `convergence`, `end`), so the step a
@@ -357,6 +372,36 @@ crashed seed was in is the last such line; the fleet replays a crashed range see
 Before each seed's run it also writes `replay: <command>` (the concrete command, as a failing seed
 prints it), so the last such line names the seed a crash or a timeout was in and how to replay it.
 A seed whose world cannot be built (out of memory) reports `step: setup`.
+
+**The trace (C3 fleet 7).** A failing report prints, after its `step:` line, the last 24
+operations of the run (`trace: op <index> at <ms> ms: <operation> [<service>]`, the time virtual
+and counted from the run's start; a service is named for `apply`, `scale`, `delete` and
+`broken`). The ring (`OpTrace`) draws nothing and is not hashed, so no world changes. The range
+form prints the trace under the failing seed's replay; with `--shrink` it reruns the smallest
+failing run for its trace. `sim_fleet ingest` puts it in the issue (`ops/sim-fleet/README.md`,
+item 7).
+
+**The soak (C3 fleet 6).** `sim_cluster <seed> soak [nodes] [flags] --soak-minutes=M |
+--soak-operations=K [--soak-epoch=E]` (E 500 by default; K a multiple of E) runs one seed with
+liveness off until the budget or a failure: the world does not depend on the run's length without
+liveness, so a soak stopped at K operations is `sim_cluster <seed> K [nodes] --liveness=false`,
+and a core failure replays as that. `Options.on_epoch` (core) hands the shell an `Epoch` every E
+operations: virtual time, the revision, transactions, agent and server steps, decisions kept and
+dropped, store keys, log and leases, jobs and the start ledger. `src/sim_soak.zig` (shell) prints
+each as a `soak: epoch` line with wall time, operations per second and the heap's live and peak
+bytes (a counting allocator), and fails the soak if virtual time or the revision stood still, if a
+counter passed half its range, if live bytes per item of history (keys + log + revision +
+decisions + ledger) grew past 4 times their value at the fourth epoch, or if bytes added per item
+added since that epoch passed 4 times their first value (once the history has doubled). After the
+world's teardown the counting allocator must hold nothing (`soak: memory still held after the
+world was torn down`). `--soak-bytes=B` (1.5 GiB by default) ends the soak as held at the epoch
+whose live bytes reach B (`budget reached`), and a held soak prints its world hash. Wall time is
+printed, never judged, so the verdict is the seed's. The tooth, `src/sim_soak_teeth_main.zig`
+(16 KiB never freed per operation), must fail the teardown check; `ops/sim-fleet/test-soak.sh`
+runs it in `zig build test` (`docs/decisions/2026-11-14-c3-soak-leak-judge.md`). `--c1` is refused (its tap grows about 1 GB by 2,000
+operations). The decisions check now reads up to 1,024 pages (`decision_pages_max`, 512,000
+decisions; it was 64, which a soak passes near 10,000 operations). Operations per second fall as
+the history grows, for the `MemoryStore` reason of the fleet's per-seed budget below.
 
 **Lost nodes in the report.** The report's `lost nodes:` line counts the `mark_lost` decisions and
 the replicas replaced after a lost node's grace (a `mark_replica_lost` caused by a decision). A
