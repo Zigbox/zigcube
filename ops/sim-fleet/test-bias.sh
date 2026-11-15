@@ -83,9 +83,9 @@ round_out
 expect "bias sim-cluster: partitions, which has run 0 seeds"
 expect "bias sim-c1: partitions"
 refuse "--profile=auto"
-[ "$(grep -c -- "--c1 --profile=partitions" "$work/args")" -eq 1 ] || fail "c1: $args"
+[ "$(grep -c -- "--c1 --signed --profile=partitions" "$work/args")" -eq 1 ] || fail "c1: $args"
 [ "$(grep -c -- "--profile=partitions" "$work/args")" -eq 2 ] || fail "args: $args"
-[ "$(kind_flags sim-c1)" = "--c1 --profile=partitions" ] || fail "replay flags: $(kind_flags \
+[ "$(kind_flags sim-c1)" = "--c1 --signed --profile=partitions" ] || fail "replay flags: $(kind_flags \
     sim-c1)"
 # The tracker counts the biased round's seeds, per kind.
 grep -q "^kind [0-9-]* sim-c1 4 0$" "$STATE/state.txt.dry" || fail "seeds not counted: $(cat \

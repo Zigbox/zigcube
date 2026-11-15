@@ -955,7 +955,7 @@ test "against a server older than the rollout routes, zcube says to upgrade the 
     var old: OldServer = undefined;
     old.env = world.env_with(null);
     old.report.reset();
-    try cli_http.Client.init(&old.client, &old.env, world.address, &old.report);
+    try cli_http.Client.init(&old.client, &old.env, world.address, .{}, &old.report);
     const commands = [_][]const []const u8{
         &.{ "rollout", "status", "hello" },
         &.{ "rollout", "pause", "hello" },

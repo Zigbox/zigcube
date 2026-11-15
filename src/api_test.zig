@@ -1402,10 +1402,15 @@ fn put_rollout(rig: *Rig, phase: records.RolloutPhase, created: ?u64) !void {
     _ = try writers.txn(ctx.store, .rollout_controller, .{ .on_success = &.{op} }, ctx.diag);
 }
 
+/// POST with no body, as the local caller.
+fn post_bare(rig: *Rig, path: []const u8) api_mod.Response {
+    return rig.call(.{ .caller = .local, .method = "POST", .path = path });
+}
+
 fn rollout_post(rig: *Rig, verb: []const u8, body: []const u8) !api_mod.Response {
     const arena = rig.parsed.allocator();
     const path = try std.fmt.allocPrint(arena, "/v1/services/hello/rollout/{s}", .{verb});
-    return rig.call(.{ .method = "POST", .path = path, .body = body });
+    return rig.call(.{ .caller = .local, .method = "POST", .path = path, .body = body });
 }
 
 test "GET /v1/services/{name}/history lists the generations newest first, env redacted" {
@@ -1469,7 +1474,7 @@ test "GET .../rollout answers null, then the record; pause and resume write it, 
     try rig.refused(try rollout_post(&rig, "pause", ""), 409, "ZC-E0129");
     try rig.refused(try rollout_post(&rig, "stop", ""), 404, "ZC-E0101");
     try rig.refused(try rollout_post(&rig, "pause", "[1]"), 400, "ZC-E0104");
-    const missing = rig.call(.{ .method = "POST", .path = "/v1/services/nope/rollout/pause" });
+    const missing = post_bare(&rig, "/v1/services/nope/rollout/pause");
     try rig.refused(missing, 404, "ZC-E0101");
     // A name no service can have is 400 on the writes as on the reads.
     try rig.refused(rig.get("/v1/services/Nope/rollout", ""), 400, "ZC-E0104");
@@ -1477,12 +1482,13 @@ test "GET .../rollout answers null, then the record; pause and resume write it, 
     const arena = rig.parsed.allocator();
     for ([_][]const u8{ "pause", "resume" }) |verb| {
         const path = try std.fmt.allocPrint(arena, "/v1/services/Nope/rollout/{s}", .{verb});
-        try rig.refused(rig.call(.{ .method = "POST", .path = path }), 400, "ZC-E0104");
+        try rig.refused(post_bare(&rig, path), 400, "ZC-E0104");
     }
 }
 
 fn rollback_post(rig: *Rig, query: []const u8, body: []const u8) api_mod.Response {
     return rig.call(.{
+        .caller = .local,
         .method = "POST",
         .path = "/v1/services/hello/rollback",
         .query = query,
@@ -1523,11 +1529,15 @@ test "POST /v1/services/{name}/rollback applies a stored generation as a new one
     try rig.refused(rollback_post(&rig, "at=1", ""), 400, "ZC-E0104");
     try rig.refused(rollback_post(&rig, "", "[1]"), 400, "ZC-E0104");
     try rig.refused(rollback_post(&rig, "", "{\"applied_by\":\"\"}"), 400, "ZC-E0104");
-    const missing = rig.call(.{ .method = "POST", .path = "/v1/services/nope/rollback" });
+    const missing = rig.call(.{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/services/nope/rollback",
+    });
     try rig.refused(missing, 404, "ZC-E0101");
-    const invalid = rig.call(.{ .method = "POST", .path = "/v1/services/Nope/rollback" });
+    const invalid = post_bare(&rig, "/v1/services/Nope/rollback");
     try rig.refused(invalid, 400, "ZC-E0104");
-    const deeper = rig.call(.{ .method = "POST", .path = "/v1/services/hello/rollback/x" });
+    const deeper = post_bare(&rig, "/v1/services/hello/rollback/x");
     try testing.expect(deeper.status >= 400);
     // `to` names an older generation: 2 again, as generation 4.
     const named = try rig.json(rollback_post(&rig, "to=2", ""));
@@ -1580,6 +1590,7 @@ test "a rollback that loses its race to an apply is 409 ZC-E0105 and writes noth
     var ctx = rig.world.controller_context();
     ctx.store = rollout_steer.Race.wrap(ctx.store, .reapply, "hello", 1);
     const response = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "POST",
         .path = "/v1/services/hello/rollback",
     });
@@ -1638,6 +1649,7 @@ test "a pause that loses every race to the rollout controller is 409 ZC-E0105" {
     const races = rollout_steer.attempts_max;
     ctx.store = rollout_steer.Race.wrap(ctx.store, .rollout, "hello", races);
     const response = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "POST",
         .path = "/v1/services/hello/rollout/pause",
     });
