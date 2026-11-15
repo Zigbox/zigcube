@@ -401,7 +401,7 @@ pub fn history(demo: *Demo) !void {
     }
     host.say("  ok: the history holds generations 1 to 4: apply, apply, apply, auto_rollback", .{});
     const to_99 = [_][]const u8{ "rollback", "app", "--to", "99" };
-    try expect_refused(host, &to_99, "ZC-E0128", "not in its history");
+    try expect_refused(host, &to_99, "ZC-E0128", "is newer than the one it runs");
 }
 
 /// `rollback --to 1`, paused after its first new replica is ready; the agent of a node restarted

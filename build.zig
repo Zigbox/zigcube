@@ -1185,6 +1185,9 @@ fn add_demo_c3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
 /// --trust-policy` where jobs are signed with `zbx sign`; unsigned, untrusted and other-tree jobs
 /// refused at the server and again at the agent. Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_demo_b5_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    if (b.graph.host.result.os.tag != .linux) {
+        return add_linux_only_steps(b, &.{ "demo-b5", "demo-b5-build" });
+    }
     const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
     const exe = b.addExecutable(.{
         .name = "demo_b5",
