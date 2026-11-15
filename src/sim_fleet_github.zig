@@ -797,7 +797,12 @@ test "the token's expiry header is read in either form, and nothing else is" {
 }
 
 /// Serves one request with `reply` (a whole response) and records its head.
-fn serve_one(io: std.Io, listener: *std.Io.net.Server, reply: []const u8, recorded: *Recorded) void {
+fn serve_one(
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    reply: []const u8,
+    recorded: *Recorded,
+) void {
     const stream = listener.accept(io) catch return;
     defer stream.close(io);
     var in_buffer: [2048]u8 = undefined;

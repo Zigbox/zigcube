@@ -1,5 +1,5 @@
 [Unit]
-Description=Zigcube simulation fleet (sim-cluster, sim-c1 and sim-swarm on fresh seeds at the tip of main)
+Description=Zigcube simulation fleet (sim-cluster, sim-c1 and sim-swarm on fresh seeds at the tip of main and soaked branches)
 Documentation=https://github.com/Zigbox/zigcube/blob/main/ops/sim-fleet/README.md
 After=network-online.target
 Wants=network-online.target
@@ -12,6 +12,9 @@ EnvironmentFile=-/etc/sim-fleet/fleet.env
 # systemd reads the token as root and hands the service a private copy under
 # $CREDENTIALS_DIRECTORY; the service user cannot read /etc/sim-fleet/token itself.
 LoadCredential=token:/etc/sim-fleet/token
+# The heartbeat URL (README.md, "Heartbeat"), a secret like the token. setup.sh creates the file
+# empty when there is none (an empty file: no heartbeat), since a missing one stops the unit.
+LoadCredential=heartbeat-url:/etc/sim-fleet/heartbeat-url
 ExecStart=/var/lib/sim-fleet/zigcube/ops/sim-fleet/run.sh
 Restart=always
 RestartSec=30

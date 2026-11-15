@@ -1,11 +1,13 @@
 #!/bin/sh
-# The simulation fleet's loop (ops/sim-fleet/README.md): follow the tip of main, rebuild when it
-# moves, run three producers over fresh seeds in parallel batches (`sim_cluster`, `sim_cluster
-# --c1` and `sim_swarm`; the kinds `sim-cluster`, `sim-c1`, `sim-swarm`), and hand each round
+# The simulation fleet's loop (ops/sim-fleet/README.md): follow the tip of main (and of each
+# branch in SIM_FLEET_SOAK_REFS), rebuild a branch when it moves, run three producers over fresh
+# seeds in parallel batches (`sim_cluster`, `sim_cluster --c1` and `sim_swarm`; the kinds
+# `sim-cluster`, `sim-c1`, `sim-swarm`) on one branch's build per round, and hand each round
 # (every batch, plus a record of each crashed seed) to `sim_fleet ingest`, once per kind. Every
 # SIM_FLEET_CANARY_ONE_IN rounds a fourth worker runs the teeth canary, a fault-on runner that
 # must fail. Settings come from the environment (the unit reads /etc/sim-fleet/fleet.env). The
-# token is a file; this script never prints it.
+# token is a file; this script never prints it. So is the heartbeat URL (send_heartbeat): it is
+# read only by `sim_fleet heartbeat`, from its file, and never printed or put on a command line.
 set -eu
 
 main() {
@@ -22,6 +24,9 @@ main() {
     : "${SIM_FLEET_REMOTE:=https://github.com/Zigbox/zigcube}"
     : "${SIM_FLEET_GH_REPO:=Zigbox/zigcube}"
     : "${SIM_FLEET_BRANCH:=main}"
+    # Branches soaked besides SIM_FLEET_BRANCH (a release branch before its tag), space-separated,
+    # at most 4. Each is built and run on its own; the rounds take the branches in turn (pick_ref).
+    : "${SIM_FLEET_SOAK_REFS:=}"
     # `auto` draws each run's size and shape from its seed, and the profile (which faults are on)
     # too: the fleet exists for the variety (docs/core.md, "Profiles and shapes"). A number fixes
     # the operations (the nodes, ttl and replicas stay the seed's own old defaults); a profile
@@ -79,6 +84,29 @@ main() {
         log "no token: set SIM_FLEET_TOKEN_FILE, run under the unit, or set SIM_FLEET_DRY_RUN=1"
         exit 2
     fi
+    REFS=""
+    for name in $SIM_FLEET_BRANCH $SIM_FLEET_SOAK_REFS; do
+        if ! ref_valid "$name"; then
+            log "the branch name '$name' is not one run.sh soaks ([A-Za-z0-9._/-], no '..'," \
+                "no leading '-', at most 128 bytes)"
+            exit 2
+        fi
+        case " $REFS " in *" $name "*) continue ;; esac
+        REFS="${REFS:+$REFS }$name"
+    done
+    set -- $REFS
+    if [ "$#" -gt 5 ]; then
+        log "SIM_FLEET_SOAK_REFS names $(($# - 1)) branches besides $SIM_FLEET_BRANCH: at most 4"
+        exit 2
+    fi
+    heartbeat_file=${SIM_FLEET_HEARTBEAT_FILE:-}
+    if [ -z "$heartbeat_file" ] && [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+        heartbeat_file=$CREDENTIALS_DIRECTORY/heartbeat-url
+    fi
+    if [ -z "$heartbeat_file" ] || [ ! -s "$heartbeat_file" ]; then
+        log "no heartbeat URL (${heartbeat_file:-no file}): no heartbeat is sent"
+        heartbeat_file=""
+    fi
     STATE=$SIM_FLEET_STATE_DIR
     KINDS="sim-cluster sim-c1 sim-swarm"
     mkdir -p "$STATE/bin" "$STATE/crashes"
@@ -94,14 +122,11 @@ main() {
             git clone --quiet "$SIM_FLEET_REMOTE" "$SIM_FLEET_REPO_DIR"
     fi
     cd "$SIM_FLEET_REPO_DIR"
-    # Remembered across restarts: a restart neither rebuilds a good commit nor retries a bad one.
-    built=$(cat "$STATE/built" 2>/dev/null || true)
-    broken=$(cat "$STATE/broken" 2>/dev/null || true)
-    if [ -n "$built" ] && [ ! -x "$STATE/bin/$built/bin/sim_swarm" ]; then built=""; fi
     rounds=0
     while [ "$SIM_FLEET_ROUNDS" -eq 0 ] || [ "$rounds" -lt "$SIM_FLEET_ROUNDS" ]; do
         rounds=$((rounds + 1))
-        follow_main
+        follow_refs
+        pick_ref
         if [ -z "$built" ]; then
             log "nothing built yet; waiting"
             sleep "$SIM_FLEET_IDLE_SECONDS"
@@ -115,45 +140,145 @@ log() {
     printf '%s sim-fleet: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 }
 
-# Fetches the branch; if its tip is a commit not built (and not already known to fail to build),
-# builds it into a directory of its own and switches to it only once the build succeeded. A
-# build that fails leaves the last good binaries in use and is logged once.
-follow_main() {
-    if ! timeout "$SIM_FLEET_GIT_TIMEOUT" git fetch --quiet origin "$SIM_FLEET_BRANCH"; then
-        log "git fetch failed or timed out; keeping ${built:-nothing}"
-        return 0
-    fi
-    head=$(git rev-parse FETCH_HEAD)
-    if [ "$head" = "$built" ] || [ "$head" = "$broken" ]; then
-        return 0
-    fi
-    prune_cache
-    git checkout --quiet --detach "$head"
-    log "building $head"
-    rm -rf "$STATE/bin/$head"
-    if timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build -Doptimize=ReleaseSafe \
-        --prefix "$STATE/bin/$head" sim-cluster-exe sim-swarm-exe sim-fleet-exe \
-        sim-canary-exe >"$STATE/build.log" 2>&1; then
-        echo "$head" >"$STATE/built.new"
-        mv "$STATE/built.new" "$STATE/built"
-        built="$head"
-        log "built $head"
-        prune_bin
+# A branch name run.sh accepts: the same rule as `sim_fleet ingest --ref`.
+ref_valid() {
+    case "$1" in
+    '' | -* | *..* | *[!A-Za-z0-9._/-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 128 ]
+}
+
+# The directory of branch $1's state: `built` (the commit in use), `broken` (the tip that failed
+# to build) and `gone` (the branch was deleted). SIM_FLEET_BRANCH keeps the top of the state
+# directory, as before soak branches, so a rollback of run.sh finds its `built` there.
+ref_dir() {
+    if [ "$1" = "$SIM_FLEET_BRANCH" ]; then
+        echo "$STATE"
     else
-        rm -rf "$STATE/bin/$head"
-        echo "$head" >"$STATE/broken.new"
-        mv "$STATE/broken.new" "$STATE/broken"
-        broken="$head"
-        log "build of $head FAILED or timed out (see $STATE/build.log);" \
-            "still testing ${built:-nothing}"
+        echo "$STATE/refs/$(printf '%s' "$1" | sha256sum | cut -c1-16)"
     fi
 }
 
-# The binaries of every commit but the one in use.
+# The commit branch $1 runs on: its `built`, if that commit's binaries are still there.
+ref_built() {
+    b=$(cat "$(ref_dir "$1")/built" 2>/dev/null || true)
+    if [ -n "$b" ] && [ -x "$STATE/bin/$b/bin/sim_swarm" ]; then echo "$b"; fi
+}
+
+# Writes $2 to file $1 at once.
+put() {
+    echo "$2" >"$1.new"
+    mv "$1.new" "$1"
+}
+
+# Looks up every branch's tip (one `git ls-remote`) and follows each (follow_ref). A branch the
+# remote no longer has is dropped: one log line, its build forgotten, and nothing run on it until
+# it comes back. A lookup that fails keeps everything as it was.
+follow_refs() {
+    if ! timeout "$SIM_FLEET_GIT_TIMEOUT" git ls-remote --heads origin >"$STATE/heads.new"; then
+        log "git ls-remote failed or timed out; keeping every branch's build"
+        return 0
+    fi
+    for name in $REFS; do
+        dir=$(ref_dir "$name")
+        mkdir -p "$dir"
+        head=$(awk -v r="refs/heads/$name" '$2 == r { print $1 }' "$STATE/heads.new")
+        if [ -z "$head" ]; then
+            if [ ! -e "$dir/gone" ]; then
+                log "branch $name is gone from the remote; dropped until it comes back"
+                : >"$dir/gone"
+                rm -f "$dir/built" "$dir/broken"
+            fi
+            continue
+        fi
+        if [ -e "$dir/gone" ]; then
+            log "branch $name is back"
+            rm -f "$dir/gone"
+        fi
+        follow_ref "$name" "$head"
+    done
+    prune_bin
+}
+
+# Branch $1's tip is $2. If that commit is neither in use nor known to fail to build, fetches and
+# builds it into a directory of its own (one already built for another branch is shared) and
+# switches the branch to it only once the build succeeded. A build that fails leaves the last good
+# binaries in use and is logged once.
+follow_ref() {
+    dir=$(ref_dir "$1")
+    built=$(ref_built "$1")
+    broken=$(cat "$dir/broken" 2>/dev/null || true)
+    if [ "$2" = "$built" ] || [ "$2" = "$broken" ]; then return 0; fi
+    if [ -x "$STATE/bin/$2/bin/sim_swarm" ]; then
+        put "$dir/built" "$2"
+        log "$1 is at $2, already built"
+        return 0
+    fi
+    if ! timeout "$SIM_FLEET_GIT_TIMEOUT" git fetch --quiet origin "refs/heads/$1"; then
+        log "git fetch of $1 failed or timed out; keeping ${built:-nothing}"
+        return 0
+    fi
+    head=$(git rev-parse FETCH_HEAD)
+    if [ "$head" = "$built" ] || [ "$head" = "$broken" ]; then return 0; fi
+    log "building $head ($1)"
+    if build_commit "$head"; then
+        put "$dir/built" "$head"
+        log "built $head ($1)"
+    else
+        put "$dir/broken" "$head"
+        log "build of $head ($1) FAILED or timed out (see $STATE/build.log);" \
+            "$1 still runs ${built:-nothing}"
+    fi
+}
+
+# Builds commit $1 into $STATE/bin/$1; exit code 0 when it built.
+build_commit() {
+    prune_cache
+    git checkout --quiet --detach "$1"
+    rm -rf "$STATE/bin/$1"
+    if timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build -Doptimize=ReleaseSafe \
+        --prefix "$STATE/bin/$1" sim-cluster-exe sim-swarm-exe sim-fleet-exe \
+        sim-canary-exe >"$STATE/build.log" 2>&1; then
+        return 0
+    fi
+    rm -rf "$STATE/bin/$1"
+    return 1
+}
+
+# Picks the branch this round runs on: the branches with a build take turns, one round each, in
+# the order of $REFS (SIM_FLEET_BRANCH first), the place kept in $STATE/ref-next. Every worker of
+# the round runs on that branch's commit. Sets ref and built (empty: nothing built yet).
+pick_ref() {
+    ref=""
+    built=""
+    n=0
+    for name in $REFS; do
+        if [ -n "$(ref_built "$name")" ]; then n=$((n + 1)); fi
+    done
+    if [ "$n" -eq 0 ]; then return 0; fi
+    next=$(cat "$STATE/ref-next" 2>/dev/null || echo 0)
+    case "$next" in '' | *[!0-9]*) next=0 ;; esac
+    want=$((next % n))
+    i=0
+    for name in $REFS; do
+        b=$(ref_built "$name")
+        if [ -z "$b" ]; then continue; fi
+        if [ "$i" -eq "$want" ]; then
+            ref=$name
+            built=$b
+        fi
+        i=$((i + 1))
+    done
+    put "$STATE/ref-next" "$((want + 1))"
+}
+
+# The binaries of every commit no branch uses.
 prune_bin() {
+    keep=" "
+    for name in $REFS; do keep="$keep$(cat "$(ref_dir "$name")/built" 2>/dev/null || true) "; done
     for dir in "$STATE"/bin/*; do
         [ -d "$dir" ] || continue
-        if [ "$(basename "$dir")" != "$built" ]; then rm -rf "$dir"; fi
+        case "$keep" in *" $(basename "$dir") "*) ;; *) rm -rf "$dir" ;; esac
     done
 }
 
@@ -260,6 +385,8 @@ kind_workers() {
 # replayed seed by seed. Workers are numbered across kinds; `$round/kind-W` names worker W's.
 run_round() {
     bin="$STATE/bin/$built/bin"
+    round_started=$(date +%s)
+    round_clean=1
     round="$STATE/round"
     rm -rf "$round"
     mkdir -p "$round"
@@ -289,9 +416,29 @@ run_round() {
             fi
             w=$((w + 1))
         done
-        if [ -s "$round/all-$kind" ]; then ingest "$kind" "$round/all-$kind" || true; fi
+        if [ -s "$round/all-$kind" ]; then ingest "$kind" "$round/all-$kind" || round_clean=""; fi
     done
     if [ -n "$canary_runner" ]; then canary_report "$canary_worker"; fi
+    heartbeat
+}
+
+# After the round: `sim_fleet heartbeat` checks the token (its expiry is kept in the state and
+# a warning logged under 14 days; a refusal logged) and, when every ingest of the round
+# succeeded and the heartbeat file holds a URL, sends one GET to it. sim_fleet logs the outcome;
+# the URL stays in its file. A dry run checks no token.
+heartbeat() {
+    set -- heartbeat
+    if [ -z "$SIM_FLEET_DRY_RUN" ]; then
+        set -- "$@" --repo "$SIM_FLEET_GH_REPO" --token-file "$token_file" \
+            --state "$STATE/state.txt"
+    elif [ -z "${heartbeat_file:-}" ]; then
+        return 0
+    fi
+    if [ -n "${heartbeat_file:-}" ]; then set -- "$@" --url-file "$heartbeat_file"; fi
+    if [ -n "${round_clean:-}" ]; then set -- "$@" --clean; fi
+    hc=0
+    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$bin/sim_fleet" "$@" || hc=$?
+    if [ "$hc" -ne 0 ]; then log "sim_fleet heartbeat exited $hc"; fi
 }
 
 # The teeth canary (docs/briefs/c3-sim-fleet.md, item 3): the fleet's own proof that it still
@@ -419,6 +566,7 @@ canary_report() {
     esac >"$round/all-sim-canary"
     ic=0
     ingest sim-canary "$round/all-sim-canary" "$base..$last" || ic=$?
+    if [ "$ic" -ne 0 ]; then round_clean=""; fi
     if [ "$ic" -eq 0 ]; then
         word=$(sed -n "s/^sim-fleet: canary $canary_runner: //p" "$round/ingest-sim-canary")
         if [ "$word" != caught ]; then keep_crash "$1" "canary-$canary_runner"; fi
@@ -610,7 +758,8 @@ ingest() {
     kind=$1
     input=$2
     seeds=${3:-}
-    set -- ingest --kind "$(kind_sim "$kind")" --commit "$built" --state "$STATE/state.txt"
+    set -- ingest --kind "$(kind_sim "$kind")" --commit "$built" --state "$STATE/state.txt" \
+        --ref "${ref:--}" --round-started "${round_started:-$(date +%s)}"
     if [ "$kind" = sim-canary ]; then
         set -- "$@" --canary "$canary_runner" --canary-seeds "$seeds"
         if [ -n "$canary_symptom" ]; then set -- "$@" --expect-symptom "$canary_symptom"; fi

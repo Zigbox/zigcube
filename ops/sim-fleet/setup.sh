@@ -1,7 +1,10 @@
 #!/bin/sh
 # Sets up the simulation fleet on a fresh Ubuntu 24.04 host (ops/sim-fleet/README.md). Run as
-# root: `sh setup.sh [--token-file PATH]`. Safe to run again. With --token-file the token is
-# copied (never printed, never passed as an argument value) to /etc/sim-fleet/token, mode 0600.
+# root: `sh setup.sh [--token-file PATH] [--heartbeat-file PATH]`. Safe to run again. With
+# --token-file the token is copied (never printed, never passed as an argument value) to
+# /etc/sim-fleet/token, mode 0600; with --heartbeat-file the file holding the heartbeat URL (a
+# secret too) is copied the same way to /etc/sim-fleet/heartbeat-url. Without it that file is
+# left as it is, or created empty (no heartbeat): the unit's LoadCredential needs it to exist.
 # It starts the service only when a token is present. It stops a running service first, so its
 # build never races the service's, and starts it again at the end.
 set -eu
@@ -16,6 +19,8 @@ HOME_DIR=/var/lib/sim-fleet
 ZIG_DIR=/opt/zig-x86_64-linux-$ZIG_VERSION
 
 TOKEN_SRC=""
+HEARTBEAT_SRC=""
+usage="usage: setup.sh [--token-file PATH] [--heartbeat-file PATH]"
 while [ $# -gt 0 ]; do
     case "$1" in
     --token-file)
@@ -26,8 +31,16 @@ while [ $# -gt 0 ]; do
         TOKEN_SRC=$2
         shift 2
         ;;
+    --heartbeat-file)
+        if [ $# -lt 2 ]; then
+            echo "setup.sh: --heartbeat-file needs a path" >&2
+            exit 1
+        fi
+        HEARTBEAT_SRC=$2
+        shift 2
+        ;;
     *)
-        echo "usage: setup.sh [--token-file PATH]" >&2
+        echo "$usage" >&2
         exit 1
         ;;
     esac
@@ -95,6 +108,21 @@ if [ -n "$TOKEN_SRC" ]; then
     chmod 600 /etc/sim-fleet/token.new
     mv /etc/sim-fleet/token.new /etc/sim-fleet/token
 fi
+
+# Copied, never printed: the URL is a secret (README.md, "Heartbeat").
+if [ -n "$HEARTBEAT_SRC" ]; then
+    if [ ! -s "$HEARTBEAT_SRC" ]; then
+        echo "setup.sh: $HEARTBEAT_SRC is missing or empty" >&2
+        exit 1
+    fi
+    (umask 077 && cat "$HEARTBEAT_SRC" >/etc/sim-fleet/heartbeat-url.new)
+    chmod 600 /etc/sim-fleet/heartbeat-url.new
+    mv /etc/sim-fleet/heartbeat-url.new /etc/sim-fleet/heartbeat-url
+fi
+if [ ! -e /etc/sim-fleet/heartbeat-url ]; then
+    (umask 077 && : >/etc/sim-fleet/heartbeat-url)
+fi
+chmod 600 /etc/sim-fleet/heartbeat-url
 
 if [ -s /etc/sim-fleet/token ]; then
     chmod 600 /etc/sim-fleet/token

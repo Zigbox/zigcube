@@ -1265,7 +1265,7 @@ test "--ref and --round-started are checked; heartbeat's repo, token and state c
     }
     try std.testing.expect(parse_args(&(base ++ [_][]const u8{ "--round-started", "-1" })) == null);
     const full = parse_heartbeat_args(&.{
-        "f",       "heartbeat", "--repo",     "a/b",                   "--token-file", "t",
+        "f",       "heartbeat", "--repo",     "a/b",                     "--token-file", "t",
         "--state", "s",         "--url-file", "/run/cred/heartbeat-url", "--clean",
     }).?;
     try std.testing.expect(full.clean);

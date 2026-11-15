@@ -370,8 +370,8 @@ pub const State = struct {
         if (state.reported.len > 0) try out.print("reported {s}\n", .{state.reported});
         for (state.soaks.items) |item| {
             try out.print("soak {s} {s} {s} {d} {d} {d} {d} {s}\n", .{
-                &item.ymd, item.commit, item.kind, item.seeds, item.failed,
-                item.first, item.last,  item.ref,
+                &item.ymd,  item.commit, item.kind, item.seeds, item.failed,
+                item.first, item.last,   item.ref,
             });
         }
         if (state.token_expires > 0) {
@@ -898,6 +898,12 @@ test "soak lines add up per commit and kind, are bounded per day, and go with th
     for (state.soaks.items) |item| {
         try std.testing.expect(!std.mem.eql(u8, &item.ymd, "2026-11-13"));
     }
+}
+
+test "a soak line that does not add up is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     try std.testing.expectError(
         error.BadState,
         parse(arena, "version 4\nsoak 2026-11-14 c sim-c1 1 0 3 2 main\n"),
