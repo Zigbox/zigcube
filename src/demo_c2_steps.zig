@@ -121,12 +121,20 @@ pub const Demo = struct {
 
     /// What the fetch.log of each of `nodes` (guest index = position) says about O5: whether the
     /// node was elected to pull from the registry first, and how long it waited for a peer.
-    pub fn o5_evidence(demo: *Demo, nodes: []const []const u8) ![]check.Evidence {
+    /// With `containers`, only their fetch.logs count (step 2: v1's logs stay on the node).
+    pub fn o5_evidence(
+        demo: *Demo,
+        nodes: []const []const u8,
+        containers: ?[]const []const u8,
+    ) ![]check.Evidence {
         const found = try demo.arena().alloc(check.Evidence, nodes.len);
         for (found, nodes, 0..) |*item, node, index| {
             assert(std.mem.eql(u8, vms.names[index], node));
             const log = try demo.guest(@intCast(index), "fetch-logs 'O5'", .{});
-            item.* = check.evidence_of(node, log);
+            item.* = if (containers) |names|
+                check.evidence_in(node, log, names)
+            else
+                check.evidence_of(node, log);
         }
         return found;
     }
