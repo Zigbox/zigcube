@@ -17,7 +17,8 @@ pub const Error = error{
     GitHubForbidden,
     /// 429, or 403 with `Retry-After` or no requests left: wait `retry_after` seconds.
     GitHubRateLimited,
-    /// Any other status (401: the token expired), or a reply that is not what the API returns.
+    /// Any other status (401: the token expired or was revoked), or a reply that is not what the
+    /// API returns.
     GitHubRefused,
     /// No answer: DNS, TCP, TLS, or the connection was cut.
     GitHubUnreachable,
@@ -229,6 +230,128 @@ pub const Printer = struct {
     }
 };
 
+/// What `refused` logs for a 401, in the fleet's journal (owner, 2026-11-15).
+pub const token_refused = "token refused (expired or revoked): replace /etc/sim-fleet/token";
+
+/// GitHub's header on a reply to a fine-grained token that expires (or a classic one with an
+/// expiry): when it does.
+pub const token_expiry_header = "github-authentication-token-expiration";
+
+/// Unix seconds of a `github-authentication-token-expiration` value: GitHub does not document
+/// its form; it is `2026-12-01 09:30:00 UTC` (or `-0800` in place of `UTC`). Null for anything
+/// else.
+pub fn parse_expiry(value: []const u8) ?i64 {
+    var words = std.mem.tokenizeScalar(u8, std.mem.trim(u8, value, " \t"), ' ');
+    const date = words.next() orelse return null;
+    const time = words.next() orelse return null;
+    const zone = words.next() orelse "UTC";
+    if (words.next() != null) return null;
+    if (date.len != 10 or date[4] != '-' or date[7] != '-') return null;
+    if (time.len != 8 or time[2] != ':' or time[5] != ':') return null;
+    const year = std.fmt.parseInt(u16, date[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, date[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, date[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(u8, time[0..2], 10) catch return null;
+    const minute = std.fmt.parseInt(u8, time[3..5], 10) catch return null;
+    const second = std.fmt.parseInt(u8, time[6..8], 10) catch return null;
+    if (year < 1970 or month < 1 or month > 12 or day < 1 or day > 31) return null;
+    if (hour > 23 or minute > 59 or second > 60) return null;
+    const offset = zone_offset(zone) orelse return null;
+    const days = days_from_civil(year, month, day);
+    const at = days * 86_400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset;
+    if (at < 0) return null;
+    return at;
+}
+
+/// Seconds east of UTC of `UTC`, `Z` or `+hhmm`/`-hhmm`; null for anything else.
+fn zone_offset(zone: []const u8) ?i64 {
+    if (std.mem.eql(u8, zone, "UTC") or std.mem.eql(u8, zone, "Z")) return 0;
+    if (zone.len != 5) return null;
+    const sign: i64 = switch (zone[0]) {
+        '+' => 1,
+        '-' => -1,
+        else => return null,
+    };
+    for (zone[1..]) |byte| if (!std.ascii.isDigit(byte)) return null;
+    const hours = std.fmt.parseInt(i64, zone[1..3], 10) catch return null;
+    const minutes = std.fmt.parseInt(i64, zone[3..5], 10) catch return null;
+    if (hours > 14 or minutes > 59) return null;
+    return sign * (hours * 3600 + minutes * 60);
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's `days_from_civil`).
+fn days_from_civil(year: u16, month: u8, day: u8) i64 {
+    assert(month >= 1);
+    assert(month <= 12);
+    const y: i64 = @as(i64, year) - @intFromBool(month <= 2);
+    const era = @divFloor(y, 400);
+    const year_of_era = y - era * 400;
+    const m: i64 = month;
+    const shifted: i64 = if (m > 2) m - 3 else m + 9;
+    const day_of_year = @divFloor(153 * shifted + 2, 5) + @as(i64, day) - 1;
+    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) -
+        @divFloor(year_of_era, 100) + day_of_year;
+    return era * 146_097 + day_of_era - 719_468;
+}
+
+/// Sends the heartbeat: one GET of `url`, no redirect followed, nothing sent but the request
+/// line and the host. `url` is a secret (it lets anyone report the fleet alive), so nothing here
+/// prints it: the log gets "heartbeat sent" or "heartbeat failed: ...". Plain http is refused
+/// except to the loopback address (tests). True if it was sent and answered 2xx.
+pub fn send_heartbeat(
+    client: *std.http.Client,
+    url: []const u8,
+    log: *std.Io.Writer,
+) bool {
+    const uri = std.Uri.parse(url) catch {
+        log.writeAll("sim-fleet: heartbeat failed: the heartbeat file holds no URL\n") catch {};
+        return false;
+    };
+    if (!heartbeat_scheme_allowed(uri)) {
+        log.writeAll("sim-fleet: heartbeat failed: the URL is not https\n") catch {};
+        return false;
+    }
+    var req = client.request(.GET, uri, .{
+        // Seen, never followed: a redirect is a failure.
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .headers = .{
+            .authorization = .omit,
+            .user_agent = .{ .override = "zigcube-sim-fleet" },
+            .accept_encoding = .omit,
+        },
+    }) catch |err| return heartbeat_unanswered(log, err);
+    defer req.deinit();
+    req.sendBodiless() catch |err| return heartbeat_unanswered(log, err);
+    var response = req.receiveHead(&.{}) catch |err| return heartbeat_unanswered(log, err);
+    const status = @backingInt(response.head.status);
+    var transfer: [64]u8 = undefined;
+    // The body says nothing the status does not; it is read so the connection ends cleanly.
+    const limit: std.Io.Limit = .limited(constants.fleet_response_bytes_max);
+    _ = response.reader(&transfer).discard(limit) catch {}; // Its end, or a cut: either will do.
+    if (status < 200 or status >= 300) {
+        log.print("sim-fleet: heartbeat failed: status {d}\n", .{status}) catch {};
+        return false;
+    }
+    log.writeAll("sim-fleet: heartbeat sent\n") catch {};
+    return true;
+}
+
+fn heartbeat_scheme_allowed(uri: std.Uri) bool {
+    if (std.mem.eql(u8, uri.scheme, "https")) return true;
+    if (!std.mem.eql(u8, uri.scheme, "http")) return false;
+    const host = uri.host orelse return false;
+    var buffer: [255]u8 = undefined; // A DNS name's most.
+    const name = host.toRaw(&buffer) catch return false;
+    return std.mem.eql(u8, name, "127.0.0.1");
+}
+
+fn heartbeat_unanswered(log: *std.Io.Writer, err: anyerror) bool {
+    // The error's name only: std's errors carry no part of the URL.
+    log.print("sim-fleet: heartbeat failed: no answer ({s})\n", .{@errorName(err)}) catch {};
+    return false;
+}
+
 /// What a reply's headers say about the rate limit.
 pub const RateHeaders = struct {
     /// `Retry-After` in seconds, or the wait to `x-ratelimit-reset` when none are left.
@@ -295,6 +418,10 @@ pub const Http = struct {
     log: *std.Io.Writer,
     /// From the last rate-limited reply.
     wait_seconds: u32 = 0,
+    /// When the token expires, from the last reply that said (`token_expiry_header`).
+    token_expires: ?i64 = null,
+    /// A reply sent the expiry header in a form `parse_expiry` does not read.
+    token_expiry_unread: bool = false,
 
     /// The REST root; tests point it at a loopback server.
     api: []const u8 = "https://api.github.com",
@@ -324,8 +451,8 @@ pub const Http = struct {
         path: []const u8,
         payload: ?[]const u8,
     ) Error![]const u8 {
-        assert(path.len > 0);
-        assert(path[0] == '/');
+        // Empty: the repository itself (`check_token`).
+        if (path.len > 0) assert(path[0] == '/');
         const url = try std.fmt.allocPrint(arena, "{s}/repos/{s}{s}", .{
             http.api, http.repo, path,
         });
@@ -363,6 +490,8 @@ pub const Http = struct {
         var headers = response.head.iterateHeaders();
         const now = std.Io.Clock.real.now(http.client.io).toSeconds();
         const rate = rate_headers(&headers, now);
+        var expiry_headers = response.head.iterateHeaders();
+        http.read_expiry(&expiry_headers);
         const identity = response.head.content_encoding == .identity;
         var transfer: [64]u8 = undefined;
         const body = response.reader(&transfer).allocRemaining(
@@ -397,7 +526,7 @@ pub const Http = struct {
         why: []const u8,
     ) Error {
         http.log.print("sim-fleet: {s} {s}: no answer from GitHub ({s})\n", .{
-            @tagName(method), path, why,
+            @tagName(method), shown(path), why,
         }) catch {}; // Nowhere else to report it.
         return error.GitHubUnreachable;
     }
@@ -413,12 +542,34 @@ pub const Http = struct {
             error.GitHubGone => "the issue was deleted or moved; it is filed again",
             error.GitHubForbidden => "forbidden; the issue may be locked; skipped",
             error.GitHubRateLimited => "rate limited; GitHub writes wait",
-            else => if (status == 401) "the token is wrong or expired" else "refused",
+            else => if (status == 401) token_refused else "refused",
         };
         http.log.print("sim-fleet: {s} {s}: HTTP {d}: {s}\n", .{
-            @tagName(method), path, status, meaning,
+            @tagName(method), shown(path), status, meaning,
         }) catch {}; // Nowhere else to report it.
         return failure;
+    }
+
+    /// The path a log line names: the token check asks for the repository itself.
+    fn shown(path: []const u8) []const u8 {
+        return if (path.len == 0) "(the repository: token check)" else path;
+    }
+
+    fn read_expiry(http: *Http, headers: *std.http.HeaderIterator) void {
+        while (headers.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, token_expiry_header)) continue;
+            if (parse_expiry(header.value)) |at| {
+                http.token_expires = at;
+            } else {
+                http.token_expiry_unread = true;
+            }
+        }
+    }
+
+    /// Asks GitHub for the repository: does the token still work, and when does it expire. One
+    /// request a round (`sim_fleet heartbeat`), so a round with nothing to file still finds out.
+    pub fn check_token(http: *Http, arena: std.mem.Allocator) Error!void {
+        _ = try http.request(arena, .GET, "", null);
     }
 
     fn http_find(ptr: *anyopaque, arena: std.mem.Allocator, fp: []const u8) Error!?u32 {
@@ -624,4 +775,172 @@ test "every request carries the Authorization header, on a reused connection too
             "\r\nauthorization: Bearer tok-123\r\n",
         ) != null);
     }
+}
+
+test "the token's expiry header is read in either form, and nothing else is" {
+    // 2026-12-01 09:30:00 UTC.
+    const at: i64 = 1_796_117_400;
+    try std.testing.expectEqual(@as(?i64, at), parse_expiry("2026-12-01 09:30:00 UTC"));
+    try std.testing.expectEqual(@as(?i64, at), parse_expiry("2026-12-01 09:30:00"));
+    try std.testing.expectEqual(@as(?i64, at), parse_expiry(" 2026-12-01 01:30:00 -0800"));
+    try std.testing.expectEqual(@as(?i64, at), parse_expiry("2026-12-01 10:30:00 +0100"));
+    try std.testing.expectEqual(@as(?i64, 951_782_400), parse_expiry("2000-02-29 00:00:00 UTC"));
+    try std.testing.expectEqual(@as(?i64, 0), parse_expiry("1970-01-01 00:00:00 UTC"));
+    try std.testing.expectEqual(@as(?i64, null), parse_expiry(""));
+    try std.testing.expectEqual(@as(?i64, null), parse_expiry("2026-12-01"));
+    try std.testing.expectEqual(@as(?i64, null), parse_expiry("2026-13-01 00:00:00 UTC"));
+    try std.testing.expectEqual(@as(?i64, null), parse_expiry("2026-12-01 24:00:00 UTC"));
+    try std.testing.expectEqual(@as(?i64, null), parse_expiry("2026-12-01 09:30:00 PST"));
+    try std.testing.expectEqual(@as(?i64, null), parse_expiry("2026-12-01 09:30:00 +08:00"));
+    try std.testing.expectEqual(@as(?i64, null), parse_expiry("2026-12-01 09:30:00 UTC x"));
+    try std.testing.expectEqual(@as(?i64, null), parse_expiry("Tue, 01 Dec 2026 09:30:00 GMT"));
+}
+
+/// Serves one request with `reply` (a whole response) and records its head.
+fn serve_one(io: std.Io, listener: *std.Io.net.Server, reply: []const u8, recorded: *Recorded) void {
+    const stream = listener.accept(io) catch return;
+    defer stream.close(io);
+    var in_buffer: [2048]u8 = undefined;
+    var out_buffer: [512]u8 = undefined;
+    var reader = stream.reader(io, &in_buffer);
+    var writer = stream.writer(io, &out_buffer);
+    var length: usize = 0;
+    while (true) {
+        const line = reader.interface.takeDelimiterInclusive('\n') catch return;
+        const slot = &recorded.heads[0];
+        if (length + line.len > slot.len) return;
+        @memcpy(slot[length..][0..line.len], line);
+        length += line.len;
+        if (line.len == 2) break; // The empty line ends the head.
+    }
+    recorded.lens[0] = @intCast(length);
+    recorded.count = 1;
+    writer.interface.writeAll(reply) catch return;
+    writer.interface.flush() catch return;
+}
+
+const Served = struct {
+    log_buffer: [512]u8 = undefined,
+    log: std.Io.Writer = undefined,
+    recorded: Recorded = .{},
+    url_buffer: [96]u8 = undefined,
+    url: []const u8 = "",
+};
+
+/// Runs `serve_one` with `reply` and sends the heartbeat to it; the URL carries a secret path.
+fn heartbeat_against(served: *Served, reply: []const u8) !bool {
+    const io = std.testing.io;
+    const any = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try any.listen(io, .{});
+    defer listener.deinit(io);
+    served.log = .fixed(&served.log_buffer);
+    served.url = try std.fmt.bufPrint(&served.url_buffer, "http://127.0.0.1:{d}/ping/s3cr3t", .{
+        listener.socket.address.getPort(),
+    });
+    const args = .{ io, &listener, reply, &served.recorded };
+    const thread = try std.Thread.spawn(.{}, serve_one, args);
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+    const sent = send_heartbeat(&client, served.url, &served.log);
+    thread.join();
+    return sent;
+}
+
+test "the heartbeat is one GET with no credentials; its URL is never logged" {
+    var served: Served = .{};
+    const ok = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nOK";
+    try std.testing.expect(try heartbeat_against(&served, ok));
+    try std.testing.expectEqualStrings("sim-fleet: heartbeat sent\n", served.log.buffered());
+    const head = served.recorded.head(0);
+    try std.testing.expect(std.mem.startsWith(u8, head, "GET /ping/s3cr3t HTTP/1.1\r\n"));
+    try std.testing.expect(std.ascii.findIgnoreCase(head, "authorization") == null);
+}
+
+test "a heartbeat answered with a redirect is a failure, and the redirect is not followed" {
+    // Goal: never follow a redirect (the brief), so the URL's secret and the request stay with
+    // the host it names. Method: a 302 to another host; one request is made, the log says the
+    // status, and neither URL is logged.
+    var served: Served = .{};
+    const moved = "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.2:1/elsewhere\r\n" ++
+        "content-length: 0\r\nconnection: close\r\n\r\n";
+    try std.testing.expect(!try heartbeat_against(&served, moved));
+    try std.testing.expectEqualStrings(
+        "sim-fleet: heartbeat failed: status 302\n",
+        served.log.buffered(),
+    );
+    try std.testing.expectEqual(@as(u32, 1), served.recorded.count);
+    var served_error: Served = .{};
+    const failed = "HTTP/1.1 500 Oops\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    try std.testing.expect(!try heartbeat_against(&served_error, failed));
+    try std.testing.expectEqualStrings(
+        "sim-fleet: heartbeat failed: status 500\n",
+        served_error.log.buffered(),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, served_error.log.buffered(), "s3cr3t") == null);
+}
+
+test "a heartbeat URL that is not https, or not a URL, is refused unsent and unlogged" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var buffer: [256]u8 = undefined;
+    var log: std.Io.Writer = .fixed(&buffer);
+    try std.testing.expect(!send_heartbeat(&client, "http://example.com/s3cr3t", &log));
+    try std.testing.expect(!send_heartbeat(&client, "s3cr3t", &log));
+    try std.testing.expect(!send_heartbeat(&client, "ftp://example.com/s3cr3t", &log));
+    try std.testing.expectEqualStrings(
+        "sim-fleet: heartbeat failed: the URL is not https\n" ++
+            "sim-fleet: heartbeat failed: the heartbeat file holds no URL\n" ++
+            "sim-fleet: heartbeat failed: the URL is not https\n",
+        log.buffered(),
+    );
+}
+
+/// Runs `serve_one` with `reply` and checks the token against it.
+fn check_against(served: *Served, http: *Http, reply: []const u8) Error!void {
+    const io = std.testing.io;
+    const any = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable; // A literal.
+    var listener = any.listen(io, .{}) catch return error.GitHubUnreachable;
+    defer listener.deinit(io);
+    served.log = .fixed(&served.log_buffer);
+    served.url = std.fmt.bufPrint(&served.url_buffer, "http://127.0.0.1:{d}", .{
+        listener.socket.address.getPort(),
+    }) catch unreachable; // 96 bytes hold the loopback address and a port.
+    http.api = served.url;
+    http.log = &served.log;
+    const args = .{ io, &listener, reply, &served.recorded };
+    const thread = std.Thread.spawn(.{}, serve_one, args) catch return error.GitHubUnreachable;
+    defer thread.join();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    return http.check_token(arena_state.allocator());
+}
+
+test "the token check reads the expiry header; a 401 says to replace the token" {
+    var served: Served = .{};
+    var sink: [8]u8 = undefined;
+    var unused: std.Io.Writer = .fixed(&sink);
+    var http: Http = .{
+        .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+        .repo = "o/r",
+        .token = "tok-123",
+        .log = &unused,
+    };
+    defer http.client.deinit();
+    const ok = "HTTP/1.1 200 OK\r\n" ++
+        "GitHub-Authentication-Token-Expiration: 2026-12-01 09:30:00 UTC\r\n" ++
+        "content-length: 2\r\nconnection: close\r\n\r\n{}";
+    try check_against(&served, &http, ok);
+    try std.testing.expectEqual(@as(?i64, 1_796_117_400), http.token_expires);
+    try std.testing.expect(!http.token_expiry_unread);
+    const head = served.recorded.head(0);
+    try std.testing.expect(std.mem.startsWith(u8, head, "GET /repos/o/r HTTP/1.1\r\n"));
+    var refused: Served = .{};
+    const denied = "HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\n" ++
+        "connection: close\r\n\r\n{}";
+    try std.testing.expectError(error.GitHubRefused, check_against(&refused, &http, denied));
+    try std.testing.expectEqualStrings(
+        "sim-fleet: GET (the repository: token check): HTTP 401: " ++ token_refused ++ "\n",
+        refused.log.buffered(),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, refused.log.buffered(), "tok-123") == null);
 }
