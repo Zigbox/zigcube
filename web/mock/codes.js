@@ -355,7 +355,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "external",
     "summary": "a stored record can't be read",
-    "explanation": "A controller, the agent or the API read a value from the store that is\nnot a record of the kind its key says: not JSON, a field of the wrong\ntype, a name that breaks the naming rules, or fields that contradict each\nother (a rollout back to generation 0). Zigcube validates what it writes,\nso something else wrote this key, or the store was edited by hand.\n\nThe cause line names the key. Fix or delete that key (zcube get shows\nit); the controller skips nothing silently and tries again on its next\npass."
+    "explanation": "A controller, the agent or the API read a value from the store that is\nnot a record of the kind its key says: not JSON, a field of the wrong\ntype, a name that breaks the naming rules, a health check outside the\nbounds apply enforces, or fields that contradict each other (a rollout\nback to generation 0). Zigcube validates what it writes, so something\nelse wrote this key, or the store was edited by hand.\n\nThe cause line names the key. Fix or delete that key (zcube get shows\nit); the controller skips nothing silently and tries again on its next\npass."
   },
   {
     "code": "ZC-E0302",
@@ -467,7 +467,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "the runtime failed an operation",
-    "explanation": "The runtime could not carry out a request that is not about one workload's\nimage or command: listing its containers, stopping one, reading its state\ndirectory, or running out of the slots it provisions at startup.\n\nThe cause line names the operation and what the host reported. A failure\nto start one workload is not this code: it is reported on that workload,\nwith the runtime's own diagnostic."
+    "explanation": "The runtime could not carry out a request that is not about one workload's\nimage or command: listing its containers, stopping one, reading its state\ndirectory, or running out of the slots it provisions at startup. A health\ncheck is refused with it when its worker (the `zcube-agent probe` process\nthat runs the check in the container) could not start, ended without a\nresult, or did not end in time.\n\nThe cause line names the operation and what the host reported. A failure\nto start one workload is not this code: it is reported on that workload,\nwith the runtime's own diagnostic."
   },
   {
     "code": "ZC-E0503",

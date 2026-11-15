@@ -74,6 +74,9 @@ test {
 test {
     _ = @import("cli_rollout.zig");
     _ = @import("cli_test.zig");
+    _ = @import("probe_scheduler.zig");
+    _ = @import("agent_health.zig");
+    _ = @import("agent_health_test.zig");
     _ = @import("tidy.zig");
 }
 
@@ -104,6 +107,8 @@ comptime {
     _ = @import("secure_random.zig");
     _ = @import("peer_server.zig");
     _ = @import("fetch_cli.zig");
+    _ = @import("probe_worker.zig");
+    _ = @import("zigbox_probes.zig");
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
     _ = @import("agent_run.zig");

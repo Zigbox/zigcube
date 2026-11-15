@@ -16,7 +16,8 @@
 //! ```
 //!
 //! `zcube-agent supervise <container directory>` is the supervisor mode (`fake_supervisor.zig`),
-//! used only by the agent itself.
+//! and `zcube-agent probe <replica> <timeout_ms> <command...>` the health check worker
+//! (`probe_worker.zig`), both used only by the agent itself.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -102,6 +103,8 @@ pub const Command = union(enum) {
     supervise_zigbox: []const u8,
     /// `zcube-agent fetch ...` (`fetch_cli.zig`): the arguments after `fetch`.
     fetch: []const []const u8,
+    /// `zcube-agent probe ...` (`probe_worker.zig`): the arguments after `probe`.
+    probe: []const []const u8,
     version,
     help,
 };
@@ -153,6 +156,7 @@ const Flags = struct {
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
     if (args.len >= 1 and std.mem.eql(u8, args[0], "fetch")) return .{ .fetch = args[1..] };
+    if (args.len >= 1 and std.mem.eql(u8, args[0], "probe")) return .{ .probe = args[1..] };
     if (args.len >= 1) {
         const zigbox_mode = std.mem.eql(u8, args[0], "supervise-zigbox");
         if (zigbox_mode or std.mem.eql(u8, args[0], "supervise")) {

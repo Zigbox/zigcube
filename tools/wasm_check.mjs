@@ -95,6 +95,7 @@ if (simCluster) {
     profileIndex(CLUSTER_PROFILES, profileText),
     0,
     0,
+    process.argv.slice(3).includes("--health") ? 1 : 0,
   );
   const label = simC1 ? "sim-c1" : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);

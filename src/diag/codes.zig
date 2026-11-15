@@ -983,9 +983,10 @@ pub const registry = [_]Entry{
         .explanation =
         \\A controller, the agent or the API read a value from the store that is
         \\not a record of the kind its key says: not JSON, a field of the wrong
-        \\type, a name that breaks the naming rules, or fields that contradict each
-        \\other (a rollout back to generation 0). Zigcube validates what it writes,
-        \\so something else wrote this key, or the store was edited by hand.
+        \\type, a name that breaks the naming rules, a health check outside the
+        \\bounds apply enforces, or fields that contradict each other (a rollout
+        \\back to generation 0). Zigcube validates what it writes, so something
+        \\else wrote this key, or the store was edited by hand.
         \\
         \\The cause line names the key. Fix or delete that key (zcube get shows
         \\it); the controller skips nothing silently and tries again on its next
@@ -1252,7 +1253,10 @@ pub const registry = [_]Entry{
         .explanation =
         \\The runtime could not carry out a request that is not about one workload's
         \\image or command: listing its containers, stopping one, reading its state
-        \\directory, or running out of the slots it provisions at startup.
+        \\directory, or running out of the slots it provisions at startup. A health
+        \\check is refused with it when its worker (the `zcube-agent probe` process
+        \\that runs the check in the container) could not start, ended without a
+        \\result, or did not end in time.
         \\
         \\The cause line names the operation and what the host reported. A failure
         \\to start one workload is not this code: it is reported on that workload,

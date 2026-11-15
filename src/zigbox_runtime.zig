@@ -14,6 +14,12 @@
 //! `lost` when its supervisor is gone and left nothing. A record older than the launch is an
 //! earlier container of the same name and is ignored.
 //!
+//! **Health checks run in a worker.** `probe_begin` starts `zcube-agent probe <name> <timeout>
+//! <command...>` (`probe_worker.zig`), which runs the command in the container with
+//! `zigbox.exec_start` and `exec_wait`, kills it at the timeout and writes one line of result;
+//! `probe_poll` reaps it without blocking (`zigbox_probes.zig`). Exec blocks, so it never runs in
+//! the agent. docs/decisions/2026-11-14-probe-worker.md.
+//!
 //! ## Where it differs from the contract
 //!
 //! `stop` does not wait out a grace period (`lifecycle.stop` would block the agent's lease for
@@ -35,6 +41,7 @@ const files = @import("fake_files.zig");
 const launch = @import("zigbox_launch.zig");
 const process_session = @import("process_session.zig");
 const map = @import("zigbox_map.zig");
+const zigbox_probes = @import("zigbox_probes.zig");
 const runtime = @import("runtime.zig");
 
 const Allocator = std.mem.Allocator;
@@ -100,6 +107,8 @@ pub const ZigboxRuntime = struct {
     children_count: u32,
     known: [constants.runtime_handles_max]Known,
     known_count: u32,
+    /// The health checks in flight, each a `zcube-agent probe` worker.
+    probes: zigbox_probes.Probes,
 
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
@@ -108,6 +117,8 @@ pub const ZigboxRuntime = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .probe_begin = probe_begin_impl,
+        .probe_poll = probe_poll_impl,
     };
 
     /// Initialises in place (the tables are large): opens the directories and takes the lock.
@@ -124,6 +135,7 @@ pub const ZigboxRuntime = struct {
         self.options = options;
         self.children_count = 0;
         self.known_count = 0;
+        self.probes = .{};
         self.state = Dir.openDirAbsolute(io, options.state_dir, .{}) catch
             return state_dir_failed(diag, options.state_dir, "open it");
         errdefer self.state.close(io);
@@ -147,6 +159,7 @@ pub const ZigboxRuntime = struct {
     }
 
     pub fn deinit(self: *ZigboxRuntime) void {
+        self.probes.deinit();
         self.options.gpa.free(self.entries);
         self.lock.close(self.io);
         self.root.close(self.io);
@@ -317,7 +330,9 @@ pub const ZigboxRuntime = struct {
         diag: *Diag,
     ) runtime.Error!void {
         const number = if (grace_ms > 0) runtime.signal_term else runtime.signal_kill;
-        return from(context).deliver(handle, number, .wait, diag);
+        const self = from(context);
+        self.probes.forget(handle); // A check of a container that is going would be refused.
+        return self.deliver(handle, number, .wait, diag);
     }
 
     fn signal_impl(
@@ -495,6 +510,59 @@ pub const ZigboxRuntime = struct {
             }) catch return no_memory(diag);
         }
         return result.items;
+    }
+
+    // ---- health checks ----
+
+    /// A check is a `zcube-agent probe` worker that runs the command with Zigbox `exec`
+    /// (`zigbox_probes.zig`, `probe_worker.zig`). An unknown container is `NotFound`; one that is
+    /// not running comes to `refused` with Zigbox's own code (ZBX-E0220, the container is not
+    /// running), which the agent reports as ZC-E0516.
+    fn probe_begin_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) runtime.Error!void {
+        assert(command.len > 0);
+        assert(timeout_ms > 0);
+        const self = from(context);
+        _ = try self.inspect_or_forget(handle, diag);
+        const now = self.host.monotonic_ms();
+        try self.probes.begin(
+            self.io,
+            self.options.supervisor_exe,
+            handle,
+            command,
+            timeout_ms,
+            now,
+            diag,
+        );
+    }
+
+    fn probe_poll_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        diag: *Diag,
+    ) runtime.Error!runtime.ProbeResult {
+        const self = from(context);
+        _ = try self.inspect_or_forget(handle, diag);
+        return self.probes.poll(handle, self.host.monotonic_ms()) orelse
+            .{ .refused = no_probe() };
+    }
+
+    /// `inspect`; a container that is gone also loses its check in flight, whose worker would
+    /// otherwise hold its slot until its timeout and grace.
+    fn inspect_or_forget(
+        self: *ZigboxRuntime,
+        handle: runtime.Handle,
+        diag: *Diag,
+    ) runtime.Error!runtime.Status {
+        return inspect_impl(self, handle, diag) catch |err| {
+            if (err == error.NotFound) self.probes.forget(handle);
+            return err;
+        };
     }
 
     // ---- events ----
@@ -684,6 +752,18 @@ fn refusal_diagnostic(reason: map.Refusal, spec: *const runtime.Spec) Diagnostic
         collector.fix(.{ .sentence = "shorten it in the service file, then apply it again" });
     }
     collector.while_("starting container {s}", .{spec.name});
+    var out: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&out, &collector);
+    return out;
+}
+
+/// A poll with no check in flight (none begun, or its result already read).
+fn no_probe() Diagnostic {
+    var collector: Diag = undefined;
+    collector.reset();
+    collector.raise(.E0502);
+    collector.cause("no health check is in flight", .{});
+    collector.fix(.{ .sentence = "begin a check before polling it" });
     var out: Diagnostic = undefined;
     diag_mod.to_diagnostic(&out, &collector);
     return out;

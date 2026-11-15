@@ -122,6 +122,19 @@ for kv in json.load(sys.stdin)["kvs"]:
 ' "$1"
 }
 
+# `replica status health health_failures last_probe_exit diagnostic_code` for every observed
+# replica of a service (`-` for a field the record does not have).
+observed_health() {
+    api_get "/v1/list?prefix=/observed/${ON:-$NODE}/" | python3 -c '
+import json, sys
+for kv in json.load(sys.stdin)["kvs"]:
+    v = kv["value"]
+    if v["replica"].startswith(sys.argv[1] + "-"):
+        print(v["replica"], v["status"], v.get("health", "-"), v.get("health_failures", "-"),
+              v.get("last_probe_exit", "-"), (v.get("diagnostic") or {}).get("code", "-"))
+' "$1"
+}
+
 running_count() { observed "$1" | grep -c ' running '; }
 has_code() { observed "$1" | grep -q " $2\$"; }
 has_exit() { observed "$1" | grep -q " stopped $2 "; }
@@ -294,6 +307,84 @@ stage_scale0() {
         "launch box-5: $(ls -l "$STATE"/zigbox/box-5 | tr '\n' ';') supervisor.pid: $(cat "$STATE"/zigbox/box-5/supervisor.pid)" \
         "zbx ps: $("$BIN/zbx" ps --all 2>&1 | tr '\n' ';')"
     ok "removing a service during its pull leaves the agent and box running"
+}
+
+# ---- Health checks (C3 slice 10): the real probe, `zcube-agent probe` over Zigbox exec --------
+
+# A replica whose check passes for its first 30 s and fails after: the container makes /tmp/ok,
+# and removes it 30 s later. Its health is checked every 2 s with `test -f /tmp/ok`, which runs
+# in the container through the agent's probe worker.
+flip_json() {
+    echo "[\"sh\",\"-c\",\"touch /tmp/ok; sleep 30; rm -f /tmp/ok; while true; do sleep 1; done # $1\"]"
+}
+health_json() { # command-json timeout_ms
+    echo "{\"command\":$1,\"interval_ms\":2000,\"timeout_ms\":$2,\"failure_threshold\":2,\"success_threshold\":1}"
+}
+health_service() { # name command health
+    echo "{\"name\":\"$1\",\"image\":\"$ALPINE_TREE\",\"replicas\":1,\"limits\":{},\"command\":$2,\"health\":$3}"
+}
+health_is() { observed_health "$1" | grep -q "^$1-[0-9]* running $2 "; }
+health_line() { observed_health "$1" | tr '\n' ';'; }
+
+stage_health() {
+    apply "$(health_service flip "$(flip_json flip)" "$(health_json '["test","-f","/tmp/ok"]' 1000)")"
+    until_ok 90 "flip to be observed healthy" health_is flip healthy
+    flip_pid=$(box_pids flip)
+    ok "a check that passes is observed healthy: $(health_line flip)"
+    until_ok 90 "flip to be observed unhealthy" health_is flip unhealthy
+    observed_health flip | grep -q " unhealthy [0-9]* 1 -\$" \
+        || fail "unhealthy flip should say exit 1 and no diagnostic: $(health_line flip)"
+    [ "$(box_pids flip)" = "$flip_pid" ] || fail "flip's container changed while it was checked"
+    ok "the check flips: observed unhealthy, last probe exit 1: $(health_line flip)"
+
+    # A check that outlives its timeout: killed by the worker, a failure with ZC-W0502. The
+    # command leaves a second `sleep` in the background; the agent kills the worker's whole
+    # group, so at most the current check's two are alive at any time.
+    apply "$(health_service slow "$(loop_json slow)" \
+        "$(health_json '["sh","-c","sleep 30 & sleep 30"]' 500)")"
+    slow_timed_out() { observed_health slow | grep -q " running unhealthy .* ZC-W0502\$"; }
+    until_ok 90 "slow's check to time out" slow_timed_out
+    sleep 5
+    few_sleeps() { [ "$(pgrep -fc '^sleep 30$' || true)" -le 2 ]; }
+    until_ok 5 "at most the current check's two sleeps ($(pgrep -fc '^sleep 30$' || true) now)" \
+        few_sleeps
+    ok "a check past its timeout is killed with its group, unhealthy, ZC-W0502: $(health_line slow)"
+
+    # A check that passes but leaves a child running: the child dies with the check.
+    apply "$(health_service lefty "$(loop_json lefty)" \
+        "$(health_json '["sh","-c","sleep 31 & exit 0"]' 1000)")"
+    until_ok 90 "lefty to be observed healthy" health_is lefty healthy
+    sleep 3
+    few_left() { [ "$(pgrep -fc '^sleep 31$' || true)" -le 1 ]; }
+    until_ok 5 "at most the current check's sleep ($(pgrep -fc '^sleep 31$' || true) now)" \
+        few_left
+    ok "a check that passes leaves nothing behind: $(health_line lefty)"
+
+    # An agent restart: the replicas are adopted and checked again by the new agent, which
+    # starts from `unknown` (the counts are memory only). /tmp/ok is made again while no agent
+    # runs, so only a check by the new agent can say healthy.
+    supervisors=$(pgrep -fc 'zcube-agent supervise-zigbox')
+    kill -TERM "$(agent_pid)"
+    gone() { ! agent_pid; }
+    until_ok 30 "the agent to stop" gone
+    pgrep -f 'zcube-agent probe' >/dev/null && fail "a probe worker outlived its agent"
+    fpid=$(box_pids flip)
+    [ -n "$fpid" ] || fail "stopping the agent stopped flip's container"
+    # The container's root as the host sees it; its root user is this user.
+    touch "/proc/$fpid/root/tmp/ok" || fail "could not make /tmp/ok in flip's container (as $(id -un), /proc/$fpid/root)"
+    start_agent
+    until_ok 60 "flip to be checked healthy again after the agent restart" health_is flip healthy
+    [ "$(box_pids flip)" = "$fpid" ] || fail "flip's container changed over the agent restart"
+    [ "$(pgrep -fc 'zcube-agent supervise-zigbox')" -eq "$supervisors" ] || fail "supervisors changed"
+    ok "after an agent restart, the adopted replica is checked again: $(health_line flip)"
+    for s in flip slow lefty; do
+        curl -sf -X DELETE "$API/v1/services/$s" >/dev/null || fail "delete $s"
+    done
+    no_health() {
+        [ "$(count flip)" -eq 0 ] && [ "$(count slow)" -eq 0 ] && [ "$(count lefty)" -eq 0 ]
+    }
+    until_ok 60 "flip, slow and lefty to stop" no_health
+    two_boxes || fail "box was disturbed by the health checks: $(observed box | tr '\n' ';')"
 }
 
 # ---- Peer fetch (C2 slice 8, M4): agent B gets images from agent A --------------------------

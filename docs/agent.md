@@ -318,6 +318,75 @@ be interrupted, so stopping a relay whose upstream name is black-holed can wait 
 
 The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a run by its id.
 
+## Health checks (C3 slice 9)
+
+A replica whose spec has `health` (keys.md, `/replicas` version 4) is checked by the agent once its
+container is `running`. `agent_health.zig` runs each step, before the replicas are reconciled;
+`probe_scheduler.zig` keeps the times and the counts. Both are core code: they take the
+monotonic clock from the step and never block.
+
+- **Through the seam.** `Runtime.probe_begin(handle, command, timeout_ms)` starts a check and
+  returns at once; `Runtime.probe_poll(handle)` says `running`, `exited` (0 passes, anything else
+  fails), `timed_out` (a failure, ZC-W0502) or `refused` (the check could not run). The runtime
+  kills a check at its `timeout_ms`. FakeRuntime settles a check from the fault file
+  (`unhealthy` exits 1, `probe_timeout` times out, `probe_refused` is refused, otherwise exit 0;
+  the word stays until the container ends); SimRuntime from `set_health`; ZigboxRuntime runs it
+  in the container (below).
+- **ZigboxRuntime (C3 slice 10).** `probe_begin` starts a worker, `zcube-agent probe <replica>
+  <timeout_ms> <command...>` (internal, `src/probe_worker.zig`), as the leader of a process
+  group of its own, with its stdout on a pipe. The worker runs the command in the container
+  with Zigbox's `exec_start` and `exec_wait` (no terminal; the command's own output goes to
+  `/dev/null`), kills it with SIGKILL through a pidfd at `timeout_ms` (counted from when the
+  command has started, after `exec_start`), and writes one line, `exited N`, `timed_out` or
+  `refused <diagnostic JSON>`, then exits. The command, and anything it starts, stays in the
+  worker's group. Every end of a check kills that whole group, so a child the command left
+  running (`sleep 30 &`) dies with the check whether it passed, failed or timed out:
+  `probe_poll` sees the worker end with `waitid(WNOWAIT)`, which keeps its pid (the group's
+  id) from being reused, sends SIGKILL to the group, then reaps the worker and reads its line
+  (`src/zigbox_probes.zig`). A command that calls `setsid` or `setpgid` leaves the group, and
+  what it starts then is not killed. A worker that ends without a line is refused (ZC-E0502),
+  and one still running 5 s past its check's timeout is killed with its group and refused.
+  Nothing waits: every wait is `WNOHANG`.
+- **The table of workers.** A new check of the same replica, a `stop` of the container, a
+  container that is gone (`probe_begin` or `probe_poll` answers `NotFound`) or the agent's exit
+  abandons the check in flight: SIGKILL to its group, and the worker stays in the table, marked
+  killed, until a later `probe_begin` or `probe_poll` reaps it. Those calls also sweep checks
+  nobody polls any more (the health check was removed): one 5 s past its timeout is collected
+  if its worker ended and abandoned if not, so no check holds its slot or its pipe longer. The
+  table holds as many live checks as the runtime has containers (512) and as many killed
+  workers again; when the live checks fill their share, a worker that ended is dropped first,
+  else the check begun first is abandoned, and when workers that did not die of SIGKILL fill
+  the table, `probe_begin` is refused (ZC-E0502) rather than waiting for them.
+- **When.** The first check begins the step the agent first sees the container running; the next
+  is due `interval_ms` after the last one began (or at once, if it ran longer). At most
+  `probes_concurrent_max` (8) are in flight per node; the due ones go in order of due time, then
+  name. A check in flight is polled `probe_poll_ms_min` (100 ms) after it began, then each
+  time it has run twice as long, and at its timeout (and on the same doubling past it, until the
+  runtime reports it): a check that ends early is seen early, at a few polls per check.
+- **Cost.** Each due check and each poll wakes the agent for a whole step (heartbeat, listing,
+  store reads), so a node with N checked containers at an interval of I steps about 2N/I more
+  times a second; the cluster simulation's busy-loop bound (200 steps a minute) holds at a 5 s
+  interval, not at 1 s with three replicas a node.
+- **A stored check is valid.** `records.read` refuses (ZC-E0301) a service, replica or history
+  record whose `health` breaks a bound `apply` enforces (`records.health_valid`), so a bad record
+  in the store fails one read, never an assertion in the agent's step.
+- **Counting.** `failure_threshold` failures in a row make the replica `unhealthy`;
+  `success_threshold` passes in a row make it `healthy`. A failure inside `start_period_ms`, counted
+  from the container's `started_at_ms`, is not counted; a pass inside it counts, and does not end
+  the period early. A refused check counts as neither: the verdict stands, and the record carries
+  ZC-E0516 with the runtime's code and cause until a check runs again.
+- **Reporting.** The observed record (keys.md, version 3) gets `health`, `health_failures` and
+  `last_probe_exit`, and the diagnostic of a check that timed out or was refused. It is written on
+  a change of the verdict or of the kind of problem (none, timed out, refused), never on a timer
+  and not for each check: `health_failures` and `last_probe_exit` are what the checks said at that
+  change (a record that turned `unhealthy` says `failure_threshold` failures, not the count since).
+- **Memory only.** The counts are not kept on disk: a restarted agent reports `unknown` for every
+  checked replica until its checks settle the verdict again (the start period, counted from the
+  container's start, is not restarted). A check in flight when the agent died is never polled;
+  the runtime forgets it.
+- **Not yet.** The verdict changes no placement and no rollout (later slices), and neither the
+  API nor `zcube apply` takes `health` until slice 11, so `agent-smoke` cannot exercise it.
+
 ## What survives what
 
 | Event | Containers | The agent's work |
@@ -329,6 +398,7 @@ The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a
 | a command is killed | the supervisor records it | reported; the controller replaces the replica |
 | a supervisor is killed | the command is killed by the agent | reported `lost` with `ZC-E0509`; replaced |
 | the host restarts | none | everything is `lost`; replaced; a kept lease of another boot (`/proc/sys/kernel/random/boot_id` in `lease.json`) fences |
+| agent restarted, containers running | keep running | every checked replica reports health `unknown` until its checks settle it again |
 | the agent dies while fencing | keep fencing: the kept `fencing` flag makes the next agent finish the fence by the first kill time | as above |
 
 ## What the real-process model showed about `Runtime`

@@ -408,6 +408,8 @@ fn validate_health(ctx: *const Context, health: records.Health) Error!void {
         return refuse(ctx, .E0125, "health.success_threshold is 0; it must be at least 1", .{});
     }
     try validate_health_bounds(ctx, health);
+    // One rule: what `apply` admits is what `records.read` accepts back.
+    assert(records.health_valid(health));
 }
 
 fn validate_health_bounds(ctx: *const Context, health: records.Health) Error!void {

@@ -41,10 +41,12 @@ const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const agent_jobs = @import("agent_jobs.zig");
 const c1_teeth = @import("c1_teeth.zig");
+const agent_health = @import("agent_health.zig");
 const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
 const compare_sets = @import("compare_sets.zig");
 const node_store = @import("node_store.zig");
+const probe_scheduler = @import("probe_scheduler.zig");
 const records = @import("records.zig");
 const runtime = @import("runtime.zig");
 const store = @import("store.zig");
@@ -246,6 +248,9 @@ pub const Agent = struct {
     pull_drops: u32,
     pull_drop_text: [pull_drop_text_bytes]u8,
     pull_drop_len: u8,
+    /// The health checks of the replicas this node runs (C3), in memory only: a restarted agent
+    /// reports every replica's health `unknown` until its checks run again.
+    probes: probe_scheduler.Table,
 
     const store_refusal_text_bytes = 160;
     const pull_drop_text_bytes = 200;
@@ -320,6 +325,7 @@ pub const Agent = struct {
         agent.steps = 0;
         agent.input_failure_run = 0;
         agent.input_failure_len = 0;
+        agent.probes.clear();
     }
 
     /// Keeps what the last failed input fetch of `run` said.
@@ -452,6 +458,9 @@ pub const Agent = struct {
         kept: *Kept,
     ) u32 {
         var acted: u32 = 0;
+        // A failed health stage stops the replica stages (`replicas` checks `stopped`), not the
+        // job pass below (#247).
+        kept.stage(agent, ctx, "run the health checks", pass.health_checks());
         pass.replicas(kept);
         // The job pass runs even after a failure that is not the runtime's, in a replica stage
         // (#247), in the loading or in the image summary (#142): it then makes one read (the
@@ -562,6 +571,10 @@ pub const Agent = struct {
         }
         if (agent.deadline_wake_mono_ms != maxInt(u64)) {
             wake = @min(wake, now + (agent.deadline_wake_mono_ms -| mono));
+        }
+        const probes_wake_mono_ms = agent.probes.wake_ms(mono);
+        if (probes_wake_mono_ms != maxInt(u64)) {
+            wake = @min(wake, now + (probes_wake_mono_ms -| mono));
         }
         return @max(wake, now);
     }
@@ -1153,6 +1166,29 @@ const Pass = struct {
             return failures.no_memory(ctx.diag);
     }
 
+    // ---- Health checks ----
+
+    /// Runs the health checks of this node's replicas whose containers run (`agent_health`).
+    /// Before the replicas' reports, so they carry the results this step took.
+    fn health_checks(pass: *Pass) Error!void {
+        const ctx = pass.ctx;
+        var targets: std.ArrayList(agent_health.Target) = .empty;
+        for (pass.mine) |*item| {
+            const health = &(item.rec.health orelse continue);
+            const listing = find_listing_by_replica(pass.listings, item.rec.id) orelse continue;
+            if (listing.status != .running) continue;
+            if (!is_this_replica(listing, item)) continue;
+            const seen = pass.observed_for(item);
+            targets.append(ctx.arena, .{
+                .handle = listing.handle,
+                .created = item.kv.create_revision,
+                .health = health,
+                .started_at_ms = if (seen) |record| record.started_at_ms else null,
+            }) catch return failures.no_memory(ctx.diag);
+        }
+        agent_health.step(&pass.agent.probes, ctx, targets.items);
+    }
+
     // ---- Desired replicas ----
 
     fn replicas(pass: *Pass, kept: *Kept) void {
@@ -1240,6 +1276,9 @@ const Pass = struct {
             .starting => wanted.status = .starting,
             .running => {},
             .stopped => |reason| try pass.apply_exit(&wanted, reason),
+        }
+        if (wanted.status != .stopped) {
+            try agent_health.fill(&pass.agent.probes, pass.ctx, replica, &wanted);
         }
         if (seen) |record| {
             if (same_state(record, &wanted)) return;
@@ -1501,7 +1540,10 @@ fn same_state(first: *const records.Observed, second: *const records.Observed) b
     if (first.exit) |left| {
         if (!left.equal(second.exit.?)) return false;
     }
-    return true;
+    // The health verdict and the kind of check problem are state; the failures in a row and the
+    // last exit are what the checks had said when one of those last changed (docs/keys.md).
+    if (first.health != second.health) return false;
+    return agent_health.problem_of(first) == agent_health.problem_of(second);
 }
 
 // The test-only fault is a constant only a root file can switch on, and no root that runs these

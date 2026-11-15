@@ -79,6 +79,31 @@ const Ended = union(enum) {
     lost,
 };
 
+/// How a container's health checks (C3) come out, scripted by `set_health`. Every container
+/// starts `healthy`, and the script draws nothing from the seed, so a world without health
+/// checks runs as it did before them.
+pub const HealthScript = enum {
+    /// The check exits 0 after `probe_run_ms`.
+    healthy,
+    /// The check exits 1 after `probe_run_ms`.
+    unhealthy,
+    /// The check never ends by itself: it times out.
+    hangs,
+    /// The check cannot run (as Zigbox refusing the exec would): `refused`.
+    refuses,
+    /// The runtime refuses to begin the check: `probe_begin` fails with ZC-E0502.
+    refuses_to_begin,
+};
+
+/// How long a simulated health check runs before it exits, unless its timeout is shorter.
+pub const probe_run_ms: u32 = 20;
+
+/// A health check in flight on a container.
+const Probe = struct {
+    began_ms: u64,
+    timeout_ms: u32,
+};
+
 const Phase = union(enum) {
     running,
     /// A stop was asked for; the container is killed at this time (ms on the clock).
@@ -101,6 +126,8 @@ const Container = struct {
     /// The listener of the container's relay is open. Opened at start, closed by every ending
     /// (`end`) and gone with the container when its node's disk is wiped (the host died).
     relay_open: bool = false,
+    health: HealthScript = .healthy,
+    probe: ?Probe = null,
 };
 
 const Change = struct {
@@ -123,6 +150,9 @@ pub const SimRuntime = struct {
     /// simulation sets it to keep a ledger of starts (sim-c1's J2 and J7).
     on_start: ?*const fn (context: *anyopaque, spec: *const runtime.Spec) void = null,
     on_start_context: *anyopaque = undefined,
+    /// Health checks begun and refused at begin so far (the report's tally of the probe seam).
+    probes_begun: u32 = 0,
+    probes_refused: u32 = 0,
     /// Listeners opened and closed so far (the report's tally of the relay model).
     relays_opened: u32 = 0,
     relays_closed: u32 = 0,
@@ -140,6 +170,8 @@ pub const SimRuntime = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .probe_begin = probe_begin_impl,
+        .probe_poll = probe_poll_impl,
     };
 
     /// Initialises in place. `fixtures` is borrowed: it must outlive the runtime.
@@ -192,6 +224,39 @@ pub const SimRuntime = struct {
             .supervisor_died, .process_vanished => self.end(container, .lost),
             .slow_stop => container.ignores_stop = true,
         }
+    }
+
+    /// Scripts how the named container's health checks come out from now on, the one in flight
+    /// included. A new container (a restart under the same name) is `healthy` again.
+    pub fn set_health(
+        self: *SimRuntime,
+        name: []const u8,
+        script: HealthScript,
+    ) error{NotFound}!void {
+        const container = self.find(name) orelse return error.NotFound;
+        container.health = script;
+    }
+
+    /// Scripts the health checks of the running container `index` places, counted round the
+    /// running containers in creation order, and returns its name; null if none runs. Draws
+    /// nothing from the seed.
+    pub fn script_health(self: *SimRuntime, index: u32, script: HealthScript) ?[]const u8 {
+        var running: u32 = 0;
+        for (self.containers.items) |container| {
+            if (container.phase != .stopped) running += 1;
+        }
+        if (running == 0) return null;
+        var pick = index % running;
+        for (self.containers.items) |*container| {
+            if (container.phase == .stopped) continue;
+            if (pick > 0) {
+                pick -= 1;
+                continue;
+            }
+            container.health = script;
+            return container.name;
+        }
+        unreachable; // `pick` is below the number of running containers.
     }
 
     /// A fault on a random running container, or null if none runs. The seed decides which.
@@ -613,6 +678,62 @@ pub const SimRuntime = struct {
         return out;
     }
 
+    // ---- Health checks ----
+
+    fn probe_begin_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) runtime.Error!void {
+        assert(command.len > 0);
+        assert(timeout_ms > 0);
+        const self = from(context);
+        self.tick();
+        const container = self.find(handle.name()) orelse return not_found(diag, handle);
+        if (container.health == .refuses_to_begin) {
+            self.probes_refused += 1;
+            diag.raise(.E0502);
+            diag.cause("the simulated runtime refused to begin the check", .{});
+            diag.fix(.{ .sentence = "see why the container cannot run the command" });
+            return error.RuntimeFailed;
+        }
+        self.probes_begun += 1;
+        container.probe = .{ .began_ms = self.clock.now_ms(), .timeout_ms = timeout_ms };
+    }
+
+    fn probe_poll_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        diag: *Diag,
+    ) runtime.Error!runtime.ProbeResult {
+        const self = from(context);
+        self.tick();
+        const container = self.find(handle.name()) orelse return not_found(diag, handle);
+        const probe = container.probe orelse
+            return .{ .refused = probe_refused("no health check is in flight") };
+        const result = probe_result(container, probe, self.clock.now_ms());
+        if (result.final()) container.probe = null;
+        return result;
+    }
+
+    fn probe_result(container: *const Container, probe: Probe, now: u64) runtime.ProbeResult {
+        if (container.phase != .running) {
+            return .{ .refused = probe_refused("the container is not running") };
+        }
+        if (container.health == .refuses) {
+            return .{ .refused = probe_refused("the runtime refused to run the command") };
+        }
+        const elapsed = now -| probe.began_ms;
+        const exits = container.health != .hangs and probe_run_ms < probe.timeout_ms;
+        if (exits and elapsed >= probe_run_ms) {
+            return .{ .exited = if (container.health == .healthy) 0 else 1 };
+        }
+        if (elapsed >= probe.timeout_ms) return .timed_out;
+        return .running;
+    }
+
     fn no_memory(diag: *Diag) error{RuntimeFailed} {
         assert(diag.code == null);
         diag.raise(.E0502);
@@ -629,6 +750,19 @@ pub const SimRuntime = struct {
         return error.NotFound;
     }
 };
+
+/// The diagnostic of a health check that could not run (ZC-E0502 with `cause`), which the agent
+/// reports as the cause of ZC-E0516. `FakeRuntime` uses it too.
+pub fn probe_refused(cause: []const u8) Diagnostic {
+    var collector: Diag = undefined;
+    collector.reset();
+    collector.raise(.E0502);
+    collector.cause("{s}", .{cause});
+    collector.fix(.{ .sentence = "see why the container cannot run the command" });
+    var out: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&out, &collector);
+    return out;
+}
 
 /// The diagnostic of a start that failed because the image is not in the node's store: HANDOFF's
 /// `ZBX-E0410`, with the digest shortened as its example shows (in ASCII: diagnostics are).
@@ -687,6 +821,7 @@ fn sanitise(buffer: []u8, text: []const u8) []const u8 {
 const testing = std.testing;
 const ManualClock = @import("clock.zig").ManualClock;
 const repeat = @import("test_util.zig").repeat;
+const codes = @import("diag/codes.zig");
 
 const labels_of = struct {
     fn one(id: []const u8) [1]runtime.Label {
@@ -970,4 +1105,60 @@ test "a listener left open on a stopped or forgotten container is a problem" {
     sim.evict("r-1");
     try testing.expect(sim.relay_forgotten);
     try testing.expect(std.mem.startsWith(u8, sim.relay_problem().?, "R1"));
+}
+
+test "a simulated health check runs, comes out as scripted, and is reported once" {
+    // Goal: each script's result and the timeout, the one-result rule and the refusals of the
+    // contract. Method: one container; begin a check per script and poll it before and after
+    // `probe_run_ms` and its timeout on a manual clock.
+    var manual: ManualClock = .{};
+    var sim: SimRuntime = undefined;
+    sim.init(testing.allocator, manual.clock(), 4, &default_fixtures);
+    defer sim.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = sim.interface();
+    const labels = labels_of.one("r-1");
+    const spec = spec_for("r-1", "b3:51aa9c03", &labels);
+    _ = try rt.start(&spec, &diag);
+    const handle = runtime.Handle.init("r-1");
+    const check: []const []const u8 = &.{ "test", "-f", "/ready" };
+
+    try rt.probe_begin(handle, check, 1000, &diag);
+    try testing.expect((try rt.probe_poll(handle, &diag)) == .running);
+    manual.advance(probe_run_ms);
+    try testing.expectEqual(@as(u8, 0), (try rt.probe_poll(handle, &diag)).exited);
+    const again = try rt.probe_poll(handle, &diag);
+    try testing.expectEqualStrings(codes.full_name(.E0502), again.refused.code.slice());
+
+    try sim.set_health("r-1", .unhealthy);
+    try rt.probe_begin(handle, check, 1000, &diag);
+    manual.advance(probe_run_ms);
+    try testing.expectEqual(@as(u8, 1), (try rt.probe_poll(handle, &diag)).exited);
+
+    try sim.set_health("r-1", .hangs);
+    try rt.probe_begin(handle, check, 1000, &diag);
+    manual.advance(999);
+    try testing.expect((try rt.probe_poll(handle, &diag)) == .running);
+    manual.advance(1);
+    try testing.expect((try rt.probe_poll(handle, &diag)) == .timed_out);
+
+    // A timeout shorter than the run: the check times out even though it would pass.
+    try sim.set_health("r-1", .healthy);
+    try rt.probe_begin(handle, check, probe_run_ms, &diag);
+    manual.advance(probe_run_ms);
+    try testing.expect((try rt.probe_poll(handle, &diag)) == .timed_out);
+
+    try sim.set_health("r-1", .refuses);
+    try rt.probe_begin(handle, check, 1000, &diag);
+    try testing.expect((try rt.probe_poll(handle, &diag)) == .refused);
+
+    // A container that stops under a check: refused, not a failure.
+    try sim.set_health("r-1", .healthy);
+    try rt.probe_begin(handle, check, 1000, &diag);
+    try sim.inject("r-1", .{ .exit = 0 });
+    try testing.expect((try rt.probe_poll(handle, &diag)) == .refused);
+
+    try testing.expectError(error.NotFound, rt.probe_poll(runtime.Handle.init("r-9"), &diag));
+    try testing.expectEqual(@as(@TypeOf(diag.code.?), .E0501), diag.code.?);
 }

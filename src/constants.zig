@@ -135,6 +135,14 @@ pub const health_interval_ms_max: u32 = lost_grace_ms_max;
 /// The longest a health check's thresholds may take to settle a verdict, `threshold *
 /// interval_ms`: a day, the longest deadline a job may have (`job_deadline_ms_max`).
 pub const health_verdict_ms_max: u64 = job_deadline_ms_max;
+/// The most health checks an agent has in flight at once (C3 slice 9). The rest wait their turn,
+/// soonest due first: a check is a command in a container, and a node of 512 replicas must not
+/// start 512 at one instant. Provisional, for the supervisor to confirm.
+pub const probes_concurrent_max: u32 = 8;
+/// The first poll of a health check in flight comes this long after it began; later polls come
+/// each time it has run twice as long, and at its timeout (`probe_scheduler.poll_at`). Internal:
+/// how soon the agent sees a check that ended, the fence's poll interval.
+pub const probe_poll_ms_min: u32 = fence_poll_ms;
 /// The longest `rollout.progress_deadline_ms` (which bounds `ready_timeout_ms` and
 /// `min_ready_ms` too): a day, the longest deadline a job may have.
 pub const rollout_deadline_ms_max: u32 = @intCast(job_deadline_ms_max);
@@ -841,6 +849,9 @@ comptime {
     assert(history_scan_max <= store_list_limit_max);
     assert(history_scan_max >= history_generations_max);
     assert(health_interval_ms_max <= health_verdict_ms_max);
+    assert(probes_concurrent_max > 0);
+    assert(probes_concurrent_max <= runtime_handles_max);
+    assert(probe_poll_ms_min > 0);
     assert(rollout_grace_ms_max <= rollout_deadline_ms_max);
     assert(rollout_deadline_ms_max == job_deadline_ms_max);
     assert(service_name_bytes_max + 1 + 9 <= 63); // "<service>-<n>" fits a container name.
