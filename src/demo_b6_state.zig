@@ -21,7 +21,7 @@ pub const ttl_ms = b1.ttl_ms;
 pub const start_wait_ms = b1.start_wait_ms;
 pub const job_wait_ms = b1.job_wait_ms;
 pub const failover_ms = b1.failover_ms;
-pub const keepalive_slack_ms = b1.keepalive_slack_ms;
+pub const lost_grace_ms = b1.lost_grace_ms;
 pub const settle_ms = b1.settle_ms;
 
 pub const JobView = b1.JobView;
@@ -37,6 +37,14 @@ pub const Demo = struct {
     /// The libpq settings of a Postgres run; empty for SQLite.
     postgres: []const u8,
 };
+
+/// What is left of the lease of node `name`, as the server reports it (`remaining_ms`).
+pub fn lease_left_ms(host: *Host, name: []const u8) !u64 {
+    const rows = try c1.need_nodes(host);
+    const row = c1.find_node(rows, name) orelse return host.fail("{s} unlisted", .{name});
+    const left = row.remaining_ms orelse return host.fail("{s} has no lease", .{name});
+    return @intCast(left);
+}
 
 /// The index in the fleet of the node a job was placed on, or the demo fails.
 pub fn node_index(host: *Host, view: JobView) !usize {

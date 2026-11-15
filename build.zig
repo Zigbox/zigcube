@@ -651,6 +651,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
             },
         }),
     });
+    demos_build(b).dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;
@@ -693,6 +694,14 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     add_demo_b5_step(b, step_options, transcript);
 }
 
+/// `zig build demos-build`: every demo run for real compiled, none run. `check` depends on it, so
+/// a demo that no longer compiles (demo-b6 after #259 renamed a bound of demo-b1's) fails there,
+/// not only in CI's demo jobs. demo-b3 and demo-b5 have their own `-build` steps.
+fn demos_build(b: *std.Build) *std.Build.Step {
+    if (b.top_level_steps.get("demos-build")) |top| return &top.step;
+    return b.step("demos-build", "Compile every demo that runs for real, no run");
+}
+
 /// `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: HANDOFF's C1 demo, run for
 /// real (src/demo_c1.zig): the server, three agents and the `zcube` command as real processes.
 /// It does not stop the database, so it needs no `pg-up` control.
@@ -710,6 +719,7 @@ fn add_demo_c1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
             },
         }),
     });
+    demos_build(b).dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;
@@ -763,6 +773,7 @@ fn add_fake_demo_step(
             },
         }),
     });
+    demos_build(b).dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;
@@ -801,6 +812,7 @@ fn add_demo_b7_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
             },
         }),
     });
+    demos_build(b).dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;
@@ -834,6 +846,7 @@ fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
             },
         }),
     });
+    demos_build(b).dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;
@@ -2608,6 +2621,7 @@ fn add_check_step(b: *std.Build) void {
         "install",            "test",       "tidy",          "errors-site-check",
         "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
         "check-store-sqlite", "mtls-teeth", "demo-b3-build", "demo-b5-build",
+        "demos-build",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);

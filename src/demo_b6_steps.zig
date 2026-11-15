@@ -178,6 +178,11 @@ pub fn power_off(demo: *Demo) !void {
 fn lose_node(demo: *Demo, index: usize) !void {
     const host = demo.host;
     const name = fleet_mod.names[index];
+    // As demo-b1's step 4 (#259): the lease's expiry is at least `remaining_ms` after a read
+    // sent before the power-off, and the job controller fails the running job `lost_grace_ms`
+    // after the expiry. The last renewal may be up to ttl / 3 old at the power-off.
+    const read_ms = host.now_ms();
+    const left_ms = try state.lease_left_ms(host, name);
     host.say("  # power off {s} (under a1): kill -9 of its agent and its supervisors", .{name});
     const off_ms = host.now_ms();
     try demo.fleet.power_off(index);
@@ -186,11 +191,10 @@ fn lose_node(demo: *Demo, index: usize) !void {
     const cli = try state.wait_job(host, "a1", 11, "failed");
     try host.check(state.contains(cli.out, "end: failed (unreachable)"), "a1 ended failed " ++
         "(unreachable): the node was lost", .{});
-    const floor: u64 = state.ttl_ms - state.keepalive_slack_ms;
+    const floor: u64 = (read_ms + left_ms + state.lost_grace_ms) -| off_ms;
     try host.check(failed_after + state.c1.tolerance_ms >= floor, "it was read failed {d} ms " ++
-        "after the power-off (not before the lease ran out: at least {d} ms)", .{
-        failed_after, floor,
-    });
+        "after the power-off (not before the lease ran out, {d} ms left when read, and the " ++
+        "grace passed: at least {d} ms)", .{ failed_after, left_ms, floor });
     const why = try host.zcube(&.{ "why", "job", "a1" });
     try host.check(why.code == 0 and state.contains(why.out, "the node of the run was lost"), "" ++
         "zcube why job a1 names the lost node", .{});
