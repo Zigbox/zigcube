@@ -290,7 +290,7 @@ fn rollback_nothing(diag: *diag_mod.Diag) void { // C3 slice 8: the rollback han
 }
 
 fn rollback_compacted(diag: *diag_mod.Diag) void { // C3 slice 8: the rollback handler
-    rollback.raise_not_in_history(diag, "hello", 3, 7, 22);
+    rollback.raise_not_in_history(diag, "hello", 23, 3, 7, 22);
 }
 
 fn rollout_none(diag: *diag_mod.Diag) void { // C3 slice 11: pause and resume

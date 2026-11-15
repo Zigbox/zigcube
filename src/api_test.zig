@@ -1391,9 +1391,7 @@ test "POST /v1/services/{name}/rollback applies a stored generation as a new one
     defer rig.stop();
     _ = try rig.json(post(&rig, "", hello_json));
     try rig.refused(rollback_post(&rig, "", ""), 400, "ZC-E0127");
-    const second =
-        try std.mem.replaceOwned(u8, rig.parsed.allocator(), hello_json, "51aa9c03", "77bb0d14");
-    _ = try rig.json(post(&rig, "", second));
+    _ = try rig.json(post(&rig, "", hello_v2_json));
     const done = rollback_post(&rig, "", "{\"applied_by\":\"alex@laptop\"}");
     const body = try rig.json(done);
     try testing.expectEqual(@as(u16, 200), done.status);
@@ -1409,6 +1407,7 @@ test "POST /v1/services/{name}/rollback applies a stored generation as a new one
     try testing.expectEqualStrings("rollback", field(newest, "reason").string);
     try testing.expectEqual(@as(i64, 1), field(newest, "restores").integer);
     try testing.expectEqualStrings("alex@laptop", field(newest, "applied_by").string);
+    try expect_hello_spec(&rig);
 
     try rig.refused(rollback_post(&rig, "to=3", ""), 400, "ZC-E0127");
     try rig.refused(rollback_post(&rig, "to=99", ""), 400, "ZC-E0128");
@@ -1427,6 +1426,38 @@ test "POST /v1/services/{name}/rollback applies a stored generation as a new one
     const named = try rig.json(rollback_post(&rig, "to=2", ""));
     try testing.expectEqual(@as(i64, 4), field(named, "generation").integer);
     try testing.expectEqual(@as(i64, 2), field(named, "restores").integer);
+    // With no `to`, the newest generation below the current one: 3, not the oldest, 1.
+    const newer = try rig.json(rollback_post(&rig, "", ""));
+    try testing.expectEqual(@as(i64, 5), field(newer, "generation").integer);
+    try testing.expectEqual(@as(i64, 3), field(newer, "restores").integer);
+    try expect_hello_spec(&rig);
+}
+
+/// `hello_json`'s generation 2: every field a rollback restores differs.
+const hello_v2_json =
+    \\{"name":"hello","image":"b3:77bb0d14","replicas":2,
+    \\ "command":["sh","-c","exec ./serve"],"env":[["API_TOKEN","t0k3n"],["MODE","v2"]],
+    \\ "limits":{"cpu_millis":200,"memory_bytes":67108864},
+    \\ "source":"ghcr.io/zigbox/hello@sha256:
+++ "77bb0d1477bb0d1477bb0d1477bb0d14" ++ "77bb0d1477bb0d1477bb0d1477bb0d14" ++
+    \\",
+    \\ "health":{"command":["true"],"interval_ms":1000,"timeout_ms":500,
+    \\  "failure_threshold":3,"success_threshold":1},"applied_by":"alex@laptop"}
+;
+
+/// Whether the stored `hello` runs `hello_json`'s spec in every field a rollback restores.
+fn expect_hello_spec(rig: *Rig) !void {
+    const ctx = rig.world.controller_context();
+    const found = try ctx.store.get(ctx.arena, "/services/hello", null, ctx.diag);
+    const service = try records.read(records.Service, ctx.arena, found.kv.?, ctx.diag);
+    try testing.expectEqualStrings("b3:51aa9c03", service.image);
+    try testing.expectEqualStrings("", service.source);
+    const command: []const []const u8 = &.{ "sh", "-c", "sleep 1" };
+    try testing.expect(records.strings_equal(command, service.command));
+    const env: []const records.Pair = &.{.{ "API_TOKEN", "s3cr3t" }};
+    try testing.expect(records.pairs_equal(env, service.env));
+    try testing.expectEqual(records.Limits{}, service.limits);
+    try testing.expect(service.health == null);
 }
 
 test "a rollback that loses its race to an apply is 409 ZC-E0105 and writes nothing" {

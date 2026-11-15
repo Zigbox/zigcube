@@ -571,25 +571,29 @@ pub const registry = [_]Entry{
         .blame = .user,
         .summary = "there is nothing to roll back to",
         .explanation =
-        \\A rollback asks for a generation of the service other than the one it
-        \\runs now, and the service's history holds none: it was created by one
-        \\apply and never changed what its replicas run, or its history was deleted
-        \\with an earlier service of the same name.
+        \\A rollback restores a generation of the service older than the one it
+        \\runs now. Either the rollback named the generation the service runs now
+        \\(`--to` with the current generation), or it named none and the history
+        \\holds no older one: the service was created by one apply and never
+        \\changed what its replicas run, or its history was deleted with an
+        \\earlier service of the same name.
         \\
-        \\Nothing was changed. To run something else, apply the service file you
-        \\want; `zcube history <service>` lists the generations there are.
+        \\Nothing was changed. `zcube history <service>` lists the generations
+        \\there are: name an older one with `--to`. To run something else, apply
+        \\the service file you want.
         ,
     },
     .{
         .code = .E0128,
         .severity = .@"error",
         .blame = .user,
-        .summary = "the generation to roll back to is no longer in the history",
+        .summary = "the generation to roll back to is not in the history",
         .explanation =
         \\A service keeps the 16 newest generations it was applied with; an apply
         \\that adds a 17th deletes the oldest. The generation the rollback named is
-        \\older than that, or was never one of this service's (a service deleted
-        \\and applied again starts at generation 1 with no history).
+        \\older than that, newer than the one the service runs now, or was never
+        \\one of this service's (a service deleted and applied again starts at
+        \\generation 1 with no history).
         \\
         \\Nothing was changed. `zcube history <service>` lists the generations that
         \\can be restored. To run an older one, apply its service file again.

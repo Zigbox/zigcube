@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0128 · Zigcube</title>
-<meta name="description" content="the generation to roll back to is no longer in the history">
+<meta name="description" content="the generation to roll back to is not in the history">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0128.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,10 +73,10 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0128</h1>
-<p class="summary">the generation to roll back to is no longer in the history</p>
+<p class="summary">the generation to roll back to is not in the history</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>A service keeps the 16 newest generations it was applied with; an apply that adds a 17th deletes the oldest. The generation the rollback named is older than that, or was never one of this service's (a service deleted and applied again starts at generation 1 with no history).</p>
+<p>A service keeps the 16 newest generations it was applied with; an apply that adds a 17th deletes the oldest. The generation the rollback named is older than that, newer than the one the service runs now, or was never one of this service's (a service deleted and applied again starts at generation 1 with no history).</p>
 <p>Nothing was changed. `zcube history &lt;service&gt;` lists the generations that can be restored. To run an older one, apply its service file again.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
