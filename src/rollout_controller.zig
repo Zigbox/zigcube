@@ -13,7 +13,9 @@
 //!     live and stopping until the agent reports it stopped or deletes it;
 //!   - it is **ready** once the controller has seen it running for `min_ready_ms`; a replica
 //!     with a health check counts as running only while its report says `healthy` (`update`,
-//!     and the replica controller's `running_healthy`);
+//!     and the replica controller's `running_healthy`), except that an agent restart's `unknown`
+//!     after `healthy` keeps an old replica's time and keeps a new one not ready
+//!     (`Track.unknown_after_healthy`, docs/decisions/2026-11-15-c3-rollout-health-gate.md);
 //!   - a new replica that is held (`hold_failed_replica`), that dies more than
 //!     `constants.rollout_restarts_max` times in all, or that is placed and not ready within
 //!     `ready_timeout_ms` fails the rollout (ZC-E0304), as `rollout_plan` decides.
@@ -72,6 +74,13 @@ const Track = struct {
     assigned_since_ms: ?u64 = null,
     /// Since when the controller has seen it running (C3 slice 10: and healthy).
     running_since_ms: ?u64 = null,
+    /// The replica has a health check, its last admissible report before this one said
+    /// `healthy`, and every report since says `unknown` (an agent restart, until it probes
+    /// again): `running_since_ms` is kept, so an old replica stays ready, and a new one is not
+    /// ready while this holds (docs/decisions/2026-11-15-c3-rollout-health-gate.md).
+    unknown_after_healthy: bool = false,
+    /// The last report this controller saw said `healthy` (or the replica has no check).
+    last_healthy: bool = false,
     /// When the controller first saw it held (a start that failed by the user's fault).
     held_at_ms: ?u64 = null,
     /// When the controller first saw it stopped for another reason; `counted` once a rollout's
@@ -261,11 +270,17 @@ fn update(
     const lost = node_lost(snap, replica.rec.id);
     const status: ?records.ObservedStatus = if (observed) |found| found.rec.status else null;
     // A replica with a health check is "running" for readiness only while its report says it
-    // is healthy: `unknown` (not yet checked, or just after an agent restart) and `unhealthy`
-    // are not ready.
-    const healthy = replica.rec.health == null or
-        (observed != null and observed.?.rec.health == .healthy);
-    const running = status == .running and !lost and healthy;
+    // is healthy. `unknown` straight after `healthy` (an agent restart) keeps the replica's
+    // time, and `ready_now` decides by age; any other `unknown` and `unhealthy` are not running.
+    const health: records.HealthState = if (replica.rec.health == null)
+        .healthy
+    else if (observed) |found| records.observed_health(&found.rec) else .unknown;
+    const held_over = health == .unknown and status == .running and
+        track.running_since_ms != null and
+        (track.unknown_after_healthy or track.last_healthy);
+    track.unknown_after_healthy = held_over;
+    track.last_healthy = health == .healthy;
+    const running = status == .running and !lost and (health == .healthy or held_over);
     if (!running) track.running_since_ms = null;
     if (running and track.running_since_ms == null) track.running_since_ms = now;
     if (status != .stopped) return;
@@ -375,7 +390,11 @@ const Run = struct {
                 continue;
             }
             const since = if (track) |found| found.running_since_ms else null;
-            const ready = plan_mod.ready(since, run.now, policy.min_ready_ms);
+            const held_over = if (track) |found| found.unknown_after_healthy else false;
+            // A new replica is ready only on `healthy`; an old one keeps counting through an
+            // agent restart's `unknown` (`Track.unknown_after_healthy`).
+            const ready = plan_mod.ready(since, run.now, policy.min_ready_ms) and
+                !(fresh and held_over);
             if (!ready) {
                 if (plan_mod.ready_at(since, policy.min_ready_ms)) |at| {
                     result.ready_pending_at_ms = earlier(result.ready_pending_at_ms, at);
