@@ -94,6 +94,11 @@ const starved_ms_max: u64 = 24_000;
 const ok_steps_per_minute_min: u64 = 5;
 /// The nodes' uptime together, while the faults were on, below which that rate is not checked.
 const cluster_up_ms_min: u64 = 120_000;
+/// A fault phase shorter than this is not judged by the request floor (`request_floor_met`):
+/// it is what one lost call or cut link costs the agent (its I/O timeout, which `sim_net`
+/// charges), so in a shorter window a single one stalls a node for all the time left (#56;
+/// docs/decisions/2026-11-15-request-floor-short-fault-phase.md).
+const request_floor_fault_ms_min: u64 = constants.agent_io_timeout_ms;
 /// No node's agent may take more steps than this per minute it was up, over the run. Set from
 /// the busiest node over seeds 1 to 300 at 100 operations (docs/DECISIONS.md).
 ///
@@ -3342,7 +3347,11 @@ fn cluster_up_ms(c: *const Cluster) u64 {
 /// requests than it has operations by luck alone (seeds 3491114665 and 1995814075: 72 of 73 and
 /// 37 of 38). There the floor is half a request per operation (the lowest ratio seen over seeds
 /// 1 to 200 among such runs was 2.22), which still fails a world that is down most of the time.
-fn request_floor_met(delivered: u64, operations: u32, up_ms: u64) bool {
+/// A fault phase of `fault_ms` below `request_floor_fault_ms_min` is not judged: 35 operations
+/// can draw 3 `advance`s and last 8 s, and seeds 2846914288 (17 of 35 in 8.2 s, one node cut and
+/// the other's call lost for the last 2.9 s) and 207 (2 of 10 in 6.5 s) missed by luck alone.
+fn request_floor_met(delivered: u64, operations: u32, up_ms: u64, fault_ms: u64) bool {
+    if (fault_ms < request_floor_fault_ms_min) return true;
     if (up_ms >= cluster_up_ms_min) return delivered >= operations;
     return delivered * 2 >= operations;
 }
@@ -3358,7 +3367,12 @@ fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
         try check(c, rate >= ok_steps_per_minute_min, "too few agent steps while faults were " ++
             "on");
     }
-    const met = request_floor_met(during.delivered, operations, cluster_up_ms(c));
+    const met = request_floor_met(
+        during.delivered,
+        operations,
+        cluster_up_ms(c),
+        c.fault_ms,
+    );
     try check(c, met, "too few requests reached the server while faults were on");
 }
 
@@ -3497,13 +3511,73 @@ test "the request floor is one per operation with enough uptime and half below i
     // delivering under half of its operations fails it, and the full floor applies from
     // `cluster_up_ms_min` of uptime.
     const short = cluster_up_ms_min - 1;
-    try std.testing.expect(request_floor_met(72, 73, short));
-    try std.testing.expect(request_floor_met(37, 38, short));
-    try std.testing.expect(request_floor_met(20, 40, short));
-    try std.testing.expect(!request_floor_met(19, 40, short));
-    try std.testing.expect(!request_floor_met(0, 40, 0));
-    try std.testing.expect(request_floor_met(40, 40, cluster_up_ms_min));
-    try std.testing.expect(!request_floor_met(39, 40, cluster_up_ms_min));
+    const window = request_floor_fault_ms_min;
+    try std.testing.expect(request_floor_met(72, 73, short, window));
+    try std.testing.expect(request_floor_met(37, 38, short, window));
+    try std.testing.expect(request_floor_met(20, 40, short, window));
+    try std.testing.expect(!request_floor_met(19, 40, short, window));
+    try std.testing.expect(!request_floor_met(0, 40, window, window));
+    try std.testing.expect(request_floor_met(40, 40, cluster_up_ms_min, window));
+    try std.testing.expect(!request_floor_met(39, 40, cluster_up_ms_min, window));
+}
+
+test "the request floor does not judge a fault phase shorter than a lost call" {
+    // Goal: #56's short windows pass and the floor keeps its teeth from
+    // `request_floor_fault_ms_min` up. Method: seed 2846914288's numbers (17 of 35, 14,861 ms of
+    // uptime in an 8,249 ms fault phase) pass, and the same counts fail in a window of the
+    // minimum; a world that delivered nothing fails from the minimum.
+    try std.testing.expect(request_floor_met(17, 35, 14_861, 8_249));
+    try std.testing.expect(request_floor_met(0, 35, 14_861, request_floor_fault_ms_min - 1));
+    try std.testing.expect(!request_floor_met(17, 35, 14_861, request_floor_fault_ms_min));
+    try std.testing.expect(!request_floor_met(0, 35, 20_000, request_floor_fault_ms_min));
+}
+
+test "the request floor catches a cluster cut off for a fault phase long enough to judge" {
+    // Goal: the floor keeps its teeth above `request_floor_fault_ms_min`. Method: two worlds of
+    // one node, each with a fault phase of twice the minimum: one whose link is cut both ways
+    // the whole time (nothing reaches the server) must fail the floor, one left alone must meet
+    // it. The same cut for under the minimum is not judged.
+    const window = 2 * request_floor_fault_ms_min;
+    const operations: u32 = 10;
+    {
+        var report: Report = .{};
+        const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
+        defer c.destroy();
+        var cut = c.swarm.net;
+        cut.partition_up = true;
+        cut.partition_down = true;
+        c.net.set_faults(0, cut);
+        c.nodes[0].partitioned_until_ms = c.manual.ms + window + 1;
+        c.advance(window);
+        c.fault_totals = c.phase_totals();
+        try testing.expect(c.fault_ms >= request_floor_fault_ms_min);
+        try testing.expectEqual(@as(u64, 0), c.fault_totals.?.delivered);
+        try testing.expectError(error.StepFailed, enough_work_under_faults(c, operations));
+        try testing.expect(report.failed);
+    }
+    {
+        var report: Report = .{};
+        const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
+        defer c.destroy();
+        c.advance(window);
+        c.fault_totals = c.phase_totals();
+        try enough_work_under_faults(c, operations);
+        try testing.expect(!report.failed);
+    }
+    {
+        var report: Report = .{};
+        const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
+        defer c.destroy();
+        var cut = c.swarm.net;
+        cut.partition_up = true;
+        cut.partition_down = true;
+        c.net.set_faults(0, cut);
+        c.nodes[0].partitioned_until_ms = c.manual.ms + window;
+        c.advance(request_floor_fault_ms_min - 1);
+        c.fault_totals = c.phase_totals();
+        try enough_work_under_faults(c, operations);
+        try testing.expect(!report.failed);
+    }
 }
 
 test "the same seed gives the same report and the same hash" {
