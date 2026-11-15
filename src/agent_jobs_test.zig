@@ -1791,6 +1791,17 @@ test "the local job fence kills a job container fence_stop_ms after it falls, wh
             try testing.expect(world.agent.pending_stop(run_id) != null);
             try testing.expect(fence_at > world.now_ms());
         }
+        if (case == .fresh) {
+            // The fence's first stop already carries the short grace: not left to a later step.
+            world.advance(fence_at - world.now_ms());
+            var waited: u32 = 0;
+            while (world.agent.pending_stop(run_id) == null) : (waited += 1) {
+                try testing.expect(waited < sim_world.tick_ms * 2);
+                world.advance(1);
+            }
+            const stop = world.agent.pending_stop(run_id).?;
+            try testing.expect(stop.deadline_ms <= world.now_ms() + constants.fence_stop_ms);
+        }
         const kill_at = fence_at + constants.fence_stop_ms;
         world.advance(kill_at - world.now_ms() - sim_world.tick_ms);
         try testing.expect(rig.running());
