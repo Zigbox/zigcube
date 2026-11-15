@@ -1925,6 +1925,21 @@ const c1_regressions = [_][]const []const u8{
         "--heal-at=42",
     },
     &.{ "207", "10", "1", "--strong" },
+    // #151 again on f49041a and on the b3 candidate 00f35c1: a checker false positive. The node
+    // was frozen across the run's deadline while the store was out, so the tracker took J8's
+    // wedge mark at its next look, seconds late, and dropped the frozen time between (129 ms
+    // and 340 ms over the bound). The mark is placed back at the deadline now
+    // (`sim_jobs.note_marks`).
+    &.{
+        "966942719",          "17",           "3",
+        "--c1",               "--strong",     "--lease-ttl-ms=10000",
+        "--replicas-pct=300", "--heal-at=57",
+    },
+    &.{
+        "2344280920",         "430",           "3",
+        "--c1",               "--strong",      "--lease-ttl-ms=10000",
+        "--replicas-pct=300", "--heal-at=701",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).

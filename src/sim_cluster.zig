@@ -2609,6 +2609,8 @@ fn track_jobs(c: *Cluster) Failure!void {
             };
             if (watch_of(c, node.index, hash) == null) {
                 watch.wedged_base_ms = node.wedged_total_ms;
+                watch.seen_ms = c.manual.ms;
+                watch.seen_wedged_total_ms = node.wedged_total_ms;
             }
             const run = job_run_of(&ctx, job);
             if (run) |known| note_marks(c, known, node, &watch);
@@ -2708,12 +2710,12 @@ fn note_marks(
     node: *const Node,
     watch: *sim_jobs.Watch,
 ) void {
-    const stopped = run.stop != null;
+    const stop_at_ms: ?u64 = if (run.stop) |stop| stop.at_ms else null;
     sim_jobs.note_marks(
         watch,
         c.manual.ms,
         run.deadline_ms,
-        stopped,
+        stop_at_ms,
         node.wedged_total_ms,
     );
 }
