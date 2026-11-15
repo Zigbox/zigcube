@@ -218,6 +218,10 @@ pub const Agent = struct {
     /// Like the fence, it caps every pause, wait and call, so a cut-off server never holds a
     /// run's stop back.
     deadline_wake_mono_ms: u64,
+    /// When the last read of the runs that succeeded was sent, monotonic (`agent_jobs.pass`), or
+    /// the start of a pass that had no run to read: the local job fence falls the lease fence's
+    /// term after it (`job_fence_at_ms`). maxInt until the first step sets it.
+    runs_read_mono_ms: u64,
     /// The cap the step last gave its calls (`cap_calls`), monotonic; maxInt if none. A run that
     /// starts mid-step may only lower it (`arm_run_deadline`).
     calls_cap_mono_ms: u64,
@@ -311,6 +315,7 @@ pub const Agent = struct {
         agent.store_hash = 0;
         agent.jobs_wake_mono_ms = maxInt(u64);
         agent.deadline_wake_mono_ms = maxInt(u64);
+        agent.runs_read_mono_ms = maxInt(u64);
         agent.calls_cap_mono_ms = maxInt(u64);
         agent.calls_ctx = null;
         agent.in_before_call = false;
@@ -342,6 +347,20 @@ pub const Agent = struct {
     pub fn fence_at_ms(agent: *const Agent) ?u64 {
         if (agent.lease == store.lease_none or agent.fence.active) return null;
         return fencing.fence_at_ms(agent.sent_ms, agent.lease_ttl_ms);
+    }
+
+    /// When the local job fence falls, on the monotonic clock: the lease fence's term
+    /// (`fencing.fence_at_ms`) after the last read of the runs that succeeded. From then on the
+    /// server-free enforcement (`agent_jobs.enforce_deadlines`) stops every running job
+    /// container, cause `unreachable`, and kills it `fence_stop_ms` later; replicas and the lease
+    /// are left alone. It bounds J6 when keepalives are answered and the runs read is not, which
+    /// the lease fence cannot (docs/decisions/2026-11-15-j6-jobs-local-fence.md). Null with no
+    /// lease, while the lease fence is on, and before the first step.
+    pub fn job_fence_at_ms(agent: *const Agent) ?u64 {
+        if (c1_teeth.job_runs_unread) return null; // Test-only: the fence is off (J6).
+        if (agent.lease == store.lease_none or agent.fence.active) return null;
+        if (agent.runs_read_mono_ms == maxInt(u64)) return null;
+        return fencing.fence_at_ms(agent.runs_read_mono_ms, agent.lease_ttl_ms);
     }
 
     /// How long until the fence, so a caller that waits does not wait past it (`maxInt` if
@@ -480,6 +499,8 @@ pub const Agent = struct {
         defer agent.calls_ctx = null;
         const now = ctx.clock.now_ms();
         const mono = ctx.mono_ms();
+        // A fresh agent has read no runs yet: its local job fence counts from its first step.
+        if (agent.runs_read_mono_ms == maxInt(u64)) agent.runs_read_mono_ms = mono;
         // The fence comes first and needs no server: an agent cut off from everything still stops.
         try agent.restore_lease(ctx);
         if (agent.fence_at_ms()) |at| {

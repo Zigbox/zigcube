@@ -146,11 +146,18 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
 pub const job_pass_break = declared("c1_teeth_job_pass_break");
 
-/// Not an agent fault but a gap shown (pending the owner, docs/decisions/
-/// 2026-11-14-j6-runs-unread-gap.md): the server fails a node's read of its runs whenever one of
-/// them has a stop asked, while its keepalives and every other call are answered. The agent
-/// never learns of the stop and keeps renewing, so the fence never comes either (must break J6).
+/// The local job fence is off (`Agent.job_fence_at_ms`), in the world of `runs_unread_world`:
+/// the server fails a node's read of its runs whenever one of them has a stop asked, while its
+/// keepalives and every other call are answered. The agent never learns of the stop and keeps
+/// renewing, so the lease fence never comes either (must break J6). The gap was
+/// docs/decisions/2026-11-14-j6-runs-unread-gap.md; the fence that closes it,
+/// docs/decisions/2026-11-15-j6-jobs-local-fence.md.
 pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
+
+/// Not a fault: the world of `job_runs_unread` (the server cuts a node's runs read while a stop
+/// is asked) with the local job fence on, for the positive run `sim-c1-runs-unread`, where J6
+/// must hold. Not in `any`.
+pub const runs_unread_world = declared("c1_runs_unread_world") or job_runs_unread;
 
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).

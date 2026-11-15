@@ -27,6 +27,7 @@ const Diag = diag_mod.Diag;
 comptime {
     assert(!agent.fault_ignore_stop);
     assert(!c1_teeth.any);
+    assert(!c1_teeth.runs_unread_world);
     // `zcube_agent_teeth.zig` is the one root that switches the fetch plan's fault on.
     if (@import("root") == @This()) assert(!fetch_plan.fault_skip_verify);
 }

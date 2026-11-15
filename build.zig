@@ -1512,6 +1512,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
+    add_runs_unread_step(b, sim);
     add_burst_step(b, sim);
     add_worlds_step(b, sim);
     add_reuse_step(b, sim);
@@ -1845,6 +1846,31 @@ fn add_offline_step(b: *std.Build, sim: SimStepOptions) void {
     });
     b.step("sim-c1-offline", "Run sim-c1 in the offline-deadline world with the fix on (J8 holds)")
         .dependOn(&run.step);
+}
+
+/// Seeds of `sim-c1-runs-unread`.
+const runs_unread_seeds_max = 40;
+
+/// `zig build sim-c1-runs-unread`: the positive run of the `job_runs_unread` tooth's world (the
+/// server cuts a node's runs read while a stop is asked) with the local job fence on. It passes
+/// only if no seed fails (J6 and the rest; docs/decisions/2026-11-15-j6-jobs-local-fence.md).
+fn add_runs_unread_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_runs_unread",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c1_runs_unread_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                            b.fmt("1..{d}", .{runs_unread_seeds_max}),
+        b.fmt("{d}", .{c1_teeth_operations}), "--c1",
+    });
+    b.step("sim-c1-runs-unread", "Run sim-c1 in the runs-unread world with the job fence on " ++
+        "(J6 holds)").dependOn(&run.step);
 }
 
 /// Replays of sim-c1 runs that once failed, each a fixed command line; each must pass.
