@@ -11,6 +11,7 @@
 //! Every read and write waits with `poll` against one deadline (a socket timeout makes the
 //! standard library's reader panic, ZC-B0001). A request is one message and so is a reply.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
@@ -247,6 +248,7 @@ pub fn connect(io: std.Io, address: std.Io.net.IpAddress, end_ms: u64) Error!std
 // ---- Tests -----------------------------------------------------------------------------------
 
 test "a connected socket has Nagle off" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // macOS TLS port, required before 0.6.0
     const linux = std.os.linux;
     const listener = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     try std.testing.expect(linux.errno(listener) == .SUCCESS);
@@ -313,6 +315,7 @@ const Echo = struct {
 };
 
 test "a handshake with a failing random source is Entropy and sends nothing" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // macOS TLS port, required before 0.6.0
     // Goal: RB-N9 at the caller: no ClientHello-equivalent leaves when the kernel's source fails.
     // Method: an Io whose `randomSecure` fails; the seed is drawn before the first write.
     var vtable: std.Io.VTable = undefined;
@@ -327,6 +330,7 @@ test "a handshake with a failing random source is Entropy and sends nothing" {
 }
 
 test "a message of several records crosses a handshaken stream both ways" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // macOS TLS port, required before 0.6.0
     // Goal: the handshake runs over a real socket and a message longer than one record comes
     // back intact, with the server seeing the client's authenticated name. Method: a socketpair,
     // the server on a concurrent task, a 40 000 byte message echoed.
@@ -355,6 +359,7 @@ test "a message of several records crosses a handshaken stream both ways" {
 }
 
 test "a message longer than the reader's buffer is TooBig, and a wrong node is refused" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // macOS TLS port, required before 0.6.0
     // Goal: the two bounds the protocol relies on. Method: a 100 byte buffer for a 200 byte
     // message; then a client that expects another node name.
     const io = std.testing.io;
