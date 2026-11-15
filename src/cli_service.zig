@@ -25,6 +25,9 @@ pub const Service = struct {
     limits: records.Limits = .{},
     /// The OCI reference `image` is pulled from, digest-pinned (docs/cli.md); apply checks it.
     source: []const u8 = "",
+    /// The health check and the rollout policy (C3, docs/keys.md); the API checks them.
+    health: ?records.Health = null,
+    rollout: ?records.RolloutPolicy = null,
 };
 
 /// Reads and parses `path`. The strings of the result live in `env.arena`.
@@ -158,6 +161,8 @@ pub fn body_json(
         .env = service.env,
         .limits = service.limits,
         .source = if (service.source.len > 0) service.source else null,
+        .health = service.health,
+        .rollout = service.rollout,
         .applied_by = applied_by,
     };
     return std.json.Stringify.valueAlloc(arena, body, .{ .emit_null_optional_fields = false });
@@ -243,4 +248,32 @@ test "every way a file can be wrong points at its line" {
         try testing.expect(std.mem.startsWith(u8, pair.value.slice(), case.at));
         try testing.expect(std.mem.indexOf(u8, report.diag.last_cause().?, case.at) != null);
     }
+}
+
+test "a service file's health and rollout go into the body, and are left out when absent" {
+    // Goal: C3 slice 11, the apply body takes both (docs/api.md). The first test covers a file
+    // without them: its JSON has neither member.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var report: Report = undefined;
+    report.reset();
+    const source =
+        \\.{
+        \\    .name = "hello",
+        \\    .image = "b3:51aa9c03",
+        \\    .replicas = 3,
+        \\    .command = .{ "sh" },
+        \\    .health = .{ .command = .{ "true" }, .interval_ms = 1000, .timeout_ms = 500,
+        \\        .failure_threshold = 3, .success_threshold = 1 },
+        \\    .rollout = .{ .max_surge = 2 },
+        \\}
+    ;
+    const service = try parse(arena, source, "hello.zon", &report);
+    try testing.expectEqual(@as(u32, 2), service.rollout.?.max_surge);
+    const body = try body_json(arena, service, "alex@laptop");
+    const health = "\"health\":{\"command\":[\"true\"],\"interval_ms\":1000,";
+    try testing.expect(std.mem.indexOf(u8, body, health) != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"rollout\":{\"strategy\":\"rolling\"," ++
+        "\"max_surge\":2,") != null);
 }

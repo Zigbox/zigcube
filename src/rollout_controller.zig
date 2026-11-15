@@ -831,7 +831,7 @@ pub fn request(
     };
 }
 
-fn write_state(rollout: *records.Rollout, state: *const plan_mod.State) void {
+pub fn write_state(rollout: *records.Rollout, state: *const plan_mod.State) void {
     rollout.phase = state.phase;
     rollout.deadline_at_ms = state.deadline_at_ms;
     rollout.evidence_from_ms = if (state.evidence_from_ms == state.started_at_ms)

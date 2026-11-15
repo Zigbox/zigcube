@@ -255,6 +255,9 @@ body[data-mock] main, body[data-sim] main { padding-bottom: 7rem; } /* the mock 
   .drow { grid-template-columns: 1fr; gap: 0; }
   .node-row { grid-template-columns: 1fr; }
   .dev { right: 0; left: 0; width: auto; border-radius: 10px 10px 0 0; }
+  /* A how-to command wraps rather than hiding its end behind a scroll (copy still copies it whole). */
+  .howto .cmd { display: flex; width: 100%; }
+  .howto .cmd-text { white-space: normal; overflow-wrap: anywhere; flex: 1; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
 @media print { .dev, nav.side, .top { display: none; } }

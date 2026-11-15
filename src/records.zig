@@ -1987,6 +1987,37 @@ test "C3: a rollout record that contradicts itself is refused when read" {
     try testing.expectEqual(@as(u64, 0), first_back.from);
 }
 
+test "C3 slice 11: a rollout's pause members round-trip, and are left out when absent" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rollout: Rollout = .{
+        .service = "hello",
+        .service_created = 40,
+        .from = 6,
+        .to = 7,
+        .phase = .progressing,
+        .started_at_ms = 10,
+        .deadline_at_ms = 600_010,
+    };
+    const rollout_bytes = try encode(arena, rollout, &diag);
+    try testing.expect(std.mem.indexOf(u8, rollout_bytes, "paused") == null);
+    var paused = rollout;
+    paused.phase = .paused;
+    paused.reason = .rollback;
+    paused.evidence_from_ms = 20;
+    paused.paused_at_ms = 30;
+    paused.paused_by = .user;
+    const paused_bytes = try encode(arena, paused, &diag);
+    const paused_back = try read(Rollout, arena, kv_of("/rollouts/hello", paused_bytes), &diag);
+    try testing.expectEqual(@as(RolloutReason, .rollback), paused_back.reason);
+    try testing.expectEqual(@as(?u64, 20), paused_back.evidence_from_ms);
+    try testing.expectEqual(@as(?u64, 30), paused_back.paused_at_ms);
+    try testing.expectEqual(@as(?RolloutPauseCause, .user), paused_back.paused_by);
+}
+
 test "C3: a history key names one generation, in decimal, with no leading zero" {
     try testing.expectEqual(@as(?u64, 12), history_generation("/history/hello/12"));
     try testing.expectEqual(@as(?u64, null), history_generation("/history/hello/012"));

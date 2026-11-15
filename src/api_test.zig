@@ -1271,3 +1271,191 @@ test "a job names a relay the server configures; any other name or an env overri
         try testing.expect(std.mem.indexOf(u8, response.body, case.field) != null);
     }
 }
+
+// ---- Rollouts and history (C3 slice 11) --------------------------------------------------------
+
+/// Puts a rollout of `hello`'s current generation as the rollout controller would (docs/keys.md):
+/// the API pauses and resumes only a rollout of the generation the service asks for.
+fn put_rollout(rig: *Rig, phase: records.RolloutPhase, created: ?u64) !void {
+    const ctx = rig.world.controller_context();
+    const service = try ctx.store.get(ctx.arena, "/services/hello", null, ctx.diag);
+    const service_rec = try records.read(records.Service, ctx.arena, service.kv.?, ctx.diag);
+    const rollout: records.Rollout = .{
+        .service = "hello",
+        .service_created = created orelse service.kv.?.create_revision,
+        .from = service_rec.generation - 1,
+        .to = service_rec.generation,
+        .phase = phase,
+        .started_at_ms = sim_world.epoch_ms,
+        .deadline_at_ms = sim_world.epoch_ms + 600_000,
+        .budget = .{ .start = 1, .retire = 1 },
+    };
+    const bytes = try records.encode(ctx.arena, rollout, ctx.diag);
+    const op: store.Op = .{ .put = .{ .key = "/rollouts/hello", .value = bytes } };
+    _ = try writers.txn(ctx.store, .rollout_controller, .{ .on_success = &.{op} }, ctx.diag);
+}
+
+fn rollout_post(rig: *Rig, verb: []const u8, body: []const u8) !api_mod.Response {
+    const arena = rig.parsed.allocator();
+    const path = try std.fmt.allocPrint(arena, "/v1/services/hello/rollout/{s}", .{verb});
+    return rig.call(.{ .method = "POST", .path = path, .body = body });
+}
+
+test "GET /v1/services/{name}/history lists the generations newest first, env redacted" {
+    var rig = try Rig.start(31);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    const arena = rig.parsed.allocator();
+    const changed = try std.mem.replaceOwned(u8, arena, hello_json, "9c03", "9c04");
+    _ = try rig.json(post(&rig, "", changed));
+    const body = try rig.ok("/v1/services/hello/history", "");
+    try testing.expectEqual(@as(i64, 2), field(body, "generation").integer);
+    const generations = field(body, "generations").array.items;
+    try testing.expectEqual(@as(usize, 2), generations.len);
+    try testing.expectEqual(@as(i64, 2), field(generations[0], "generation").integer);
+    try testing.expectEqual(@as(i64, 1), field(generations[1], "generation").integer);
+    const value = field(generations[0], "value");
+    try testing.expectEqualStrings("b3:51aa9c04", field(value, "image").string);
+    const env = field(value, "env").array.items;
+    try testing.expectEqualStrings("API_TOKEN", env[0].array.items[0].string);
+    try testing.expect(env[0].array.items[1] == .null);
+    try rig.refused(rig.get("/v1/services/nope/history", ""), 404, "ZC-E0101");
+    try rig.refused(rig.get("/v1/services/hello/other", ""), 404, "ZC-E0101");
+}
+
+test "GET .../rollout answers null, then the record; pause and resume write it, ZC-E0129 else" {
+    // Goal: docs/api.md, "Rollouts and history": status is a read, pause and resume are writes
+    // to the rollout record by the rollout controller's role (rollout_steer.zig).
+    var rig = try Rig.start(32);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    const none = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expect(field(none, "rollout") == .null);
+    try testing.expectEqual(@as(i64, 2), field(none, "replicas").integer);
+    try rig.refused(try rollout_post(&rig, "pause", ""), 409, "ZC-E0129");
+
+    try put_rollout(&rig, .progressing, null);
+    const running = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expectEqualStrings("progressing", field(field(running, "rollout"), "phase").string);
+
+    const paused = try rollout_post(&rig, "pause", "{\"applied_by\":\"alex@laptop\"}");
+    const paused_body = try rig.json(paused);
+    try testing.expectEqual(@as(u16, 200), paused.status);
+    try testing.expectEqualStrings("pause", field(paused_body, "action").string);
+    try testing.expectEqualStrings("paused", field(paused_body, "phase").string);
+    try testing.expectEqualStrings("progressing → paused", field(paused_body, "change").string);
+    try testing.expect(field(paused_body, "decision").string.len > 0);
+    const record = field(try rig.ok("/v1/services/hello/rollout", ""), "rollout");
+    try testing.expectEqualStrings("user", field(record, "paused_by").string);
+    try testing.expectEqual(@as(i64, 0), field(field(record, "budget"), "start").integer);
+
+    const again = try rig.json(try rollout_post(&rig, "pause", ""));
+    try testing.expectEqualStrings("none", field(again, "action").string);
+    const resumed = try rig.json(try rollout_post(&rig, "resume", ""));
+    try testing.expectEqualStrings("progressing", field(resumed, "phase").string);
+
+    try put_rollout(&rig, .complete, null);
+    try rig.refused(try rollout_post(&rig, "resume", ""), 409, "ZC-E0129");
+    try put_rollout(&rig, .progressing, 999_999);
+    const stale = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expect(field(stale, "rollout") == .null);
+    try rig.refused(try rollout_post(&rig, "pause", ""), 409, "ZC-E0129");
+    try rig.refused(try rollout_post(&rig, "stop", ""), 404, "ZC-E0101");
+    try rig.refused(try rollout_post(&rig, "pause", "[1]"), 400, "ZC-E0104");
+    const missing = rig.call(.{ .method = "POST", .path = "/v1/services/nope/rollout/pause" });
+    try rig.refused(missing, 404, "ZC-E0101");
+    // A name no service can have is 400 on the writes as on the reads.
+    try rig.refused(rig.get("/v1/services/Nope/rollout", ""), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/services/Nope/history", ""), 400, "ZC-E0104");
+    const arena = rig.parsed.allocator();
+    for ([_][]const u8{ "pause", "resume" }) |verb| {
+        const path = try std.fmt.allocPrint(arena, "/v1/services/Nope/rollout/{s}", .{verb});
+        try rig.refused(rig.call(.{ .method = "POST", .path = path }), 400, "ZC-E0104");
+    }
+}
+
+/// `{"applied_by": "aaa..."}` with a name of `length` bytes.
+fn applied_by_body(arena: std.mem.Allocator, length: u32) ![]const u8 {
+    const name = try arena.alloc(u8, length);
+    @memset(name, 'a');
+    return std.fmt.allocPrint(arena, "{{\"applied_by\":\"{s}\"}}", .{name});
+}
+
+test "pause and resume refuse an empty, overlong or unprintable applied_by with ZC-E0104" {
+    var rig = try Rig.start(34);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    try put_rollout(&rig, .progressing, null);
+    const arena = rig.parsed.allocator();
+    const overlong = try applied_by_body(arena, api_mod.applied_by_bytes_max + 1);
+    const bodies = [_][]const u8{
+        "{\"applied_by\":\"\"}",
+        overlong,
+        "{\"applied_by\":\"alex\\nmallory\"}",
+        "{\"applied_by\":\"alex\\u0007\"}",
+    };
+    for ([_][]const u8{ "pause", "resume" }) |verb| {
+        for (bodies) |body| {
+            const response = try rollout_post(&rig, verb, body);
+            try rig.refused(response, 400, "ZC-E0104");
+            try testing.expect(std.mem.indexOf(u8, response.body, "applied_by") != null);
+        }
+    }
+    // Nothing was written: the rollout is still running.
+    const status = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expectEqualStrings("progressing", field(field(status, "rollout"), "phase").string);
+    // The longest name passes.
+    const longest = try applied_by_body(arena, api_mod.applied_by_bytes_max);
+    try testing.expectEqual(@as(u16, 200), (try rollout_post(&rig, "pause", longest)).status);
+}
+
+test "a pause that loses every race to the rollout controller is 409 ZC-E0105" {
+    // Goal: the API's answer when `rollout_steer.steer` returns `.conflict`: every attempt lost,
+    // nothing written, 409 with ZC-E0105.
+    const rollout_steer = @import("rollout_steer.zig");
+    var rig = try Rig.start(35);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    try put_rollout(&rig, .progressing, null);
+    var ctx = rig.world.controller_context();
+    const races = rollout_steer.attempts_max;
+    ctx.store = rollout_steer.Race.wrap(ctx.store, .rollout, "hello", races);
+    const response = rig.api.handle(&ctx, .{
+        .method = "POST",
+        .path = "/v1/services/hello/rollout/pause",
+    });
+    try rig.refused(response, 409, "ZC-E0105");
+    try testing.expectEqual(rollout_steer.attempts_max, rollout_steer.Race.transactions());
+    const status = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expectEqualStrings("progressing", field(field(status, "rollout"), "phase").string);
+}
+
+test "POST /v1/apply takes health and rollout, and refuses invalid ones" {
+    var rig = try Rig.start(33);
+    defer rig.stop();
+    const with_policy =
+        \\{"name":"hello","image":"b3:51aa9c03","replicas":2,"command":["sh"],
+        \\ "health":{"command":["true"],"interval_ms":1000,"timeout_ms":500,
+        \\  "failure_threshold":3,"success_threshold":1},"rollout":{"max_surge":2}}
+    ;
+    const applied = post(&rig, "", with_policy);
+    if (applied.status != 200) std.debug.print("{s}\n", .{applied.body});
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    const status = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expectEqual(@as(i64, 2), field(field(status, "policy"), "max_surge").integer);
+    // The health check reaches the stored service, which the replica controller copies onto
+    // each replica for the agent to run.
+    const ctx = rig.world.controller_context();
+    const found = try ctx.store.get(ctx.arena, "/services/hello", null, ctx.diag);
+    const service = try records.read(records.Service, ctx.arena, found.kv.?, ctx.diag);
+    const health = service.health.?;
+    try testing.expectEqual(@as(usize, 1), health.command.len);
+    try testing.expectEqualStrings("true", health.command[0]);
+    try testing.expectEqual(@as(u32, 1000), health.interval_ms);
+    try testing.expectEqual(@as(u32, 3), health.failure_threshold);
+    const bad =
+        \\{"name":"hello","image":"b3:51aa9c03","replicas":2,"command":["sh"],
+        \\ "rollout":{"max_surge":0,"max_unavailable":0}}
+    ;
+    try rig.refused(post(&rig, "", bad), 400, "ZC-E0126");
+}

@@ -2,6 +2,7 @@
 import { h, keyed, setText, setAttr, pill, setPill, whyHref, whyLink, digest, plural, timeEl, cpu, mem, rebuild, howTo, emptyState, command } from "../ui.js";
 import { pageHead, makeReplicaBar, cpuMeter, memMeter, makeDecisionItem } from "./parts.js";
 import { makeReplicaRow, replicaTable } from "./lists.js";
+import { serviceRollout } from "./rollout.js";
 
 function dl(pairs) {
   return h("dl", { class: "kv" }, ...pairs.filter(Boolean).flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)]));
@@ -11,8 +12,10 @@ function notFound(kind, name) {
     h("p", {}, h("a", { href: whyHref(kind, name) }, `Ask why ${kind} ${name} is not there`)));
 }
 
-export function serviceDetail({ model }, params) {
+export function serviceDetail(ctx, params) {
+  const { model } = ctx;
   const name = params[0];
+  const rollout = serviceRollout(ctx, name);
   const status = pill("idle");
   const bar = makeReplicaBar();
   const head = h("div", { class: "page-head" }, h("div", {}, h("p", { class: "crumb" }, h("a", { href: "#/services" }, "Services")), h("h1", { id: "page-title", tabindex: "-1" }, name)),
@@ -27,16 +30,18 @@ export function serviceDetail({ model }, params) {
     summary,
     howTo("The console is read-only. To change this service, edit its file and run", `zcube apply ${name}.zon`),
     h("section", { class: "card flush", "aria-labelledby": "h-reps" }, h("h2", { class: "pad-h", id: "h-reps" }, "Replicas"), replicaTable(body, { showService: false })),
+    rollout.el,
     h("div", { class: "cols" },
       h("section", { class: "card", "aria-labelledby": "h-spec" }, h("h2", { id: "h-spec" }, "Spec"), spec),
       h("section", { class: "card", "aria-labelledby": "h-dh" }, h("div", { class: "card-h" }, h("h2", { id: "h-dh" }, "Decision history"), h("a", { href: whyHref("service", name) }, "Follow the chain")), hist, histEmpty)));
   const el = h("div", { class: "view" }, head, main, missing);
 
-  return { el, update() {
+  return { el, destroy: rollout.destroy, update() {
     const s = model.serviceViews().find(x => x.name === name);
     main.hidden = head.hidden = !s;
     if (!s) { if (model.loaded) { missing.hidden = false; rebuild(missing, "nf", () => notFound("service", name)); } return; }
     missing.hidden = true;
+    rollout.update();
     setPill(status, s.health); bar.update(s.counts, s.desired);
     setText(summary, s.why);
     const sp = s.spec;

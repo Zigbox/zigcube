@@ -72,6 +72,7 @@ test {
 }
 
 test {
+    _ = @import("cli_rollout.zig");
     _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
 }

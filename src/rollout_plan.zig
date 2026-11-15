@@ -512,9 +512,10 @@ fn resumed(policy: *const Policy, state: *const State, now_ms: u64) State {
     assert(state.phase == .paused);
     const paused_at = state.paused_at_ms.?;
     const at = @max(now_ms, paused_at);
+    // Saturating: a stored deadline is read from the store, and a far one must not overflow.
     const deadline_at_ms = switch (state.paused_by.?) {
-        .user => state.deadline_at_ms + (at - paused_at),
-        .failure => at + policy.progress_deadline_ms,
+        .user => state.deadline_at_ms +| (at - paused_at),
+        .failure => at +| policy.progress_deadline_ms,
     };
     return .{
         .phase = state.reason.active_phase(),
@@ -873,6 +874,22 @@ test "rollout plan: every edge of pause, resume and begin" {
     try testing.expectEqual(Phase.progressing, applied.phase);
     try testing.expectEqual(now + 300_000, applied.deadline_at_ms);
     try testing.expectEqual(Phase.rolling_back, begin(&short, .rollback, true, now).phase);
+}
+
+test "rollout plan: a resume saturates a deadline at the end of time" {
+    // Goal: a deadline read from the store may be any u64, and a resume after a user's pause
+    // moves it later: it stops at the largest one instead of overflowing. Method: a paused
+    // rollout whose deadline is near the end, resumed after a pause longer than what is left.
+    const policy: Policy = .{};
+    const max = std.math.maxInt(u64);
+    var held = state_in(.paused);
+    held.deadline_at_ms = max - 10;
+    const now = held.paused_at_ms.? + 1_000;
+    const resumed_state = try resume_rollout(&policy, &held, now);
+    try testing.expectEqual(max, resumed_state.deadline_at_ms);
+    held.paused_by = .failure;
+    const late = try resume_rollout(&policy, &held, max - 5);
+    try testing.expectEqual(max, late.deadline_at_ms);
 }
 
 test "rollout plan: a resumed failure is judged on new evidence only" {

@@ -7,7 +7,7 @@ client and model, and the first two are the product:
 | --- | --- | --- |
 | **Live server** | open the page `zcube-server` serves at `/` (or `/console/`) | the real server, on the same origin |
 | **Simulation** | `?sim=c0` | the **real control-plane core compiled to WebAssembly**, in the browser, over a memory store and the simulated runtime, on virtual time (`web/sim/`, `src/console_wasm.zig`) |
-| **Mock** | `?mock=c1`, `?mock=b1` | a JavaScript model of the proposed API (`web/mock/`). It remains for **C1** (several nodes, failover) and **B1** (jobs in every state and ending), which the simulation does not run; the UI says "mock" |
+| **Mock** | `?mock=c1`, `?mock=b1`, `?mock=c3` | a JavaScript model of the proposed API (`web/mock/`). It remains for **C1** (several nodes, failover), **B1** (jobs in every state and ending) and **C3** (a rollout record; the mock's own controller does not roll out), which the simulation does not run; the UI says "mock" |
 
 The simulation is labelled **simulated** in the header and the panel. It is a simulation: nothing
 in it is recorded, no process starts, and it is never presented as a demo that passed (`demo-c0`
@@ -82,6 +82,13 @@ The list adds "what is happening" (the same one-liner as Needs attention), the g
 shows it; `–` when a service has none. The service detail shows it in full.
 The detail screen leads with the replicas table, then the spec (environment values masked) and the
 decision history for the service and its replicas, each linking to "why at that point".
+Since C3 slice 11 two cards follow the replicas: **Rollout** (`GET /v1/services/{name}/rollout`:
+the phase, generations from and to, new replicas ready and old ones retired, when it started, the
+deadline while it runs, who paused it, the policy, and the `zcube rollout pause|resume` command to
+copy; "No rollout" when there is none) and **Generations** (`GET .../history`: generation, image,
+reason, who applied it, request id, the current one marked "now"). They refetch when the store
+revision moves, at most every 2 s. The console stays read-only: pause and resume are commands to
+copy, not buttons. `?mock=c3` (`&at=4`) ends with a paused rollout of hello.
 
 ### Replicas
 
@@ -343,10 +350,12 @@ web/
   browser will not fetch it), and open `/?sim=c0`. `zcube-server` also serves it at
   `/?sim=c0`.
 - **The C1 mock:** the same, with `/?mock=c1`. **The B1 mock:** `/?mock=b1` (`&at=3` runs the three
-  steps at once and settles).
+  steps at once and settles). **The C3 mock:** `/?mock=c3&at=4#/services/hello`, a paused rollout.
 - **Check it in a browser:** `node tools/browser_check.mjs <base-url> --mode sim|server|mock`
   (`mock` opens `?mock=b1`: the list, the state filter, a page per ending cause, the logs
-  placeholder, no log request, and no environment value or input text on any page)
+  placeholder, no log request, and no environment value or input text on any page; then `?mock=c3`'s
+  Rollout and Generations cards at desktop and phone width; `sim` also asks the real core for
+  hello's rollout and history and checks a pause with no rollout is `ZC-E0129`)
   (Playwright and the installed Chromium; a dev-time tool, not part of the build).
 
 ## The simulation, and the mock for C1

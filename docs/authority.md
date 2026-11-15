@@ -72,7 +72,7 @@ the layout.
 | `/job-runs/<name>`, `/job-status/<name>`, `/job-endings` | job controller | B1 (§7): the run, how it is going and how it ended, the aggregate of endings | until retention |
 | `/job-observed/<node>/<name>` | that node's agent | B1 (§7): a run's claim and what the agent saw | until retention |
 | `/history/<svc>/<generation>` | API, in the apply's transaction | C3: what one generation ran; **immutable**; at most 16 per service (`docs/keys.md`) | until compacted or the service is deleted |
-| `/rollouts/<svc>` | rollout controller (C3) | C3: one rollout's phase and the budget the replica controller obeys | a retention period after `complete`; at once when its service is deleted or is another incarnation (`service_created`, docs/keys.md) |
+| `/rollouts/<svc>` | rollout controller (C3); the API process writes it in that role for a user's pause or resume (`src/rollout_steer.zig`, C3 slice 11) | C3: one rollout's phase and the budget the replica controller obeys | a retention period after `complete`; at once when its service is deleted or is another incarnation (`service_created`, docs/keys.md) |
 | `/replicas/<svc>/<id>` | replica controller | desired replica: spec and generation; **no placement** | until the replica is retired |
 | `/assigned/<node>/<id>` | scheduler | the placement: replica id, service, the resolved `requests`, and the reason | until unassigned |
 | `/nodes/<node>` | that node's agent | registration and declared capacity | **bound to the node's lease** |
@@ -89,7 +89,10 @@ A seventh role, `retention`, deletes expired decisions (§5). It may write only 
 `/decisions-by-subject/` and `/decision-summaries/`, which every role may write, and delete (never
 write) an ended job's records (§7); B1 adds an eighth role, `job_controller` (§7). C3 adds a
 ninth, `rollout_controller`, which writes `/rollouts/` only: the replica controller stays the only
-writer of `/replicas/` and obeys the budget it reads there.
+writer of `/replicas/` and obeys the budget it reads there. Two processes act in that role: the
+rollout controller, and the API process for `POST /v1/services/<name>/rollout/pause|resume`
+(`rollout_steer.zig`), whose transaction compares on both the service's and the rollout's
+`mod_revision` (docs/decisions/2026-11-14-c3-slice11-surfaces.md, item 1).
 
 - **`/assigned/<node>/` replaces the `node` field.** An agent's long-poll watches its own prefix,
   so fan-out is O(replicas on the node), not O(all replicas). The agent endpoint joins each
