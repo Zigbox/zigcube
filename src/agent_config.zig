@@ -58,8 +58,8 @@ pub const usage =
     \\                     --peer-listen is 0.0.0.0 or :: (default: the --peer-listen address)
     \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
     \\                     peer has it (needs --images-dir)
-    \\  --mesh-ports A-B   the ports this node gives its replicas' mesh listeners (default
-    \\                     30000-30999); the mesh runs only with an address for peers
+    \\  --mesh-ports A-B   the ports this node gives its replicas' mesh listeners, at least 512
+    \\                     (default 30000-30999); the mesh runs only with an address for peers
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -262,7 +262,13 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
     };
 }
 
-/// `A-B`: two ports, A above 0 and at most B; the default range without one.
+const mesh_ports_fix = std.fmt.comptimePrint(
+    "give --mesh-ports a range of at least {d} ports, e.g. 30000-30999",
+    .{constants.runtime_handles_max},
+);
+
+/// `A-B`: two ports, A above 0 and at most B, at least `runtime_handles_max` of them; the default
+/// range without one.
 fn mesh_ports_of(given: ?[]const u8, diag: *Diag) Error!MeshPorts {
     const text = given orelse return .{};
     const fix = "give --mesh-ports A-B, two ports with A at most B, e.g. 30000-30999";
@@ -272,6 +278,18 @@ fn mesh_ports_of(given: ?[]const u8, diag: *Diag) Error!MeshPorts {
     const last = std.fmt.parseInt(u16, text[dash + 1 ..], 10) catch 0;
     if (first == 0 or last == 0 or first > last) {
         return bad(diag, "the mesh port range {s} is not A-B", .{text}, fix);
+    }
+    // A replica the range has no port for fails to start (ZC-E0710) and is replaced at once, so a
+    // range the node's containers can spend churns
+    // (docs/decisions/2026-11-15-mesh-ports-minimum.md).
+    const size = @as(u32, last) - first + 1;
+    if (size < constants.runtime_handles_max) {
+        return bad(
+            diag,
+            "the mesh port range {s} holds {d} ports, fewer than the minimum of {d}",
+            .{ text, size, constants.runtime_handles_max },
+            mesh_ports_fix,
+        );
     }
     return .{ .first = first, .last = last };
 }
@@ -803,18 +821,51 @@ test "the mesh port range is A-B with A above 0 and at most B, and defaults to 3
     const plain = try load(arena, std.testing.io, &base, &diag);
     try testing.expectEqual(constants.mesh_ports_default_first, plain.run.mesh_ports.first);
     try testing.expectEqual(constants.mesh_ports_default_last, plain.run.mesh_ports.last);
-    const ranged = base ++ [_][]const u8{ "--mesh-ports", "31000-31009" };
+    const ranged = base ++ [_][]const u8{ "--mesh-ports", "31000-31511" };
     const loaded = try load(arena, std.testing.io, &ranged, &diag);
     try testing.expectEqual(@as(u16, 31_000), loaded.run.mesh_ports.first);
-    try testing.expectEqual(@as(u16, 31_009), loaded.run.mesh_ports.last);
-    const one = base ++ [_][]const u8{ "--mesh-ports", "31000-31000" };
-    try testing.expectEqual(@as(u16, 31_000), (try load(arena, std.testing.io, &one, &diag))
+    try testing.expectEqual(@as(u16, 31_511), loaded.run.mesh_ports.last);
+    const top = base ++ [_][]const u8{ "--mesh-ports", "65024-65535" };
+    try testing.expectEqual(@as(u16, 65_535), (try load(arena, std.testing.io, &top, &diag))
         .run.mesh_ports.last);
     for ([_][]const u8{ "31000", "0-10", "20-10", "a-b", "1-70000", "-5", "5-" }) |text| {
         const wrong = base ++ [_][]const u8{ "--mesh-ports", text };
         diag.reset();
         try expect_bad(load(arena, std.testing.io, &wrong, &diag), &diag);
     }
+}
+
+test "a mesh port range narrower than runtime_handles_max is refused with size and minimum" {
+    // Goal: the supervisor's ruling on E0710's churn (docs/decisions/
+    // 2026-11-15-mesh-ports-minimum.md): a range the node's containers could spend is refused at
+    // start-up, in one cause line that names the range, its size and the minimum. Method: the
+    // narrowest accepted range, one port fewer, a single port, and the line of one refusal.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base = [_][]const u8{
+        "--node",         "node1",   "--server",     "127.0.0.1:7070",
+        "--state-dir",    "/tmp",    "--cpu-millis", "1000",
+        "--memory-bytes", "1000000", "--images",     "fixtures/images.zon",
+    };
+    comptime assert(constants.runtime_handles_max == 512);
+    const least = base ++ [_][]const u8{ "--mesh-ports", "31000-31511" };
+    _ = try load(arena, std.testing.io, &least, &diag);
+    for ([_][]const u8{ "31000-31510", "31000-31000", "65535-65535" }) |text| {
+        const narrow = base ++ [_][]const u8{ "--mesh-ports", text };
+        diag.reset();
+        try expect_bad(load(arena, std.testing.io, &narrow, &diag), &diag);
+    }
+    diag.reset();
+    const ten = base ++ [_][]const u8{ "--mesh-ports", "31000-31009" };
+    try expect_bad(load(arena, std.testing.io, &ten, &diag), &diag);
+    try testing.expectEqual(@as(usize, 1), diag.causes.slice().len);
+    try testing.expectEqualStrings(
+        "the mesh port range 31000-31009 holds 10 ports, fewer than the minimum of 512",
+        diag.causes.slice()[0].slice(),
+    );
 }
 
 test "the published peer address is the advertised one, or a specified listen address" {

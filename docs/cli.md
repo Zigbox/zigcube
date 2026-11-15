@@ -438,8 +438,8 @@ handshake, rate limited (ZC-E0808, `docs/peer.md`, "Rate limit"). `--registry HO
 an image no peer has is fetched from (also needs `--images-dir`). `--peer-advertise HOST:PORT` is
 the address published for peers; it is required when `--peer-listen` names `0.0.0.0` or `::`.
 Its host is also the host of every replica's mesh endpoint: with a peer address (and the fake
-runtime) the agent gives each replica a port of `--mesh-ports A-B` (default 30000-30999;
-`docs/agent.md`, "The mesh").
+runtime) the agent gives each replica a port of `--mesh-ports A-B` (default 30000-30999, at
+least 512 ports, else ZC-E0505; `docs/agent.md`, "The mesh").
 
 ## How it is tested
 

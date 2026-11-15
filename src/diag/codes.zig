@@ -1321,6 +1321,9 @@ pub const registry = [_]Entry{
         \\range, or the image fixtures file it names cannot be read. The cause
         \\line names the setting. The agent did not start and changed nothing.
         \\
+        \\The mesh port range (--mesh-ports A-B) must hold at least 512 ports, as
+        \\many as the agent can run containers, so that it cannot run out.
+        \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,
     },

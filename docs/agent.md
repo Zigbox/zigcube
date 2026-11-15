@@ -356,7 +356,9 @@ The Zigbox runtime's relay is still plain TCP until B4 slice 4.
 
 `agent_mesh.zig`. When the agent advertises a peer address (the host of the address it gives
 C2's chunk server) it runs the mesh: each replica container that starts is given the lowest free
-port of `--mesh-ports A-B` (default 30000-30999, `mesh_ports` in a ZON file), kept in its
+port of `--mesh-ports A-B` (default 30000-30999, `mesh_ports` in a ZON file; a range of fewer
+than `runtime_handles_max`, 512, ports is refused at start-up with ZC-E0505, so that it cannot run
+out, docs/decisions/2026-11-15-mesh-ports-minimum.md), kept in its
 `zcube.mesh-port` label so it survives an agent restart, and publishes `<host>:<port>` as its
 `endpoint` in `/observed`. Each step the agent reads the node's view
 (`GET /v1/agent/nodes/{node}/mesh`, docs/api.md), plans it with `mesh_plan.plan` and

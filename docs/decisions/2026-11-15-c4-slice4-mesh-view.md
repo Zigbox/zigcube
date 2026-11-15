@@ -38,3 +38,6 @@ tight loop: the slice's test (a 1-port range, two replicas) saw about 16,000 sto
 - A grant or readiness change does not wake the agent's watch; new rules reach a supervisor
   within the step period.
 - The server reads the whole snapshot for each call.
+
+**Resolved** (C4 slice 5): the supervisor chose option 1; a range of fewer than 512 ports is
+refused at start-up with ZC-E0505 (docs/decisions/2026-11-15-mesh-ports-minimum.md).
