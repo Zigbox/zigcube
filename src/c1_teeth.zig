@@ -188,3 +188,13 @@ pub const rollout_pause = declared("c1_teeth_rollout_pause");
 /// An apply also writes its history record over the newest older generation's (C3 slice 7; must
 /// break R6).
 pub const rollout_history = declared("c1_teeth_rollout_history");
+/// The automatic rollback copies the failed generation's image instead of the restored one's
+/// (C3 slice 8; must break R5).
+pub const rollout_exact = declared("c1_teeth_rollout_exact");
+/// The rollout controller remembers an owed automatic rollback and carries it out a pass later on
+/// the service as it is then, without the compare on the service and rollout revisions its pass
+/// read (C3 slice 8; must break R8).
+pub const rollout_race = declared("c1_teeth_rollout_race");
+/// The rollout controller never carries out an automatic rollback it owes, nor records it refused
+/// (C3 slice 8; must break R7).
+pub const rollout_stuck = declared("c1_teeth_rollout_stuck");

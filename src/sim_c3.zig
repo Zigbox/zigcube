@@ -1,5 +1,5 @@
 //! C3's rollout checks over the cluster simulation (docs/briefs/c3.md, "Simulation: checks and
-//! teeth"), R1 R2 R3 R4 and R6, judged at the head of the store as `sim_c1`'s are: `before_commit`
+//! teeth"), R1 R2 R3 R4 R5 R6 and R8 (R7, a liveness check, is `sim_cluster`'s), judged at the head of the store as `sim_c1`'s are: `before_commit`
 //! over the head a transaction is about to commit over, `at_revision` over the revision it made.
 //! Each check reads only the store, so it judges what was written, not what the controllers
 //! meant; each is a little weaker than its sentence in the brief, as its comment says, and never
@@ -38,11 +38,19 @@ pub const Tally = struct {
     paused_judged: u64 = 0,
     /// History records written (R6).
     history_judged: u64 = 0,
+    /// Rollbacks written, compared with the generation they restore (R5).
+    rollbacks_judged: u64 = 0,
+    /// Of them, automatic rollbacks judged against the head they landed on (R8).
+    auto_rollbacks_judged: u64 = 0,
+    /// Rollbacks that completed, their live replicas compared with the restored spec (R5).
+    rollbacks_completed: u64 = 0,
 };
 
-/// R1, R4 and R6 over the head `request` is about to commit over.
+/// R1, R4, R5, R6 and R8 over the head `request` is about to commit over.
 pub fn before_commit(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Found {
     if (history_problem(ctx, request, tally)) |found| return found;
+    if (rollback_problem(ctx, request, tally)) |found| return found;
+    if (completion_problem(ctx, request, tally)) |found| return found;
     if (!touches(request, records.prefix_replicas)) return null;
     const snap = controller.read_snapshot(ctx) catch {
         ctx.diag.reset();
@@ -422,6 +430,119 @@ fn history_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tally
         }
     }
     return null;
+}
+
+/// R5 and R8 over each history record `request` writes for a rollback. R5: its spec is the spec
+/// of the generation it restores, byte for byte. R8: an automatic rollback of generation g lands
+/// only over the service still at g - 1 with that generation's rollout failed, so it never
+/// replaces an apply or a rollback written after the failure it answers.
+fn rollback_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Found {
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_history)) continue;
+        const written = decode(records.History, ctx, put.key, put.value) orelse continue;
+        const restores = written.restores orelse continue;
+        tally.rollbacks_judged += 1;
+        const key = records.history_key(written.service, restores);
+        const kv = get(ctx, key.slice()) orelse
+            return "R5: a rollback restores a generation that is not in the history";
+        const restored = decode(records.History, ctx, kv.key, kv.value) orelse continue;
+        if (!same_spec(&written, &restored)) {
+            return "R5: a rollback did not copy the spec of the generation it restores";
+        }
+        if (written.reason != .auto_rollback) continue;
+        tally.auto_rollbacks_judged += 1;
+        if (!auto_rollback_owed(ctx, &written)) {
+            return "R8: an automatic rollback landed over a newer write of its service";
+        }
+    }
+    return null;
+}
+
+/// Whether the head still shows what an automatic rollback to `written` answers: the service at
+/// the generation below it, whose rollout failed.
+fn auto_rollback_owed(ctx: *const Context, written: *const records.History) bool {
+    const key = records.service_key(written.service);
+    const kv = get(ctx, key.slice()) orelse return false;
+    const service: ServiceEntry = .{
+        .kv = kv,
+        .rec = decode(records.Service, ctx, kv.key, kv.value) orelse return false,
+    };
+    if (service.rec.generation + 1 != written.generation) return false;
+    const rollout = rollout_of(ctx, &service) orelse return false;
+    return rollout.phase == .failed;
+}
+
+/// R5 at the end of a rollback: when `request` marks a rollout of a rollback complete, every
+/// live replica of its service runs the spec of the generation the rollback restored.
+fn completion_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Found {
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_rollouts)) continue;
+        const rollout = decode(records.Rollout, ctx, put.key, put.value) orelse continue;
+        if (rollout.phase != .complete or rollout.reason != .rollback) continue;
+        const key = records.history_key(rollout.service, rollout.to);
+        const kv = get(ctx, key.slice()) orelse continue;
+        const written = decode(records.History, ctx, kv.key, kv.value) orelse continue;
+        const restores = written.restores orelse continue;
+        const restored_key = records.history_key(rollout.service, restores);
+        const restored_kv = get(ctx, restored_key.slice()) orelse continue;
+        const restored = decode(records.History, ctx, restored_kv.key, restored_kv.value) orelse
+            continue;
+        tally.rollbacks_completed += 1;
+        const snap = controller.read_snapshot(ctx) catch {
+            ctx.diag.reset();
+            return null;
+        };
+        for (snap.replicas) |*replica| {
+            if (!std.mem.eql(u8, replica.rec.service, rollout.service)) continue;
+            if (stopped(&snap, &replica.rec) or on_lost_node(&snap, &replica.rec)) continue;
+            if (!runs_history(&replica.rec, &restored)) {
+                return "R5: a completed rollback left a live replica of another spec";
+            }
+        }
+    }
+    return null;
+}
+
+/// Whether two history records hold the same spec: what a rollback copies.
+fn same_spec(first: *const records.History, second: *const records.History) bool {
+    if (!std.mem.eql(u8, first.image, second.image)) return false;
+    if (!std.mem.eql(u8, first.source, second.source)) return false;
+    if (!records.strings_equal(first.command, second.command)) return false;
+    if (!records.pairs_equal(first.env, second.env)) return false;
+    if (!std.meta.eql(first.limits, second.limits)) return false;
+    return health_equal(first.health, second.health);
+}
+
+fn runs_history(replica: *const records.Replica, spec: *const records.History) bool {
+    if (!std.mem.eql(u8, replica.image, spec.image)) return false;
+    if (!std.mem.eql(u8, replica.source, spec.source)) return false;
+    if (!records.strings_equal(replica.command, spec.command)) return false;
+    if (!records.pairs_equal(replica.env, spec.env)) return false;
+    if (!std.meta.eql(replica.limits, spec.limits)) return false;
+    return health_equal(replica.health, spec.health);
+}
+
+fn health_equal(first: ?records.Health, second: ?records.Health) bool {
+    const a = first orelse return second == null;
+    const b = second orelse return false;
+    return a.equal(b);
+}
+
+/// `value` written at `key` as a `T`, or null if it is not one.
+fn decode(comptime T: type, ctx: *const Context, key: []const u8, value: []const u8) ?T {
+    const kv: store.KeyValue = .{ .key = key, .value = value, .create_revision = 1, .mod_revision = 1 };
+    return records.read(T, ctx.arena, kv, ctx.diag) catch {
+        ctx.diag.reset();
+        return null;
+    };
 }
 
 fn service_created(ctx: *const Context, name: []const u8) ?u64 {

@@ -31,6 +31,7 @@ const evidence = @import("evidence.zig");
 const plan_mod = @import("rollout_plan.zig");
 const records = @import("records.zig");
 const replica_controller = @import("replica_controller.zig");
+const rollback = @import("rollback.zig");
 
 const Batch = controller.Batch;
 const Context = controller.Context;
@@ -98,6 +99,22 @@ const Deaths = struct {
     }
 };
 
+/// The `rollout_race` tooth (`c1_teeth.zig`): an owed rollback the controller remembers and carries
+/// out on a later pass without the CAS, over whatever the service has become (R8 must fail).
+const Deferred = struct {
+    armed: bool = false,
+    name_buffer: [constants.service_name_bytes_max]u8 = undefined,
+    name_len: u8 = 0,
+    decision_buffer: [records.decision_id_bytes]u8 = undefined,
+    decision_len: u8 = 0,
+    to: u64 = 0,
+    rollout_revision: u64 = 0,
+
+    fn name(deferred: *const Deferred) []const u8 {
+        return deferred.name_buffer[0..deferred.name_len];
+    }
+};
+
 pub const RolloutController = struct {
     source: controller.DecisionSource,
     passes: u64 = 0,
@@ -105,6 +122,8 @@ pub const RolloutController = struct {
     tracks_count: u32 = 0,
     deaths: [constants.services_max]Deaths = undefined,
     deaths_count: u32 = 0,
+    /// The `rollout_race` tooth's one owed rollback, carried out a pass late (test-only).
+    deferred: Deferred = .{},
 
     /// Decision ids: `0xA000 | instance`, above the job controller's half (`0x8000 | instance`).
     pub fn init(instance: u16) RolloutController {
@@ -192,6 +211,27 @@ pub const RolloutController = struct {
         @memcpy(deaths.name_buffer[0..service.len], service);
         rc.deaths_count += 1;
         return deaths;
+    }
+
+    /// The `rollout_race` tooth: remembers the rollback `rollout` owes instead of doing it.
+    fn defer_rollback(
+        rc: *RolloutController,
+        service: *const records.Service,
+        rollout: *const RolloutEntry,
+    ) void {
+        comptime assert(c1_teeth.rollout_race);
+        if (rc.deferred.armed) return;
+        if (rollout.rec.cause_decision.len > rc.deferred.decision_buffer.len) return;
+        rc.deferred = .{
+            .armed = true,
+            .name_len = @intCast(service.name.len),
+            .decision_len = @intCast(rollout.rec.cause_decision.len),
+            .to = rollout.rec.from,
+            .rollout_revision = rollout.kv.mod_revision,
+        };
+        @memcpy(rc.deferred.name_buffer[0..service.name.len], service.name);
+        const decision = rollout.rec.cause_decision;
+        @memcpy(rc.deferred.decision_buffer[0..decision.len], decision);
     }
 
     fn sweep_deaths(rc: *RolloutController) void {
@@ -400,6 +440,7 @@ const Run = struct {
         service: *const ServiceEntry,
         found: ?*const RolloutEntry,
     ) Error!void {
+        if (c1_teeth.rollout_race) try run.deferred_rollback(service);
         const policy = service.rec.rollout_policy();
         const seen = run.view(service, &policy);
         var current: ?*const RolloutEntry = null;
@@ -577,6 +618,11 @@ const Run = struct {
         var result = plan_mod.pass(policy, &state, &facts);
         if (result.failure == .deadline and facts.unplaceable) result.failure = .stalled;
         if (result.next_at_ms) |at| run.wake_at_ms = @min(run.wake_at_ms, at);
+        // The pass that failed the rollout stores `failed` and its decision first; the next one
+        // rolls back, naming that decision as the cause.
+        if (state.phase == .failed and result.rollback) {
+            return run.roll_back(service, policy, rollout, &state);
+        }
         var next = rollout.rec;
         const before_old = rollout.rec.budget_old;
         try run.fill(&next, service, seen, &result);
@@ -592,6 +638,106 @@ const Run = struct {
         }
         batch.put(rollout.kv.key, try records.encode(run.ctx.arena, next, run.ctx.diag));
         try run.finish(&batch);
+    }
+
+    /// The automatic rollback a failed rollout owes (owner question O3): the API's own handler,
+    /// applied by `rollout-controller`, as a CAS on the service and the rollout this pass read,
+    /// so a user's apply or pause after them wins (R8). A refusal (ZC-E0127, ZC-E0128) is
+    /// recorded on the rollout, which then ends `failed` owing nothing (R7).
+    fn roll_back(
+        run: *Run,
+        service: *const ServiceEntry,
+        policy: *const plan_mod.Policy,
+        rollout: *const RolloutEntry,
+        state: *const plan_mod.State,
+    ) Error!void {
+        assert(state.phase == .failed);
+        assert(plan_mod.rollback_owed(policy, state));
+        assert(rollout.rec.from > 0);
+        assert(rollout.rec.from < service.rec.generation);
+        if (c1_teeth.rollout_stuck) return;
+        if (c1_teeth.rollout_race) return run.rc.defer_rollback(&service.rec, rollout);
+        const input = auto_input(&service.rec, rollout.rec.from, rollout.rec.cause_decision, .{
+            .service_revision = service.kv.mod_revision,
+            .rollout_key = rollout.kv.key,
+            .rollout_revision = rollout.kv.mod_revision,
+            .failed_decision = rollout.rec.cause_decision,
+        });
+        const outcome = rollback.rollback(run.ctx, &run.rc.source, input) catch |err| switch (err) {
+            error.NothingToRestore, error.NotInHistory => {
+                return run.rollback_refused(service, policy, rollout, state);
+            },
+            error.NotFound => {
+                // Deleted since the snapshot: the next pass sees it gone.
+                run.ctx.diag.reset();
+                run.more = true;
+                return;
+            },
+            else => |other| return other,
+        };
+        run.more = true;
+        if (outcome == .written) run.acted += 1;
+    }
+
+    /// Records the handler's refusal (its code and cause, in `ctx.diag`) on the rollout.
+    fn rollback_refused(
+        run: *Run,
+        service: *const ServiceEntry,
+        policy: *const plan_mod.Policy,
+        rollout: *const RolloutEntry,
+        state: *const plan_mod.State,
+    ) Error!void {
+        const ctx = run.ctx;
+        const code = ctx.diag.code.?;
+        assert(code == .E0127 or code == .E0128);
+        const why = try controller.format(ctx, "{s}", .{ctx.diag.last_cause() orelse "refused"});
+        ctx.diag.reset();
+        const after = plan_mod.rollback_refused(policy, state);
+        var next = rollout.rec;
+        write_state(&next, &after);
+        var batch: Batch = .{};
+        batch.expect(service.kv.key, service.kv.mod_revision);
+        batch.expect(rollout.kv.key, rollout.kv.mod_revision);
+        const text = try controller.format(ctx, "ZC-{s} the automatic rollback of {s} to " ++
+            "generation {d} was refused: {s}; the rollout stays failed and owes no rollback", .{
+            @tagName(code), service.rec.name, rollout.rec.from, why,
+        });
+        const id = try controller.put_decision(ctx, &run.rc.source, .{
+            .actor = actor,
+            .action = "rollout_fail",
+            .subject = .{ .kind = .service, .name = service.rec.name },
+            .reason = text,
+            .cause = cause_of(&rollout.rec),
+        }, &batch);
+        next.cause_decision = try controller.format(ctx, "{s}", .{id.slice()});
+        batch.put(rollout.kv.key, try records.encode(ctx.arena, next, ctx.diag));
+        try run.finish(&batch);
+    }
+
+    /// The `rollout_race` tooth: carries out a remembered rollback of `service` over the service
+    /// as it is now, with no CAS (test-only; R8 must fail).
+    fn deferred_rollback(run: *Run, service: *const ServiceEntry) Error!void {
+        comptime assert(c1_teeth.rollout_race);
+        const deferred = &run.rc.deferred;
+        if (!deferred.armed) return;
+        if (!std.mem.eql(u8, deferred.name(), service.rec.name)) return;
+        deferred.armed = false;
+        const decision = deferred.decision_buffer[0..deferred.decision_len];
+        const key = records.rollout_key(service.rec.name);
+        const input = auto_input(&service.rec, deferred.to, decision, .{
+            .service_revision = service.kv.mod_revision,
+            .rollout_key = try controller.key_copy(run.ctx, &key),
+            .rollout_revision = deferred.rollout_revision,
+            .failed_decision = decision,
+        });
+        _ = rollback.rollback(run.ctx, &run.rc.source, input) catch |err| switch (err) {
+            error.NothingToRestore, error.NotInHistory, error.NotFound => {
+                run.ctx.diag.reset();
+                return;
+            },
+            else => |other| return other,
+        };
+        run.more = true;
     }
 
     /// Whether the stored rollout no longer says what this pass would write: the budget's basis
@@ -709,6 +855,25 @@ const Run = struct {
         if (done == .applied) run.acted += 1;
     }
 };
+
+/// The rollback handler's input for the controller's automatic rollback of `service` to `to`.
+fn auto_input(
+    service: *const records.Service,
+    to: u64,
+    failed_decision: []const u8,
+    expect: rollback.Expect,
+) rollback.Input {
+    assert(to > 0);
+    assert(to < service.generation);
+    return .{
+        .name = service.name,
+        .to = to,
+        .reason = .auto_rollback,
+        .applied_by = rollback.controller_applied_by,
+        .request_id = failed_decision,
+        .expect = expect,
+    };
+}
 
 /// The plan's state as `rollout` stores it, or null if what is stored is not a state the plan
 /// could have written (the rollout then begins again).
