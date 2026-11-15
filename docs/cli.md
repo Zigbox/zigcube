@@ -247,6 +247,49 @@ restarts the listing (up to 8 times, then `ZC-E0103`); a list of more than 1,024
 
 `job logs` is not here: slice 8 is cut.
 
+## rollout, history and rollback (C3 slices 11 and 8)
+
+`zcube history <service>` lists the stored generations (at most 16, newest first), the current one
+marked `*`, with its image (shortened past 15 bytes), why it was made (`apply`, or `rollback of N`),
+who applied it and the request id:
+
+```
+GEN  IMAGE                REASON         APPLIED BY   REQUEST
+3*   b3:51aa9c03          rollback of 1  alex@laptop  r-0000003
+2    b3:0123456789ab...   apply          alex@laptop  r-0000002
+```
+
+`zcube rollout status <service>` shows the generation, the rollout (or `no rollout`) and the
+policy:
+
+```
+hello: generation 2, 3 replicas
+rollout 1 → 2 (apply): paused, started 3m ago
+  1 new ready, 0 old retired
+  paused by user 1m ago; zcube rollout resume continues it
+policy: rolling, surge 1, unavailable 0, min ready 5s, deadline 600s, on failure rollback
+```
+
+`zcube rollout pause|resume <service>` steers it and prints `hello: progressing → paused (decision
+d-7)`, or `hello: already paused, no change`. Without a rollout, or once it is complete, both are
+`ZC-E0129`, as is a resume of a failed rollout (pause it first). `-o json` prints the server's answer; `-o wide` is not taken. `zcube rollback <service>
+[--to GENERATION]` (slice 8) applies one of the stored generations again as a new generation
+(users address versions by generation, owner 2026-11-05): without `--to`, the newest stored one
+below the current. It prints `hello: generation 7 → 8, restoring 6 (decision d-9)`; `-o json` prints
+the server's answer. After an automatic rollback (say generation 7 failed and generation 8 restored
+6), a bare `zcube rollback` restores 7, the newest below the current: the broken one. Name the
+generation you want with `--to` (`zcube history` lists them). `--to` is refused on any other command. The codes these relay, `ZC-E0125` to
+`E0129`, are in [api.md](api.md), "Rollouts and history".
+
+### Upgrading
+
+Upgrade `zcube-server` first, then the command line. A server from before C3 slice 11 does not
+serve these routes: it answers a read with `404` "the API serves nothing at ..." and a pause or
+resume with `400` naming the paths POST is accepted at, without `/v1/services`. The command line
+recognises both and says so as `ZC-E0101` (``zcube-server does not serve `zcube rollout
+pause`: it is older than this zcube``), with the fix "upgrade zcube-server first, then the command
+line", rather than relaying a refusal that reads as a mistake of the user's.
+
 ## explain
 
 `zcube explain E0201` (also `ZC-E0201`, in any letter case) prints the registry's long explanation,
@@ -355,7 +398,7 @@ reads; with none it is `ZC-E0117`.
 ## Codes the command line raises
 
 `ZC-E0101` to `E0108` are documented in [api.md](api.md); the command line raises `E0101` (a service
-that does not exist), `E0102`, `E0103` and relays the rest from the server, as it relays the
+that does not exist, or a server too old to serve the command: "Upgrading" above), `E0102`, `E0103` and relays the rest from the server, as it relays the
 repair's `ZC-E0401` to `E0403` ([api.md](api.md)).
 
 | Code | Blame | Summary |
@@ -385,7 +428,8 @@ repair's `ZC-E0401` to `E0403` ([api.md](api.md)).
 something to talk to. This is the one command that is not an HTTP client: it lives in
 `src/cli_local.zig`, outside the wasm core, and starts `zcube-server` (SQLite) and `zcube-agent`
 (`FakeRuntime`, node `local`), which it finds beside the `zcube` executable (E0122 if they are not
-there). It waits for `GET /v1/status` and for the node to be registered (E0123 if either does not
+there). It runs only on Linux: on macOS, `zcube local` refuses with E0122 before it looks for
+either program (`docs/macos.md`). It waits for `GET /v1/status` and for the node to be registered (E0123 if either does not
 happen within 20 s; the fix names the log), then prints the address, `export ZCUBE_SERVER=...` and
 `zcube apply hello.zon`.
 

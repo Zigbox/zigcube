@@ -13,6 +13,8 @@
 //! zcube [options] check allocations
 //! zcube [options] stats pull [node]
 //! zcube [options] repair allocations <node> [--confirm]
+//! zcube [options] rollout status|pause|resume <service>
+//! zcube [options] history <service>
 //! zcube [options] local up|down
 //! zcube [options] job run|get|list|cancel|watch ...    (src/cli_job_args.zig)
 //! ```
@@ -22,6 +24,7 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const cli_job_args = @import("cli_job_args.zig");
+const cli_rollout = @import("cli_rollout.zig");
 
 const Diag = diag_mod.Diag;
 
@@ -54,6 +57,8 @@ pub const Options = struct {
     no_redact: bool = false,
     /// store accept-rollback, repair allocations: the operator has looked and means it.
     confirm: bool = false,
+    /// rollback: `--to GENERATION`; null means the newest stored generation below the current.
+    to: ?u64 = null,
 };
 
 /// `zcube local`: the one command that starts processes (src/cli_local.zig).
@@ -78,6 +83,12 @@ pub const Command = union(enum) {
     /// `repair allocations <node>`: the node. Without `--confirm` it shows what it would write.
     repair_allocations: []const u8,
     local: LocalAction,
+    /// `rollout status|pause|resume <service>`.
+    rollout: struct { action: cli_rollout.Action, name: []const u8 },
+    /// `history <service>`: the service.
+    history: []const u8,
+    /// `rollback <service> [--to GENERATION]`: the service (the generation is `Options.to`).
+    rollback: []const u8,
     /// `job run|get|list|cancel|watch`.
     job: cli_job_args.Job,
     help,
@@ -115,6 +126,11 @@ pub const help_text =
     \\                               jobs, newest names first; S is a state or ended
     \\  job cancel <name>            stop a job
     \\  job watch [--from REV]       one line per ending, as they happen
+    \\  rollout status <service>     a service's rollout: phase, progress, deadline and policy
+    \\  rollout pause <service>      hold a rollout where it is; nothing new starts or retires
+    \\  rollout resume <service>     continue a paused rollout, with a fresh deadline
+    \\  history <service>            the stored generations, newest first, and who applied each
+    \\  rollback <service> [--to N]  apply a stored generation's spec again, as a new generation
     \\  local up                     start a server and an agent on this machine (SQLite)
     \\  local down                   stop them; the state and the containers are kept
     \\  help                         show this text
@@ -231,6 +247,9 @@ fn split(
             options.no_redact = true;
         } else if (std.mem.eql(u8, arg, "--confirm")) {
             options.confirm = true;
+        } else if (std.mem.eql(u8, arg, "--to")) {
+            index += 1;
+            options.to = try generation_value(args, index, diag);
         } else if (!std.mem.eql(u8, arg, "--last")) {
             return refuse(diag, "{s} is not a flag zcube has", .{arg});
         } else {
@@ -304,6 +323,13 @@ fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
     if (std.mem.eql(u8, name, "repair")) return repair_of(diag, rest);
     if (std.mem.eql(u8, name, "stats")) return stats_of(diag, rest);
     if (std.mem.eql(u8, name, "local")) return local_of(diag, rest);
+    if (std.mem.eql(u8, name, "rollout")) return rollout_of(diag, rest);
+    if (std.mem.eql(u8, name, "history")) return .{
+        .history = try one_argument(diag, name, rest, "a service"),
+    };
+    if (std.mem.eql(u8, name, "rollback")) return .{
+        .rollback = try one_argument(diag, name, rest, "a service"),
+    };
     if (std.mem.eql(u8, name, "job")) return .{ .job = try cli_job_args.parse(rest, diag) };
     if (std.mem.eql(u8, name, "store")) {
         if (rest.len == 1 and std.mem.eql(u8, rest[0], "accept-rollback")) return .accept_rollback;
@@ -316,6 +342,14 @@ fn stats_of(diag: *Diag, rest: []const []const u8) Error!Command {
     const ok = rest.len >= 1 and rest.len <= 2 and std.mem.eql(u8, rest[0], "pull");
     if (!ok) return refuse(diag, "stats takes pull and, optionally, a node: stats pull node1", .{});
     return .{ .stats_pull = if (rest.len == 2) rest[1] else null };
+}
+
+fn rollout_of(diag: *Diag, rest: []const []const u8) Error!Command {
+    const usage = "rollout takes status, pause or resume and a service: rollout status hello";
+    if (rest.len != 2) return refuse(diag, usage, .{});
+    const action = std.meta.stringToEnum(cli_rollout.Action, rest[0]) orelse
+        return refuse(diag, usage, .{});
+    return .{ .rollout = .{ .action = action, .name = rest[1] } };
 }
 
 fn repair_of(diag: *Diag, rest: []const []const u8) Error!Command {
@@ -428,6 +462,9 @@ fn check_options(options: *const Options, command: Command, diag: *Diag) Error!v
     if (options.confirm and command != .accept_rollback and command != .repair_allocations) {
         return refuse(diag, "--confirm is for zcube store accept-rollback and repair", .{});
     }
+    if (options.to != null and command != .rollback) {
+        return refuse(diag, "--to is for zcube rollback", .{});
+    }
     if (options.dry_run and command != .apply) {
         return refuse(diag, "--dry-run is for zcube apply", .{});
     }
@@ -445,6 +482,16 @@ fn takes_wide(command: Command) bool {
         .job => |job| job == .list,
         else => false,
     };
+}
+
+/// `--to N`: a generation, 1 or more.
+fn generation_value(args: []const []const u8, index: usize, diag: *Diag) Error!u64 {
+    if (index >= args.len) return missing_value(diag, "--to", "a generation, 1 or more");
+    const number = std.fmt.parseInt(u64, args[index], 10) catch 0;
+    if (number == 0) {
+        return refuse(diag, "--to needs a generation, 1 or more, not {s}", .{args[index]});
+    }
+    return number;
 }
 
 fn missing_value(diag: *Diag, flag: []const u8, what: []const u8) Error {
@@ -620,6 +667,54 @@ test "check and repair allocations, and --confirm for repair only" {
         var parsed: Parsed = undefined;
         try testing.expectError(error.Failed, parse(case.line, &parsed, &diag));
         try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, case.cause) != null);
+    }
+}
+
+test "rollback takes a service and, optionally, --to a generation" {
+    // Goal: the C3 slice 8 surface. Method: the accepted lines, then one refusal per rule.
+    const newest = try parse_text(&.{ "rollback", "hello" });
+    try testing.expectEqualStrings("hello", newest.command.rollback);
+    try testing.expectEqual(@as(?u64, null), newest.options.to);
+    const named = try parse_text(&.{ "rollback", "hello", "--to", "3" });
+    try testing.expectEqual(@as(?u64, 3), named.options.to);
+    const cases = [_]struct { line: []const []const u8, cause: []const u8 }{
+        .{ .line = &.{"rollback"}, .cause = "rollback needs a service" },
+        .{ .line = &.{ "rollback", "a", "b" }, .cause = "rollback" },
+        .{ .line = &.{ "rollback", "a", "--to" }, .cause = "--to needs a value" },
+        .{ .line = &.{ "rollback", "a", "--to", "0" }, .cause = "--to needs a generation" },
+        .{ .line = &.{ "rollback", "a", "--to", "x" }, .cause = "--to needs a generation" },
+        .{ .line = &.{ "history", "a", "--to", "2" }, .cause = "--to is for zcube rollback" },
+    };
+    for (cases) |case| {
+        var diag: Diag = undefined;
+        diag.reset();
+        var parsed: Parsed = undefined;
+        try testing.expectError(error.Failed, parse(case.line, &parsed, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, case.cause) != null);
+    }
+}
+
+test "rollout takes status, pause or resume and a service; history takes a service" {
+    // Goal: the C3 slice 11 surface. Method: the accepted lines, then one refusal per rule.
+    const status = try parse_text(&.{ "rollout", "status", "hello" });
+    try testing.expectEqual(cli_rollout.Action.status, status.command.rollout.action);
+    try testing.expectEqualStrings("hello", status.command.rollout.name);
+    const pause = try parse_text(&.{ "rollout", "pause", "hello", "-o", "json" });
+    try testing.expectEqual(cli_rollout.Action.pause, pause.command.rollout.action);
+    const history = try parse_text(&.{ "history", "hello" });
+    try testing.expectEqualStrings("hello", history.command.history);
+    const lines = [_][]const []const u8{
+        &.{"rollout"},                                &.{ "rollout", "stop", "hello" },
+        &.{ "rollout", "status" },                    &.{ "rollout", "pause", "a", "b" },
+        &.{"history"},                                &.{ "history", "a", "b" },
+        &.{ "rollout", "status", "a", "-o", "wide" },
+    };
+    for (lines) |line| {
+        var diag: Diag = undefined;
+        diag.reset();
+        var parsed: Parsed = undefined;
+        try testing.expectError(error.Failed, parse(line, &parsed, &diag));
+        try testing.expect(diag.last_cause() != null);
     }
 }
 

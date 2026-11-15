@@ -44,11 +44,20 @@ const shell_allowlist = [_][]const u8{
     // calls `zig build` and pipes `sim_cluster` into `sim_fleet`; the logic is Zig.
     "ops/sim-fleet/setup.sh",
     "ops/sim-fleet/run.sh",
-    // Both source run.sh to test its shell functions, which only a shell can call:
+    // The opt-in soak's loop (item 8), the same kind of script as `run.sh`: it copies the
+    // binaries `run.sh` built and pipes one long `sim_cluster` run into `sim_fleet`.
+    "ops/sim-fleet/soak.sh",
+    // Runs `soak.sh` end to end against a fake `sim_cluster` and the built `sim_fleet`.
+    "ops/sim-fleet/test-soak-loop.sh",
+    // Each sources run.sh to test its shell functions, which only a shell can call:
     // `test-canary.sh` runs its canary cycle against fake fault-on runners and the built
-    // `sim_fleet`, and `test-crash-record.sh` feeds its crash records to `sim_fleet`.
+    // `sim_fleet`, `test-crash-record.sh` feeds its crash records to `sim_fleet`, and
+    // `test-bias.sh` runs its coverage feedback (bias_pick) against a fake `sim_cluster`.
     "ops/sim-fleet/test-canary.sh",
+    // Sources run.sh and runs `store_faults_day` against a fake `zig` and the built `sim_fleet`.
+    "ops/sim-fleet/test-store-faults.sh",
     "ops/sim-fleet/test-crash-record.sh",
+    "ops/sim-fleet/test-bias.sh",
     // Sources run.sh to test its soak branches and heartbeat against a local git remote, a
     // fake build and the built `sim_fleet` against a local fake server.
     "ops/sim-fleet/test-soak.sh",
@@ -74,6 +83,9 @@ const shell_allowlist = [_][]const u8{
     // demo-b3's guest half (docs/demos/b3.md), for the same reason: it starts the agent and a test
     // upstream as root and reads logs and listeners.
     "ops/demo-b3/guest.sh",
+    // demo-c3's guest half (docs/demos/c3.md), for the same reason: it starts, kills and
+    // restarts the agent as root, learns the images' trees and lists the container supervisors.
+    "ops/demo-c3/guest.sh",
     // demo-b5's guest half (docs/demos/b5.md), for the same reason: it signs with `zbx`, writes
     // the node's trust policy, starts the agent as root and lists the runtime's containers. Its
     // test runs it against a fake `zbx` in `zig build test`.

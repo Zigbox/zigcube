@@ -570,16 +570,40 @@ fn service_counts(world: *const World, service: []const u8, counts: []u32) void 
     }
 }
 
+/// Replicas of `service` at `generation` assigned to each node: the tie-break after spread, so a
+/// rolling update spreads the new generation while the old one still holds its nodes. Without it
+/// a surge replica placed where an old one was just retired ties on spread, and locality (that
+/// node already holds the new image) sends the next one to the same node. An assignment whose
+/// replica record is gone (a ghost) is of no generation. Null `generation` (a run) counts none.
+fn generation_counts(
+    world: *const World,
+    service: []const u8,
+    generation: ?u64,
+    counts: []u32,
+) void {
+    assert(counts.len == world.nodes.len);
+    @memset(counts, 0);
+    const wanted = generation orelse return;
+    for (world.assigns.items) |assign| {
+        if (!assign.live or assign.node == no_node or assign.job) continue;
+        if (!std.mem.eql(u8, assign.service, service)) continue;
+        const index = world.desired.get(assign.replica) orelse continue;
+        if (world.replicas[index].rec.generation == wanted) counts[assign.node] += 1;
+    }
+}
+
 /// Whether node `first` is a better home than `second`: fewest assignments of the same service
-/// (spread), then the most bytes of the replica's image already held (locality), then least
-/// allocated (CPU, then memory, as a fraction of capacity), then the lower name. Fit is decided
-/// before: only nodes that fit are compared.
+/// (spread), then fewest of the replica's own generation (a rollout's tie-break), then the most
+/// bytes of the replica's image already held (locality), then least allocated (CPU, then memory,
+/// as a fraction of capacity), then the lower name. Fit is decided before: only nodes that fit
+/// are compared.
 fn precedes(world: *const World, rank: Rank, first: u32, second: u32) bool {
     // The teeth fault: locality ahead of spread (a build whose root switched it on).
     if (c1_teeth.locality_before_spread and rank.locality[first] != rank.locality[second]) {
         return rank.locality[first] > rank.locality[second];
     }
     if (rank.counts[first] != rank.counts[second]) return rank.counts[first] < rank.counts[second];
+    if (rank.same[first] != rank.same[second]) return rank.same[first] < rank.same[second];
     if (rank.locality[first] != rank.locality[second]) {
         return rank.locality[first] > rank.locality[second];
     }
@@ -605,6 +629,8 @@ fn precedes(world: *const World, rank: Rank, first: u32, second: u32) bool {
 /// What `precedes` ranks by, per node index.
 const Rank = struct {
     counts: []const u32,
+    /// Of `counts`, those of the placed replica's generation.
+    same: []const u32,
     locality: []const u64,
 };
 
@@ -655,16 +681,20 @@ const Chosen = struct {
 fn choose(
     world: *const World,
     service: []const u8,
+    generation: ?u64,
     image: []const u8,
     verdicts: []const Verdict,
 ) ?Chosen {
     assert(verdicts.len == world.nodes.len);
     var counts: [views_max]u32 = undefined;
     service_counts(world, service, counts[0..world.nodes.len]);
+    var same: [views_max]u32 = undefined;
+    generation_counts(world, service, generation, same[0..world.nodes.len]);
     var locality: [views_max]u64 = undefined;
     locality_of(world, image, locality[0..world.nodes.len]);
     const rank: Rank = .{
         .counts = counts[0..world.nodes.len],
+        .same = same[0..world.nodes.len],
         .locality = locality[0..world.nodes.len],
     };
     var best: ?u32 = null;
@@ -997,7 +1027,13 @@ pub const Scheduler = struct {
         var verdicts: [views_max]Verdict = undefined;
         const judged = verdicts[0..world.nodes.len];
         for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need, false, &.{});
-        const chosen = choose(world, replica.rec.service, replica.rec.image, judged) orelse {
+        const chosen = choose(
+            world,
+            replica.rec.service,
+            replica.rec.generation,
+            replica.rec.image,
+            judged,
+        ) orelse {
             const subject: Held = .{
                 .kind = .replica,
                 .id = replica.rec.id,
@@ -1082,7 +1118,7 @@ pub const Scheduler = struct {
         for (world.nodes, judged) |*view, *verdict| {
             verdict.* = judge(view, need, true, require);
         }
-        const chosen = choose(world, "", run.image, judged) orelse {
+        const chosen = choose(world, "", null, run.image, judged) orelse {
             const subject: Held = .{
                 .kind = .job,
                 .id = run_id,

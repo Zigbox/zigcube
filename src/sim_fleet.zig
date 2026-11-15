@@ -1,10 +1,13 @@
 //! `sim_fleet`: the simulation fleet's reporter (docs/briefs/c1-9.md, ops/sim-fleet/README.md).
 //!
 //!     sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]
-//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]
+//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|sim-soak|store-faults]
+//!                      [--dry-run]
 //!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT[|TEXT...]]]
 //!                      [--ref BRANCH] [--round-started UNIX]
 //!                      < one run kind's output of a round
+//!     sim_fleet coverage|bias --kind sim-cluster|sim-c1 --commit SHA --file FILE
+//!                      (src/sim_fleet_coverage.zig)
 //!     sim_fleet heartbeat [--repo OWNER/NAME --token-file FILE --state FILE]
 //!                         [--url-file FILE] [--clean]
 //!
@@ -54,17 +57,24 @@ const issue = @import("sim_fleet_issue.zig");
 const symptom_spec = @import("symptom.zig");
 const state_file = @import("sim_fleet_state.zig");
 const github_api = @import("sim_fleet_github.zig");
+const coverage = @import("sim_fleet_coverage.zig");
 
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
-    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]\n" ++
-    "                        [--canary RUNNER --canary-seeds A..B\n" ++
+    "                        [--tracker N]\n" ++
+    "                        [--kind sim-cluster|sim-c1|sim-swarm|sim-soak|store-faults]\n" ++
+    "                        [--dry-run] [--canary RUNNER --canary-seeds A..B\n" ++
     "                         [--expect-symptom TEXT[|TEXT]]]\n" ++
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
     "(--kind sim-cluster), the same with --c1 (sim-c1), or `sim_swarm --seeds A..B <ops>\n" ++
-    "--shrink` (sim-swarm), concatenated; with --canary, the fault-on RUNNER's run of that\n" ++
+    "--shrink` (sim-swarm), concatenated, or `zig build test-store-faults` (store-faults,\n" ++
+    "once a day); with --canary, the fault-on RUNNER's run of that\n" ++
     "kind over seeds A..B, filed as sim-canary\n" ++
     "       sim_fleet ingest ... [--ref BRANCH] [--round-started UNIX]\n" ++
+    "       sim_fleet coverage --kind sim-cluster|sim-c1 --commit SHA --file FILE\n" ++
+    "adds the `coverage: profile=` lines of that kind's round on stdin to FILE\n" ++
+    "       sim_fleet bias --kind sim-cluster|sim-c1 --commit SHA --file FILE\n" ++
+    "prints the fault profile a biased round runs (src/sim_fleet_coverage.zig)\n" ++
     "       sim_fleet heartbeat [--repo OWNER/NAME --token-file FILE --state FILE]\n" ++
     "                           [--url-file FILE] [--clean]\n" ++
     "checks the token (and records its expiry), then after a clean round GETs the URL in\n" ++
@@ -603,6 +613,7 @@ fn parse_args(args: []const []const u8) ?Args {
 pub fn main(init: std.process.Init) u8 {
     const arena = init.arena.allocator();
     const argv = init.minimal.args.toSlice(arena) catch return constants.exit_user;
+    if (coverage.parse_args(argv)) |args| return run_coverage(init, args);
     var err_buffer: [1024]u8 = undefined;
     var err_writer = std.Io.File.stderr().writerStreaming(init.io, &err_buffer);
     const log = &err_writer.interface;
@@ -621,6 +632,24 @@ pub fn main(init: std.process.Init) u8 {
     };
 }
 
+fn run_coverage(init: std.process.Init, args: coverage.Args) u8 {
+    var out_buffer: [1024]u8 = undefined;
+    var out_writer = std.Io.File.stdout().writerStreaming(init.io, &out_buffer);
+    defer out_writer.interface.flush() catch {}; // Nowhere else to report it.
+    var err_buffer: [1024]u8 = undefined;
+    var err_writer = std.Io.File.stderr().writerStreaming(init.io, &err_buffer);
+    const log = &err_writer.interface;
+    defer log.flush() catch {}; // Nowhere else to report it.
+    coverage.run(init, args, &out_writer.interface, log) catch |err| {
+        log.print("sim-fleet: {s}\n", .{coverage.explain(err)}) catch {}; // Nowhere else.
+        return switch (err) {
+            error.BadLine, error.BadBook => constants.exit_user,
+            else => constants.exit_environment,
+        };
+    };
+    return constants.exit_ok;
+}
+
 const RunError = issue.ParseError || state_file.ParseError || IngestError ||
     std.Io.Writer.Error ||
     error{
@@ -637,8 +666,9 @@ const RunError = issue.ParseError || state_file.ParseError || IngestError ||
 fn explain(err: RunError) []const u8 {
     return switch (err) {
         error.NoSummary => "stdin has no summary line of --kind (`sim-cluster: seeds A..B`, " ++
-            "`sim-cluster --c1: seeds A..B` or `sim-swarm: seeds A..B`), or a failure after " ++
-            "the last one; feed it that producer's --seeds output (run.sh does)",
+            "`sim-cluster --c1: seeds A..B`, `sim-swarm: seeds A..B` or " ++
+            "`sim-cluster --soak: seeds A..B`), or a failure after the last one; feed it " ++
+            "that producer's output unchanged (run.sh and soak.sh do)",
         error.BadLine => "stdin has a line sim_fleet cannot read, batches of different " ++
             "operation counts, or a summary whose count of failed seeds is not the number of " ++
             "`seed N:` records before it; feed it unchanged --seeds output",
@@ -1276,8 +1306,12 @@ test "parse_args wants a commit and a state, and a repo and token unless dry" {
         "--repo", "a/b",    "--tracker", "9", "--token-file", "t",
     });
     try std.testing.expectEqual(@as(?u32, 9), real.?.tracker);
-    const other = parse_args(&.{
+    const faults = parse_args(&.{
         "f", "ingest", "--commit", "c", "--state", "s", "--dry-run", "--kind", "store-faults",
+    });
+    try std.testing.expectEqualStrings("store-faults", faults.?.kind);
+    const other = parse_args(&.{
+        "f", "ingest", "--commit", "c", "--state", "s", "--dry-run", "--kind", "bogus",
     });
     try std.testing.expect(other == null);
     try std.testing.expect(parse_args(&.{ "f", "ingest", "--bogus", "1" }) == null);

@@ -65,6 +65,8 @@ pub const prefix_pulls = "/pulls/";
 pub const prefix_summaries = "/decision-summaries/";
 pub const prefix_replica_numbers = "/replica-numbers/";
 pub const prefix_jobs = "/jobs/";
+pub const prefix_history = "/history/";
+pub const prefix_rollouts = "/rollouts/";
 /// What the cause of ZC-E0523 says of a damaged input; the agent's client tells it from an
 /// absent one by this. THIS TEXT IS WIRE PROTOCOL: the refusal carries no structured member
 /// to tell the two apart, and an agent and a server of different versions meet during an
@@ -133,6 +135,36 @@ pub fn job_observed_key(node: []const u8, name: []const u8) Key {
 pub fn service_key(name: []const u8) Key {
     assert(name_problem(name, constants.service_name_bytes_max) == null);
     return Key.build(&.{ prefix_services, name });
+}
+
+/// `/history/<service>/<generation>`, the generation in decimal without padding: a reader sorts
+/// by the number, never by the key (docs/keys.md).
+pub fn history_key(service: []const u8, generation: u64) Key {
+    assert(name_problem(service, constants.service_name_bytes_max) == null);
+    assert(generation > 0);
+    var digits: [20]u8 = undefined;
+    const text = std.fmt.bufPrint(&digits, "{d}", .{generation}) catch unreachable; // 20 digits.
+    return Key.build(&.{ prefix_history, service, "/", text });
+}
+
+pub fn history_prefix(service: []const u8) Key {
+    assert(name_problem(service, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_history, service, "/" });
+}
+
+/// The generation a history key names, or null when the last part is not a generation.
+pub fn history_generation(key: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, key, prefix_history)) return null;
+    const slash = std.mem.lastIndexOfScalar(u8, key, '/') orelse return null;
+    const text = key[slash + 1 ..];
+    if (text.len == 0 or text[0] == '0') return null;
+    const generation = std.fmt.parseInt(u64, text, 10) catch return null;
+    return generation;
+}
+
+pub fn rollout_key(service: []const u8) Key {
+    assert(name_problem(service, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_rollouts, service });
 }
 
 pub fn replica_numbers_key(service: []const u8) Key {
@@ -640,8 +672,77 @@ pub const Requests = struct {
 
 pub const Pair = [2][]const u8;
 
+/// A service's health check (C3): a command run inside the container, exit 0 healthy. Every member
+/// is written; `apply` refuses a check that cannot be met (ZC-E0125).
+pub const Health = struct {
+    command: []const []const u8,
+    interval_ms: u32,
+    timeout_ms: u32,
+    start_period_ms: u32 = 0,
+    failure_threshold: u32,
+    success_threshold: u32,
+
+    pub fn equal(first: Health, second: Health) bool {
+        if (!strings_equal(first.command, second.command)) return false;
+        if (first.interval_ms != second.interval_ms) return false;
+        if (first.timeout_ms != second.timeout_ms) return false;
+        if (first.start_period_ms != second.start_period_ms) return false;
+        if (first.failure_threshold != second.failure_threshold) return false;
+        return first.success_threshold == second.success_threshold;
+    }
+};
+
+/// Whether a health check is one `apply` admits (ZC-E0125 says which rule a check breaks): a
+/// command of 1 to `runtime_command_words_max` words with a first word, times that nest, and the
+/// bounds `health_interval_ms_max` and `health_verdict_ms_max`. `read` refuses a stored service,
+/// replica or history record whose check is not, so no such value reaches the agent's scheduler.
+pub fn health_valid(health: Health) bool {
+    if (health.command.len == 0) return false;
+    if (health.command.len > constants.runtime_command_words_max) return false;
+    if (health.command[0].len == 0) return false;
+    if (health.interval_ms == 0 or health.timeout_ms == 0) return false;
+    if (health.timeout_ms > health.interval_ms) return false;
+    if (health.failure_threshold == 0 or health.success_threshold == 0) return false;
+    if (health.interval_ms > constants.health_interval_ms_max) return false;
+    if (health.start_period_ms > constants.health_interval_ms_max) return false;
+    const threshold = @max(health.failure_threshold, health.success_threshold);
+    return @as(u64, threshold) * health.interval_ms <= constants.health_verdict_ms_max;
+}
+
+fn health_absent_or_valid(health: ?Health) bool {
+    const check = health orelse return true;
+    return health_valid(check);
+}
+
+pub fn health_equal(first: ?Health, second: ?Health) bool {
+    const left = first orelse return second == null;
+    const right = second orelse return false;
+    return left.equal(right);
+}
+
+pub const RolloutStrategy = enum { rolling, recreate };
+pub const RolloutOnFailure = enum { rollback, pause };
+
+/// How a new generation replaces the old (C3). The defaults are every service's rollout
+/// (docs/decisions/2026-11-05-c3-owner-answers.md, answer 4); a service that holds no `rollout`
+/// has exactly these.
+pub const RolloutPolicy = struct {
+    strategy: RolloutStrategy = .rolling,
+    max_surge: u32 = 1,
+    max_unavailable: u32 = 0,
+    min_ready_ms: u32 = 5_000,
+    ready_timeout_ms: u32 = 120_000,
+    progress_deadline_ms: u32 = 600_000,
+    grace_ms: u32 = 10_000,
+    on_failure: RolloutOnFailure = .rollback,
+
+    pub fn equal(first: RolloutPolicy, second: RolloutPolicy) bool {
+        return std.meta.eql(first, second);
+    }
+};
+
 pub const Service = struct {
-    v: u32 = 3,
+    v: u32 = service_version_rollout,
     name: []const u8,
     image: []const u8,
     replicas: u32,
@@ -657,7 +758,35 @@ pub const Service = struct {
     /// The OCI reference `image` is pulled from, pinned by digest (docs/keys.md); empty when the
     /// tree must already be on the node. Absent in records before version 3.
     source: []const u8 = "",
+    /// The health check (version 4); absent: none.
+    health: ?Health = null,
+    /// The rollout policy (version 4); absent: the default, `RolloutPolicy{}`. `apply` stores
+    /// none when the policy is the default.
+    rollout: ?RolloutPolicy = null,
+
+    /// The policy in force: the stored one, or the default.
+    pub fn rollout_policy(service: *const Service) RolloutPolicy {
+        return service.rollout orelse .{};
+    }
 };
+
+/// Services and replicas are written at the oldest version that holds their members: version 4
+/// only with a `health` or a `rollout`, so that a release before C3 still reads every service that
+/// uses neither (docs/keys.md, "Versions"). `encode` sets it, so no writer can leave `v` at the
+/// default.
+pub const service_version_plain: u32 = 3;
+pub const service_version_rollout: u32 = 4;
+
+pub fn service_version(service: *const Service) u32 {
+    if (service.health != null) return service_version_rollout;
+    if (service.rollout != null) return service_version_rollout;
+    return service_version_plain;
+}
+
+pub fn replica_version(replica: *const Replica) u32 {
+    if (replica.health != null) return service_version_rollout;
+    return service_version_plain;
+}
 
 /// The counter that keeps replica ids unique forever: the number the next replica takes.
 pub const ReplicaNumber = struct {
@@ -668,7 +797,7 @@ pub const ReplicaNumber = struct {
 /// What a service asks for, once per replica. Where it runs is `/assigned`'s (the scheduler's);
 /// a v1 record's `node` and `requests` are ignored on read.
 pub const Replica = struct {
-    v: u32 = 3,
+    v: u32 = service_version_rollout,
     id: []const u8,
     service: []const u8,
     generation: u64,
@@ -678,13 +807,129 @@ pub const Replica = struct {
     limits: Limits = .{},
     /// The service's `source`, copied (absent before version 3).
     source: []const u8 = "",
+    /// The service's `health`, copied (version 4): the agent runs the check.
+    health: ?Health = null,
 };
 
-/// Whether `replica` runs what `service` asks for now: the image, `source`, command, `env` and
-/// `limits`, the inputs that bump a service's `generation`. The generation alone cannot say: it
-/// restarts at 1 when a service is deleted and applied again, so a replica of the previous
-/// incarnation can be ahead of the new service, or equal to it, and still run something else.
+/// Why a generation was applied (`/history`).
+pub const HistoryReason = enum { apply, rollback, auto_rollback };
+
+/// `/history/<service>/<generation>`: what one generation of a service ran, as the service record
+/// held it when that generation was applied. Written by the API in the apply's transaction, never
+/// changed; at most `history_generations_max` per service (docs/keys.md).
+pub const History = struct {
+    v: u32 = 1,
+    service: []const u8,
+    generation: u64,
+    image: []const u8,
+    source: []const u8 = "",
+    command: []const []const u8,
+    env: []const Pair = &.{},
+    limits: Limits = .{},
+    health: ?Health = null,
+    applied_by: []const u8,
+    request_id: []const u8,
+    applied_at_ms: u64,
+    reason: HistoryReason,
+    /// The generation whose spec a rollback copied; absent for `apply`.
+    restores: ?u64 = null,
+};
+
+/// The history record of what `service` runs now, at its generation.
+pub fn history_of(service: *const Service, applied_at_ms: u64) History {
+    assert(service.generation > 0);
+    return .{
+        .service = service.name,
+        .generation = service.generation,
+        .image = service.image,
+        .source = service.source,
+        .command = service.command,
+        .env = service.env,
+        .limits = service.limits,
+        .health = service.health,
+        .applied_by = service.applied_by,
+        .request_id = service.request_id,
+        .applied_at_ms = applied_at_ms,
+        .reason = .apply,
+    };
+}
+
+pub const RolloutPhase = enum { progressing, paused, rolling_back, complete, failed };
+
+/// Why a rollout runs: a generation the user applied, or a rollback that landed as one.
+pub const RolloutReason = enum { apply, rollback };
+
+/// Who paused a rollout: the user (`zcube rollout pause`) or a failure under `on_failure: pause`.
+pub const RolloutPauseCause = enum { user, failure };
+
+/// What the replica controller may do now for a rollout: start this many new replicas, retire
+/// this many ready old ones (`retire`, the count R1 limits) and this many old ones that are not
+/// ready (`retire_unready`). A replica counted as unready that is ready when the controller acts
+/// is not retired on `retire_unready`.
+pub const RolloutBudget = struct {
+    start: u32 = 0,
+    retire: u32 = 0,
+    retire_unready: u32 = 0,
+};
+
+/// `/rollouts/<service>`: the one rollout of a service, written by the rollout controller (C3
+/// slice 7). Defined here so that its key, writer and version are fixed first.
+pub const Rollout = struct {
+    v: u32 = 1,
+    service: []const u8,
+    /// The `create_revision` of the service key the rollout was started for. A service deleted
+    /// and applied again is another service (its generations restart at 1): a rollout of the old
+    /// one is not its rollout (`rollout_of`).
+    service_created: u64,
+    from: u64,
+    to: u64,
+    phase: RolloutPhase,
+    started_at_ms: u64,
+    deadline_at_ms: u64,
+    /// When the controller next looks without a store change (`min_ready_ms` timers).
+    next_at_ms: ?u64 = null,
+    ready_new: u32 = 0,
+    retired_old: u32 = 0,
+    budget: RolloutBudget = .{},
+    /// The decision that started or last moved the rollout.
+    cause_decision: []const u8 = "",
+    /// C3 slice 7: the rest of the controller's state (`rollout_plan.State`), so that another
+    /// server's controller, or this one after a restart, goes on where it stopped.
+    reason: RolloutReason = .apply,
+    /// Failures seen before this moment no longer count (a resume moves it); null: `started_at_ms`.
+    evidence_from_ms: ?u64 = null,
+    paused_at_ms: ?u64 = null,
+    paused_by: ?RolloutPauseCause = null,
+    /// `true`: the automatic rollback this failed rollout owed was refused (ZC-E0127, ZC-E0128),
+    /// so it has ended owing nothing; null otherwise (`false` is never written).
+    rollback_refused: ?bool = null,
+    /// What `budget` was computed on, so the replica controller can tell what of it is spent: the
+    /// store revision the controller read, the `/replica-numbers/<service>` counter then (null:
+    /// no counter yet) and the old replicas (`/replicas/` records of an older spec) then. Starts
+    /// spent are the counter's advance since; retirements, the old replicas gone since.
+    budget_revision: u64 = 0,
+    budget_next: ?u64 = null,
+    budget_old: u32 = 0,
+};
+
+/// Whether `rollout` is the rollout of the service whose key was created at
+/// `service_create_revision` (null: no service). The API leaves `/rollouts/` alone when it deletes
+/// a service (authority.md: the rollout controller is the prefix's one writer), so a rollout left
+/// from a deleted service, or from one deleted and applied again, is not this service's: every
+/// reader treats it as absent and the rollout controller deletes it.
+pub fn rollout_of(rollout: *const Rollout, service_create_revision: ?u64) bool {
+    const created = service_create_revision orelse return false;
+    assert(created > 0);
+    return rollout.service_created == created;
+}
+
+/// Whether `replica` runs what `service` asks for now: the image, `source`, command, `env`,
+/// `limits` and `health`, the inputs that bump a service's `generation`. The generation alone
+/// cannot say: it restarts at 1 when a service is deleted and applied again, so a replica of the
+/// previous incarnation can be ahead of the new service, or equal to it, and still run something
+/// else.
 pub fn replica_runs_service(replica: *const Replica, service: *const Service) bool {
+    if (!health_equal(replica.health, service.health)) return false;
     if (!std.mem.eql(u8, replica.image, service.image)) return false;
     if (!std.mem.eql(u8, replica.source, service.source)) return false;
     if (!strings_equal(replica.command, service.command)) return false;
@@ -832,8 +1077,11 @@ pub const Exit = struct {
     }
 };
 
+/// What the agent's health check last said of a replica (`Observed` version 3).
+pub const HealthState = enum { unknown, healthy, unhealthy };
+
 pub const Observed = struct {
-    v: u32 = 2,
+    v: u32 = 3,
     replica: []const u8,
     node: []const u8,
     generation: u64,
@@ -847,7 +1095,33 @@ pub const Observed = struct {
     /// The `/assigned/<node>/<replica>` revision it ran under (the placement epoch). Absent in C0
     /// records.
     assignment: ?u64 = null,
+    /// Version 3: the health check's verdict, absent for a replica without one.
+    health: ?HealthState = null,
+    /// Version 3: consecutive failed probes since the last success.
+    health_failures: ?u32 = null,
+    /// Version 3: the exit code of the last probe that ran to an exit, 0 to 255 like every exit
+    /// code (`Exit`): a value outside it does not parse.
+    last_probe_exit: ?u8 = null,
 };
+
+/// Observations are written at the oldest version that holds their members: version 3 only with
+/// health, so a C1 or C2 server reads what an agent of this release reports for a replica without
+/// a health check (docs/keys.md, `/observed`).
+pub const observed_version_plain: u32 = 2;
+pub const observed_version_health: u32 = 3;
+
+pub fn observed_version(observed: *const Observed) u32 {
+    const health = observed.health != null or observed.health_failures != null or
+        observed.last_probe_exit != null;
+    return if (health) observed_version_health else observed_version_plain;
+}
+
+/// The health verdict an observation carries: `unknown` for one without a check, and for every
+/// version 1 and 2 record, which predate health checks.
+pub fn observed_health(observed: *const Observed) HealthState {
+    if (observed.v < observed_version_health) return .unknown;
+    return observed.health orelse .unknown;
+}
 
 /// A replica's record never carries `refused`: only a job run is judged by the node's policy.
 pub fn observed_valid(observed: *const Observed) bool {
@@ -1067,7 +1341,7 @@ fn run_too_large(diag: *Diag, id: []const u8, bytes: usize) Error {
 pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
-    std.json.Stringify.value(value, options, &out.writer) catch
+    std.json.Stringify.value(at_oldest_version(value), options, &out.writer) catch
         return failures.no_memory(diag);
     const bytes = out.toOwnedSlice() catch return failures.no_memory(diag);
     assert(bytes.len > 0);
@@ -1081,6 +1355,19 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
         return run_too_large(diag, value.id, bytes.len);
     }
     return bytes;
+}
+
+/// A service, replica or observation with `v` set to the oldest version that holds its members;
+/// anything else as it is. The writer owns `v`, not whoever built the value: an agent's report
+/// is parsed into an `Observed` (the endpoint refuses a member it does not know, ZC-E0104) and
+/// stored at the version its members need, whatever `v` it named.
+fn at_oldest_version(value: anytype) @TypeOf(value) {
+    const T = @TypeOf(value);
+    var written = value;
+    if (T == Service) written.v = service_version(&value);
+    if (T == Replica) written.v = replica_version(&value);
+    if (T == Observed) written.v = observed_version(&value);
+    return written;
 }
 
 /// Parses the value of `kv` as a `T`. A value that is not one is ZC-E0301 naming the key.
@@ -1117,13 +1404,51 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         if (!job_valid(record)) return malformed(diag, kv.key, @typeName(T));
     }
     if (T == Assigned and !assigned_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    // `apply` refuses these (ZC-E0125); the agent's health scheduler asserts what it checks.
+    if (T == Service or T == Replica or T == History) {
+        if (!health_absent_or_valid(record.health)) return malformed(diag, kv.key, @typeName(T));
+    }
     if (T == Observed and !observed_valid(&record)) return malformed(diag, kv.key, @typeName(T));
     if (T == JobStatus and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobObserved and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobAdmission and !admission_valid(record)) {
         return malformed(diag, kv.key, @typeName(T));
     }
+    if (T == Rollout and !rollout_valid(&record)) return malformed(diag, kv.key, @typeName(T));
     return record;
+}
+
+/// Whether a rollout record agrees with itself: its target is a generation, `from` (the
+/// generation the service last ran to completion, 0 if none) is older than it, its deadline is
+/// not before its start, and a rollback has a generation to roll back to. The rollout controller
+/// writes no other kind; one that contradicts itself is refused here (ZC-E0301), never asserted
+/// on by the plan (docs/decisions/2026-11-14-c3-rollout-from-rule.md).
+fn rollout_valid(record: *const Rollout) bool {
+    if (record.to == 0) return false;
+    if (record.from >= record.to) return false;
+    if (record.deadline_at_ms < record.started_at_ms) return false;
+    if (record.phase == .rolling_back and record.from == 0) return false;
+    // Slice 7's members: what `State.assert_valid` and `begin` assert
+    // (docs/decisions/2026-11-14-c3-rollout-from-rule.md, rule 2).
+    if (record.reason == .rollback and record.from == 0) return false;
+    const evidence_from = record.evidence_from_ms orelse record.started_at_ms;
+    if (evidence_from < record.started_at_ms) return false;
+    const paused = record.phase == .paused;
+    if (paused != (record.paused_at_ms != null)) return false;
+    if (paused != (record.paused_by != null)) return false;
+    if (record.paused_at_ms) |at| {
+        if (at < evidence_from) return false;
+    }
+    if (record.rollback_refused) |refused| {
+        if (!refused) return false;
+        if (record.phase != .failed) return false;
+        if (record.reason != .apply) return false;
+    }
+    return switch (record.phase) {
+        .progressing => record.reason == .apply,
+        .rolling_back => record.reason == .rollback,
+        .paused, .complete, .failed => true,
+    };
 }
 
 /// Whether a pull record names at most `pull_peers_max` peers in each list and every one is a
@@ -1619,6 +1944,404 @@ test "records a C1 build wrote still read" {
     for (seen) |count| try testing.expect(count > 0);
 }
 
+const test_health: Health = .{
+    .command = &.{ "/bin/check", "--quick" },
+    .interval_ms = 2_000,
+    .timeout_ms = 1_000,
+    .failure_threshold = 3,
+    .success_threshold = 1,
+};
+
+test "C3: services and replicas are version 4 only with health or a rollout" {
+    // Goal: the oldest-version rule (docs/keys.md, "Versions"): a release before C3 reads every
+    // service that sets neither. Method: encode with and without each, read back, compare.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const plain: Service = .{
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 2,
+        .command = &.{"run"},
+        .generation = 3,
+    };
+    const plain_bytes = try encode(arena, plain, &diag);
+    const plain_back = try read(Service, arena, kv_of("/s", plain_bytes), &diag);
+    try testing.expectEqual(service_version_plain, plain_back.v);
+    try testing.expect(plain_back.health == null and plain_back.rollout == null);
+    try testing.expect(plain_back.rollout_policy().equal(.{}));
+
+    var checked = plain;
+    checked.health = test_health;
+    checked.rollout = .{ .strategy = .recreate, .max_surge = 0, .on_failure = .pause };
+    const checked_bytes = try encode(arena, checked, &diag);
+    try testing.expect(std.mem.startsWith(u8, checked_bytes, "{\"v\":4,"));
+    const checked_back = try read(Service, arena, kv_of("/s", checked_bytes), &diag);
+    try testing.expect(health_equal(checked.health, checked_back.health));
+    try testing.expect(checked_back.rollout_policy().equal(checked.rollout.?));
+    try testing.expectEqual(RolloutOnFailure.pause, checked_back.rollout.?.on_failure);
+
+    var rolled = plain;
+    rolled.rollout = .{ .max_surge = 2 };
+    const rolled_bytes = try encode(arena, rolled, &diag);
+    try testing.expect(std.mem.startsWith(u8, rolled_bytes, "{\"v\":4,"));
+
+    const replica: Replica = .{
+        .id = "hello-1",
+        .service = "hello",
+        .generation = 3,
+        .image = "b3:51aa9c03",
+        .command = &.{"run"},
+    };
+    const replica_plain = try encode(arena, replica, &diag);
+    try testing.expect(std.mem.startsWith(u8, replica_plain, "{\"v\":3,"));
+    var probed = replica;
+    probed.health = test_health;
+    const probed_bytes = try encode(arena, probed, &diag);
+    try testing.expect(std.mem.startsWith(u8, probed_bytes, "{\"v\":4,"));
+    const probed_back = try read(Replica, arena, kv_of("/r", probed_bytes), &diag);
+    try testing.expect(health_equal(probed.health, probed_back.health));
+    // A change of health is a change of what a replica runs.
+    try testing.expect(replica_runs_service(&probed_back, &checked));
+    try testing.expect(!replica_runs_service(&replica, &checked));
+}
+
+test "C3: read refuses a stored health check that apply would refuse" {
+    // Goal: no stored check the apply would refuse reaches the agent's scheduler, whose
+    // assertions hold for admitted checks only (a bad row crash-looped the agent). Method: a
+    // service, a replica and a history record, each with one field out of bounds at a time, read
+    // with ZC-E0301; each boundary value reads back.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const interval_max = constants.health_interval_ms_max;
+    const words_most: [constants.runtime_command_words_max][]const u8 = @splat("w");
+    const words_too_many: [constants.runtime_command_words_max + 1][]const u8 = @splat("w");
+    const bad = [_]Health{
+        with_health(.{ .command = &.{} }),
+        with_health(.{ .command = &words_too_many }),
+        with_health(.{ .command = &.{ "", "x" } }),
+        with_health(.{ .interval_ms = 0 }),
+        with_health(.{ .timeout_ms = 0 }),
+        with_health(.{ .timeout_ms = test_health.interval_ms + 1 }),
+        with_health(.{ .failure_threshold = 0 }),
+        with_health(.{ .success_threshold = 0 }),
+        with_health(.{ .interval_ms = interval_max + 1, .timeout_ms = 1 }),
+        with_health(.{ .start_period_ms = interval_max + 1 }),
+        with_health(.{ .interval_ms = interval_max, .failure_threshold = std.math.maxInt(u32) }),
+        with_health(.{ .interval_ms = interval_max, .success_threshold = std.math.maxInt(u32) }),
+    };
+    const good = [_]Health{
+        test_health,
+        with_health(.{ .interval_ms = interval_max, .start_period_ms = interval_max }),
+        with_health(.{ .timeout_ms = test_health.interval_ms }),
+        with_health(.{ .command = &words_most }),
+        with_health(.{
+            .interval_ms = interval_max,
+            .failure_threshold = @intCast(constants.health_verdict_ms_max / interval_max),
+        }),
+    };
+    for (bad) |health| {
+        try testing.expect(!health_valid(health));
+        try expect_health_read(arena, health, &diag, false);
+    }
+    for (good) |health| {
+        try testing.expect(health_valid(health));
+        try expect_health_read(arena, health, &diag, true);
+    }
+}
+
+const HealthChange = struct {
+    command: ?[]const []const u8 = null,
+    interval_ms: ?u32 = null,
+    timeout_ms: ?u32 = null,
+    start_period_ms: ?u32 = null,
+    failure_threshold: ?u32 = null,
+    success_threshold: ?u32 = null,
+};
+
+fn with_health(change: HealthChange) Health {
+    var health = test_health;
+    if (change.command) |command| health.command = command;
+    if (change.interval_ms) |value| health.interval_ms = value;
+    if (change.timeout_ms) |value| health.timeout_ms = value;
+    if (change.start_period_ms) |value| health.start_period_ms = value;
+    if (change.failure_threshold) |value| health.failure_threshold = value;
+    if (change.success_threshold) |value| health.success_threshold = value;
+    return health;
+}
+
+fn expect_health_read(arena: Allocator, health: Health, diag: *Diag, valid: bool) !void {
+    const service: Service = .{
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 1,
+        .command = &.{"run"},
+        .generation = 3,
+        .health = health,
+    };
+    const replica: Replica = .{
+        .id = "hello-1",
+        .service = "hello",
+        .generation = 3,
+        .image = "b3:51aa9c03",
+        .command = &.{"run"},
+        .health = health,
+    };
+    var history = std.mem.zeroes(History);
+    history.v = version_current(History);
+    history.health = health;
+    inline for (.{ service, replica, history }) |value| {
+        const T = @TypeOf(value);
+        const bytes = try encode(arena, value, diag);
+        const result = read(T, arena, kv_of("/k", bytes), diag);
+        if (valid) {
+            _ = try result;
+        } else {
+            try testing.expectError(error.Malformed, result);
+            try testing.expectEqual(codes.Code.E0301, diag.code.?);
+        }
+        diag.reset();
+    }
+}
+
+test "C3: an observation is version 3 only with a health verdict" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const seen: Observed = .{
+        .replica = "hello-1",
+        .node = "n1",
+        .generation = 3,
+        .status = .running,
+        .reported_at_ms = 5,
+    };
+    try testing.expect(std.mem.startsWith(u8, try encode(arena, seen, &diag), "{\"v\":2,"));
+    var judged = seen;
+    judged.health = .unhealthy;
+    judged.health_failures = 3;
+    judged.last_probe_exit = 1;
+    const judged_bytes = try encode(arena, judged, &diag);
+    try testing.expect(std.mem.startsWith(u8, judged_bytes, "{\"v\":3,"));
+    const judged_back = try read(Observed, arena, kv_of("/o", judged_bytes), &diag);
+    try testing.expectEqual(HealthState.unhealthy, judged_back.health.?);
+    try testing.expectEqual(@as(u32, 3), judged_back.health_failures.?);
+    try testing.expectEqual(@as(u8, 1), judged_back.last_probe_exit.?);
+    try testing.expectEqual(HealthState.unhealthy, observed_health(&judged_back));
+    // A verdict in a record older than version 3 is not one: no build wrote it.
+    const old_text =
+        \\{"v":2,"replica":"hello-1","node":"n1","generation":3,"status":"running",
+    ++
+        \\"reported_at_ms":5,"health":"healthy"}
+    ;
+    const old_back = try read(Observed, arena, kv_of("/o", old_text), &diag);
+    try testing.expectEqual(HealthState.unknown, observed_health(&old_back));
+    // An exit code is 0 to 255.
+    const wide_text =
+        \\{"v":3,"replica":"hello-1","node":"n1","generation":3,"status":"running",
+    ++
+        \\"reported_at_ms":5,"health":"healthy","last_probe_exit":256}
+    ;
+    try testing.expectError(error.Malformed, read(Observed, arena, kv_of("/o", wide_text), &diag));
+}
+
+test "C3: history and rollout records encode and read back" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const service: Service = .{
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 2,
+        .command = &.{"run"},
+        .env = &.{.{ "GREETING", "hi" }},
+        .generation = 7,
+        .health = test_health,
+        .applied_by = "ana",
+        .request_id = "r7",
+    };
+    var history = history_of(&service, 1_761_350_000_123);
+    history.reason = .rollback;
+    history.restores = 5;
+    const key = history_key("hello", 7);
+    try testing.expectEqualStrings("/history/hello/7", key.slice());
+    try testing.expectEqual(@as(?u64, 7), history_generation(key.slice()));
+    const history_bytes = try encode(arena, history, &diag);
+    const history_back = try read(History, arena, kv_of(key.slice(), history_bytes), &diag);
+    try testing.expectEqual(@as(u64, 7), history_back.generation);
+    try testing.expectEqual(@as(?u64, 5), history_back.restores);
+    try testing.expectEqual(HistoryReason.rollback, history_back.reason);
+    try testing.expect(health_equal(service.health, history_back.health));
+    try testing.expect(pairs_equal(service.env, history_back.env));
+
+    const rollout: Rollout = .{
+        .service = "hello",
+        .service_created = 40,
+        .from = 6,
+        .to = 7,
+        .phase = .progressing,
+        .started_at_ms = 10,
+        .deadline_at_ms = 600_010,
+        .budget = .{ .start = 1, .retire = 0, .retire_unready = 2 },
+        .cause_decision = "0000000000000001-0000",
+    };
+    const rollout_key_value = rollout_key("hello");
+    try testing.expectEqualStrings("/rollouts/hello", rollout_key_value.slice());
+    const rollout_bytes = try encode(arena, rollout, &diag);
+    const rollout_back = try read(Rollout, arena, kv_of("/rollouts/hello", rollout_bytes), &diag);
+    try testing.expectEqual(RolloutPhase.progressing, rollout_back.phase);
+    try testing.expectEqual(@as(u32, 1), rollout_back.budget.start);
+    try testing.expectEqual(@as(u32, 2), rollout_back.budget.retire_unready);
+    // A budget written before `retire_unready` existed (docs/keys.md's first example) reads as 0.
+    const rollout_old =
+        \\{"v":1,"service":"hello","service_created":40,"from":6,"to":7,"phase":"progressing",
+        \\"started_at_ms":10,"deadline_at_ms":600010,"budget":{"start":1,"retire":0},
+        \\"cause_decision":"0000000000000001-0000"}
+    ;
+    const rollout_old_back = try read(Rollout, arena, kv_of("/rollouts/hello", rollout_old), &diag);
+    try testing.expectEqual(@as(u32, 1), rollout_old_back.budget.start);
+    try testing.expectEqual(@as(u32, 0), rollout_old_back.budget.retire_unready);
+    // A rollout belongs to one incarnation of its service: not to one created again, nor to none.
+    try testing.expect(rollout_of(&rollout_back, 40));
+    try testing.expect(!rollout_of(&rollout_back, 41));
+    try testing.expect(!rollout_of(&rollout_back, null));
+}
+
+test "C3: a rollout record that contradicts itself is refused when read" {
+    // Goal: the plan's asserts never meet a contradicting record (docs/decisions/
+    // 2026-11-14-c3-rollout-from-rule.md). Method: read each contradiction, then a first
+    // generation's rollout, which is none.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    // A record that contradicts itself is refused when read (ZC-E0301), so the plan's asserts
+    // never meet it: a rollback with nothing to roll back to, `from` not older than `to`, a
+    // deadline before the start, no target.
+    const contradictions = [_][]const u8{
+        \\{"v":1,"service":"hello","service_created":40,"from":0,"to":7,"phase":"rolling_back",
+        \\"started_at_ms":10,"deadline_at_ms":600010}
+        ,
+        \\{"v":1,"service":"hello","service_created":40,"from":7,"to":7,"phase":"progressing",
+        \\"started_at_ms":10,"deadline_at_ms":600010}
+        ,
+        \\{"v":1,"service":"hello","service_created":40,"from":6,"to":7,"phase":"failed",
+        \\"started_at_ms":10,"deadline_at_ms":9}
+        ,
+        \\{"v":1,"service":"hello","service_created":40,"from":0,"to":0,"phase":"progressing",
+        \\"started_at_ms":10,"deadline_at_ms":600010}
+        ,
+    };
+    for (contradictions) |bytes| {
+        var refused: Diag = undefined;
+        refused.reset();
+        const result = read(Rollout, arena, kv_of("/rollouts/hello", bytes), &refused);
+        try testing.expectError(error.Malformed, result);
+        try testing.expect(refused.code == .E0301);
+    }
+    // A first generation's rollout (`from` 0) that is not a rollback is a rollout.
+    const first =
+        \\{"v":1,"service":"hello","service_created":40,"from":0,"to":1,"phase":"failed",
+        \\"started_at_ms":10,"deadline_at_ms":600010}
+    ;
+    const first_back = try read(Rollout, arena, kv_of("/rollouts/hello", first), &diag);
+    try testing.expectEqual(@as(u64, 0), first_back.from);
+}
+
+test "C3 slice 11: a rollout's pause members round-trip, and are left out when absent" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rollout: Rollout = .{
+        .service = "hello",
+        .service_created = 40,
+        .from = 6,
+        .to = 7,
+        .phase = .progressing,
+        .started_at_ms = 10,
+        .deadline_at_ms = 600_010,
+    };
+    const rollout_bytes = try encode(arena, rollout, &diag);
+    try testing.expect(std.mem.indexOf(u8, rollout_bytes, "paused") == null);
+    var paused = rollout;
+    paused.phase = .paused;
+    paused.reason = .rollback;
+    paused.evidence_from_ms = 20;
+    paused.paused_at_ms = 30;
+    paused.paused_by = .user;
+    const paused_bytes = try encode(arena, paused, &diag);
+    const paused_back = try read(Rollout, arena, kv_of("/rollouts/hello", paused_bytes), &diag);
+    try testing.expectEqual(@as(RolloutReason, .rollback), paused_back.reason);
+    try testing.expectEqual(@as(?u64, 20), paused_back.evidence_from_ms);
+    try testing.expectEqual(@as(?u64, 30), paused_back.paused_at_ms);
+    try testing.expectEqual(@as(?RolloutPauseCause, .user), paused_back.paused_by);
+}
+
+test "C3: a history key names one generation, in decimal, with no leading zero" {
+    try testing.expectEqual(@as(?u64, 12), history_generation("/history/hello/12"));
+    try testing.expectEqual(@as(?u64, null), history_generation("/history/hello/012"));
+    try testing.expectEqual(@as(?u64, null), history_generation("/history/hello/"));
+    try testing.expectEqual(@as(?u64, null), history_generation("/history/hello/x1"));
+    try testing.expectEqual(@as(?u64, null), history_generation("/services/hello"));
+    try testing.expectEqualStrings("/history/hello/", history_prefix("hello").slice());
+}
+
+/// The store a build before C3 (main f49041a) wrote, with C2's `source` (src/testdata/README.md).
+const b3_store = @embedFile("testdata/b3_store.txt");
+
+test "records a build before C3 wrote still read" {
+    // Goal: a stored value is read by the next release. Method: read every record of a store the
+    // last release before C3 produced (services with env, limits and a source, a generation bump,
+    // a held replica) as the type its key says: services and replicas at version 3, with no health
+    // and the default rollout; observed and decisions at version 2.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var seen: [5]u32 = @splat(0);
+    var lines = std.mem.splitScalar(u8, b3_store, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t').?;
+        const kv = kv_of(line[0..tab], line[tab + 1 ..]);
+        if (std.mem.startsWith(u8, kv.key, prefix_services)) {
+            const record = try read(Service, arena, kv, &diag);
+            try testing.expectEqual(service_version_plain, record.v);
+            try testing.expect(record.health == null);
+            try testing.expect(record.rollout_policy().equal(.{}));
+            seen[0] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
+            const record = try read(Replica, arena, kv, &diag);
+            try testing.expectEqual(service_version_plain, record.v);
+            try testing.expect(record.health == null);
+            seen[1] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_observed)) {
+            const record = try read(Observed, arena, kv, &diag);
+            try testing.expectEqual(@as(u32, 2), record.v);
+            seen[2] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_decisions)) {
+            _ = try read(Decision, arena, kv, &diag);
+            seen[3] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_nodes)) {
+            _ = try read(Node, arena, kv, &diag);
+            seen[4] += 1;
+        }
+    }
+    for (seen) |count| try testing.expect(count > 0);
+}
+
 /// `/pulls/` rows captured from a real swarm-smoke run (src/testdata/README.md).
 const c2_pulls = @embedFile("testdata/c2_pulls.txt");
 
@@ -1724,13 +2447,13 @@ test "a newer version is refused with ZC-E0303, not as malformed" {
     const arena = arena_state.allocator();
     var diag: Diag = undefined;
     diag.reset();
-    const observed = "{\"v\":3,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
+    const observed = "{\"v\":4,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
         "\"status\":\"running\",\"reported_at_ms\":5}";
     const kv = kv_of("/observed/node1/hello-1", observed);
     try testing.expectError(error.Malformed, read(Observed, arena, kv, &diag));
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
     try testing.expectEqualStrings(
-        "the value at /observed/node1/hello-1 is version 3; this release reads up to version 2",
+        "the value at /observed/node1/hello-1 is version 4; this release reads up to version 3",
         diag.last_cause().?,
     );
     // Version 1 of a record that C1 has not changed is the newest there is.
@@ -1741,9 +2464,9 @@ test "a newer version is refused with ZC-E0303, not as malformed" {
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
 }
 
-test "source round-trips at version 3 and a version 4 service is refused" {
+test "source round-trips at version 3 and a version 5 service is refused" {
     // Goal: `source` is stored and read back, absent means empty, and a newer service is named.
-    // Method: encode a service with and without it, read both back, then read a v4 value.
+    // Method: encode a service with and without it, read both back, then read a v5 value.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1779,12 +2502,12 @@ test "source round-trips at version 3 and a version 4 service is refused" {
     const replica_kv = kv_of("/replicas/hello/hello-1", replica_bytes);
     const replica_back = try read(Replica, arena, replica_kv, &diag);
     try testing.expectEqualStrings(reference, replica_back.source);
-    const newer = "{\"v\":4,\"name\":\"hello\"}";
+    const newer = "{\"v\":5,\"name\":\"hello\"}";
     const newer_kv = kv_of("/services/hello", newer);
     try testing.expectError(error.Malformed, read(Service, arena, newer_kv, &diag));
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
     try testing.expectEqualStrings(
-        "the value at /services/hello is version 4; this release reads up to version 3",
+        "the value at /services/hello is version 5; this release reads up to version 4",
         diag.last_cause().?,
     );
 }
@@ -1820,12 +2543,17 @@ test "the version a record is written in is the version the reader accepts" {
         ReplicaNumber, Decision,   IndexEntry,
         NodeStore,     Pull,       JobInput,
         JobAdmission,  JobEndings, JobStatus,
-        JobObserved,
+        JobObserved,   History,    Rollout,
     }) |T| {
         var value = std.mem.zeroes(T);
         value.v = version_current(T);
         // A replica's assignment: `read` refuses one with neither a service nor a job.
         if (T == Assigned) value.service = "s";
+        // A service or replica is written at version 4 only with a health check (`encode`).
+        if (T == Service or T == Replica) value.health = test_health;
+        if (T == Observed) value.health = .healthy;
+        // A rollout has a target generation (`read` refuses one with `to` 0).
+        if (T == Rollout) value.to = 1;
         const bytes = try encode(arena, value, &diag);
         const prefix = try std.fmt.allocPrint(arena, "{{\"v\":{d},", .{version_current(T)});
         try testing.expect(std.mem.startsWith(u8, bytes, prefix));

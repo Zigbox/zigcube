@@ -72,7 +72,12 @@ test {
 }
 
 test {
+    _ = @import("cli_rollout.zig");
     _ = @import("cli_test.zig");
+    _ = @import("probe_scheduler.zig");
+    _ = @import("agent_health.zig");
+    _ = @import("agent_health_test.zig");
+    _ = @import("sim_fleet_coverage.zig");
     _ = @import("tidy.zig");
     _ = @import("harness_tls.zig");
 }
@@ -94,6 +99,7 @@ comptime {
     _ = @import("tls_conn.zig"); // Sockets and the real clock: native only.
     _ = @import("tls_conn_test.zig");
     _ = @import("fuzz_seeds.zig");
+    _ = @import("rollout_plan_fuzz.zig"); // Reads ZCUBE_FUZZ_SEED: native only.
     _ = @import("agent.zig"); // Its tests (next_wake) otherwise ran only in the WASM core root.
     _ = @import("agent_peer.zig");
     _ = @import("peer_files.zig");
@@ -107,6 +113,8 @@ comptime {
     _ = @import("secure_random.zig");
     _ = @import("peer_server.zig");
     _ = @import("fetch_cli.zig");
+    _ = @import("probe_worker.zig");
+    _ = @import("zigbox_probes.zig");
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
     _ = @import("server_revoked.zig");

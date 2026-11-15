@@ -6,6 +6,9 @@
 //!     sim-cluster --seeds A..B <operations|auto> [<nodes>] [--liveness=true|false] [--shrink]
 //!                 [--profile=NAME|auto] [--lease-ttl-ms=N] [--replicas-pct=N]
 //!                 [--expect-fail] [--trace-steps]
+//!     sim-cluster <seed> soak [<nodes>] (--soak-minutes=M | --soak-operations=N)
+//!                 [--soak-epoch=E] [--soak-bytes=B] [--profile=NAME] [--jobs=true|false]
+//!                 [--strong]
 //!
 //! `<nodes>` 0 lets the seed pick. Liveness is on by default (src/sim_cluster.zig says what it
 //! is). `--heal-at=N` makes the faults end before operation N instead of where the seed chose.
@@ -14,13 +17,15 @@
 //! seed: operations (40 to 800), nodes (unless given), lease ttl, replica counts.
 //! `--profile=auto` draws which fault classes are on (`mixed` is today's mix and the default,
 //! so a command line without these flags runs what it always ran; `partitions`, `skew`,
-//! `crash_heavy` and `slow_store` switch the other classes off). A flag given beats the draw.
+//! `crash_heavy`, `slow_store` and `bad_release` switch the other classes off). A flag given
+//! beats the draw.
 //! The report and each failure say what ran, and the replay line is concrete: it names the
 //! drawn values, so it needs no draw to reproduce.
 //!
 //! A single seed prints its whole report. A range (`A..B` is inclusive of both) prints one line
 //! per failing seed, `seed N: FAILED: <what>`, `  step: <faults|healed|convergence|end>` (where the
-//! run was), then the command that replays it, and a last line
+//! run was), then the command that replays it, the run's last operations (`  trace: op N at T
+//! ms: <operation> [<service>]`, of the shrunk run when it shrank), and a last line
 //! with the counts. `--shrink` bisects the operations of each failing seed down to the smallest
 //! count that still fails the same way, with the heal point held where the full run had it, so
 //! the printed replay command (with `--heal-at`) reproduces exactly that shorter run.
@@ -30,6 +35,7 @@
 //! `--jobs=false` leaves the job workload and its checks out (J1 to J3, J5 to J8; on by default).
 //!
 //! `--c1` runs sim-c1 (docs/core.md, "sim-c1"): the per-revision checks of docs/authority.md §4.
+//! `--c3` runs sim-c3 on top (C3 slice 7, docs/briefs/c3.md): R1 R2 R3 R4 R6, with pauses.
 //! `--expect-symptom=TEXT` with `--expect-fail` makes the failure count only if it starts with
 //! TEXT, or with one of several `|`-separated alternatives (src/symptom.zig); the negative tests
 //! of sim-c1 use it (`sim_c1_teeth_main.zig`).
@@ -38,6 +44,11 @@
 //! ("faults", "healed", "convergence", "end"), so a run that panics leaves where it was: the
 //! simulation fleet's runner files a crash under that step (ops/sim-fleet/run.sh). A range writes
 //! each failing seed's lines as soon as it has them, so a later crash does not lose them.
+//!
+//! `soak` for `<operations>` runs the long soak (src/sim_soak.zig says what it checks): one seed,
+//! liveness off, until `--soak-minutes=M` of wall clock or `--soak-operations=N` (a replay), with
+//! a `soak:` line every `--soak-epoch=E` operations (500), or until its live bytes reach
+//! `--soak-bytes=B` at an epoch (1.5 GiB), which ends it as held.
 //!
 //! Exit code 0 if every check held (or, with `--expect-fail`, one failed), 1 if one did not (or,
 //! with `--expect-fail`, none did), and 2 for a usage error. A simulation, not a demo.
@@ -48,16 +59,21 @@ const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const fencing = @import("fencing.zig");
 const sim_cluster = @import("sim_cluster.zig");
+const sim_coverage = @import("sim_coverage.zig");
 const sim_shape = @import("sim_shape.zig");
+const sim_soak = @import("sim_soak.zig");
 const symptom_spec = @import("symptom.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--trace-steps]\n" ++
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--health] " ++
+    "[--trace-steps]\n" ++
     "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--expect-fail] " ++
-    "[--trace-steps]\n";
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--health] " ++
+    "[--expect-fail] [--trace-steps]\n" ++
+    "       sim-cluster <seed> soak [<nodes>] (--soak-minutes=M | --soak-operations=N) " ++
+    "[--soak-epoch=E] [--soak-bytes=B] [--profile=NAME] [--jobs=true|false] [--strong]\n";
 
 /// What the command line asked for.
 const Args = struct {
@@ -77,6 +93,12 @@ const Args = struct {
     /// `--expect-symptom-any` (with `--expect-symptom`): a seed that fails with another symptom is
     /// skipped; the run passes if some seed in the range shows the symptom, and fails if none does.
     expect_symptom_any: bool = false,
+    /// `soak` for `<operations>`: the long soak (src/sim_soak.zig), with its flags.
+    soak: ?sim_soak.Plan = null,
+    soak_minutes: ?u32 = null,
+    soak_operations: ?u32 = null,
+    soak_epoch: ?u32 = null,
+    soak_bytes: ?u64 = null,
 };
 
 /// Null if the arguments are not a valid command line.
@@ -110,7 +132,13 @@ fn parse(args: []const []const u8) ?Args {
     } else if (parsed.options.heal_at != null) {
         return null; // Each seed in a range draws its own.
     }
-    if (!std.mem.eql(u8, positional[skip], "auto")) {
+    if (std.mem.eql(u8, positional[skip], "soak")) {
+        parsed.soak = soak_plan(&parsed) orelse return null;
+    } else if (parsed.soak_minutes != null or parsed.soak_operations != null or
+        parsed.soak_epoch != null or parsed.soak_bytes != null)
+    {
+        return null; // Soak flags need a soak.
+    } else if (!std.mem.eql(u8, positional[skip], "auto")) {
         const operations = std.fmt.parseInt(u32, positional[skip], 10) catch return null;
         if (operations == 0) return null;
         parsed.operations = operations;
@@ -121,6 +149,32 @@ fn parse(args: []const []const u8) ?Args {
         parsed.options.nodes = if (count == 0) null else count;
     }
     return parsed;
+}
+
+/// Null unless the soak's flags make one: a single seed, one way to end, and a count that ends
+/// at an epoch.
+fn soak_plan(parsed: *const Args) ?sim_soak.Plan {
+    if (parsed.range) return null;
+    if (parsed.options.heal_at != null or parsed.options.c1) return null;
+    if ((parsed.soak_minutes == null) == (parsed.soak_operations == null)) return null;
+    const epoch = parsed.soak_epoch orelse sim_soak.epoch_operations_default;
+    if (epoch == 0) return null;
+    if (parsed.soak_minutes) |minutes| if (minutes == 0) return null;
+    if (parsed.soak_operations) |operations| {
+        if (operations == 0 or operations % epoch != 0) return null;
+    }
+    const bytes_max = parsed.soak_bytes orelse sim_soak.bytes_max_default;
+    if (bytes_max == 0) return null;
+    return .{
+        .epoch_operations = epoch,
+        .minutes = parsed.soak_minutes,
+        .operations = parsed.soak_operations,
+        .bytes_max = bytes_max,
+    };
+}
+
+fn parse_count(text: []const u8) ?u32 {
+    return std.fmt.parseInt(u32, text, 10) catch null;
 }
 
 fn parse_profile(parsed: *Args, text: []const u8) bool {
@@ -160,8 +214,13 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.options.signed = true;
     } else if (std.mem.eql(u8, arg, "--tenants")) {
         parsed.options.tenants = true;
+    } else if (std.mem.eql(u8, arg, "--health")) {
+        parsed.options.health = true;
     } else if (std.mem.eql(u8, arg, "--c1")) {
         parsed.options.c1 = true;
+    } else if (std.mem.eql(u8, arg, "--c3")) {
+        parsed.options.c1 = true;
+        parsed.options.c3 = true;
     } else if (std.mem.eql(u8, arg, "--expect-symptom-any")) {
         parsed.expect_symptom_any = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
@@ -178,6 +237,15 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         const pct = std.fmt.parseInt(u32, arg["--replicas-pct=".len..], 10) catch return false;
         if (pct == 0 or pct > 1600) return false;
         parsed.options.replicas_pct = pct;
+    } else if (std.mem.startsWith(u8, arg, "--soak-minutes=")) {
+        parsed.soak_minutes = parse_count(arg["--soak-minutes=".len..]) orelse return false;
+    } else if (std.mem.startsWith(u8, arg, "--soak-operations=")) {
+        parsed.soak_operations = parse_count(arg["--soak-operations=".len..]) orelse return false;
+    } else if (std.mem.startsWith(u8, arg, "--soak-epoch=")) {
+        parsed.soak_epoch = parse_count(arg["--soak-epoch=".len..]) orelse return false;
+    } else if (std.mem.startsWith(u8, arg, "--soak-bytes=")) {
+        const text = arg["--soak-bytes=".len..];
+        parsed.soak_bytes = std.fmt.parseInt(u64, text, 10) catch return false;
     } else if (std.mem.eql(u8, arg, "--trace-steps")) {
         parsed.trace_steps = true;
     } else if (std.mem.startsWith(u8, arg, "--heal-at=")) {
@@ -199,6 +267,7 @@ pub fn main(init: std.process.Init) u8 {
     const report = init.gpa.create(sim_cluster.Report) catch return constants.exit_environment;
     defer init.gpa.destroy(report);
     if (parsed.range) return run_range(init, &parsed, report);
+    if (parsed.soak != null) return run_soak(init, &parsed, report);
     const resolved = sim_cluster.plan(parsed.first_seed, parsed.operations, parsed.options);
     const seed = parsed.first_seed;
     sim_cluster.simulate(init.gpa, seed, resolved.operations, resolved.options, report);
@@ -300,13 +369,19 @@ fn print_replay(
     try out.print("  replay: zig-out/bin/{s} {d} {d} {d}", .{
         runner, seed, operations, options.nodes orelse 0,
     });
+    try print_flags(out, options, heal_at);
+}
+
+/// The flags of a replay line: every option the run had that is not the default.
+fn print_flags(out: *std.Io.Writer, options: sim_cluster.Options, heal_at: ?u32) !void {
     if (!options.liveness) try out.writeAll(" --liveness=false");
-    if (options.c1) try out.writeAll(" --c1");
+    if (options.c3) try out.writeAll(" --c3") else if (options.c1) try out.writeAll(" --c1");
     if (!options.jobs) try out.writeAll(" --jobs=false");
     // A tooth that needs the strong world implies it; the line says so anyway.
     if (options.strong or c1_teeth.strong_world) try out.writeAll(" --strong");
     if (options.signed) try out.writeAll(" --signed");
     if (options.tenants) try out.writeAll(" --tenants");
+    if (options.health) try out.writeAll(" --health");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
     if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});
     if (options.lease_ttl_ms) |ttl| try out.print(" --lease-ttl-ms={d}", .{ttl});
@@ -322,11 +397,18 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
     defer out.flush() catch {}; // Nowhere else to report it.
     var failures: u64 = 0;
     var matched = false;
+    // How many seeds of each profile reached each coverage name, printed before the summary
+    // (`sim_fleet coverage` adds the ranges up). On the heap: five tables are about 40 KiB.
+    const reach = init.gpa.create(sim_coverage.Reach) catch return constants.exit_environment;
+    defer init.gpa.destroy(reach);
+    reach.* = .{};
     var seed = parsed.first_seed;
     while (true) : (seed += 1) {
         const resolved = sim_cluster.plan(seed, parsed.operations, parsed.options);
         if (parsed.trace_steps) trace_plan(init.io, seed, resolved);
         sim_cluster.simulate(init.gpa, seed, resolved.operations, resolved.options, report);
+        // Before `report_failure`, whose shrink runs other worlds in `report`.
+        reach.note(resolved.options.profile, &report.coverage);
         if (report.failed) {
             failures += 1;
             report_failure(init, parsed, seed, resolved, report, out) catch
@@ -367,21 +449,34 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         }) catch return constants.exit_environment;
         return constants.exit_ok;
     }
-    const total = parsed.last_seed - parsed.first_seed + 1;
-    // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
-    const run_name: []const u8 = if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
-    if (parsed.operations) |operations| {
-        out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
-            run_name, parsed.first_seed, parsed.last_seed, operations, failures, total,
-        }) catch return constants.exit_environment;
-    } else {
-        // Not the fixed form above: the fleet's parser reads the drawn form separately.
-        out.print("{s}: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
-            run_name, parsed.first_seed, parsed.last_seed, failures, total,
-        }) catch return constants.exit_environment;
-    }
+    print_range_summary(out, parsed, reach, failures) catch return constants.exit_environment;
     if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;
     return if (failures == 0) constants.exit_ok else constants.exit_user;
+}
+
+/// The coverage of each profile the range ran, then the summary line the fleet's parser reads.
+fn print_range_summary(
+    out: *std.Io.Writer,
+    parsed: *const Args,
+    reach: *const sim_coverage.Reach,
+    failures: u64,
+) !void {
+    try reach.print(out);
+    const total = parsed.last_seed - parsed.first_seed + 1;
+    // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
+    const run_name: []const u8 = if (parsed.options.c3)
+        "sim-cluster --c3"
+    else if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
+    if (parsed.operations) |operations| {
+        try out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
+            run_name, parsed.first_seed, parsed.last_seed, operations, failures, total,
+        });
+    } else {
+        // Not the fixed form above: the fleet's parser reads the drawn form separately.
+        try out.print("{s}: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
+            run_name, parsed.first_seed, parsed.last_seed, failures, total,
+        });
+    }
 }
 
 fn report_failure(
@@ -411,12 +506,102 @@ fn report_failure(
     else
         null;
     try print_replay(out, seed, resolved.operations, options, heal_at);
-    if (!parsed.shrink) return;
+    if (!parsed.shrink) return print_trace(out, report);
     var pinned = options;
     pinned.heal_at = heal_at orelse resolved.operations;
     const smallest = shrink(init, seed, resolved.operations, pinned, what, report);
     try out.print("  shrunk to {d} operations\n", .{smallest});
     try print_replay(out, seed, smallest, options, heal_at);
+    // The bisection's last run need not be the smallest: run it again for its trace.
+    sim_cluster.simulate(init.gpa, seed, smallest, pinned, report);
+    try print_trace(out, report);
+}
+
+/// The report's `trace:` lines (the last operations before the failure, src/sim_cluster.zig),
+/// indented under the failing seed, where the fleet's parser collects them.
+fn print_trace(out: *std.Io.Writer, report: *const sim_cluster.Report) !void {
+    var lines = std.mem.splitScalar(u8, report.text(), '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "trace: ")) try out.print("  {s}\n", .{line});
+    }
+}
+
+/// `<operations>` = `soak`: one seed until the budget or a check ends it (src/sim_soak.zig).
+fn run_soak(init: std.process.Init, parsed: *const Args, report: *sim_cluster.Report) u8 {
+    var buffer: [2048]u8 = undefined;
+    var file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
+    const out = &file_writer.interface;
+    defer out.flush() catch {}; // Nowhere else to report it.
+    const seed = parsed.first_seed;
+    var options = sim_cluster.plan(seed, 1, parsed.options).options;
+    options.liveness = false;
+    var counting: sim_soak.Counting = .{ .child = init.gpa };
+    var soak: sim_soak.Soak = .{
+        .plan = parsed.soak.?,
+        .counting = &counting,
+        .io = init.io,
+        .out = out,
+        .started = std.Io.Clock.boot.now(init.io),
+    };
+    sim_soak.run(&soak, seed, options, report);
+    if (soak.out_failed) return constants.exit_environment;
+    const operations = report.operations_run;
+    print_soak_end(out, &soak, seed, options, report) catch return constants.exit_environment;
+    const failed = report.failed or sim_soak.failure(&soak) != null;
+    out.print("sim-cluster --soak: seeds {d}..{d}, {d} operations: {d} of 1 failed\n", .{
+        seed, seed, operations, @intFromBool(failed),
+    }) catch return constants.exit_environment;
+    return if (failed) constants.exit_user else constants.exit_ok;
+}
+
+/// A soak's verdict: the failing seed's block, as a range prints it, or one line that it held.
+fn print_soak_end(
+    out: *std.Io.Writer,
+    soak: *const sim_soak.Soak,
+    seed: u64,
+    options: sim_cluster.Options,
+    report: *const sim_cluster.Report,
+) !void {
+    const operations = report.operations_run;
+    const what = if (report.failed) symptom(report) else sim_soak.failure(soak) orelse {
+        try out.print("soak: held for {d} operations, {d} epochs, peak {d} bytes", .{
+            operations, soak.epochs, soak.counting.peak,
+        });
+        if (soak.budget_reached) |live| {
+            try out.print(", budget reached ({d} live bytes, limit {d})", .{
+                live, soak.plan.bytes_max,
+            });
+        }
+        return out.print("\n{s}\n", .{sim_soak.world_hash(report)});
+    };
+    try out.print("seed {d}: FAILED: {s}\n", .{ seed, what });
+    try out.print("  step: {s}\n", .{if (report.failed) step_of(report) else "soak"});
+    try out.print("  profile: {s}\n", .{options.profile.name()});
+    try out.print("  shape: operations={d} nodes={d} lease_ttl_ms={d} replicas_pct={d}\n", .{
+        operations,
+        options.nodes orelse 0,
+        options.lease_ttl_ms orelse constants.lease_ttl_ms,
+        options.replicas_pct orelse sim_shape.replicas_pct_default,
+    });
+    if (report.failed) {
+        // The simulation's own check: the same world cut at the same operation.
+        try print_replay(out, seed, operations, options, null);
+        try print_trace(out, report);
+        // A soak check that failed too (the teardown, after a failing world): evidence only.
+        if (sim_soak.failure(soak)) |also| {
+            try out.print("  soak: also {s}: {s}\n", .{ also, sim_soak.failure_detail(soak) });
+        }
+        return;
+    }
+    // A soak check: the soak again, stopped by count where this one stopped.
+    try out.print("  replay: zig-out/bin/sim_cluster {d} soak {d} --soak-operations={d} " ++
+        "--soak-epoch={d}", .{
+        seed, options.nodes orelse 0, operations, soak.plan.epoch_operations,
+    });
+    var flags = options;
+    flags.liveness = true; // Implied by `soak`: not printed.
+    try print_flags(out, flags, null);
+    try out.print("  soak: {s}\n", .{sim_soak.failure_detail(soak)});
 }
 
 fn usage(io: std.Io, args: []const []const u8) u8 {
@@ -442,6 +627,10 @@ fn ttl_refusal(args: []const []const u8) ?[]const u8 {
         if (fencing.inequality_problem(ttl) != null) return ttl_refusal_text;
     }
     return null;
+}
+
+test {
+    _ = sim_soak;
 }
 
 test "--expect-symptom takes |-separated alternatives and refuses an empty one" {
@@ -493,6 +682,24 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--nope" }) == null);
     const traced = parse(&.{ "sim", "--seeds", "1..1", "60", "--trace-steps" }).?;
     try std.testing.expect(traced.trace_steps);
+}
+
+test "the soak's command line: one way to end, a byte budget, flags only with a soak" {
+    const timed = parse(&.{ "sim", "7", "soak", "--soak-minutes=5" }).?;
+    try std.testing.expectEqual(@as(?u32, 5), timed.soak.?.minutes);
+    try std.testing.expectEqual(sim_soak.bytes_max_default, timed.soak.?.bytes_max);
+    const counted = parse(&.{
+        "sim", "7", "soak", "--soak-operations=1000", "--soak-epoch=250", "--soak-bytes=4096",
+    }).?;
+    try std.testing.expectEqual(@as(?u32, 1000), counted.soak.?.operations);
+    try std.testing.expectEqual(@as(u64, 4096), counted.soak.?.bytes_max);
+    try std.testing.expect(parse(&.{ "sim", "7", "soak", "--soak-minutes=5", "--soak-bytes=0" }) ==
+        null);
+    try std.testing.expect(parse(&.{ "sim", "7", "100", "--soak-bytes=4096" }) == null);
+    try std.testing.expect(parse(&.{ "sim", "7", "soak" }) == null);
+    try std.testing.expect(parse(&.{
+        "sim", "7", "soak", "--soak-operations=1000", "--soak-epoch=300",
+    }) == null);
 }
 
 test "a shrunk run is the run: the heal point held, the same symptom" {

@@ -8,6 +8,7 @@
 //! (docs/decisions/2026-11-13-b5-policy-file-ownership.md). A policy Zigbox refuses names its
 //! line, column and kind.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
@@ -204,6 +205,7 @@ test "a policy file is used only when root or the process's own user alone can w
 }
 
 test "a refusal raises the caller's code and names its setting" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // macOS TLS port, required before 0.6.0
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

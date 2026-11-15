@@ -1,0 +1,5 @@
+error[ZC-E0127]: there is nothing to roll back to
+  cause  service hello has run only generation 1
+  fix    apply the service file you want to run
+  more   zcube explain E0127 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0127.html

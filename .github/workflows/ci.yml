@@ -57,9 +57,12 @@ jobs:
       demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
       mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
       demo_b3: ${{ steps.pick.outputs.demo_b3 || 'true' }}
+      c3_smoke: ${{ steps.pick.outputs.c3_smoke || 'true' }}
+      demo_c3: ${{ steps.pick.outputs.demo_c3 || 'true' }}
       demo_b7: ${{ steps.pick.outputs.demo_b7 || 'true' }}
       demo_b5: ${{ steps.pick.outputs.demo_b5 || 'true' }}
       demo_b6: ${{ steps.pick.outputs.demo_b6 || 'true' }}
+      macos: ${{ steps.pick.outputs.macos || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,6 +129,10 @@ jobs:
       # time); the pages that the `docs` link of a diagnostic points at are checked here.
       - name: Error pages are up to date
         run: zig build errors-site-check
+      # zcube alone, compiled for aarch64-macos and x86_64-macos and not run: every change, so
+      # code zcube shares with the server cannot break the macOS build unseen (docs/macos.md).
+      - name: zcube cross-compiles for macOS
+        run: zig build mac-cross
       # The suite picks a random seed per run; a failure prints it, and -Dseed=N replays it.
       - name: Store conformance (memory)
         run: zig build test-store -Dbackend=memory --summary all
@@ -144,6 +151,38 @@ jobs:
       # directory, with real containers. It cleans up what it starts.
       - name: Local smoke (zcube local up and down)
         run: zig build local-smoke --summary all
+
+  # zcube alone on a GitHub-hosted Apple silicon runner (docs/macos.md): the unsigned build, the
+  # command line's unit tests, `zcube help`, and `zcube local` refusing. Only when zcube's own
+  # files, the build or CI change, or on a full run (ci-changes.sh, is_macos;
+  # docs/decisions/2026-11-13-macos-ci-paths.md). No secret is in reach: signing and notarization
+  # run only on the owner's Mac (`zig build mac-release`).
+  macos:
+    name: zcube on macOS
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.macos == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig-macos
+      - name: Build zcube (unsigned)
+        run: zig build cli
+      - name: The command line's unit tests
+        run: zig build test-cli --summary all
+      # `zcube help`: zcube has no --help flag.
+      - name: zcube help
+        run: zig-out/bin/zcube help
+      # Exit 2 (environment) and ZC-E0122, which says zcube local runs only on Linux.
+      - name: zcube local refuses on macOS
+        shell: /bin/bash --noprofile --norc -uo pipefail {0}
+        run: |
+          zig-out/bin/zcube local up 2> local.err
+          status=$?
+          cat local.err
+          test "${status}" -eq 2
+          grep -q 'ZC-E0122' local.err
+          grep -q 'only on Linux' local.err
 
   # The same conformance suite against a real Postgres 16, the server a deployment would run.
   # The image is pinned by digest (postgres:16.15, resolved from Docker Hub on 2026-10-26), so a
@@ -246,13 +285,13 @@ jobs:
   # everything it started. One job per backend builds once (the demos share the build cache of
   # the job) and runs the demos in sequence, each its own step, so a failure names its demo; a
   # failed demo does not stop the next from running, and the job still fails. Each demo still
-  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1, demo_b6, and demo_b7 on SQLite only);
-  # the job runs when any is picked. Before this they were six jobs, each downloading Zig and
-  # building the same binaries.
+  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1, c3_smoke, demo_b6, and
+  # demo_b7 on SQLite only); the job runs when any is picked. Before this they were six jobs,
+  # each downloading Zig and building the same binaries.
   demos-sqlite:
     name: demos (sqlite)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_b7 == 'true' || needs.changes.outputs.demo_b6 == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.c3_smoke == 'true' || needs.changes.outputs.demo_b7 == 'true' || needs.changes.outputs.demo_b6 == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -273,6 +312,10 @@ jobs:
       - name: demo-b1 on SQLite
         if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
         run: zig build demo-b1 -Dbackend=sqlite -Dtranscript=demo-b1-sqlite.txt --summary all
+      # Not demo-c3 (KVM, real Zigbox): C3's demo script with FakeRuntime, SQLite only.
+      - name: c3-smoke on SQLite
+        if: ${{ !cancelled() && needs.changes.outputs.c3_smoke == 'true' }}
+        run: zig build c3-smoke -Dbackend=sqlite -Dtranscript=c3-smoke-sqlite.txt --summary all
       - name: demo-b7 (the API over mTLS)
         if: ${{ !cancelled() && needs.changes.outputs.demo_b7 == 'true' }}
         run: zig build demo-b7 -Dtranscript=demo-b7-sqlite.txt --summary all
@@ -284,7 +327,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: demos-sqlite-transcripts
-          path: demo-*-sqlite.txt
+          path: |
+            demo-*-sqlite.txt
+            c3-smoke-sqlite.txt
           if-no-files-found: warn
 
   # The same image, by digest, as store-postgres. demo-c0 stops the database mid-run: the service
@@ -425,6 +470,14 @@ jobs:
       # the old ttl / 3 renewal rule must fail it.
       - name: Fencing negative test
         run: zig build sim-fencing-teeth --summary all
+      # sim-c3 (docs/core.md, "sim-c3"): C3's rollout checks, the slice gate's sweep and the
+      # negative tests of R1, R4 and R6 (docs/decisions/2026-11-14-c3-slice7-controller.md).
+      - name: sim-c3 sweep, seeds 1 to 40
+        run: |
+          zig build -Doptimize=ReleaseSafe sim-c1-exe --summary all
+          zig-out/bin/sim_cluster --seeds 1..40 150 --c3
+      - name: sim-c3 negative tests
+        run: zig build sim-c3-teeth --summary all
 
   # The sim-c1 negative tests (about 22 minutes), apart from the other simulations so that no job
   # nears its timeout (docs/decisions/2026-11-09-sim-job-split.md).
@@ -562,6 +615,54 @@ jobs:
           path: |
             demo-c2.txt
             demo-c2-transcript.txt
+          if-no-files-found: warn
+
+  # C3's demo: v1 v2 v3 rolled out and rolled back on three guests running real Zigbox; the
+  # health check is the image's own (docs/demos/c3.md).
+  demo-c3:
+    name: demo-c3 (three Ubuntu 24.04 VMs, KVM, Alpine images)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.demo_c3 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      ZBX_REGISTRY_MIRRORS: mirror.gcr.io
+      ZCUBE_REAL_HOST: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files, QEMU
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
+      # key is the pinned package (build.zig.zon).
+      - name: Cache the VM base image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/vm/*.img
+          key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
+      # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
+      - name: demo-c3
+        shell: bash
+        run: |
+          zig build demo-c3 -Doptimize=ReleaseSafe -Dtranscript=demo-c3-transcript.txt \
+            --summary all 2>&1 | tee demo-c3.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-c3-output
+          path: |
+            demo-c3.txt
+            demo-c3-transcript.txt
           if-no-files-found: warn
 
   demo-b3:

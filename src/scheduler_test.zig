@@ -118,15 +118,39 @@ const Fixture = struct {
         cpu: ?u32,
         memory: ?u64,
     ) !void {
+        try self.replica_at(service, id, 1, cpu, memory);
+    }
+
+    /// A replica record of `generation` (the image stays the same: the scheduler reads only the
+    /// generation and the image's summary, and `image` is held by whichever node a test says).
+    fn replica_at(
+        self: *Fixture,
+        service: []const u8,
+        id: []const u8,
+        generation: u64,
+        cpu: ?u32,
+        memory: ?u64,
+    ) !void {
         const value: records.Replica = .{
             .id = id,
             .service = service,
-            .generation = 1,
+            .generation = generation,
             .image = "b3:51aa9c03",
             .command = &.{"true"},
             .limits = .{ .cpu_millis = cpu, .memory_bytes = memory },
         };
         try self.put(.replica_controller, records.replica_key(service, id).slice(), value);
+    }
+
+    /// Deletes a replica record as the replica controller's retirement would.
+    fn retire(self: *Fixture, service: []const u8, id: []const u8) !void {
+        const ctx = self.context();
+        const key = records.replica_key(service, id);
+        const delete: store.Op = .{ .delete = key.slice() };
+        const ops: store.TxnRequest = .{ .on_success = &.{delete} };
+        _ = try writers.txn(ctx.store, .replica_controller, ops, &self.diag);
+        try self.settle();
+        try self.expect_on(id, null);
     }
 
     /// Writes a job's run and its status, as the job controller would.
@@ -858,6 +882,41 @@ test "spread outranks locality, and locality outranks least allocated" {
     try fixture.replica("web", "web-2", 100, gib);
     try fixture.settle();
     try fixture.expect_on("web-2", "a"); // Spread ahead of locality.
+}
+
+test "a rollout spreads the new generation: fewest of it breaks a spread tie before locality" {
+    // Goal: demo-c2 step 2's regression. A surge replica of generation 2 lands on a; a's old
+    // replica is retired, so every node holds one of the service, and a holds the new image.
+    // Locality alone would send the next replica of generation 2 to a again and leave c without
+    // one; fewest of the replica's own generation sends it to b, and the last to c.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.replica_at("web", "web-1", 1, 100, gib);
+    try fixture.replica_at("web", "web-2", 1, 100, gib);
+    try fixture.replica_at("web", "web-3", 1, 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+    try fixture.replica_at("web", "web-4", 2, 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-4", "a"); // A tie on spread; the name.
+    try fixture.summary("a", &.{image});
+    try fixture.retire("web", "web-1");
+    try fixture.replica_at("web", "web-5", 2, 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-5", "b"); // Not a, which holds the image.
+    try fixture.retire("web", "web-2");
+    try fixture.replica_at("web", "web-6", 2, 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-6", "c");
+    // Spread still comes first: one service's count, every generation, as L1 judges it.
+    try fixture.retire("web", "web-3");
+    try fixture.replica_at("web", "web-7", 3, 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-7", "a"); // A tie everywhere; a holds the image.
 }
 
 test "fit comes first: a node that holds the image but cannot fit is not chosen" {

@@ -17,7 +17,8 @@
 //! ```
 //!
 //! `zcube-agent supervise <container directory>` is the supervisor mode (`fake_supervisor.zig`),
-//! used only by the agent itself.
+//! and `zcube-agent probe <replica> <timeout_ms> <command...>` the health check worker
+//! (`probe_worker.zig`), both used only by the agent itself.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -138,6 +139,8 @@ pub const Command = union(enum) {
     supervise_zigbox: []const u8,
     /// `zcube-agent fetch ...` (`fetch_cli.zig`): the arguments after `fetch`.
     fetch: []const []const u8,
+    /// `zcube-agent probe ...` (`probe_worker.zig`): the arguments after `probe`.
+    probe: []const []const u8,
     version,
     help,
 };
@@ -203,6 +206,7 @@ const Flags = struct {
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
     if (args.len >= 1 and std.mem.eql(u8, args[0], "fetch")) return .{ .fetch = args[1..] };
+    if (args.len >= 1 and std.mem.eql(u8, args[0], "probe")) return .{ .probe = args[1..] };
     if (args.len >= 1) {
         const zigbox_mode = std.mem.eql(u8, args[0], "supervise-zigbox");
         if (zigbox_mode or std.mem.eql(u8, args[0], "supervise")) {
@@ -763,7 +767,7 @@ fn absolute_state_dir(
     diag: *Diag,
 ) Error![]const u8 {
     const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, text) catch
+    create_dir_path(io, cwd, text) catch
         return bad(
             diag,
             "can't create the state directory {s}",
@@ -779,6 +783,30 @@ fn absolute_state_dir(
             "choose another with --state-dir",
         );
     return arena.dupe(u8, buffer[0..length]) catch error.OutOfMemory;
+}
+
+/// `createDirPath`, except that a component which exists as a symbolic link to a directory is
+/// taken as that directory: std refuses it with NotDir (it does not follow links, so a dangling
+/// one cannot loop), and a user may well name one, such as `/tmp` on macOS (`/private/tmp`).
+/// Only on that refusal is the path walked again from its root, following links: a component
+/// that exists and is no directory, through any links, is still NotDir.
+fn create_dir_path(io: std.Io, cwd: std.Io.Dir, text: []const u8) !void {
+    if (cwd.createDirPath(io, text)) |_| {
+        return;
+    } else |err| switch (err) {
+        error.NotDir => {},
+        else => return err,
+    }
+    var components = std.fs.path.componentIterator(text);
+    while (components.next()) |component| {
+        cwd.createDir(io, component.path, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                const stat = try cwd.statFile(io, component.path, .{ .follow_symlinks = true });
+                if (stat.kind != .directory) return error.NotDir;
+            },
+            else => return err,
+        };
+    }
 }
 
 /// The path is published with the node (`/nodes/<node>.trust_policy`) as typed, so it must name
@@ -807,6 +835,37 @@ const testing = std.testing;
 fn expect_bad(result: anytype, diag: *const Diag) !void {
     try testing.expectError(error.BadConfig, result);
     try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0505), diag.code);
+}
+
+test "a state directory that is a symbolic link to a directory is taken, and resolved" {
+    // Goal: the macOS failure of `--state-dir /tmp` (a link to /private/tmp), on any host.
+    // Method: a link to a directory, a path below that link still to be created, and a link to
+    // a file, which stays refused.
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "real", .default_dir);
+    try tmp.dir.symLink(io, "real", "link", .{ .is_directory = true });
+    var file = try tmp.dir.createFile(io, "plain", .{});
+    file.close(io);
+    try tmp.dir.symLink(io, "plain", "file_link", .{});
+    var buffer: [constants.state_path_bytes_max]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var diag: Diag = undefined;
+    diag.reset();
+    const link = try std.fs.path.join(arena, &.{ root, "link" });
+    const real = try std.fs.path.join(arena, &.{ root, "real" });
+    try testing.expectEqualStrings(real, try absolute_state_dir(arena, io, link, &diag));
+    const deep = try std.fs.path.join(arena, &.{ root, "link", "a", "b" });
+    const made = try std.fs.path.join(arena, &.{ root, "real", "a", "b" });
+    try testing.expectEqualStrings(made, try absolute_state_dir(arena, io, deep, &diag));
+    const stat = try tmp.dir.statFile(io, "real/a/b", .{});
+    try testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
+    const file_link = try std.fs.path.join(arena, &.{ root, "file_link" });
+    try expect_bad(absolute_state_dir(arena, io, file_link, &diag), &diag);
 }
 
 test "a --trust-policy path is absolute and printable, or it is refused" {

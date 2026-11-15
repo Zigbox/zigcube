@@ -12,9 +12,14 @@
 #   demo_c2       demo-c2 (four VMs, KVM, GHCR images)
 #   mtls_interop  mtls-interop (stock openssl and JDK servers)
 #   demo_b3       demo-b3 (one VM, KVM, a GHCR image)
+#   c3_smoke      c3-smoke on SQLite (C3's demo script with FakeRuntime; not demo-c3)
 #   demo_b7       demo-b7 (the API over mTLS, FakeRuntime, SQLite)
 #   demo_b5       demo-b5 (one VM, KVM, a GHCR image, signed jobs)
 #   demo_b6       demo-b6 on SQLite and on Postgres
+#   macos         the macOS job: zcube alone, built and tested on a macOS runner. Not in `jobs`:
+#                 a path no rule names does not run it, only a path of zcube's own or of CI
+#                 (is_macos) or a full run does. The Linux check job cross-compiles zcube for
+#                 macOS on every change (docs/decisions/2026-11-13-macos-ci-paths.md).
 #
 # Environment: EVENT (github.event_name), HEAD_REF (the PR's head branch), LABELS (the PR's labels,
 # space separated). See docs/decisions/2026-11-04-ci-affected-demos.md.
@@ -25,7 +30,8 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 demo_b7 demo_b5 demo_b6)
+jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 c3_smoke demo_c3
+  demo_b7 demo_b5 demo_b6)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -45,6 +51,18 @@ is_docs() {
   return 1
 }
 
+# What the macOS job builds or runs: the command line's own files, its release tool and formula
+# lines, the build, and CI. Code the command line shares with the server (diag, text, constants)
+# is checked for macOS by the Linux job's cross-compile, not here.
+is_macos() {
+  case "$1" in
+    src/zcube.zig | src/cli*.zig | src/mac_release.zig | packaging/homebrew/* | \
+      build.zig | build.zig.zon | .github/workflows/ci.yml | .github/actions/setup-zig-macos/* | \
+      .github/ci-changes.sh | .github/ci-changes-test.sh) return 0 ;;
+  esac
+  return 1
+}
+
 classify() {
   case "$1" in
     # What every job is built from, or CI itself, and what a demo's start scripts run.
@@ -56,21 +74,33 @@ classify() {
     # demo-b7 imports demo_b1_state.zig and demo_c1_state.zig.
     # demo-b6 imports demo_b1_state.zig, so all of these too.
     src/demo_c0_state.zig) want_one demo_c0; want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6; return ;;
-    src/demo_c1_state.zig | src/demo_c1_fleet.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6; return ;;
+    src/demo_c1_state.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6; return ;;
+    # c3-smoke imports demo_c1_fleet.zig alone.
+    src/demo_c1_fleet.zig)
+      want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6
+      want_one c3_smoke; return ;;
     src/demo_c0*.zig) want_one demo_c0; return ;;
     src/demo_c1*.zig) want_one demo_c1; return ;;
+    # demo-c3 runs c3-smoke's steps and witness on QEMU guests (src/c3_smoke.zig is the smoke's own).
+    src/c3_smoke.zig) want_one c3_smoke; return ;;
+    src/c3_smoke*.zig | src/c3_witness.zig) want_one c3_smoke; want_one demo_c3; return ;;
+    src/demo_c3*.zig | ops/demo-c3/*) want_one demo_c3; return ;;
     # demo-b3 and demo-b5 import demo_b1_state.zig (so demo_b1_fleet.zig, demo_c1_state.zig and what they import), and demo_c2_steps.zig, demo_c2_vms.zig and demo_c2_check.zig (their rig; demo_c2_steps.zig imports demo_c2_check.zig).
     src/demo_b1_state.zig | src/demo_b1_fleet.zig) want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6; return ;;
     src/demo_b1*.zig) want_one demo_b1; return ;;
     src/demo_b6*.zig) want_one demo_b6; return ;;
-    src/demo_c2_steps.zig | src/demo_c2_vms.zig | src/demo_c2_check.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
+    # demo-c3 imports demo_c2_vms.zig (the rig) but not demo_c2_steps.zig.
+    src/demo_c2_vms.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; want_one demo_c3; return ;;
+    src/demo_c2_steps.zig | src/demo_c2_check.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
     src/demo_c2*.zig | ops/demo-c2/*) want_one demo_c2; return ;;
     src/demo_b3*.zig | ops/demo-b3/*) want_one demo_b3; return ;;
     src/demo_b7*.zig) want_one demo_b7; return ;;
     src/demo_b5*.zig | ops/demo-b5/*) want_one demo_b5; return ;;
     # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
-    src/zigbox_* | src/relay*.zig) want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
+    src/zigbox_* | src/relay*.zig)
+      want_one zigbox_smoke; want_one demo_c2; want_one demo_b3; want_one demo_b5; want_one demo_c3
+      return ;;
     # The mTLS interop harness and its Java server.
     src/mtls_interop*.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
     # The smoke's own files.
@@ -81,17 +111,20 @@ classify() {
     # Not part of any job but the build, test, tidy and wasm ones: the web console and its
     # checks, the tools, the simulations and their runners, tests of the code, the gate's own
     # runner, the generated error pages' tool, the smokes' own drivers, the cloud container's
-    # hook, the fleet's host side, the site's generated pages.
+    # hook, the fleet's host side, the site's generated pages, the macOS release tool and the
+    # formula lines (the macOS job's, `is_macos`).
     web/* | tools/* | .claude/* | ops/sim-fleet/* | ops/demo-c2-images/* | site/errors/* | \
       src/console_*.zig | src/web_embed.zig | src/sim_*.zig | src/tests.zig | src/tidy.zig | \
       src/errors_site.zig | src/testdata/* | src/testing/check.zig | src/wasm_core.zig | \
       src/*_test.zig | src/agent_smoke.zig | src/local_smoke.zig | src/swarm_smoke.zig | \
-      src/bench_watch.zig | src/zcube_agent_teeth.zig | src/zcube_agent_relay_teeth_*.zig) return ;;
+      src/bench_watch.zig | src/zcube_agent_teeth.zig | src/zcube_agent_relay_teeth_*.zig | \
+      src/mac_release.zig | packaging/homebrew/*) return ;;
   esac
   want_all
 }
 
 docs_only=1
+macos=0
 count=0
 while IFS= read -r path; do
   [ -n "$path" ] || continue
@@ -100,6 +133,7 @@ while IFS= read -r path; do
   if ! is_docs "$path"; then
     docs_only=0
     classify "$path"
+    if is_macos "$path"; then macos=1; fi
   fi
 done
 
@@ -121,10 +155,13 @@ emit() { echo "$1=$2" >> "${GITHUB_OUTPUT:-/dev/stdout}"; }
 if [ "$skip" -eq 1 ]; then
   emit code false
   for j in "${jobs[@]}"; do emit "$j" false; done
+  emit macos false
 elif [ "$full" -eq 1 ]; then
   emit code true
   for j in "${jobs[@]}"; do emit "$j" true; done
+  emit macos true
 else
   emit code true
   for j in "${jobs[@]}"; do emit "$j" "$([ -n "${want[$j]:-}" ] && echo true || echo false)"; done
+  emit macos "$([ "$macos" -eq 1 ] && echo true || echo false)"
 fi

@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) void {
     };
     const built = add_executables(b, shared_options);
     add_unit_tests(b, shared_options, built);
+    add_macos_steps(b, options, target, optimize);
     const built_debug = add_debug_executables(b, shared_options);
 
     // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
@@ -118,8 +119,11 @@ fn add_store_and_demo_steps(b: *std.Build, sets: [2]Built, seed: ?u64, shared: S
     const pg_dev = add_pg_dev_steps(b);
     const failover_help = "test-store-faults on Postgres: also run the failover runs " ++
         "(default true; they need the Postgres 16 programs, as pg-up does)";
+    const only_help = "test-store-faults: run only this part (Postgres: conformance, faults, " ++
+        "sync, async; SQLite: faults), as the fleet's replay lines do (default: every part)";
     add_store_faults_step(b, store_options, .{
         .enabled = b.option(bool, "failover", failover_help) orelse true,
+        .only = b.option(FaultsPart, "store-faults-only", only_help),
         .pg_dev = pg_dev,
         .server = built.server,
     });
@@ -187,6 +191,132 @@ fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
     const check_run = b.addRunArtifact(check_tests);
     check_run.setCwd(b.path("."));
     test_step.dependOn(&check_run.step);
+}
+
+// ---- zcube alone, and on macOS (docs/macos.md) ---------------------------------------------
+
+/// The macOS targets `zcube` is built for. Only the command line: the server links SQLite and
+/// libpq, and the agent runs Zigbox containers, which need Linux.
+const mac_architectures = [_][]const u8{ "aarch64", "x86_64" };
+
+/// The `zcube` executable and the test binary of its own files (src/cli_tests.zig) for `target`.
+/// Neither imports the server's client libraries or the console, so both build wherever Zig does.
+const Cli = struct { exe: *std.Build.Step.Compile, tests: *std.Build.Step.Compile };
+
+fn add_cli(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) Cli {
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
+    const build_options = options.createModule();
+    const imports: []const std.Build.Module.Import = &.{
+        .{ .name = "build_options", .module = build_options },
+        .{ .name = "zigbox", .module = zigbox.module("zigbox") },
+    };
+    const exe = b.addExecutable(.{
+        .name = "zcube",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zcube.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        }),
+    });
+    const tests = b.addTest(.{
+        .name = "cli_tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        }),
+    });
+    return .{ .exe = exe, .tests = tests };
+}
+
+fn mac_target(b: *std.Build, architecture: []const u8) std.Build.ResolvedTarget {
+    const query = std.Target.Query.parse(.{ .arch_os_abi = b.fmt("{s}-macos", .{architecture}) });
+    return b.resolveTargetQuery(query catch @panic("a macOS target query is a constant"));
+}
+
+/// `zig build cli` installs `zcube` alone and `zig build test-cli` runs its tests, for the target
+/// given (the macOS job runs both natively). `zig build mac-cross` compiles both for each macOS
+/// target from any host, without running them (a gate of `check`). `zig build mac-release` is
+/// the owner's signed release (src/mac_release.zig).
+fn add_macos_steps(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const cli = add_cli(b, options, target, optimize);
+    const install = b.addInstallArtifact(cli.exe, .{});
+    b.step("cli", "Build and install zcube alone (no server, no agent)").dependOn(&install.step);
+    const run = b.addRunArtifact(cli.tests);
+    b.step("test-cli", "Run the tests of zcube's own files").dependOn(&run.step);
+
+    const cross = b.step("mac-cross", "Compile zcube and its tests for each macOS target");
+    for (mac_architectures) |architecture| {
+        const mac = add_cli(b, options, mac_target(b, architecture), .Debug);
+        cross.dependOn(&mac.exe.step);
+        cross.dependOn(&mac.tests.step);
+    }
+    add_mac_release(b, options);
+}
+
+/// `zig build mac-release`: the universal ReleaseSafe macOS `zcube`, signed with the hardened
+/// runtime, zipped, and (with `-Dnotarize=true`) notarized, then the Homebrew lines for Zigbox's
+/// `zigbox` formula filled in. Follows Zigbox's step of the same name; runs on the owner's Mac
+/// only. `-Dsign-identity=-` signs ad hoc, for trying it; the defaults are the owner's.
+fn add_mac_release(b: *std.Build, options: *std.Build.Step.Options) void {
+    const release = @import("src/mac_release.zig");
+    const identity_help = "mac-release: the codesign identity (- is ad hoc); default " ++
+        release.default_identity;
+    const identity = b.option([]const u8, "sign-identity", identity_help) orelse
+        release.default_identity;
+    const profile_help = "mac-release: the notarytool keychain profile; default " ++
+        release.default_profile;
+    const profile = b.option([]const u8, "notary-profile", profile_help) orelse
+        release.default_profile;
+    const keychain_help = "mac-release: the keychain file codesign and notarytool use; " ++
+        "default the login keychain";
+    const keychain = b.option([]const u8, "keychain", keychain_help) orelse "";
+    const notarize_help = "mac-release: submit the archive to Apple's notary service";
+    const notarize = b.option(bool, "notarize", notarize_help) orelse false;
+    const tool = b.addExecutable(.{
+        .name = "mac_release",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mac_release.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    for (mac_architectures) |architecture| {
+        const mac = add_cli(b, options, mac_target(b, architecture), .ReleaseSafe);
+        run.addArg(b.fmt("--binary-{s}", .{architecture}));
+        run.addArtifactArg(mac.exe);
+    }
+    run.addArgs(&.{ "--formula", "packaging/homebrew/zcube-resource.rb" });
+    run.addArgs(&.{ "--out", "zig-out/mac-release" });
+    run.addArgs(&.{ "--version", @import("build.zig.zon").version });
+    run.addArgs(&.{ "--identity", identity, "--profile", profile });
+    if (keychain.len > 0) run.addArgs(&.{ "--keychain", keychain });
+    if (notarize) run.addArg("--notarize");
+    run.has_side_effects = true;
+    const step = b.step("mac-release", "Sign, zip and optionally notarize the macOS zcube");
+    if (b.graph.host.result.os.tag == .macos) {
+        step.dependOn(&run.step);
+    } else {
+        const why = "mac-release runs only on macOS: it needs lipo, codesign, ditto and notarytool";
+        step.dependOn(&b.addFail(why).step);
+    }
+    // The release tool's own tests run on any host, in `zig build test`.
+    const tool_tests = b.addTest(.{ .root_module = tool.root_module });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(tool_tests).step);
 }
 
 const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
@@ -413,6 +543,21 @@ fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Buil
             },
         }),
     });
+    // The Jepsen lease test's negative control (`zcube_agent_fence_teeth.zig`). Installed, so
+    // that the Jepsen harness can copy it to a node; it is never part of a release.
+    const fence_teeth_agent = b.addExecutable(.{
+        .name = "zcube-agent-fence-teeth",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zcube_agent_fence_teeth.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.options.createModule() },
+                .{ .name = "zigbox", .module = options.zigbox },
+            },
+        }),
+    });
+    b.installArtifact(fence_teeth_agent);
     // Both are built by plain `zig build`, so neither smoke can stop compiling unnoticed.
     b.installArtifact(exe);
     b.getInstallStep().dependOn(&teeth_agent.step);
@@ -544,9 +689,21 @@ fn add_bench_watch_step(b: *std.Build, options: ExecutablesOptions) void {
         .dependOn(&run.step);
 }
 
+/// The steps that boot QEMU guests need KVM and Zigbox's Linux `zbx`, which Zigbox's build does
+/// not define for a macOS host (asking for it panics while configuring). Off Linux they are
+/// registered as failing steps, so `zig build cli` configures on a Mac and `check` still finds
+/// its gates by name.
+fn add_linux_only_steps(b: *std.Build, names: []const []const u8) void {
+    for (names) |name| {
+        const why = b.fmt("{s} runs only on Linux: it boots QEMU guests with KVM", .{name});
+        b.step(name, why).dependOn(&b.addFail(why).step);
+    }
+}
+
 /// `zig build zigbox-smoke`: the Zigbox runtime on a real host, in a QEMU guest booted through
 /// Zigbox's exported `zigbox_vm` module (src/zigbox_smoke.zig). Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_zigbox_smoke_step(b: *std.Build, built: Built) void {
+    if (b.graph.host.result.os.tag != .linux) return add_linux_only_steps(b, &.{"zigbox-smoke"});
     const vm = b.dependency("zigbox", .{}).module("zigbox_vm");
     // The guest runs the host's architecture; Zigbox's zbx is static and libc-free, and the guest
     // gets it only to run `zbx doctor` for the log of a failure.
@@ -676,6 +833,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     const help = "Run HANDOFF's C0 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c0", help).dependOn(&run.step);
     add_demo_c1_step(b, step_options, transcript);
+    add_c3_smoke_step(b, step_options, transcript);
     add_fake_demo_step(b, step_options, transcript, .{
         .name = "demo-b1",
         .exe = "demo_b1",
@@ -691,6 +849,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     add_demo_b7_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
+    add_demo_c3_step(b, step_options, transcript);
     add_demo_b5_step(b, step_options, transcript);
 }
 
@@ -740,6 +899,45 @@ fn add_demo_c1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run HANDOFF's C1 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c1", help).dependOn(&run.step);
+}
+
+/// `zig build c3-smoke -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: C3's demo script with
+/// `FakeRuntime` (src/c3_smoke.zig, docs/demos/c3.md), a smoke and not `demo-c3`: rollouts, a
+/// failed one rolled back, pause, resume and rollback, judged at every revision. It writes its own
+/// image list.
+fn add_c3_smoke_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const exe = b.addExecutable(.{
+        .name = "c3_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/c3_smoke.zig"),
+            .target = step_options.target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--backend");
+    switch (step_options.backend) {
+        .sqlite => run.addArg("sqlite"),
+        .postgres => run.addArgs(&.{ "postgres", "--postgres", step_options.postgres }),
+        .memory => unreachable, // `add_store_and_demo_steps` never passes it.
+    }
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addArtifactArg(built.agent);
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    b.step("c3-smoke-build", "Compile c3-smoke, no run").dependOn(&exe.step);
+    const help = "Run C3's demo script with FakeRuntime, not demo-c3 (-Dbackend=, -Dtranscript=)";
+    b.step("c3-smoke", help).dependOn(&run.step);
 }
 
 /// A demo over `FakeRuntime` that takes the same arguments as demo-b1's.
@@ -833,6 +1031,7 @@ fn add_demo_b7_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
 /// server on the host over SQLite, four QEMU guests booted through Zigbox's `zigbox_vm`, each
 /// with one `zcube-agent --runtime zigbox`. Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    if (b.graph.host.result.os.tag != .linux) return add_linux_only_steps(b, &.{"demo-c2"});
     const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
     const exe = b.addExecutable(.{
         .name = "demo_c2",
@@ -869,6 +1068,9 @@ fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
 /// on the host with one relay, one QEMU guest with `zcube-agent --runtime zigbox`, a relayed job
 /// that tries to reach the world. Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    if (b.graph.host.result.os.tag != .linux) {
+        return add_linux_only_steps(b, &.{ "demo-b3", "demo-b3-build" });
+    }
     const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
     const exe = b.addExecutable(.{
         .name = "demo_b3",
@@ -936,11 +1138,56 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     b.step("demo-b3", help).dependOn(&run.step);
 }
 
+/// `zig build demo-c3 [-Dtranscript=FILE]`: C3's demo for real (src/demo_c3.zig,
+/// docs/demos/c3.md): three QEMU guests, each with `zcube-agent --runtime zigbox`, the server on
+/// SQLite on the host, three digest-pinned Alpine images, judged at every revision by
+/// `c3_witness.zig`. Skips unless `ZCUBE_REAL_HOST=1` (KVM).
+fn add_demo_c3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    if (b.graph.host.result.os.tag != .linux) {
+        return add_linux_only_steps(b, &.{ "demo-c3", "demo-c3-build" });
+    }
+    const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
+    const exe = b.addExecutable(.{
+        .name = "demo_c3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_c3.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+            },
+        }),
+    });
+    // demo-c3 runs only on KVM hosts, so `check` compiles it (no run), as demo-b3's.
+    const build_step = b.step("demo-c3-build", "Compile demo-c3, no run");
+    build_step.dependOn(&exe.step);
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addFileArg(stripped(b, built.agent));
+    run.addArg("--zbx");
+    run.addFileArg(stripped(b, zigbox.artifact("zbx")));
+    run.addArg("--guest-script");
+    run.addFileArg(b.path("ops/demo-c3/guest.sh"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run C3's demo for real in three QEMU guests (needs ZCUBE_REAL_HOST=1)";
+    b.step("demo-c3", help).dependOn(&run.step);
+}
+
 /// `zig build demo-b5 [-Dtranscript=FILE]`: B5's demo, run for real (src/demo_b5.zig): the server
 /// on the host with a trust policy, one QEMU guest with `zcube-agent --runtime zigbox
 /// --trust-policy` where jobs are signed with `zbx sign`; unsigned, untrusted and other-tree jobs
 /// refused at the server and again at the agent. Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_demo_b5_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    if (b.graph.host.result.os.tag != .linux) {
+        return add_linux_only_steps(b, &.{ "demo-b5", "demo-b5-build" });
+    }
     const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
     const exe = b.addExecutable(.{
         .name = "demo_b5",
@@ -1089,9 +1336,15 @@ fn add_store_tests(
 /// Slice 10d's failover runs (`src/store_failover.zig`): a `pg_dev` pair and a real server.
 const FailoverOptions = struct {
     enabled: bool,
+    /// `-Dstore-faults-only`: one part of the step alone, with nothing before it, so that a
+    /// replay runs exactly the part that failed (the parts draw their seeds separately unless
+    /// `-Dseed` is given, and a later part runs only after the one before it passed).
+    only: ?FaultsPart,
     pg_dev: *std.Build.Step.Compile,
     server: *std.Build.Step.Compile,
 };
+
+const FaultsPart = enum { conformance, faults, sync, async };
 
 fn add_store_faults_step(
     b: *std.Build,
@@ -1112,39 +1365,73 @@ fn add_store_faults_step(
             },
         }),
     });
-    const run = b.addRunArtifact(exe);
-    run.has_side_effects = true;
-    run.setCwd(b.path("."));
-    switch (step_options.backend) {
-        .postgres => {
-            run.addArgs(&.{ "--backend", "postgres", "--postgres", step_options.postgres });
-            // The conformance suite's tests, through a proxy that delays and stalls but never cuts.
-            step.dependOn(&add_store_tests(b, step_options, true).step);
-        },
-        .sqlite => run.addArgs(&.{ "--backend", "sqlite" }),
-        .memory => {
-            step.dependOn(&b.addFail("test-store-faults needs -Dbackend=postgres or sqlite").step);
-            return;
-        },
+    if (step_options.backend == .memory) {
+        step.dependOn(&b.addFail("test-store-faults needs -Dbackend=postgres or sqlite").step);
+        return;
     }
-    if (step_options.seed) |seed| run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
-    step.dependOn(&run.step);
+    const only = failover.only;
+    if (step_options.backend == .sqlite) {
+        if (only) |part| {
+            if (part != .faults) {
+                step.dependOn(&b.addFail("-Dstore-faults-only on SQLite takes faults").step);
+                return;
+            }
+        }
+    }
+    if (step_options.backend == .postgres) {
+        // The conformance suite's tests, through a proxy that delays and stalls but never cuts.
+        if (only == null or only == .conformance) {
+            step.dependOn(&add_store_tests(b, step_options, true).step);
+        }
+    }
+    var before: ?*std.Build.Step = null;
+    if (only == null or only == .faults) {
+        const run = b.addRunArtifact(exe);
+        run.has_side_effects = true;
+        run.setCwd(b.path("."));
+        if (step_options.backend == .postgres) {
+            run.addArgs(&.{ "--backend", "postgres", "--postgres", step_options.postgres });
+        } else {
+            run.addArgs(&.{ "--backend", "sqlite" });
+        }
+        if (step_options.seed) |seed| run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
+        step.dependOn(&run.step);
+        before = &run.step;
+    }
     if (step_options.backend != .postgres) return;
-    if (!failover.enabled) return;
-    // One after the other, after 10c's run: each makes and removes the same pair of servers.
-    var before: *std.Build.Step = &run.step;
-    for ([_][]const u8{ "sync", "async" }) |mode| {
+    // `-Dstore-faults-only=sync|async` runs that failover run whatever `-Dfailover` says.
+    if (only == null and !failover.enabled) return;
+    add_failover_runs(b, step, exe, step_options.seed, failover, before);
+}
+
+/// Slice 10d's failover runs, one after the other and after 10c's run (`before`, when it runs):
+/// each makes and removes the same pair of servers.
+fn add_failover_runs(
+    b: *std.Build,
+    step: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    seed_option: ?u64,
+    failover: FailoverOptions,
+    first: ?*std.Build.Step,
+) void {
+    const only = failover.only;
+    var before = first;
+    for ([_]FaultsPart{ .sync, .async }) |mode| {
+        if (only) |part| {
+            if (part != mode) continue;
+        }
         const failover_run = b.addRunArtifact(exe);
         failover_run.has_side_effects = true;
         failover_run.setCwd(b.path("."));
-        failover_run.addArgs(&.{ "--backend", "postgres", "--failover", mode, "--pg-dev" });
+        failover_run.addArgs(&.{ "--backend", "postgres", "--failover", @tagName(mode) });
+        failover_run.addArg("--pg-dev");
         failover_run.addArtifactArg(failover.pg_dev);
         failover_run.addArg("--server");
         failover_run.addArtifactArg(failover.server);
-        if (step_options.seed) |seed| {
+        if (seed_option) |seed| {
             failover_run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
         }
-        failover_run.step.dependOn(before);
+        if (before) |previous| failover_run.step.dependOn(previous);
         before = &failover_run.step;
         step.dependOn(&failover_run.step);
     }
@@ -1254,6 +1541,9 @@ const SimStepOptions = struct {
     /// `-Dauto-shape`: sim-cluster, sim-c1 and sim-swarm draw their operations (and the cluster
     /// its nodes, lease ttl and replica counts) from the seed; `-Dops` and `-Dnodes` are ignored.
     auto_shape: bool = false,
+    /// `-Dc1-health`: sim-c1 runs in the health world (`--health`), so `check` drives the probe
+    /// seam of C3 slice 9. On by default.
+    c1_health: bool = true,
     /// `-Dtenants`: sim-c1 runs B6's tenant world (`--strong --tenants`: node labels, operator
     /// relabels and P1), natively and as WASM.
     tenants: bool = false,
@@ -1314,13 +1604,15 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     var sim = options;
     sim.ops = b.option(u32, "ops", ops_help) orelse 100;
     const profile_help = "Fault profile of sim-cluster and sim-c1: mixed (default), partitions, " ++
-        "skew, crash_heavy, slow_store, auto";
+        "skew, crash_heavy, slow_store, bad_release, auto";
     sim.profile = b.option([]const u8, "profile", profile_help) orelse "mixed";
     const swarm_help = "Peer profile of sim-swarm: mixed (default), liars, silent, refusers, " ++
         "honest, auto";
     sim.swarm_profile = b.option([]const u8, "swarm-profile", swarm_help) orelse "mixed";
     const shape_help = "Draw operations (and nodes, lease ttl, replicas) from the seed";
     sim.auto_shape = b.option(bool, "auto-shape", shape_help) orelse false;
+    const health_help = "sim-c1 in the health world, --health (default true)";
+    sim.c1_health = b.option(bool, "c1-health", health_help) orelse true;
     const tenants_help = "sim-c1 runs the tenant world (--strong --tenants) and judges P1";
     sim.tenants = b.option(bool, "tenants", tenants_help) orelse false;
     add_sim_step(b, sim);
@@ -1357,6 +1649,7 @@ fn canary_manifest(b: *std.Build) []const u8 {
         canary_seeds_teeth, canary_symptom_teeth,
     });
     for (c1_teeth_roots) |entry| {
+        if (entry.c3) continue;
         const seeds = if (entry.canary_first) |first|
             b.fmt("{d}+{d}@{d}", .{ first, entry.canary_seeds, entry.ops })
         else
@@ -1453,6 +1746,10 @@ const c1_teeth_roots = [_]struct {
     plain_seeds: u32 = teeth_seeds_max,
     /// Operations of a run; the worlds of the two teeth outside `c1_teeth_operations` need more.
     ops: u32 = c1_teeth_operations,
+    /// A sim-c3 tooth (C3 slice 7): run with `--c3`, under `sim-c3-teeth` and
+    /// `sim-c3-teeth-<name without "rollout_">`, and left out of the canary manifest until the
+    /// fleet has a sim-c3 kind.
+    c3: bool = false,
 }{
     .{
         .name = "allocation",
@@ -1575,6 +1872,10 @@ const c1_teeth_roots = [_]struct {
         .symptom = "J8: a run that no node started",
         .canary_seeds = 60,
         .plain_symptom = "J8: a run that no node started",
+        // C3 slice 8's automatic rollback changed every world's draws: measured 2026-11-15 over
+        // seeds 1 to 40 at 100 operations, 20 fail J8 with `--c1` (first at seed 1) and 12 plain
+        // (first at seed 11), so the plain run takes 40 seeds, not ten.
+        .plain_seeds = 40,
     },
     .{
         .name = "job_wipe",
@@ -1752,6 +2053,54 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "J6",
         .plain_seeds = 2,
     },
+    // C3 slice 7: the rollout checks run only under `--c3` (they judge each transaction before
+    // it commits), so these teeth have no plain run. The symptoms are full text: B3's relay
+    // checks are also named R1 to R3. Measured 2026-11-14 over seeds 1 to 40: at 100 operations
+    // budget 40, pause 14 and history 40 fail; at 150, budget 40 (all R1), pause 20 (18 R4, two
+    // the halted-surge convergence check) and history 40 (all R6). Each is caught at seed 1.
+    .{
+        .name = "rollout_budget",
+        .root = "src/sim_c1_teeth_rollout_budget_main.zig",
+        .c3 = true,
+        .symptom = "R1: a retirement",
+        .canary_seeds = 10,
+    },
+    .{
+        .name = "rollout_pause",
+        .root = "src/sim_c1_teeth_rollout_pause_main.zig",
+        .c3 = true,
+        .symptom = "R4: a paused rollout",
+        .canary_seeds = 20,
+    },
+    .{
+        .name = "rollout_history",
+        .root = "src/sim_c1_teeth_rollout_history_main.zig",
+        .c3 = true,
+        .symptom = "R6: a history",
+        .canary_seeds = 10,
+    },
+    // C3 slice 8: the rollback teeth.
+    .{
+        .name = "rollout_exact",
+        .root = "src/sim_c1_teeth_rollout_exact_main.zig",
+        .c3 = true,
+        .symptom = "R5: a rollback",
+        .canary_seeds = 10,
+    },
+    .{
+        .name = "rollout_race",
+        .root = "src/sim_c1_teeth_rollout_race_main.zig",
+        .c3 = true,
+        .symptom = "R8: an automatic rollback",
+        .canary_seeds = 10,
+    },
+    .{
+        .name = "rollout_stuck",
+        .root = "src/sim_c1_teeth_rollout_stuck_main.zig",
+        .c3 = true,
+        .symptom = "R7: a failed rollout",
+        .canary_seeds = 10,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1771,7 +2120,8 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 34 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs 34 negative tests (`sim-c3-teeth` the other 6), each of which passes only
+/// if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1791,8 +2141,24 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     // The seed twice: as it always ran, and in B5's trust world (`--signed`, J12).
     add_c1_comparison(b, sim, exe, step, nodes_text, false);
     add_c1_comparison(b, sim, exe, step, nodes_text, true);
+    add_teeth_steps(b, sim);
+    add_offline_step(b, sim);
+    add_burst_step(b, sim);
+    add_worlds_step(b, sim);
+    add_reuse_step(b, sim);
+    add_signed_step(b, sim);
+    add_regress_step(b, sim);
+    add_regressions_step(b, sim);
+    add_fencing_teeth_step(b, sim);
+}
+
+/// `sim-c1-teeth`, `sim-c3-teeth` and one step per tooth (`c1_teeth_roots`).
+fn add_teeth_steps(b: *std.Build, sim: SimStepOptions) void {
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 34 fault-on sim-c1 runners");
+    const c3_teeth = b.step("sim-c3-teeth", "Run the sim-c3 negative tests (budget, pause, " ++
+        "history, exact, race, stuck); each must fire its check");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 40 fault-on sim-c1 and sim-c3 " ++
+        "runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1808,12 +2174,16 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         const symptom = b.fmt("--expect-symptom={s}", .{entry.symptom});
         teeth_run.addArgs(&.{
             "--seeds",                  seeds,
-            b.fmt("{d}", .{entry.ops}), "--c1",
+            b.fmt("{d}", .{entry.ops}), if (entry.c3) "--c3" else "--c1",
             "--expect-fail",            symptom,
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
-        teeth.dependOn(&teeth_run.step);
-        const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
+        (if (entry.c3) c3_teeth else teeth).dependOn(&teeth_run.step);
+        const own = if (entry.c3)
+            b.step(b.fmt("sim-c3-teeth-{s}", .{entry.name["rollout_".len..]}), "One sim-c3 " ++
+                "negative test")
+        else
+            b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
         add_also_seeds(b, &.{ teeth, own }, teeth_exe, entry);
         add_plain_tooth(b, teeth, teeth_exe, entry);
@@ -1821,18 +2191,10 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
     }
-    add_offline_step(b, sim);
-    add_burst_step(b, sim);
-    add_worlds_step(b, sim);
-    add_reuse_step(b, sim);
-    add_signed_step(b, sim);
-    add_regress_step(b, sim);
-    add_regressions_step(b, sim);
-    add_fencing_teeth_step(b, sim);
 }
 
 /// One sim-c1 seed run natively and under both V8 compilers as WASM, the reports compared byte
-/// for byte; `signed` adds `--signed` to both.
+/// for byte; `signed` adds `--signed` to both, and `-Dc1-health` `--health`.
 fn add_c1_comparison(
     b: *std.Build,
     sim: SimStepOptions,
@@ -1851,6 +2213,8 @@ fn add_c1_comparison(
     if (signed) run.addArg("--signed");
     // B6's tenant world (`-Dtenants`): node labels, operator relabels and P1.
     if (sim.tenants) run.addArg("--tenants");
+    // C3 slice 9's health world (`-Dc1-health`, on by default): `check` drives the probe seam.
+    if (sim.c1_health) run.addArg("--health");
     const native_report = run.captureStdOut(.{});
     for (v8_modes) |mode| {
         const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
@@ -1861,6 +2225,7 @@ fn add_c1_comparison(
         node.addFileArg(native_report);
         if (signed) node.addArg("--signed");
         if (sim.tenants) node.addArg("tenants");
+        if (sim.c1_health) node.addArg("--health");
         step.dependOn(&node.step);
     }
 }
@@ -2308,6 +2673,12 @@ const c1_regressions = [_][]const []const u8{
         "--c1",               "--strong",      "--lease-ttl-ms=10000",
         "--replicas-pct=300", "--heal-at=701",
     },
+    // C3 slice 7 review: R4's checker counted a user's scale-down while paused on fewer replicas
+    // than the controller keeps (held ones, and ones on a node not ready but within its lost
+    // grace), so it called the removal a retirement
+    // (docs/decisions/2026-11-14-c3-paused-scale-down.md).
+    &.{ "202", "150", "0", "--c3", "--heal-at=125" },
+    &.{ "207", "150", "0", "--c3", "--heal-at=127" },
     // #260 on b629ece: a checker false positive. node2's agent died between alpha-41's record
     // and its process (`starting` for the 10 s start timeout, then lost), then again mid-start
     // of a job; the host restart fenced and waited that timeout for the job's record too, and
@@ -2445,8 +2816,8 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     b.step("sim-fleet-exe", "Install the simulation fleet's reporter into zig-out/bin")
         .dependOn(&install.step);
     // `zig build test` also runs the fleet's own shell functions against this reporter:
-    // `run.sh`'s crash records and its canary, the latter over the manifest `sim-canary-exe`
-    // installs.
+    // `run.sh`'s crash records, its canary (over the manifest `sim-canary-exe` installs) and its
+    // coverage feedback.
     const test_step = &b.top_level_steps.get("test").?.step;
     const records = b.addSystemCommand(&.{"sh"});
     records.addFileArg(b.path("ops/sim-fleet/test-crash-record.sh"));
@@ -2461,6 +2832,28 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     canary.addFileInput(b.path("ops/sim-fleet/run.sh"));
     canary.expectExitCode(0);
     test_step.dependOn(&canary.step);
+    // Its coverage feedback: `bias_pick` and `coverage_add` against the real reporter.
+    const bias = b.addSystemCommand(&.{"sh"});
+    bias.addFileArg(b.path("ops/sim-fleet/test-bias.sh"));
+    bias.addArtifactArg(exe);
+    bias.addFileInput(b.path("ops/sim-fleet/run.sh"));
+    bias.expectExitCode(0);
+    test_step.dependOn(&bias.step);
+    // The long soak's loop (`soak.sh`): a real soak that held and a real one that leaked (the
+    // soak tooth, `src/sim_soak_teeth_main.zig`, which the soak must fail), through the real
+    // reporter; and crashed, killed and refused runs of a fake runner.
+    const soak_loop = b.addSystemCommand(&.{"sh"});
+    soak_loop.addFileArg(b.path("ops/sim-fleet/test-soak-loop.sh"));
+    soak_loop.addArtifactArg(exe);
+    soak_loop.addArtifactArg(sim_debug_exe(b, sim, "sim_cluster", "src/sim_cluster_main.zig"));
+    const soak_teeth = sim_debug_exe(b, sim, "sim_soak_teeth", "src/sim_soak_teeth_main.zig");
+    soak_loop.addArtifactArg(soak_teeth);
+    // Only this named step installs the tooth, so `zig build` never puts it in zig-out.
+    b.step("sim-soak-teeth-exe", "Install the soak's leaking runner (test-only)")
+        .dependOn(&b.addInstallArtifact(soak_teeth, .{}).step);
+    soak_loop.addFileInput(b.path("ops/sim-fleet/soak.sh"));
+    soak_loop.expectExitCode(0);
+    test_step.dependOn(&soak_loop.step);
     // Its soak branches and heartbeat, against a local git remote and a local fake server.
     const soak = b.addSystemCommand(&.{"sh"});
     soak.addFileArg(b.path("ops/sim-fleet/test-soak.sh"));
@@ -2469,6 +2862,17 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     soak.addFileInput(b.path("ops/sim-fleet/test-soak-zig.sh"));
     soak.expectExitCode(0);
     test_step.dependOn(&soak.step);
+    const store_faults = b.addSystemCommand(&.{"sh"});
+    store_faults.addFileArg(b.path("ops/sim-fleet/test-store-faults.sh"));
+    store_faults.addArtifactArg(exe);
+    store_faults.addFileInput(b.path("ops/sim-fleet/run.sh"));
+    store_faults.expectExitCode(0);
+    test_step.dependOn(&store_faults.step);
+    add_guest_script_tests(b, test_step);
+}
+
+/// The guest scripts of demo-b3 and demo-b5, tested in `zig build test` (they run only in QEMU).
+fn add_guest_script_tests(b: *std.Build, test_step: *std.Build.Step) void {
     // demo-b3's guest script reads the relay logs of the Zigbox runtime's layout and fails on none.
     const guest = b.addSystemCommand(&.{"sh"});
     guest.addFileArg(b.path("ops/demo-b3/test-guest.sh"));
@@ -2482,6 +2886,24 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     guest_b5.addFileInput(b.path("ops/demo-b5/guest.sh"));
     guest_b5.expectExitCode(0);
     test_step.dependOn(&guest_b5.step);
+}
+
+/// The cluster simulator of root `root`, in Debug (it compiles in seconds), for a test to run.
+fn sim_debug_exe(
+    b: *std.Build,
+    sim: SimStepOptions,
+    name: []const u8,
+    root: []const u8,
+) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(root),
+            .target = sim.target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
 }
 
 /// The seeds the teeth test runs and the most the simulator may need to catch the agent's
@@ -2637,10 +3059,10 @@ fn add_check_step(b: *std.Build) void {
     run.addArgs(&.{ b.graph.zig_exe, user });
     run.has_side_effects = true;
     const gates = [_][]const u8{
-        "install",            "test",       "tidy",          "errors-site-check",
-        "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
-        "check-store-sqlite", "mtls-teeth", "demo-b3-build", "demo-b5-build",
-        "demos-build",
+        "install",            "test",          "tidy",           "errors-site-check",
+        "wasm-check",         "wasm-test",     "console-wasm",   "check-store-memory",
+        "check-store-sqlite", "mtls-teeth",    "demo-b3-build",  "demo-b5-build",
+        "demos-build",        "demo-c3-build", "c3-smoke-build", "mac-cross",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);

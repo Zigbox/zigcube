@@ -103,7 +103,8 @@ until a key under one of the prefixes changes, then call `handle` again with the
 A replica-count change does not bump `generation`; a failed start is held, not retried; a held
 replica is replaced when the service changes. Placement is the C0 scheduler: a node whose declared
 capacity fits the replica's resolved requests (its limits, else 250m CPU and 128 MiB, which the
-placing decision says), the fewest replicas of the service first. A replica no node fits waits,
+placing decision says), the fewest replicas of the service first, then (C3) the fewest of the
+replica's own generation, so a rollout spreads the new generation. A replica no node fits waits,
 unplaced, with no decision; `why` says "waiting for a node".
 
 B6 puts a filter ahead of fit: among the ready nodes, one is a candidate only if it carries every
@@ -357,6 +358,21 @@ its `  step:` line; the fleet's parser ignores them. The `auto` range summary re
 (`docs/decisions/2026-11-06-renewal-before-fence.md`). Every draw has its
 own generator (the seed xor a salt); the
 decision is `docs/decisions/2026-11-04-fleet-profiles-and-shapes.md`.
+**Coverage (C3 fleet 5).** A passing report ends, after `world hash`, in `coverage:` lines, one
+per group, each `name=count`: `check.<id>` (checks evaluated through `check()`, by the id before
+its `:`, `c0` for the C0 checks; `check.revision`, `check.job_*_judged` and the like for the
+per-revision and job checks), `fault.*` (crashes, wipes, partitions, outages, suspends, runtime
+faults, server restarts, lost acks, dropped, lost, duplicated, parked and late messages), `op.*`
+(operations drawn), and `path.*` (decisions by action, fences, failed calls, nodes and replicas
+lost, jobs created, cancelled and ended, a full ledger, refused reports, watch relists and
+restarts, relays opened). The counters only read what the world already does: they add no draw
+and change no earlier line, so the report without them is a prefix of the report with them, and
+native and WASM still compare equal (`zig build sim-cluster`, `sim-c1`). At most 128 names; more
+print `coverage: dropped=N`. A failing report prints none. `--seeds` prints, before its summary,
+one line per profile run, `coverage: profile=P seeds=N name=R ...`, R the seeds that reached the
+name; `sim_fleet coverage` keeps those per commit and `sim_fleet bias` steers the fleet toward the
+least reached (`ops/sim-fleet/README.md`, item 6; the decision is
+`docs/decisions/2026-11-13-coverage-feedback.md`).
 **Crashes:** the range form flushes each failing seed's report as it is printed, so a later seed
 that panics loses no earlier one. `--trace-steps` (either form) writes `step: <name>` to stderr,
 unbuffered, as the run enters each step (`faults`, `healed`, `convergence`, `end`), so the step a
@@ -364,6 +380,36 @@ crashed seed was in is the last such line; the fleet replays a crashed range see
 Before each seed's run it also writes `replay: <command>` (the concrete command, as a failing seed
 prints it), so the last such line names the seed a crash or a timeout was in and how to replay it.
 A seed whose world cannot be built (out of memory) reports `step: setup`.
+
+**The trace (C3 fleet 7).** A failing report prints, after its `step:` line, the last 24
+operations of the run (`trace: op <index> at <ms> ms: <operation> [<service>]`, the time virtual
+and counted from the run's start; a service is named for `apply`, `scale`, `delete` and
+`broken`). The ring (`OpTrace`) draws nothing and is not hashed, so no world changes. The range
+form prints the trace under the failing seed's replay; with `--shrink` it reruns the smallest
+failing run for its trace. `sim_fleet ingest` puts it in the issue (`ops/sim-fleet/README.md`,
+item 7).
+
+**The soak (C3 fleet 6).** `sim_cluster <seed> soak [nodes] [flags] --soak-minutes=M |
+--soak-operations=K [--soak-epoch=E]` (E 500 by default; K a multiple of E) runs one seed with
+liveness off until the budget or a failure: the world does not depend on the run's length without
+liveness, so a soak stopped at K operations is `sim_cluster <seed> K [nodes] --liveness=false`,
+and a core failure replays as that. `Options.on_epoch` (core) hands the shell an `Epoch` every E
+operations: virtual time, the revision, transactions, agent and server steps, decisions kept and
+dropped, store keys, log and leases, jobs and the start ledger. `src/sim_soak.zig` (shell) prints
+each as a `soak: epoch` line with wall time, operations per second and the heap's live and peak
+bytes (a counting allocator), and fails the soak if virtual time or the revision stood still, if a
+counter passed half its range, if live bytes per item of history (keys + log + revision +
+decisions + ledger) grew past 4 times their value at the fourth epoch, or if bytes added per item
+added since that epoch passed 4 times their first value (once the history has doubled). After the
+world's teardown the counting allocator must hold nothing (`soak: memory still held after the
+world was torn down`). `--soak-bytes=B` (1.5 GiB by default) ends the soak as held at the epoch
+whose live bytes reach B (`budget reached`), and a held soak prints its world hash. Wall time is
+printed, never judged, so the verdict is the seed's. The tooth, `src/sim_soak_teeth_main.zig`
+(16 KiB never freed per operation), must fail the teardown check; `ops/sim-fleet/test-soak-loop.sh`
+runs it in `zig build test` (`docs/decisions/2026-11-14-c3-soak-leak-judge.md`). `--c1` is refused (its tap grows about 1 GB by 2,000
+operations). The decisions check now reads up to 1,024 pages (`decision_pages_max`, 512,000
+decisions; it was 64, which a soak passes near 10,000 operations). Operations per second fall as
+the history grows, for the `MemoryStore` reason of the fleet's per-seed budget below.
 
 **Lost nodes in the report.** The report's `lost nodes:` line counts the `mark_lost` decisions and
 the replicas replaced after a lost node's grace (a `mark_replica_lost` caused by a decision). A
@@ -619,3 +665,57 @@ no registration is I7's. `sim-c1-teeth-placement_exclusive` (`c1_teeth.placement
 fail P1.
 
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.
+
+## sim-c3
+
+`sim_cluster ... --c3` (C3 slice 7, `src/sim_c3.zig`; it implies `--c1`) adds C3's rollout checks
+(docs/briefs/c3.md, "Simulation: checks and teeth") to sim-c1's, judged at the head of the store
+like them: R1 (a transaction of the replica controller that retires a running replica of a rolling
+rollout leaves at least `replicas - max_unavailable` running; a report the transaction did not
+compare and that changed after every key it did is counted as running, since the controller
+promises the floor on the state it read, `docs/decisions/2026-11-14-c3-rolling-floor-compares.md`),
+R2 (no more replicas
+than `replicas + max_surge` once a replica is created, in every phase of a rollout, paused and
+failed too), R3 (every replica created runs a
+generation in the service's history), R4 (a paused rollout starts and retires nothing; a scale
+down the user asked for is exempt, counted as the replica controller counts it: held replicas and
+replicas on a node not yet lost count, `docs/decisions/2026-11-14-c3-paused-scale-down.md`) and R6 (a history record never changes under its generation).
+Slice 8 adds R5, R7 and R8. R5: a history record with `restores` copies the spec (image,
+source, command, env, limits, health) of the generation it names, which must be in the history;
+and a rollout of reason `rollback` that completes leaves no live replica (not stopped, not on a
+lost node) of its service running another spec. R8: an `auto_rollback` lands only over the
+service whose rollout failed (the service still at the generation after the failed one's, its
+rollout still `failed`), so it never overwrites a newer apply; and it answers that rollout: it
+restores the rollout's `from` and its `rollback` decision names the rollout's `cause_decision`
+as its cause (`resync` when that is empty). R7 is judged at the liveness
+stage, after the heal (`rollouts_settle` in `src/sim_cluster.zig`): no service's rollout is still
+active past its deadline plus a slack of 30 s (the controller's resync), and no failed rollout
+still owes its automatic rollback. A service with no rollout record of its current generation
+is not R7's (`converged`, judged just before, covers its replicas). Under `--c3` an apply also
+draws its command, env and limits from three specs (`rollout_prng`), so a rollback that fails to
+copy one of them fails R5; health stays the world's (`--health`). `completed=` counts each
+rollback once, though R5 judges every write of its complete rollout record. Each check is a little weaker than its sentence in the
+brief, never stronger. Readiness is observed `running`: slices 9 and 10 (probes, health) replace
+it in `rollout_controller.Track`.
+
+With `--c3` the world also pauses and resumes rollouts (`rollout_prng`, a stream of its own, so a
+run without `--c3` draws as before), and resumes any paused rollout at the heal. The report adds
+`sim-c3 R1 retirements=.. doubted=.. R2 surges=.. R3 versions=.. R4 paused=.. R5 rollbacks=..
+completed=.. R6 history=.. R7 settled=.. R8 auto=..; pauses=.. resumes=..` (`doubted` counts the replicas R1 gave that benefit; the simulator's controllers
+read and commit with nothing between, so it is 0 there, and the unit tests in
+`src/rollout_controller_test.zig` write between the read and the commit instead). The race the
+floor's compares close (a kept replica that stops between a retirement's read and its commit,
+`expect_floor`) is therefore proven only by those unit tests, the first and the last replica the
+floor counts; no world step interleaves an agent's report inside a server pass.
+`--profile=bad_release` turns the faults off and raises the share of applies whose
+image never starts (`w_broken`), so rollouts fail (ZC-E0304) and are paused and resumed failed.
+
+Teeth (`zig build sim-c3-teeth`, one step each, `src/c1_teeth.zig`): `rollout_budget` (the replica
+controller spends the budget on the plan it read, comparing neither the replica counter nor the
+rollout record, and ignores `max_unavailable`: R1), `rollout_pause` (the replica controller keeps
+a progressing budget while a rollout is paused or failed: R4) and
+`rollout_history` (`history.put` also writes the new record over the previous generation's key:
+R6), and slice 8's `rollout_exact` (a rollback keeps the current image: R5), `rollout_race` (the
+controller remembers an owed rollback and carries it out a pass later on the service as it is
+then, without comparing the service revision its pass read: R8) and `rollout_stuck` (the
+controller never carries out an owed rollback: R7). They are not yet in the canary manifest: the fleet has no `sim-c3` kind.

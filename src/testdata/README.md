@@ -16,6 +16,15 @@ added `source`; `Service` and `Replica` are version 2 in it): `zcube-server` on 
 applied with an unknown digest. `store_live` was dumped with Python's `sqlite3`, one
 `key<TAB>value` per line, unedited. Never regenerate it: it is the proof that version 2 still reads.
 
+`b3_store.txt` is the same kind of capture from the build C3 starts from (`main` at `f49041a`,
+before C3 slice 5 added service and replica version 4 and observed version 3; `Service` and
+`Replica` are version 3, `Observed` version 2): `zcube-server` on SQLite and `zcube-agent` with
+`FakeRuntime`, as real processes, with `hello` at 3 replicas, one replica killed with `kill -9`
+and replaced, then `hello` applied again with a new image, `env`, `limits`, `source` and 2
+replicas, and `ghost` applied with an unknown digest. `store_live` was dumped with Python's
+`sqlite3`, one `key<TAB>value` per line, unedited. Never regenerate it: it is the proof that the
+records before C3 still read.
+
 `c2_pulls.txt` holds the three `/pulls/` rows a C2 slice-7 `zig build swarm-smoke` run left in the
 server's SQLite store (commit `7bceea3` plus the slice's fixes): node2 from the registry, node1
 from node2, node3 from node2 with node1 struck. The rows are what the server stored (each agent's

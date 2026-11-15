@@ -5,7 +5,9 @@
 //! exit 70. Never a stack trace.
 //!
 //! `zcube-agent supervise <dir>` is the same executable run again as the supervisor of one
-//! container (`fake_supervisor.zig`); nothing else uses that mode.
+//! container (`fake_supervisor.zig`); nothing else uses that mode. `zcube-agent probe` is the
+//! same for one health check over Zigbox exec (`probe_worker.zig`); its exit code means nothing:
+//! it says its result in one line on stdout, and a worker that ends without one is a refused check.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -19,6 +21,7 @@ const fake_supervisor = @import("fake_supervisor.zig");
 const c1_teeth = @import("c1_teeth.zig");
 const zigbox_supervisor = @import("zigbox_supervisor.zig");
 const fetch_cli = @import("fetch_cli.zig");
+const probe_worker = @import("probe_worker.zig");
 const fetch_plan = @import("fetch_plan.zig");
 
 const Diag = diag_mod.Diag;
@@ -29,6 +32,8 @@ comptime {
     assert(!c1_teeth.any);
     // `zcube_agent_teeth.zig` is the one root that switches the fetch plan's fault on.
     if (@import("root") == @This()) assert(!fetch_plan.fault_skip_verify);
+    // `zcube_agent_fence_teeth.zig` is the one root that switches the late kill on.
+    if (@import("root") == @This()) assert(!c1_teeth.fence_stop_teeth);
 }
 
 /// A panic is a `bug` diagnostic. The internal message is shown only with `--verbose`
@@ -73,6 +78,7 @@ pub fn main(init: std.process.Init) u8 {
         .supervise => |directory| return fake_supervisor.run(init, directory),
         .supervise_zigbox => |directory| return zigbox_supervisor.run(init, directory),
         .fetch => |rest| return fetch_cli.run(init, rest),
+        .probe => |rest| return probe_worker.run(init, rest),
         .run => |config| {
             verbose_panics = config.verbose;
             return agent_run.run(init, config);

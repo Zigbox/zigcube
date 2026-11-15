@@ -9,7 +9,10 @@
 //! service from a pulled Alpine image runs with its cgroup limits and no network but `lo`; a
 //! `kill -9` of a container is replaced; an agent restart adopts both with no duplicates; a
 //! memory hog ends `oom`; a pull whose tree is not the locked one is refused (ZC-E0511); an
-//! unknown digest is held (ZBX-E0410); removing a service during its pull leaves the agent up.
+//! unknown digest is held (ZBX-E0410); removing a service during its pull leaves the agent up;
+//! a health check run in the container (C3 slice 10) is observed `healthy`, then `unhealthy`
+//! when its file goes, a check past its timeout is killed and observed with ZC-W0502, and after
+//! an agent restart the adopted replica is checked again and observed `healthy`.
 //! Then two agents on the one guest, each with a Zigbox store of its own (slice 8): B fetches
 //! an image from A as a peer (peer bytes, no registry bytes in its pull record), a second image
 //! that overlaps the first moves only the chunks B lacks, an image no peer has is pulled from the
@@ -69,6 +72,8 @@ const stages = [_]Stage{
     .{ .name = "oom", .timeout_s = 200 },
     .{ .name = "refusals", .timeout_s = 260 },
     .{ .name = "scale0", .timeout_s = 150 },
+    // C3 slice 10: checks run in the container through `zcube-agent probe` and Zigbox exec.
+    .{ .name = "health", .timeout_s = 300 },
     // Slice 8: a second agent with a Zigbox store of its own fetches from the first.
     .{ .name = "peers_prep", .timeout_s = 560 },
     .{ .name = "peers_up", .timeout_s = 120 },

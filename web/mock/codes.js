@@ -152,7 +152,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "zcube local can't find or start the server or agent",
-    "explanation": "zcube local up starts zcube-server and zcube-agent, and looks for them in\nthe directory that holds the zcube command itself. One of them is not\nthere, is not an executable file, or the system refused to start it, so\nnothing was left running.\n\nBuild all three with zig build and run zcube from zig-out/bin, or keep the\nthree files together when you install them."
+    "explanation": "zcube local up starts zcube-server and zcube-agent, and looks for them in\nthe directory that holds the zcube command itself. One of them is not\nthere, is not an executable file, or the system refused to start it, so\nnothing was left running.\n\nBuild all three with zig build and run zcube from zig-out/bin, or keep the\nthree files together when you install them.\n\nzcube local runs only on Linux: the server and the agent are Linux programs.\nOn macOS, zcube talks to a server elsewhere (zcube --server HOST:PORT), and\nzcube local refuses with this code before it looks for either file."
   },
   {
     "code": "ZC-E0123",
@@ -167,6 +167,41 @@ export const ZC_CODES = [
     "blame": "environment",
     "summary": "another zcube local command is running",
     "explanation": "zcube local up and zcube local down take turns: each holds a lock on the\nfile lock in the local directory while it starts or stops the server and\nthe agent, so two of them never fight over the same processes. Another one\nheld the lock for longer than this one was willing to wait.\n\nWait for the other command to finish and run this one again. The lock is\nreleased when its holder ends, however it ends, so it is never stale."
+  },
+  {
+    "code": "ZC-E0125",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a service's health check is not valid",
+    "explanation": "The service file's `health` block describes a check that cannot run as\nwritten. A health check is a command run inside each replica's container:\nit needs 1 to 64 words with a non-empty first word, an `interval_ms` above\nzero and at most an hour, a `timeout_ms` above zero and no longer than the\ninterval, a `start_period_ms` of at most an hour, and `failure_threshold`\nand `success_threshold` of at least 1, each reaching its verdict within a\nday (threshold times interval). The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again. C3\nchecks are commands only; a TCP or HTTP check waits for a network path\ninto the container."
+  },
+  {
+    "code": "ZC-E0126",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a service's rollout policy is not valid",
+    "explanation": "The service file's `rollout` block cannot be followed. A rolling update\nmust be able to move: `max_surge` and `max_unavailable` may not both be 0,\nand neither may exceed the 128 replicas a service may have. The times must\nnest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no\nlonger than `progress_deadline_ms`, which is at most a day. `grace_ms` is\nat most a minute. The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again; a\nservice with no `rollout` block uses the default policy, which is valid."
+  },
+  {
+    "code": "ZC-E0127",
+    "severity": "error",
+    "blame": "user",
+    "summary": "there is nothing to roll back to",
+    "explanation": "A rollback restores a generation of the service older than the one it\nruns now. Either the rollback named the generation the service runs now\n(`--to` with the current generation), or it named none and the history\nholds no older one: the service was created by one apply and never\nchanged what its replicas run, or its history was deleted with an\nearlier service of the same name.\n\nNothing was changed. `zcube history <service>` lists the generations\nthere are: name an older one with `--to`. To run something else, apply\nthe service file you want."
+  },
+  {
+    "code": "ZC-E0128",
+    "severity": "error",
+    "blame": "user",
+    "summary": "the generation to roll back to is not in the history",
+    "explanation": "A service keeps the 16 newest generations it was applied with; an apply\nthat adds a 17th deletes the oldest. The generation the rollback named is\nolder than that, newer than the one the service runs now, or was never\none of this service's (a service deleted and applied again starts at\ngeneration 1 with no history).\n\nNothing was changed. `zcube history <service>` lists the generations that\ncan be restored. To run an older one, apply its service file again."
+  },
+  {
+    "code": "ZC-E0129",
+    "severity": "error",
+    "blame": "user",
+    "summary": "the service has no rollout to pause or resume",
+    "explanation": "Pause stops a rollout starting or retiring replicas; resume lets a paused\nrollout go on. This service has no rollout, its rollout is complete, or\n(for resume) its rollout failed: a failed rollout can be paused, which\nstops an automatic rollback it owes, and resumed once paused. Pausing a\npaused rollout, or resuming one that is running, is not this error: it\nsucceeds and changes nothing.\n\nNothing was changed. `zcube rollout status <service>` shows what is\nrunning."
   },
   {
     "code": "ZC-E0130",
@@ -320,7 +355,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "external",
     "summary": "a stored record can't be read",
-    "explanation": "A controller, the agent or the API read a value from the store that is\nnot a record of the kind its key says: not JSON, a field of the wrong\ntype, or a name that breaks the naming rules. The API validates what it\nwrites, so something else wrote this key, or the store was edited by hand.\n\nThe cause line names the key. Fix or delete that key (zcube get shows\nit); the controller skips nothing silently and tries again on its next\npass."
+    "explanation": "A controller, the agent or the API read a value from the store that is\nnot a record of the kind its key says: not JSON, a field of the wrong\ntype, a name that breaks the naming rules, a health check outside the\nbounds apply enforces, or fields that contradict each other (a rollout\nback to generation 0). Zigcube validates what it writes, so something\nelse wrote this key, or the store was edited by hand.\n\nThe cause line names the key. Fix or delete that key (zcube get shows\nit); the controller skips nothing silently and tries again on its next\npass."
   },
   {
     "code": "ZC-E0302",
@@ -335,6 +370,41 @@ export const ZC_CODES = [
     "blame": "environment",
     "summary": "a stored record is from a newer release",
     "explanation": "A value in the store carries a format version this release does not know:\na newer zcube wrote it, and this one is older. The value is not\nmalformed, so nothing was changed and nothing was skipped; this release\njust cannot say what the newer fields mean, and acting on a half-read\nrecord could undo the newer release's work.\n\nThe cause line names the key and both versions. Run the release that\nwrote the record, or upgrade this one; if you downgraded on purpose,\nrestore the store from the backup taken before the upgrade."
+  },
+  {
+    "code": "ZC-E0304",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a rollout failed: a new replica did not become ready",
+    "explanation": "A rollout starts replicas of the new generation a few at a time and\nretires old ones only once new ones are ready. A new replica did not\nbecome ready within `ready_timeout_ms`: it exited, was held, or its\nhealth check kept failing. The new version is at fault, not the cluster.\n\nThe cause line names the replica and what it did. With `on_failure`\nrollback (the default) the service is rolled back to the generation it\nran before, if it ran one: a failed first generation stays failed. With\n`pause` the rollout stops where it is. Fix the release, then apply it\nagain; `zcube why replica <id>` shows its last failure."
+  },
+  {
+    "code": "ZC-E0305",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a rollout stalled: a new replica cannot be placed",
+    "explanation": "A rolling update starts each new replica before it retires an old one\n(`max_surge`), so for a while the service needs room for more replicas\nthan it has. No ready node had room for the next new replica, so the\nrollout cannot go on without breaking `max_unavailable`.\n\nThe cause line names the replica and what it needs. Add a node or free\ncapacity, or allow the rollout to retire first (`max_unavailable` above\n0); the rollout continues by itself once a replica can be placed. If it\nis still stalled when `progress_deadline_ms` passes, it fails with this\ncode, not ZC-E0306, and follows `on_failure` like any failed rollout."
+  },
+  {
+    "code": "ZC-E0306",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a rollout passed its progress deadline",
+    "explanation": "A rollout must finish within `progress_deadline_ms` of its start. This\none did not: new replicas became ready too slowly, or not at all, though\nnone failed outright. (A rollout stalled for room when its deadline\npassed fails with ZC-E0305 instead.)\n\nWith `on_failure` rollback (the default) the service is rolled back to\nthe generation it ran before, if it ran one: a failed first generation\nstays failed. With `pause` the rollout stops where it is.\nIf the new version is right but slow to start, raise the deadline in the\nservice file and apply it again."
+  },
+  {
+    "code": "ZC-W0304",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a rollout paused itself after a failure",
+    "explanation": "The service's rollout policy says `on_failure: pause`, and the rollout\nfailed (ZC-E0304, ZC-E0305 or ZC-E0306). It stopped where it was:\nreplicas of both generations keep running, and nothing is started or\nretired until you act.\n\n`zcube rollout status <service>` shows both generations. Resume with\n`zcube rollout resume <service>`, roll back with `zcube rollback\n<service>` (if it ran an earlier generation), or apply a fixed release."
+  },
+  {
+    "code": "ZC-W0305",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a rollout was rolled back automatically",
+    "explanation": "The rollout of a new generation failed (ZC-E0304, ZC-E0305 or\nZC-E0306) and the service's rollout policy is `on_failure: rollback`,\nthe default. The service was applied again with the spec of the\ngeneration it ran before, as a new generation, and that rollout\nreplaces the failed replicas.\n\nThe summary names the failing replica and the generation restored. Fix\nthe release and apply it again; a newer apply always wins over an\nautomatic rollback."
   },
   {
     "code": "ZC-E0307",
@@ -397,7 +467,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "the runtime failed an operation",
-    "explanation": "The runtime could not carry out a request that is not about one workload's\nimage or command: listing its containers, stopping one, reading its state\ndirectory, or running out of the slots it provisions at startup.\n\nThe cause line names the operation and what the host reported. A failure\nto start one workload is not this code: it is reported on that workload,\nwith the runtime's own diagnostic."
+    "explanation": "The runtime could not carry out a request that is not about one workload's\nimage or command: listing its containers, stopping one, reading its state\ndirectory, or running out of the slots it provisions at startup. A health\ncheck is refused with it when its worker (the `zcube-agent probe` process\nthat runs the check in the container) could not start, ended without a\nresult, or did not end in time.\n\nThe cause line names the operation and what the host reported. A failure\nto start one workload is not this code: it is reported on that workload,\nwith the runtime's own diagnostic."
   },
   {
     "code": "ZC-E0503",
@@ -491,6 +561,13 @@ export const ZC_CODES = [
     "explanation": "A replica's image was being fetched from peers into this node's Zigbox\nstore, the fetch passed its deadline (or ended badly), and the supervisor\nkilled the fetch's whole process group with SIGKILL. A process of that\ngroup was still alive afterwards. It may still be writing the store, and\nZigbox's store takes one writer at a time, so the supervisor did not\nstart the registry pull: the replica was not started.\n\nA process that outlives SIGKILL is in uninterruptible sleep, waiting on\nthe kernel: usually a disk or a network mount that stopped answering.\nFind it (ps -eo pid,stat,wchan:32,args, state D) and the device it waits\non. The replica is started again on a later pass once it is gone."
   },
   {
+    "code": "ZC-E0516",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a replica's health check could not run",
+    "explanation": "The agent runs a replica's health check as a command inside its\ncontainer. The command could not be started there at all: the runtime\nrefused it, and its code is the cause. This says nothing about whether\nthe replica is healthy, so it counts as neither a pass nor a failure.\n\nRead the runtime's code in the cause line: a container that has just\nstopped, or a runtime that does not support running a command in a\ncontainer, are the usual reasons. If the cause is a broken contract of\nthe runtime itself, report it with the diagnostic bundle."
+  },
+  {
     "code": "ZC-E0521",
     "severity": "error",
     "blame": "environment",
@@ -517,6 +594,13 @@ export const ZC_CODES = [
     "blame": "environment",
     "summary": "the agent fenced itself and registered again",
     "explanation": "The agent could not renew its lease in time, or the server said its\nlease or tenure had ended. It stopped every container, so that nothing\nruns on this node that the cluster may have placed elsewhere, then\ngranted a new lease and registered again with nothing running.\n\nThis happens when the agent was paused or cut off from the server for\nlonger than the lease time to live less the fencing margin."
+  },
+  {
+    "code": "ZC-W0502",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a replica's health check timed out",
+    "explanation": "The health check command ran in the replica's container for longer than\nthe service's `timeout_ms` and was stopped. It counts as a failed check:\n`failure_threshold` failures in a row make the replica unhealthy.\n\nThe cause line names the replica and the timeout. Make the check\ncommand faster, or raise `timeout_ms` (at most `interval_ms`) in the\nservice file and apply it again."
   },
   {
     "code": "ZC-W0503",

@@ -1,0 +1,5 @@
+error[ZC-E0305]: a rollout stalled: a new replica cannot be placed
+  cause  no ready node has room for replica hello-32 (500 cpu millis, 128 MiB)
+  fix    add a node or free capacity; the rollout continues
+  more   zcube explain E0305 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0305.html

@@ -10,7 +10,8 @@
 //! old pull records and ended jobs, and so may touch only the three decision prefixes (which
 //! every role may write) and may delete, never write, under `/pulls/` and the job prefixes
 //! (`retention_deletes`); one ended job's five records go in one transaction (`retention_only`).
-//! B1 adds an eighth, `job_controller` (authority.md, "Jobs").
+//! B1 adds an eighth, `job_controller` (authority.md, "Jobs"), and C3 a ninth,
+//! `rollout_controller`, the one writer of `/rollouts/` (authority.md, "Rollouts").
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -26,6 +27,7 @@ pub const Role = union(enum) {
     auditor,
     retention,
     job_controller,
+    rollout_controller,
     /// The agent of the named node.
     agent: []const u8,
 
@@ -42,6 +44,7 @@ const Owner = enum {
     node_controller,
     auditor,
     job_controller,
+    rollout_controller,
     agent,
     anyone,
 };
@@ -53,6 +56,8 @@ const Rule = struct { prefix: []const u8, owner: Owner, exact: bool = false };
 /// The one table of authority.md §2. Longest prefix first where one contains another.
 pub const rules = [_]Rule{
     .{ .prefix = records.prefix_services, .owner = .api },
+    .{ .prefix = records.prefix_history, .owner = .api },
+    .{ .prefix = records.prefix_rollouts, .owner = .rollout_controller },
     .{ .prefix = records.prefix_jobs, .owner = .api },
     .{ .prefix = records.prefix_job_input, .owner = .api },
     .{ .prefix = records.key_job_admission, .owner = .api, .exact = true },
@@ -256,6 +261,7 @@ fn may_write(role: Role, key: []const u8, op: store.Op) bool {
         .node_controller => return role == .node_controller,
         .auditor => return role == .auditor,
         .job_controller => return role == .job_controller,
+        .rollout_controller => return role == .rollout_controller,
         .agent => return agent_may_write(role, rule.prefix, key, op),
     }
 }
@@ -330,6 +336,8 @@ fn request_of(ops: []const store.Op) store.TxnRequest {
 /// alone.
 const samples = [_]struct { key: []const u8, role: Role }{
     .{ .key = "/services/hello", .role = .api },
+    .{ .key = "/history/hello/7", .role = .api },
+    .{ .key = "/rollouts/hello", .role = .rollout_controller },
     .{ .key = "/jobs/j1", .role = .api },
     .{ .key = "/job-input/j1", .role = .api },
     .{ .key = "/job-admission", .role = .api },
@@ -351,8 +359,8 @@ const samples = [_]struct { key: []const u8, role: Role }{
 
 const every_role = [_]Role{
     .api,               .replica_controller, .scheduler,      .node_controller,
-    .auditor,           .retention,          .job_controller, .{ .agent = "n1" },
-    .{ .agent = "n2" },
+    .auditor,           .retention,          .job_controller, .rollout_controller,
+    .{ .agent = "n1" }, .{ .agent = "n2" },
 };
 
 fn same_role(first: Role, second: Role) bool {

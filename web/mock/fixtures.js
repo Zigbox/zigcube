@@ -88,6 +88,15 @@ export function diagNotFound(what) {
   };
 }
 
+/** `ZC-E0129`: pause or resume of a service with no rollout to steer (src/rollout_steer.zig). */
+export function diagNoRollout(name, why) {
+  return {
+    code: "ZC-E0129", severity: "error", blame: "user", summary: "there is no rollout to steer",
+    causes: [why], while: [`steering the rollout of ${name}`], context: {},
+    fixes: [{ sentence: "see what the service runs", command: `zcube rollout status ${name}` }], omitted: { ...omitted },
+  };
+}
+
 /** The registry the mock serves from /v1/codes: Zigcube's real codes plus the proposals. */
 export const CODES = [
   ...ZC_CODES,

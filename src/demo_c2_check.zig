@@ -132,15 +132,31 @@ const waited_line = "no peer came to hold the tree in ";
 pub fn evidence_of(node: []const u8, log: []const u8) Evidence {
     var found: Evidence = .{ .node = node, .elected = false, .waited_ms = null };
     var lines = std.mem.splitScalar(u8, log, '\n');
+    while (lines.next()) |line| evidence_line(&found, line);
+    return found;
+}
+
+/// As `evidence_of`, from the lines of `containers` alone (`guest.sh fetch-logs` starts each
+/// line with `<container>: `). Step 2 judges v2's fetches, and v1's fetch.logs stay on the node.
+pub fn evidence_in(node: []const u8, log: []const u8, containers: []const []const u8) Evidence {
+    var found: Evidence = .{ .node = node, .elected = false, .waited_ms = null };
+    var lines = std.mem.splitScalar(u8, log, '\n');
     while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, elected_line) != null) found.elected = true;
-        const at = std.mem.indexOf(u8, line, waited_line) orelse continue;
-        const digits = line[at + waited_line.len ..];
-        var end: usize = 0;
-        while (end < digits.len and std.ascii.isDigit(digits[end])) end += 1;
-        found.waited_ms = std.fmt.parseInt(u64, digits[0..end], 10) catch continue;
+        const colon = std.mem.indexOf(u8, line, ": ") orelse continue;
+        for (containers) |container| {
+            if (std.mem.eql(u8, container, line[0..colon])) evidence_line(&found, line);
+        }
     }
     return found;
+}
+
+fn evidence_line(found: *Evidence, line: []const u8) void {
+    if (std.mem.indexOf(u8, line, elected_line) != null) found.elected = true;
+    const at = std.mem.indexOf(u8, line, waited_line) orelse return;
+    const digits = line[at + waited_line.len ..];
+    var end: usize = 0;
+    while (end < digits.len and std.ascii.isDigit(digits[end])) end += 1;
+    found.waited_ms = std.fmt.parseInt(u64, digits[0..end], 10) catch return;
 }
 
 /// How long after the elected node's registry pull ends a waiting node can first see the tree
@@ -241,6 +257,17 @@ pub fn registry_read(pulls: []const Pull, evidence: []const Evidence, cap_ms: u6
 /// Step 2: what a node transferred, from the registry and its peers together.
 pub fn transferred(pull: Pull) u64 {
     return pull.registry_bytes + pull.peer_bytes;
+}
+
+/// Step 2 (docs/decisions/2026-11-15-c2-step2-registry-reader.md): a node that fetched v2
+/// through its peers alone is bounded by `bytes_max`; the registry reader is not, since its
+/// registry pull reuses only layers that node itself pulled from the registry before (a Zigbox
+/// gap), and is judged by `registry_read` as in step 1.
+pub const RollPull = enum { registry_reader, within, over };
+
+pub fn roll_pull(pull: Pull, bytes_max: u64) RollPull {
+    if (pull.registry_bytes > 0) return .registry_reader;
+    return if (pull.peer_bytes <= bytes_max) .within else .over;
 }
 
 /// Step 3: nothing from the registry, something from the peers.
@@ -419,6 +446,57 @@ test "evidence_of reads the election and the wait from a fetch.log" {
     try testing.expectEqual(@as(?u64, 30000), waited.waited_ms);
     const nothing = evidence_of("node3", "");
     try testing.expect(!nothing.elected and nothing.waited_ms == null);
+}
+
+test "evidence_in reads only the named containers' lines" {
+    // Goal: step 2 must not count v1's election (python-app-2's fetch.log, still on node2) as
+    // v2's. Method: both containers' lines in one log, read for v2's container alone.
+    const log = "python-app-2: zcube-agent fetch: no peer holds the tree yet and this node " ++
+        "pulls it from the registry first (O5); the others fetch it from here\n" ++
+        "python-app-5: zcube-agent fetch: no peer came to hold the tree in 30001 ms; " ++
+        "2 node(s) fetch it (O5)\n";
+    const v2 = evidence_in("node2", log, &.{"python-app-5"});
+    try testing.expect(!v2.elected);
+    try testing.expectEqual(@as(?u64, 30001), v2.waited_ms);
+    const v1 = evidence_in("node2", log, &.{"python-app-2"});
+    try testing.expect(v1.elected and v1.waited_ms == null);
+    const none = evidence_in("node2", log, &.{"python-app-55"});
+    try testing.expect(!none.elected and none.waited_ms == null);
+}
+
+test "step 2 passes the C3 rollout's records: the lone registry reader is not bounded" {
+    // Goal: run 43764638241 (5d00e21): the rollout placed v2 on node1 first, alone, so O5
+    // elected node1, whose v1 came from peers; its registry pull reused nothing (43273981 B).
+    // node2 and node3 then took 516 B each from peers. The old rule (every node at most 1 MiB)
+    // failed it; the new one judges the reader as step 1 does and bounds the peer fetchers.
+    const max: u64 = 1024 * 1024;
+    const base: Pull = .{
+        .node = "node2",
+        .tree = "b3:7a91",
+        .registry_bytes = 0,
+        .peer_bytes = 516,
+        .cached_bytes = 115407369,
+        .bad_peers = &.{},
+    };
+    var three = [_]Pull{ base, base, base };
+    three[0].node = "node1";
+    three[0].registry_bytes = 43273981;
+    three[0].peer_bytes = 0;
+    three[0].cached_bytes = 0;
+    three[2].node = "node3";
+    try testing.expect(transferred(three[0]) > max); // What the old rule failed on.
+    try testing.expectEqual(RollPull.registry_reader, roll_pull(three[0], max));
+    try testing.expectEqual(RollPull.within, roll_pull(three[1], max));
+    try testing.expectEqual(RollPull.within, roll_pull(three[2], max));
+    const read = registry_read(&three, &.{}, constants.fetch_peer_wait_ms);
+    try testing.expect(read.kind == .once and read.passes());
+    try testing.expectEqualStrings("node1", read.elected);
+    // Teeth: a peer fetcher over the bound, and a second registry reader, still fail.
+    three[2].peer_bytes = max + 1;
+    try testing.expectEqual(RollPull.over, roll_pull(three[2], max));
+    three[2].peer_bytes = 0;
+    three[2].registry_bytes = 6682;
+    try testing.expect(!registry_read(&three, &.{}, constants.fetch_peer_wait_ms).passes());
 }
 
 fn overrun_pulls(cap: u64) [3]Pull {

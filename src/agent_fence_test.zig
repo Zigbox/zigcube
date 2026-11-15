@@ -289,6 +289,8 @@ const SourceSpy = struct {
         .inspect = on_inspect,
         .list = on_list,
         .events = on_events,
+        .probe_begin = on_probe_begin,
+        .probe_poll = on_probe_poll,
     };
 
     fn me(context: *anyopaque) *SourceSpy {
@@ -351,6 +353,23 @@ const SourceSpy = struct {
     ) rt.Error![]const rt.StatusChange {
         const self = me(context);
         return self.inner.vtable.events(self.inner.context, arena, timeout_ms, diag);
+    }
+
+    fn on_probe_begin(
+        context: *anyopaque,
+        handle: rt.Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) rt.Error!void {
+        const self = me(context);
+        const inner = self.inner;
+        return inner.vtable.probe_begin(inner.context, handle, command, timeout_ms, diag);
+    }
+
+    fn on_probe_poll(context: *anyopaque, handle: rt.Handle, diag: *Diag) rt.Error!rt.ProbeResult {
+        const self = me(context);
+        return self.inner.vtable.probe_poll(self.inner.context, handle, diag);
     }
 };
 

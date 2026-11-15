@@ -5,15 +5,20 @@
 # `sim-cluster`, `sim-c1`, `sim-swarm`) on one branch's build per round, and hand each round
 # (every batch, plus a record of each crashed seed) to `sim_fleet ingest`, once per kind. Every
 # SIM_FLEET_CANARY_ONE_IN rounds a fourth worker runs the teeth canary, a fault-on runner that
-# must fail. Settings come from the environment (the unit reads /etc/sim-fleet/fleet.env). The
-# token is a file; this script never prints it. So is the heartbeat URL (heartbeat): it is
-# read only by `sim_fleet heartbeat`, from its file, and never printed or put on a command line.
+# must fail. With SIM_FLEET_PROFILE=auto, one round in SIM_FLEET_BIAS_ONE_IN runs each cluster
+# kind under the one fault profile `sim_fleet bias` names: the one that best reaches what the
+# commit's seeds have reached least (coverage feedback, docs/core.md). The first round of each
+# UTC day also runs `zig build test-store-faults` on its commit (store_faults_day). Settings come
+# from the environment (the unit reads /etc/sim-fleet/fleet.env). The token is a file; this
+# script never prints it. So is the heartbeat URL (heartbeat): it is read only by `sim_fleet
+# heartbeat`, from its file, and never printed or put on a command line.
 #
 # The checkout this script runs from (the service checkout) never moves: each branch is built in
 # a git worktree of its own ($STATE/refs/<id>/src, build_commit), and a soaked commit contributes
-# only its producers. The reporter (`sim_fleet`: ingest, heartbeat, token check, state file) is
-# always the fleet's own, built at start from the service checkout (build_reporter), so a commit
-# from before a reporter change soaks as well as main; to update the reporter, redeploy.
+# only its producers (and its `zig build test-store-faults`). The reporter (`sim_fleet`: ingest,
+# coverage, bias, heartbeat, token check, state file) is always the fleet's own, built at start
+# from the service checkout (build_reporter), so a commit from before a reporter change soaks as
+# well as main; to update the reporter, redeploy.
 set -eu
 
 main() {
@@ -40,6 +45,10 @@ main() {
     # from before the draw keeps the old fixed size.
     : "${SIM_FLEET_OPS:=auto}"
     : "${SIM_FLEET_PROFILE:=auto}"
+    # Coverage feedback: with SIM_FLEET_PROFILE=auto, 1 round in this many runs the cluster kinds
+    # under the profile `sim_fleet bias` picks from $STATE/coverage.txt (bias_pick); the other
+    # rounds draw the profile from the seed. 0 never biases, 1 biases every round.
+    : "${SIM_FLEET_BIAS_ONE_IN:=2}"
     : "${SIM_FLEET_BATCH:=100}"
     # Seeds per batch by kind; the cluster kinds fall back to SIM_FLEET_BATCH. The swarm's default
     # is 50000 and ignores SIM_FLEET_BATCH, because an installed fleet.env already sets that to
@@ -62,6 +71,13 @@ main() {
     # tries in a row at most (canary_retry).
     : "${SIM_FLEET_CANARY_TRIES_MAX:=5}"
     : "${SIM_FLEET_TRACKER:=}"
+    # `zig build test-store-faults` once per UTC day (docs/briefs/c3-sim-fleet.md, item 4): SQLite,
+    # then Postgres with its two failover runs. 0 turns it off. It needs the Postgres 16 programs
+    # (setup.sh installs them; SIM_FLEET_PG_BIN is their directory) and keeps its throwaway
+    # databases under $SIM_FLEET_HOME/pg.
+    : "${SIM_FLEET_STORE_FAULTS:=1}"
+    : "${SIM_FLEET_PG_BIN:=/usr/lib/postgresql/16/bin}"
+    : "${SIM_FLEET_STORE_FAULTS_TIMEOUT:=1800}"
     # Deadlines, in seconds: nothing the loop waits on may hang it.
     : "${SIM_FLEET_GIT_TIMEOUT:=300}"
     : "${SIM_FLEET_BUILD_TIMEOUT:=3600}"
@@ -73,6 +89,18 @@ main() {
     case "$SIM_FLEET_CANARY_ONE_IN" in
     '' | *[!0-9]*)
         log "SIM_FLEET_CANARY_ONE_IN is '$SIM_FLEET_CANARY_ONE_IN': it must be a number (0: off)"
+        exit 2
+        ;;
+    esac
+    case "$SIM_FLEET_BIAS_ONE_IN" in
+    '' | *[!0-9]*)
+        log "SIM_FLEET_BIAS_ONE_IN is '$SIM_FLEET_BIAS_ONE_IN': it must be a number (0: off)"
+        exit 2
+        ;;
+    esac
+    case "$SIM_FLEET_STORE_FAULTS$SIM_FLEET_STORE_FAULTS_TIMEOUT" in
+    '' | *[!0-9]*)
+        log "SIM_FLEET_STORE_FAULTS and SIM_FLEET_STORE_FAULTS_TIMEOUT must be numbers"
         exit 2
         ;;
     esac
@@ -410,7 +438,11 @@ kind_exe() {
 
 kind_flags() {
     profile=$SIM_FLEET_PROFILE
-    if [ "$1" = sim-canary ]; then profile=auto; fi
+    case "$1" in
+    sim-canary) profile=auto ;;
+    sim-cluster) profile=${bias_cluster:-$profile} ;;
+    sim-c1) profile=${bias_c1:-$profile} ;;
+    esac
     if [ "$1" = sim-canary ] && [ -n "$canary_ops" ]; then
         # A fixed range runs the world its tooth was found in: the runner's default profile.
         echo "--c1"
@@ -494,6 +526,7 @@ run_round() {
     rm -rf "$round"
     mkdir -p "$round"
     canary_pick
+    bias_pick
     workers=0
     for kind in $KINDS; do
         if ! kind_built "$kind"; then continue; fi
@@ -526,6 +559,7 @@ run_round() {
             # 3: counted, but GitHub kept part of it from being written (ingest).
             if [ "$ic" -eq 0 ] || [ "$ic" -eq 3 ]; then seeds_counted=1; fi
             if [ "$ic" -ne 0 ]; then round_clean=""; fi
+            coverage_add "$kind" "$round/all-$kind"
         fi
     done
     if [ -n "$canary_runner" ]; then canary_report "$canary_worker"; fi
@@ -533,7 +567,196 @@ run_round() {
         log "no seed of this round was counted at $built: not a clean round"
         round_clean=""
     fi
+    # The daily store run's report does not decide the heartbeat: its own retries cover it.
+    store_faults_day
     heartbeat
+}
+
+# `test-store-faults` (docs/briefs/c3-sim-fleet.md, item 4): the first round of each UTC day runs
+# it on the round's commit, in its branch's worktree (ref_src; the service checkout never
+# moves), SQLite and then Postgres (which also makes its conformance run and its
+# two failover runs), and hands what it printed to `sim_fleet ingest --kind store-faults`, which
+# files a failure like a simulator's. It runs after the round's own work, one process at a time.
+# The day counts as done only once the reporter took its output: a report that GitHub or a
+# timeout stopped (exit 2 or 124) is kept in $STATE/store-faults-pending with its commit and day,
+# and the next round sends it again before anything else, so that day's failures are filed
+# late, never lost. Output the reporter refused (exit 1, a parser bug) is never retried, since
+# the same text gets the same answer: the day is done and the text is in
+# $STATE/last-failed-round-store-faults.txt. A run that died, or never started, is recorded as
+# the producers' crashes are (sf_record). The host has no KVM and nothing here needs it.
+store_faults_day() {
+    if [ "${SIM_FLEET_STORE_FAULTS:-0}" -eq 0 ]; then return 0; fi
+    if [ -f "$STATE/store-faults-pending/output" ]; then
+        sf_send_pending || return 0
+    fi
+    today=$(date -u +%Y-%m-%d)
+    if [ "$(cat "$STATE/store-faults-day" 2>/dev/null || true)" = "$today" ]; then return 0; fi
+    sf_src=$(ref_src "$ref")
+    if ! worktree_at "$sf_src" "$built" >"$round/sf-worktree" 2>&1; then
+        log "store-faults: cannot check out $built in $sf_src; trying again next round:" \
+            "$(head -n1 "$round/sf-worktree")"
+        return 0
+    fi
+    log "store-faults: running at $built ($ref)"
+    : >"$round/all-store-faults"
+    (cd "$sf_src" && { sf_backend sqlite; sf_backend postgres; }) >>"$round/all-store-faults"
+    pending=$STATE/store-faults-pending
+    rm -rf "$pending.new"
+    mkdir -p "$pending.new"
+    cp "$round/all-store-faults" "$pending.new/output"
+    echo "$built" >"$pending.new/commit"
+    echo "$ref" >"$pending.new/ref"
+    echo "$today" >"$pending.new/day"
+    rm -rf "$pending"
+    mv "$pending.new" "$pending"
+    sf_send_pending || true
+}
+
+# Sends the kept output of a day's run ($STATE/store-faults-pending) to the reporter under the
+# commit and branch it ran on. On success (exit 0, or 3: counted), or on a refusal that a retry
+# cannot change (exit 1), records its
+# day as done and forgets it; otherwise keeps it for the next round and returns 1.
+sf_send_pending() {
+    pending=$STATE/store-faults-pending
+    sf_built=$built
+    sf_ref=$ref
+    built=$(cat "$pending/commit")
+    ref=$(cat "$pending/ref" 2>/dev/null || echo "$SIM_FLEET_BRANCH")
+    sf_code=0
+    ingest store-faults "$pending/output" || sf_code=$?
+    built=$sf_built
+    ref=$sf_ref
+    # 3: counted, but GitHub kept part of it from being written; like a round's, not sent again.
+    case "$sf_code" in
+    0 | 1 | 3) ;;
+    *)
+        log "store-faults: the report of $(cat "$pending/day") was not sent (exit $sf_code);" \
+            "it is sent again next round"
+        return 1
+        ;;
+    esac
+    cp "$pending/day" "$STATE/store-faults-day.new"
+    mv "$STATE/store-faults-day.new" "$STATE/store-faults-day"
+    rm -rf "$pending"
+}
+
+# Runs `zig build test-store-faults -Dbackend=$1` in the current directory (the round's
+# worktree), with the producers' build cache, and prints its output, then a record of what
+# its verdict lines do not say (sf_record). Postgres is a throwaway server of the host's
+# Postgres 16 programs (`zig build pg-up`), stopped, with the failover pair, afterwards.
+sf_backend() {
+    out="$round/sf-$1"
+    code=0
+    if [ "$1" = postgres ]; then
+        : "${ZCUBE_PG_DIR:=$SIM_FLEET_HOME/pg}" "${ZCUBE_PG_PAIR_DIR:=$SIM_FLEET_HOME/pg-pair}"
+        export ZCUBE_PG_DIR ZCUBE_PG_PAIR_DIR
+        export ZCUBE_PG_BIN="$SIM_FLEET_PG_BIN"
+        if [ ! -x "$SIM_FLEET_PG_BIN/initdb" ]; then
+            log "store-faults: no Postgres 16 programs in $SIM_FLEET_PG_BIN" \
+                "(setup.sh installs them)" >&2
+            sf_setup postgres "no Postgres 16 programs in $SIM_FLEET_PG_BIN"
+            return 0
+        fi
+        zig build pg-down --cache-dir "$STATE/zig-cache" >/dev/null 2>&1 || true
+        if ! timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build pg-up \
+            --cache-dir "$STATE/zig-cache" >"$out.up" 2>&1; then
+            log "store-faults: zig build pg-up failed: $(head -n1 "$out.up")" >&2
+            sf_setup postgres "zig build pg-up failed"
+            return 0
+        fi
+    fi
+    timeout "$SIM_FLEET_STORE_FAULTS_TIMEOUT" zig build test-store-faults "-Dbackend=$1" \
+        --cache-dir "$STATE/zig-cache" >"$out" 2>&1 || code=$?
+    if [ "$1" = postgres ]; then
+        zig build pg-down --cache-dir "$STATE/zig-cache" >/dev/null 2>&1 || true
+        zig build pg-pair-down --cache-dir "$STATE/zig-cache" >/dev/null 2>&1 || true
+    fi
+    cat "$out"
+    sf_record "$1" "$code" "$out"
+}
+
+# What the reporter reads for a run that never started: counted, never filed (the host's trouble).
+sf_setup() {
+    printf 'seed 0: FAILED: %s\n  step: setup\n' "$2"
+    printf '  replay: zig build test-store-faults -Dbackend=%s\n' "$1"
+}
+
+# The records of what a run of backend $1, which ended with exit code $2 and printed $3, failed
+# at beyond its runners' own verdicts (FAIL, ERROR, `failover M: FAILED`), which the reporter
+# reads from the output itself. A non-zero exit is always accounted for: by such a verdict, by a
+# failed conformance test (Postgres runs the store conformance suite through a proxy as part of
+# the step; sf_conformance), or else by a crash record here. The crash record ends a run that
+# printed its header and no result (it died, or timed out), at that run's step and seed; with
+# no run open it is the build's failure, at `before-run` when no run printed anything and at
+# `after-run` when every run passed and the step still failed. Its message is the first panic
+# or `error:` line, a timeout, or a kill by SIGKILL, which on this host is the kernel's
+# out-of-memory killer.
+sf_record() {
+    if [ "$2" -eq 0 ]; then return 0; fi
+    results='backend=|PASS|FAIL seed=|ERROR |failover [a-z]+: (PASS|FAILED)'
+    last=$(grep -E "^store-faults: ($results)" "$3" | tail -n1)
+    case "$last" in
+    "store-faults: backend="*) open=1 ;;
+    *) open=0 ;;
+    esac
+    verdict=0
+    if grep -qE '^store-faults: (FAIL seed=|ERROR |failover [a-z]+: FAILED)' "$3"; then
+        verdict=1
+    fi
+    conformance=$(sf_conformance "$1" "$3")
+    if [ "$open" -eq 0 ] && [ "$verdict" -eq 1 ]; then
+        sf_print "$conformance"
+        return 0
+    fi
+    if [ "$open" -eq 0 ] && [ -n "$conformance" ]; then
+        sf_print "$conformance"
+        return 0
+    fi
+    message=$(sed -n 's/^.*panic: //p; s/^error: //p' "$3" | head -n1)
+    if [ "$2" -eq 124 ]; then
+        message="timed out after $SIM_FLEET_STORE_FAULTS_TIMEOUT s"
+    elif [ "$2" -eq 137 ] || grep -q 'terminated with signal KILL' "$3"; then
+        message="killed by SIGKILL, for memory (the kernel's out-of-memory killer)"
+    elif [ -z "$message" ]; then
+        message="exit $2"
+    fi
+    if [ "$open" -eq 1 ]; then
+        seed=$(printf '%s\n' "$last" |
+            sed -n 's/^store-faults: backend=[a-z]* seed=\([0-9]*\).*/\1/p')
+        printf 'seed %s: CRASHED: %s\n' "${seed:-0}" "$message"
+    else
+        step=before-run
+        if grep -qE '^store-faults: backend=' "$3"; then step=after-run; fi
+        printf 'seed 0: CRASHED: %s\n  step: %s\n' "$message" "$step"
+        printf '  replay: zig build test-store-faults -Dbackend=%s\n' "$1"
+    fi
+    sf_print "$conformance"
+}
+
+# Prints $1 and a newline, or nothing when it is empty (a command substitution drops the last
+# newline of the text it captured).
+sf_print() {
+    if [ -n "$1" ]; then printf '%s\n' "$1"; fi
+}
+
+# One failure record for a failed conformance run in $2 (backend $1): the first failing test's
+# name as the check (the build runner prints only some of the failed tests, so a count would
+# be wrong), its seed, and the replay of that run alone. Prints nothing when no
+# conformance test failed. The test runner prints `error: 'store_conformance.test.NAME'
+# failed:`, then, indented, the harness's `store conformance: backend=B seed=N` line.
+sf_conformance() {
+    name=$(sed -n "s/^error: 'store_conformance\.test\.\(.*\)' failed:\$/\1/p" "$2" | head -n1)
+    if [ -z "$name" ]; then return 0; fi
+    seed=$(sed -n 's/^ *store conformance: backend=[a-z]* seed=\([0-9]*\).*/\1/p' "$2" | head -n1)
+    printf 'seed %s: FAILED: conformance: %s\n' "${seed:-0}" "$name"
+    printf '  step: conformance\n'
+    if [ -n "$seed" ]; then
+        printf '  replay: zig build pg-up && zig build test-store-faults -Dbackend=%s' "$1"
+        printf ' -Dseed=%s -Dstore-faults-only=conformance\n' "$seed"
+    else
+        printf '  replay: zig build pg-up && zig build test-store-faults -Dbackend=%s' "$1"
+        printf ' -Dstore-faults-only=conformance\n'
+    fi
 }
 
 # Whether this round's commit has kind $1's producer; the first round without it says so once.
@@ -876,6 +1099,42 @@ crash_record() {
     fi
     printf '%s: seeds %s..%s, %s: 1 of 1 failed\n' "$(kind_prefix "$3")" "$1" "$1" \
         "$(ops_phrase "$3")"
+}
+
+# Coverage feedback (docs/core.md, "Coverage"): every SIM_FLEET_BIAS_ONE_IN-th round of an
+# `auto` fleet, each cluster kind runs under the one profile `sim_fleet bias` picks from the
+# commit's coverage so far, instead of the seed's own draw. Sets bias_cluster and bias_c1 (empty:
+# the seed draws), which kind_flags reads, so a crash's replay runs the same flags. The tracker
+# counts the round's seeds as any other's.
+bias_pick() {
+    bias_cluster=""
+    bias_c1=""
+    bias_round=$((${bias_round:-0} + 1))
+    one_in=${SIM_FLEET_BIAS_ONE_IN:-0}
+    if [ "$SIM_FLEET_PROFILE" != auto ] || [ "$one_in" -eq 0 ] ||
+        [ $((bias_round % one_in)) -ne 0 ]; then
+        return 0
+    fi
+    for kind in $KINDS; do
+        case "$kind" in sim-cluster | sim-c1) ;; *) continue ;; esac
+        picked=$("$reporter" bias --kind "$kind" --commit "$built" \
+            --file "$STATE/coverage.txt" 2>"$round/bias-$kind") || {
+            cat "$round/bias-$kind" >&2
+            log "sim_fleet bias failed for $kind; its seeds draw their profile this round"
+            continue
+        }
+        log "$(sed 's/^sim-fleet: //' "$round/bias-$kind")"
+        if [ "$kind" = sim-cluster ]; then bias_cluster=$picked; else bias_c1=$picked; fi
+    done
+}
+
+# Adds the `coverage:` lines of kind $1's round file $2 to the commit's coverage. A failure is
+# logged and costs only this round's coverage.
+coverage_add() {
+    case "$1" in sim-cluster | sim-c1) ;; *) return 0 ;; esac
+    "$reporter" coverage --kind "$1" --commit "$built" --file "$STATE/coverage.txt" \
+        <"$2" >"$round/coverage-$1" 2>&1 || log "sim_fleet coverage failed for $1:" \
+        "$(cat "$round/coverage-$1")"
 }
 
 # Hands kind $1's file $2 to the reporter; for the canary, $3 is the seeds it ran. What the

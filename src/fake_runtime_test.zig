@@ -972,6 +972,93 @@ test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC
     try testing.expectEqualStrings("ZC-E0702", now.stopped.start_failed.code.slice());
 }
 
+test "a health check passes by default; the fault file fails it, times it out or refuses it" {
+    // Goal: the fake's health-check hooks (C3 slice 9). Method: begin a check on a running
+    // container under each fault word and poll it: no word exits 0, `unhealthy` exits 1,
+    // `probe_timeout` runs until its timeout_ms and then times out, `probe_refused` is refused.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const handle = try rig.begin("probe-web", &forever);
+    const check = [_][]const u8{ "curl", "-f", "http://localhost:8080/health" };
+    try testing.expectEqual(@as(u8, 0), (try probe_once(rig, handle, &check, 1_000)).exited);
+    try fault(rig, "probe-web", "unhealthy");
+    try testing.expectEqual(@as(u8, 1), (try probe_once(rig, handle, &check, 1_000)).exited);
+    try fault(rig, "probe-web", "probe_refused");
+    const refused = try probe_once(rig, handle, &check, 1_000);
+    try testing.expectEqualStrings(codes.full_name(.E0502), refused.refused.code.slice());
+
+    try fault(rig, "probe-web", "probe_timeout");
+    var local: Diag = undefined;
+    local.reset();
+    const fake = rig.fake.interface();
+    try fake.probe_begin(handle, &check, 50, &local);
+    try testing.expect((try fake.probe_poll(handle, &local)) == .running);
+    try testing.io.sleep(.fromMilliseconds(60), .awake);
+    try testing.expect((try fake.probe_poll(handle, &local)) == .timed_out);
+    // A finished check is forgotten: polling again is refused, not a second result.
+    try testing.expect((try fake.probe_poll(handle, &local)) == .refused);
+}
+
+test "a health fault word survives the agent's lists until the container ends" {
+    // Goal: a health word scripts every check, not only those before the next `list` (the list
+    // applies and deletes the other fault words). Method: write `unhealthy`, then twice list
+    // and check; both checks exit 1 and the file is still there. Once the container ends, the
+    // next list deletes it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const handle = try rig.begin("probe-kept", &forever);
+    const check = [_][]const u8{"true"};
+    try fault(rig, "probe-kept", "unhealthy");
+    var local: Diag = undefined;
+    for (0..2) |_| {
+        local.reset();
+        _ = try rig.fake.interface().list(rig.arena.allocator(), &local);
+        try testing.expectEqual(@as(u8, 1), (try probe_once(rig, handle, &check, 1_000)).exited);
+    }
+    var buffer: [64]u8 = undefined;
+    const kept = try rig.fake.faults.readFile(testing.io, "probe-kept", &buffer);
+    try testing.expectEqualStrings("unhealthy", kept);
+
+    local.reset();
+    try rig.fake.interface().signal(handle, runtime.signal_kill, &local);
+    _ = try rig.wait_stopped(handle);
+    local.reset();
+    _ = try rig.fake.interface().list(rig.arena.allocator(), &local);
+    try testing.expectError(
+        error.FileNotFound,
+        rig.fake.faults.readFile(testing.io, "probe-kept", &buffer),
+    );
+}
+
+test "a health check of a stopped container is refused" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const handle = try rig.begin("probe-gone", &.{ "sh", "-c", "exit 0" });
+    _ = try rig.wait_stopped(handle);
+    const check = [_][]const u8{"true"};
+    const result = try probe_once(rig, handle, &check, 1_000);
+    try testing.expect(result == .refused);
+}
+
+fn fault(rig: *Rig, name: []const u8, word: []const u8) !void {
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = name, .data = word });
+}
+
+/// Begins a check and returns its first poll, which the fake settles at once unless the fault
+/// file says `probe_timeout`.
+fn probe_once(
+    rig: *Rig,
+    handle: runtime.Handle,
+    command: []const []const u8,
+    timeout_ms: u32,
+) !runtime.ProbeResult {
+    var local: Diag = undefined;
+    local.reset();
+    const fake = rig.fake.interface();
+    try fake.probe_begin(handle, command, timeout_ms, &local);
+    return fake.probe_poll(handle, &local);
+}
+
 // ---- B4 slice 2: no relay, no workload ----------------------------------------------------------
 // `zig build relay-teeth` runs these two against agents with one half switched off
 // (src/zcube_agent_relay_teeth*.zig) and passes only if they fail.

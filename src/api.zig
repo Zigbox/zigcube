@@ -35,6 +35,9 @@ const codes = @import("diag/codes.zig");
 const agent_api = @import("agent_api.zig");
 const api_scope = @import("api_scope.zig");
 const apply_mod = @import("apply.zig");
+const history = @import("history.zig");
+const rollback = @import("rollback.zig");
+const rollout_steer = @import("rollout_steer.zig");
 const job_api = @import("job_api.zig");
 const job_trust = @import("job_trust.zig");
 const constants = @import("constants.zig");
@@ -214,6 +217,7 @@ pub const Api = struct {
         if (std.mem.eql(u8, first, "check")) return call.check_allocations();
         if (std.mem.eql(u8, first, "explain")) return call.explain();
         if (std.mem.eql(u8, first, "stats")) return call.stats();
+        if (std.mem.eql(u8, first, "services")) return call.services_get();
         return no_such(ctx, request.path);
     }
 };
@@ -238,7 +242,7 @@ const apply_attempts_max: u32 = 3;
 const pulls_limit_default: u64 = 50;
 /// Who a write is attributed to while the API has no auth.
 const anonymous = "anonymous";
-const applied_by_bytes_max: u32 = 64;
+pub const applied_by_bytes_max: u32 = 64;
 
 /// The body of `POST /v1/apply`: the fields of a service the user writes (docs/keys.md), as JSON.
 const ApplyBody = struct {
@@ -250,6 +254,10 @@ const ApplyBody = struct {
     limits: records.Limits = .{},
     source: []const u8 = "",
     applied_by: []const u8 = anonymous,
+    /// C3 slice 11: in the shape of service v4 (docs/keys.md); checked by `apply` (ZC-E0125,
+    /// ZC-E0126).
+    health: ?records.Health = null,
+    rollout: ?records.RolloutPolicy = null,
 };
 
 const CheckFinding = struct { decision: []const u8, revision: u64 };
@@ -370,6 +378,8 @@ fn apply_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!ap
         .source = parsed.source,
         .applied_by = parsed.applied_by,
         .request_id = id,
+        .health = parsed.health,
+        .rollout = parsed.rollout,
     };
 }
 
@@ -678,6 +688,56 @@ fn job_parse_problem(err: anyerror) []const u8 {
     };
 }
 
+/// What a pause or resume did: `action` is `pause`, `resume` or `none` (it was paused, or
+/// running, already), `phase` the rollout's phase after it and `generation` the one it rolls to.
+const RolloutReply = struct {
+    request_id: []const u8,
+    action: []const u8,
+    name: []const u8,
+    generation: u64,
+    phase: records.RolloutPhase,
+    change: []const u8,
+    revision: ?store.Revision = null,
+    decision: ?[]const u8 = null,
+};
+
+const RollbackReply = struct {
+    request_id: []const u8,
+    action: []const u8 = "rollback",
+    name: []const u8,
+    /// The new generation, which holds the restored spec.
+    generation: u64,
+    restores: u64,
+    change: []const u8,
+    revision: store.Revision,
+    decision: []const u8,
+};
+
+fn rollback_reply(ctx: *const Context, reply: RollbackReply) Failure!Reply {
+    const out = Out.create(ctx) catch return no_memory(ctx);
+    try out.value(reply);
+    return out.finish();
+}
+
+fn rollout_reply(ctx: *const Context, reply: RolloutReply) Failure!Reply {
+    const out = Out.create(ctx) catch return no_memory(ctx);
+    out.json.options.emit_null_optional_fields = false;
+    try out.value(reply);
+    return out.finish();
+}
+
+/// ZC-E0105 for a pause or resume: the rollout controller moved the rollout under every attempt.
+fn rollout_conflict(ctx: *const Context, name: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0105);
+    ctx.diag.cause("the rollout of service {s} was changed by its controller during the " ++
+        "request", .{name});
+    ctx.diag.fix_with("look at it as it is now, then try again", "zcube rollout status {s}", .{
+        name,
+    });
+    return error.Failed;
+}
+
 fn write_reply(ctx: *const Context, reply: WriteReply) Failure!Reply {
     const out = Out.create(ctx) catch return no_memory(ctx);
     out.json.options.emit_null_optional_fields = false;
@@ -690,6 +750,19 @@ fn conflict(ctx: *const Context, name: []const u8) Failure {
     ctx.diag.raise(.E0105);
     ctx.diag.cause("service {s} was changed by someone else during the request", .{name});
     const sentence = "look at it as it is now, then apply again";
+    ctx.diag.fix_with(sentence, "zcube get service {s}", .{name});
+    return error.Failed;
+}
+
+/// ZC-E0105 for a delete: the history goes first, in transactions of its own (`delete_all`), so
+/// a delete that lost the race may already have removed some of it, and that stays removed.
+fn conflict_on_delete(ctx: *const Context, name: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0105);
+    ctx.diag.cause("service {s} was changed by someone else during the request", .{name});
+    ctx.diag.cause("the service was not deleted, but generations of its history the delete had " ++
+        "already removed stay removed (a rollback to one is ZC-E0128)", .{});
+    const sentence = "look at it as it is now, then delete it again if you still mean to";
     ctx.diag.fix_with(sentence, "zcube get service {s}", .{name});
     return error.Failed;
 }
@@ -721,6 +794,15 @@ fn bad_request(ctx: *const Context, what: []const u8, problem: []const u8) Failu
     ctx.diag.raise(.E0104);
     ctx.diag.cause("{s}: {s}", .{ what, problem });
     ctx.diag.fix(.{ .sentence = "see docs/api.md for the endpoint's parameters" });
+    return error.Failed;
+}
+
+/// ZC-E0101 for a service named in the path.
+fn no_service(ctx: *const Context, name: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0101);
+    ctx.diag.cause("service {s} does not exist", .{name});
+    ctx.diag.fix(.{ .sentence = "list what exists", .command = "zcube get service" });
     return error.Failed;
 }
 
@@ -823,6 +905,7 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
             // The state the request rested on is not (or no longer) there.
             if (code == .E0105 or code == .E0402 or code == .E0403) return 409;
             if (code == .E0131) return 409;
+            if (code == .E0129) return 409; // No rollout to pause or resume: like E0402.
             if (code == .E0132) return 429;
             if (code == .E0133) return 404;
             if (code == .E0134) return 410;
@@ -1025,17 +1108,15 @@ fn decode(ctx: *const Context, text: []const u8) Failure![]const u8 {
 
 /// Writes a key's value as JSON: parsed and written back compactly, so a value that is not JSON
 /// cannot corrupt the response (it becomes a string), and with `env` values removed for a
-/// read-only token.
+/// read-only token. The `env` of every record is redacted, whatever its prefix: a record that
+/// copies a spec (`/history/`, C3) carries the same secrets as the service, and a prefix list
+/// would leak the next one added (docs/api.md item 8).
 fn write_value(api: *const Api, out: *Out, key: []const u8, bytes: []const u8) Failure!void {
     var parsed = std.json.parseFromSliceLeaky(std.json.Value, out.ctx.arena, bytes, .{}) catch {
         return out.value(bytes);
     };
-    const secret = std.mem.startsWith(u8, key, records.prefix_services) or
-        std.mem.startsWith(u8, key, records.prefix_replicas);
-    if (api.read_only and secret) redact_env(&parsed);
-    if (api.read_only and std.mem.startsWith(u8, key, records.prefix_jobs)) redact_env(&parsed);
+    if (api.read_only) redact_env(&parsed);
     if (api.read_only and std.mem.startsWith(u8, key, records.prefix_job_runs)) {
-        redact_env(&parsed);
         if (parsed == .object) {
             if (parsed.object.getPtr("input_digest")) |digest| digest.* = .null;
         }
@@ -1603,8 +1684,10 @@ const Call = struct {
         if (std.mem.eql(u8, first, "store")) return call.accept_rollback();
         if (std.mem.eql(u8, first, "repair")) return call.repair_allocation(id);
         if (std.mem.eql(u8, first, "jobs")) return call.jobs_post(body, id);
+        if (std.mem.eql(u8, first, "services")) return call.rollout_post(body, id);
         if (!std.mem.eql(u8, first, "apply")) {
-            const where = "POST is accepted at /v1/apply, /v1/jobs, /v1/store and /v1/repair";
+            const where = "POST is accepted at /v1/apply, /v1/jobs, /v1/services, /v1/store " ++
+                "and /v1/repair";
             return bad_request(ctx, "method", where);
         }
         try call.query.allow(ctx, &.{"dry_run"});
@@ -1679,7 +1762,204 @@ const Call = struct {
                 .conflict => {},
             }
         }
-        return conflict(ctx, name);
+        return conflict_on_delete(ctx, name);
+    }
+
+    // ---- /v1/services/{name}/history, .../rollout and .../rollout/pause|resume (C3) ----
+
+    fn services_get(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.query.allow(ctx, &.{});
+        const name = call.parts.next() orelse return no_such(ctx, "/v1/services");
+        const what = call.parts.next() orelse return no_such(ctx, "/v1/services/<name>");
+        try call.no_more();
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid service name");
+        }
+        const service_key = records.service_key(name);
+        const found = ctx.store.get(ctx.arena, service_key.slice(), null, ctx.diag) catch
+            return propagate(ctx);
+        const kv = found.kv orelse return no_service(ctx, name);
+        const service = records.read(records.Service, ctx.arena, kv, ctx.diag) catch
+            return propagate(ctx);
+        if (std.mem.eql(u8, what, "history")) return call.history_get(found.revision, kv, &service);
+        if (std.mem.eql(u8, what, "rollout")) return call.rollout_get(found.revision, kv, &service);
+        return no_such(ctx, "/v1/services/<name>/<history|rollout>");
+    }
+
+    /// The generations a rollback may restore (`history.usable`), newest first, each as stored
+    /// with `env` values redacted for a read-only token.
+    fn history_get(
+        call: Call,
+        revision: store.Revision,
+        kv: store.KeyValue,
+        service: *const records.Service,
+    ) Failure!Reply {
+        const ctx = call.ctx;
+        const owner: history.Owner = .{
+            .create_revision = kv.create_revision,
+            .generation = service.generation,
+        };
+        const usable = history.usable(ctx, service.name, owner) catch return propagate(ctx);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        try out.begin_object();
+        try out.member("revision", revision);
+        try out.member("service", service.name);
+        try out.member("generation", service.generation);
+        try out.field("generations");
+        try out.begin_array();
+        var index = usable.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = usable[index];
+            const got = ctx.store.get(ctx.arena, entry.key, revision, ctx.diag) catch
+                return propagate(ctx);
+            const record = got.kv orelse continue; // Trimmed since the list: not restorable.
+            try out.begin_object();
+            try out.member("generation", entry.generation);
+            try out.member("mod_revision", record.mod_revision);
+            try out.field("value");
+            try write_value(call.api, out, record.key, record.value);
+            try out.end_object();
+        }
+        try out.end_array();
+        try out.end_object();
+        return out.finish();
+    }
+
+    /// The service's rollout, or `"rollout": null` when it has none: a rollout left by another
+    /// incarnation of the name is none (`records.rollout_of`).
+    fn rollout_get(
+        call: Call,
+        revision: store.Revision,
+        kv: store.KeyValue,
+        service: *const records.Service,
+    ) Failure!Reply {
+        const ctx = call.ctx;
+        const key = records.rollout_key(service.name);
+        const found = ctx.store.get(ctx.arena, key.slice(), revision, ctx.diag) catch
+            return propagate(ctx);
+        var rollout: ?store.KeyValue = null;
+        if (found.kv) |rollout_kv| {
+            const record = records.read(records.Rollout, ctx.arena, rollout_kv, ctx.diag) catch
+                return propagate(ctx);
+            if (records.rollout_of(&record, kv.create_revision)) rollout = rollout_kv;
+        }
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        try out.begin_object();
+        try out.member("revision", revision);
+        try out.member("service", service.name);
+        try out.member("generation", service.generation);
+        try out.member("replicas", service.replicas);
+        try out.field("policy");
+        try out.value(service.rollout_policy());
+        try out.field("rollout");
+        if (rollout) |rollout_kv| {
+            try write_value(call.api, out, rollout_kv.key, rollout_kv.value);
+        } else {
+            try out.value(null);
+        }
+        try out.member("mod_revision", if (rollout) |rollout_kv| rollout_kv.mod_revision else 0);
+        try out.end_object();
+        return out.finish();
+    }
+
+    /// POST /v1/services/{name}/rollout/pause|resume, body empty or `{"applied_by": "..."}`;
+    /// POST /v1/services/{name}/rollback[?to=N] (`rollback_post`).
+    fn rollout_post(call: Call, body: []const u8, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        const name = call.parts.next() orelse return no_such(ctx, "/v1/services");
+        const what = call.parts.next() orelse return no_such(ctx, "/v1/services/<name>");
+        if (std.mem.eql(u8, what, "rollback")) return call.rollback_post(name, body, id);
+        try call.query.allow(ctx, &.{});
+        const verb = call.parts.next() orelse return no_such(ctx, "/v1/services/<name>/rollout");
+        try call.no_more();
+        if (!std.mem.eql(u8, what, "rollout")) {
+            return no_such(ctx, "/v1/services/<name>/rollout/<pause|resume>");
+        }
+        const action = std.meta.stringToEnum(rollout_steer.Action, verb) orelse
+            return no_such(ctx, "/v1/services/<name>/rollout/<pause|resume>");
+        // As the reads answer: a name no service can have is the request's mistake, not a
+        // service that is missing.
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid service name");
+        }
+        var by: []const u8 = anonymous;
+        if (body.len > 0) {
+            const parsed = std.json.parseFromSliceLeaky(CancelBody, ctx.arena, body, .{}) catch
+                return bad_request(ctx, "body", "is not {\"applied_by\": \"...\"} or empty");
+            by = parsed.applied_by;
+        }
+        try check_applied_by(ctx, by);
+        const result = rollout_steer.steer(ctx, &call.api.source, .{
+            .name = name,
+            .action = action,
+            .applied_by = by,
+            .request_id = id,
+        }) catch return propagate(ctx);
+        return switch (result) {
+            .written => |done| rollout_reply(ctx, .{
+                .request_id = id,
+                .action = @tagName(action),
+                .name = name,
+                .generation = done.to,
+                .phase = done.phase,
+                .change = std.fmt.allocPrint(ctx.arena, "{s} → {s}", .{
+                    @tagName(done.previous), @tagName(done.phase),
+                }) catch return no_memory(ctx),
+                .revision = done.revision,
+                .decision = done.decision,
+            }),
+            .unchanged => |kept| rollout_reply(ctx, .{
+                .request_id = id,
+                .action = "none",
+                .name = name,
+                .generation = kept.to,
+                .phase = kept.phase,
+                .change = "no change",
+            }),
+            .conflict => rollout_conflict(ctx, name),
+        };
+    }
+
+    /// POST /v1/services/{name}/rollback[?to=N], body empty or `{"applied_by": "..."}`: applies
+    /// the spec of a stored generation as a new one (`rollback.zig`).
+    fn rollback_post(call: Call, name: []const u8, body: []const u8, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        try call.query.allow(ctx, &.{"to"});
+        try call.no_more();
+        const to = try call.query.number(ctx, "to");
+        if (to) |wanted| {
+            if (wanted == 0) return bad_request(ctx, "to", "is not a generation (they start at 1)");
+        }
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid service name");
+        }
+        var by: []const u8 = anonymous;
+        if (body.len > 0) {
+            const parsed = std.json.parseFromSliceLeaky(CancelBody, ctx.arena, body, .{}) catch
+                return bad_request(ctx, "body", "is not {\"applied_by\": \"...\"} or empty");
+            by = parsed.applied_by;
+        }
+        try check_applied_by(ctx, by);
+        const result = rollback.rollback(ctx, &call.api.source, .{
+            .name = name,
+            .to = to,
+            .applied_by = by,
+            .request_id = id,
+        }) catch return propagate(ctx);
+        return switch (result) {
+            .written => |done| rollback_reply(ctx, .{
+                .request_id = id,
+                .name = name,
+                .generation = done.generation,
+                .restores = done.restores,
+                .change = done.change,
+                .revision = done.revision,
+                .decision = done.decision,
+            }),
+            .conflict => conflict(ctx, name),
+        };
     }
 
     // ---- /v1/jobs ----

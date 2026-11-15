@@ -574,6 +574,67 @@ are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstrea
 | `ZC-W0701` | user | the job is at its connection limit |
 | `ZC-W0702` | user | a connection reached its byte or idle bound |
 
+## Rollouts and history (C3; defined in slice 5, served from slice 11, rollback from slice 8)
+
+Slice 5 adds the records (`docs/keys.md`: service v4, `/history/`, `/rollouts/`); slice 11 serves
+them. The apply body takes `health` and `rollout` in the shape of service v4 (`docs/keys.md`,
+"Version 4"); either may be left out. Rollback is served from slice 8 (`src/rollback.zig`).
+
+| Endpoint | Does | Codes |
+| --- | --- | --- |
+| `GET /v1/services/{name}/history` | the service's usable generations (`history.usable`), newest first, each as stored; environment values are `null` for a read-only token (`Api.read_only`, item 8), as in every record | `ZC-E0101` |
+| `POST /v1/services/{name}/rollback[?to=<generation>]` | applies a stored generation's spec (image, source, command, env, limits, health; not the replica count or the rollout policy) as a new generation, `current + 1`, with history `reason` `rollback` and `restores`; without `to`, the newest usable generation below the current. Body empty or `{"applied_by": "..."}`. One API transaction that compares the service key: an apply in between is `409` `ZC-E0105`, not retried. Answers `{request_id, action: "rollback", name, generation, restores, change, revision, decision}`. The rollout controller's automatic rollback (`on_failure: rollback`) calls the same handler, `applied_by` `rollout-controller`, history `reason` `auto_rollback`, and also compares the rollout record its pass read | `400` `ZC-E0127` nothing to restore (`to` is the current generation, or none below it), `400` `ZC-E0128` `to` is not in the history, `404` `ZC-E0101`, `409` `ZC-E0105`, `400` `ZC-E0104` (`to` not 1 or more, a bad name or body) |
+| `GET /v1/services/{name}/rollout` | the service's policy and its `/rollouts/` record, `rollout: null` when it has none | `ZC-E0101` |
+| `POST /v1/services/{name}/rollout/pause`, `.../resume` | freezes or restores the rollout's budget, as a rollout-controller transaction | `409` `ZC-E0129` no rollout, it is complete, or (resume) it failed; `ZC-E0105` it kept changing |
+
+```json
+GET /v1/services/hello/history
+{ "revision": 52, "service": "hello", "generation": 2,
+  "generations": [ { "generation": 2, "mod_revision": 50, "value": { "v": 1, "image": "...",
+    "env": [["API_TOKEN", null]], "applied_by": "alex@laptop", "request_id": "r-2",
+    "reason": "apply", ... } }, ... ] }
+
+GET /v1/services/hello/rollout
+{ "revision": 52, "service": "hello", "generation": 2, "replicas": 3,
+  "policy": { "strategy": "rolling", "max_surge": 1, "max_unavailable": 0, "min_ready_ms": 5000,
+    "ready_timeout_ms": 120000, "progress_deadline_ms": 600000, "grace_ms": 10000,
+    "on_failure": "rollback" },
+  "rollout": { ...the /rollouts/ record... } | null, "mod_revision": 51 }
+
+POST /v1/services/hello/rollout/pause      {"applied_by": "alex@laptop"}  (the body may be empty)
+{ "request_id": "...", "action": "pause", "name": "hello", "generation": 2, "phase": "paused",
+  "change": "progressing → paused", "revision": 53, "decision": "1761350000123-api0-0007" }
+
+POST /v1/services/hello/rollout/pause      (again: already paused)
+{ "request_id": "...", "action": "none", "name": "hello", "generation": 2, "phase": "paused",
+  "change": "no change" }
+```
+
+`action` is `pause` or `resume` when the request wrote, `none` when it changed nothing. `change`
+is `"<phase before> → <phase after>"` (the decision's `change`, e.g. `progressing → paused`,
+`paused → rolling_back`) or `"no change"`. `phase` is the phase after the request.
+
+On all four routes a missing service is `404` `ZC-E0101`, and a name no service can have
+(`records.name_problem`) is `400` `ZC-E0104`; pause and resume also refuse an `applied_by` that is
+empty, longer than 64 bytes or not printable with `400` `ZC-E0104`.
+
+`GET .../rollout` answers `200` with `rollout: null`, not `404`, when there is no rollout: the
+service exists, and "no rollout" is a state of it (a record whose `service_created` is not the
+service's, `records.rollout_of`, reads as none). `policy` is the stored one with the defaults
+filled in. A pause of a paused rollout, or a resume of a running one, changes nothing: `action`
+is `none`, `change` is `no change`, and there is no `revision` or `decision`. A pause sets the budget to zero in the same
+write as the phase (R4, `docs/decisions/2026-11-14-c3-slice11-surfaces.md`); a resume restarts the
+evidence window (`evidence_from_ms`) and moves the progress deadline later by the length of the
+pause. The decision is `rollout_pause` or `rollout_resume`, actor `rollout-controller`, citing
+`applied_by` and the request id.
+
+An apply with an invalid `health` is `400` `ZC-E0125`, an invalid `rollout` `400` `ZC-E0126`. A
+rollout's own outcomes are decisions, not answers: `ZC-E0304` (a new replica did not become
+ready), `ZC-E0305` (the surge cannot be placed), `ZC-E0306` (`progress_deadline_ms` passed),
+`ZC-W0304` (paused by `on_failure`), `ZC-W0305` (rolled back automatically). The agent's probe
+raises `ZC-E0516` (the probe could not run) and `ZC-W0502` (the probe timed out) in its
+observations.
+
 ## New diagnostic codes this needs
 
 The console has to explain its own failures. The `01xx` range is "API and CLI". Proposed, for
@@ -624,7 +685,9 @@ controller or API handler writes them yet.
    every status change, which is not the same thing.
 8. **[Approved]** **Environment values are secrets in `/services/<name>`.** The API must not send them to a
    read-only token; send names only. The console masks them anyway, but that is the second line
-   of defence, not the first.
+   of defence, not the first. As built, the server blanks the `env` values of every record it
+   sends a read-only token, whatever its prefix (`/services/`, `/replicas/`, `/jobs/`,
+   `/job-runs/` and, since C3 slice 5, `/history/`), on `/v1/list` and `/v1/watch` alike.
 9. **[Approved]** **Service-level decisions.** `zcube why service x` needs decisions whose subject is the
    service ("scale_up", "replace_replica", "hold_failed_replica"), not only per-replica ones,
    or the chain for a service starts nowhere. The mock records both, linked by `cause`.

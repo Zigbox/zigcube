@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">the runtime failed an operation</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
-<p>The runtime could not carry out a request that is not about one workload's image or command: listing its containers, stopping one, reading its state directory, or running out of the slots it provisions at startup.</p>
+<p>The runtime could not carry out a request that is not about one workload's image or command: listing its containers, stopping one, reading its state directory, or running out of the slots it provisions at startup. A health check is refused with it when its worker (the `zcube-agent probe` process that runs the check in the container) could not start, ended without a result, or did not end in time.</p>
 <p>The cause line names the operation and what the host reported. A failure to start one workload is not this code: it is reported on that workload, with the runtime's own diagnostic.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

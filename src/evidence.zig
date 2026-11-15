@@ -47,6 +47,18 @@ pub fn service(ctx: *const Context, record: *const records.Service) controller.E
     });
 }
 
+/// A rollout as a pause or a resume read it: what it moves, where it stood and its deadline.
+pub fn rollout(ctx: *const Context, record: *const records.Rollout) controller.Error!records.Raw {
+    return render(ctx, .{
+        .service = record.service,
+        .from = record.from,
+        .to = record.to,
+        .phase = @tagName(record.phase),
+        .deadline_at_ms = record.deadline_at_ms,
+        .paused_by = if (record.paused_by) |by| @tagName(by) else null,
+    });
+}
+
 /// A job as a submit or a cancel read it: who asked, and under which request.
 pub fn job(
     ctx: *const Context,

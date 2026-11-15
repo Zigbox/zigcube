@@ -16,6 +16,7 @@
 //! E0102.txt, E0102.verbose.txt, E0102.json.txt.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const agent_jobs = @import("agent_jobs.zig");
@@ -32,6 +33,8 @@ const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
+const rollback = @import("rollback.zig");
+const rollout_steer = @import("rollout_steer.zig");
 const secure_random = @import("secure_random.zig");
 const testpeer = @import("tls_testpeer.zig");
 const tls_client = @import("tls_client.zig");
@@ -177,13 +180,13 @@ fn no_hash(diag: *diag_mod.Diag) void { // store_failures.zig
 }
 
 fn backwards(diag: *diag_mod.Diag) void { // store_failures.zig
-    const rollback: failures.Rollback = .{
+    const went: failures.Rollback = .{
         .remembered_revision = 412,
         .remembered_hash = @splat(0xa1),
         .now_revision = 398,
         .now_hash = @splat(0xe5),
     };
-    assert(failures.went_backwards(diag, rollback) == error.BackendFailed);
+    assert(failures.went_backwards(diag, went) == error.BackendFailed);
 }
 
 fn unusable_file(diag: *diag_mod.Diag) void { // store_failures.zig
@@ -267,9 +270,73 @@ fn too_many(diag: *diag_mod.Diag) void { // controller.zig
 }
 
 fn record_too_new(diag: *diag_mod.Diag) void { // records.zig
-    const cause = "the value at /observed/node1/hello-1 is version 3; this release reads up to " ++
-        "version 2";
+    const cause = "the value at /observed/node1/hello-1 is version 4; this release reads up to " ++
+        "version 3";
     sample(diag, .E0303, &.{cause}, "run the zcube release that wrote it, or upgrade this one");
+}
+
+fn health_invalid(diag: *diag_mod.Diag) void { // apply.zig
+    const cause = "health.timeout_ms is 5000, longer than health.interval_ms (2000)";
+    sample(diag, .E0125, &.{cause}, "correct the service file and apply it again");
+}
+
+fn rollout_invalid(diag: *diag_mod.Diag) void { // apply.zig
+    const cause = "rollout.max_surge and rollout.max_unavailable are both 0, so nothing can move";
+    sample(diag, .E0126, &.{cause}, "correct the service file and apply it again");
+}
+
+fn rollback_nothing(diag: *diag_mod.Diag) void { // C3 slice 8: the rollback handler
+    // The server's own text (rollback.zig), not a copy of it.
+    rollback.raise_nothing(diag, "hello", 1, null);
+}
+
+fn rollback_compacted(diag: *diag_mod.Diag) void { // C3 slice 8: the rollback handler
+    rollback.raise_not_in_history(diag, "hello", 23, 3, 7, 22);
+}
+
+fn rollout_none(diag: *diag_mod.Diag) void { // C3 slice 11: pause and resume
+    // The server's own text (rollout_steer.zig), not a copy of it.
+    rollout_steer.raise_refused(diag, "hello", 7, .complete);
+}
+
+fn rollout_failed(diag: *diag_mod.Diag) void { // C3 slice 7: the rollout controller
+    const cause = "replica hello-31 of generation 7 was not ready after 120000 ms: " ++
+        "its health check failed 3 times in a row";
+    sample(diag, .E0304, &.{cause}, "fix the release and apply it again");
+}
+
+fn rollout_stalled(diag: *diag_mod.Diag) void { // C3 slice 7: the rollout controller
+    const cause = "no ready node has room for replica hello-32 (500 cpu millis, 128 MiB)";
+    sample(diag, .E0305, &.{cause}, "add a node or free capacity; the rollout continues");
+}
+
+fn rollout_deadline(diag: *diag_mod.Diag) void { // C3 slice 7: the rollout controller
+    const cause = "the rollout of hello to generation 7 started 600000 ms ago; 2 of 3 " ++
+        "new replicas are ready";
+    sample(diag, .E0306, &.{cause}, "raise progress_deadline_ms if the release is slow to start");
+}
+
+fn rollout_paused(diag: *diag_mod.Diag) void { // C3 slice 8: on_failure pause
+    const cause = "the rollout of hello to generation 7 failed (ZC-E0304) and paused itself";
+    const fix = "resume it, roll back (if it ran an earlier generation), or apply a fixed release";
+    sample(diag, .W0304, &.{cause}, fix);
+}
+
+fn rolled_back(diag: *diag_mod.Diag) void { // C3 slice 8: on_failure rollback
+    const cause = "replica hello-31 stayed unhealthy for 40 s; hello was rolled back to " ++
+        "generation 6 as generation 8";
+    sample(diag, .W0305, &.{cause}, "fix the release and apply it again");
+}
+
+fn probe_refused(diag: *diag_mod.Diag) void { // C3 slice 9: the agent's probe
+    const cause = "the health check of hello-1 could not start: ZBX-E0501 the container is " ++
+        "not running";
+    sample(diag, .E0516, &.{cause}, "read the runtime's code; the check runs again next interval");
+}
+
+fn probe_timeout(diag: *diag_mod.Diag) void { // C3 slice 9: the agent's probe
+    const cause = "the health check of hello-1 ran longer than timeout_ms (1000 ms)";
+    sample(diag, .W0502, &.{cause}, "make the check faster or raise timeout_ms");
 }
 
 fn job_invalid(diag: *diag_mod.Diag) void { // api.zig
@@ -888,6 +955,11 @@ const cases = [_]Case{
     with_flags(raised(.E0122, &.{ "local", "up" }), .{ .local = .no_executables }),
     with_flags(raised(.E0123, &.{ "local", "up" }), .{ .local = .dying_executables }),
     with_flags(raised(.E0124, &.{ "local", "up" }), .{ .local = .busy }),
+    relayed(.E0125, health_invalid),
+    relayed(.E0126, rollout_invalid),
+    relayed(.E0127, rollback_nothing),
+    relayed(.E0128, rollback_compacted),
+    relayed(.E0129, rollout_none),
     relayed_to(.E0130, &job_run, job_invalid),
     relayed_to(.E0131, &job_run, job_differs),
     relayed_to(.E0132, &job_run, job_too_many),
@@ -912,6 +984,11 @@ const cases = [_]Case{
     relayed(.E0301, bad_record),
     relayed(.E0302, too_many),
     relayed(.E0303, record_too_new),
+    relayed(.E0304, rollout_failed),
+    relayed(.E0305, rollout_stalled),
+    relayed(.E0306, rollout_deadline),
+    relayed(.W0304, rollout_paused),
+    relayed(.W0305, rolled_back),
     relayed(.E0307, job_contradicts),
     relayed(.W0307, job_report_dropped),
     relayed(.W0308, job_waits),
@@ -934,10 +1011,12 @@ const cases = [_]Case{
     relayed(.E0513, agent_host),
     relayed(.E0514, agent_too_long),
     relayed(.E0515, agent_fetch_outlived),
+    relayed(.E0516, probe_refused),
     relayed(.E0521, run_end_unknown),
     relayed(.E0522, run_start_record),
     relayed(.E0523, run_input_digest),
     relayed(.W0501, agent_lease),
+    relayed(.W0502, probe_timeout),
     relayed(.W0503, job_deadline),
     relayed(.W0504, pull_record_lost),
     relayed(.E0801, peer_foreign_ca),
@@ -1206,6 +1285,12 @@ fn hold_local_lock(arena: Allocator, state_root: []const u8) !std.Io.File {
     return cli_local.lock_file(testing.io, file, 0);
 }
 
+/// A `zcube local` case needs Linux: elsewhere `zcube local` refuses with ZC-E0122 before it
+/// looks at the executables (docs/macos.md), so these cases run only on Linux.
+fn runs_here(case: *const Case) bool {
+    return builtin.os.tag == .linux or case.flags.local == .off;
+}
+
 /// For a `zcube local` case: names the run's directory and returns where the executables are.
 /// Dying executables are shell scripts that exit at once, as a server that cannot start does.
 fn prepare_local(
@@ -1302,6 +1387,7 @@ test "golden: every code in default, verbose and JSON output" {
     const arena = arena_state.allocator();
     const state_root = try state_root_of(arena, &tmp);
     for (&cases) |*case| {
+        if (!runs_here(case)) continue;
         for (std.enums.values(Style)) |style| {
             const output = try run_case(arena, case, style, state_root);
             const shown = try stable(arena, output.stderr, state_root);
@@ -1385,6 +1471,7 @@ test "no raw errors: no output of any case shows a trace or a Zig error name" {
     const arena = arena_state.allocator();
     const state_root = try state_root_of(arena, &tmp);
     for (&cases) |*case| {
+        if (!runs_here(case)) continue;
         for (std.enums.values(Style)) |style| {
             const output = try run_case(arena, case, style, state_root);
             try testing.expect(!shows_trace(try stable(arena, output.stderr, state_root)));

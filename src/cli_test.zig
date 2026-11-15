@@ -8,9 +8,13 @@
 
 const std = @import("std");
 const testing = std.testing;
+const assert = std.debug.assert;
 const agent_mod = @import("agent.zig");
 const cli = @import("cli.zig");
 const cli_env = @import("cli_env.zig");
+const cli_http = @import("cli_http.zig");
+const cli_report = @import("cli_report.zig");
+const cli_rollout = @import("cli_rollout.zig");
 const config_mod = @import("server_config.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
@@ -160,16 +164,28 @@ const World = struct {
 
     /// Runs `zcube args...`; the output is in `out()` and `err()` until the next run.
     fn run(world: *World, args: []const []const u8) u8 {
+        return world.run_over(args, null);
+    }
+
+    /// `run`, with the network replaced by `transport` when it is not null.
+    fn run_over(world: *World, args: []const []const u8, transport: ?cli_env.Transport) u8 {
         world.stdout.clearRetainingCapacity();
         world.stderr.clearRetainingCapacity();
         var input = std.Io.Reader.fixed(world.stdin_text);
-        const env: cli_env.Env = .{
+        var env = world.env_with(&input);
+        env.transport = transport;
+        return cli.run(&env, args);
+    }
+
+    /// The `Env` a run has: the world's buffers, environment and timings.
+    fn env_with(world: *World, input: ?*std.Io.Reader) cli_env.Env {
+        return .{
             .io = world.io,
             .arena = world.arena_state.allocator(),
             .environ = &world.environ,
             .stdout = &world.stdout.writer,
             .stderr = &world.stderr.writer,
-            .stdin = &input,
+            .stdin = input,
             .stdin_is_terminal = world.stdin_terminal,
             .stderr_is_terminal = false,
             .version = "0.0.0-test",
@@ -180,7 +196,6 @@ const World = struct {
             .job_rounds_max = world.job_rounds_max,
             .round_backing = testing.allocator,
         };
-        return cli.run(&env, args);
     }
 
     fn out(world: *World) []const u8 {
@@ -855,4 +870,134 @@ test "job run, get --wait, cancel, list and watch against a live server, and no 
     }));
     try expect_contains(world.err(), "ZC-E0131");
     try testing.expect(std.mem.indexOf(u8, world.err(), "env-secret-value") == null);
+}
+
+test "history and rollout status, pause and resume against a live server, on its real answers" {
+    // Goal: C3 slice 11's commands read what the server really sends (REVIEW.md: a fixture is
+    // checked against real output). Method: apply hello and let its 2 replicas run, then apply a
+    // new image; `history` lists both generations; the server's rollout controller starts the
+    // rollout on its own thread once it sees the old replicas, so the test waits for `rollout
+    // status` to show it (the agent is not stepped again, so it stays progressing), then pauses
+    // and resumes it.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+
+    const arena = world.arena_state.allocator();
+    const path = try std.fmt.allocPrint(arena, "{s}/hello.zon", .{world.dir});
+    try apply_hello(&world, path, 2);
+    try world.converge("hello", "2/2");
+    const first = try hello_zon(2);
+    defer testing.allocator.free(first);
+    const second = try std.mem.replaceOwned(u8, arena, first, "b3:51aa9c03", "b3:9d20c4f1");
+    _ = try world.file("hello.zon", second);
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "apply", path, "--yes" }));
+
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "history", "hello" }));
+    try expect_contains(world.out(), "GEN  IMAGE        REASON  APPLIED BY");
+    try expect_contains(world.out(), "2*   b3:9d20c4f1  apply");
+    try expect_contains(world.out(), "1    b3:51aa9c03  apply");
+    try testing.expectEqualStrings("", world.err());
+
+    try wait_rollout(&world, "hello");
+    try expect_contains(world.out(), "hello: generation 2, 2 replicas\nrollout ");
+    try expect_contains(world.out(), " → 2 (apply): progressing, started ");
+    try expect_contains(world.out(), "\npolicy: rolling, surge 1, unavailable 0, min ready 5s, " ++
+        "deadline 600s, on failure rollback\n");
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "pause", "hello" }));
+    try expect_contains(world.out(), "hello: progressing → paused (decision ");
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "pause", "hello" }));
+    try testing.expectEqualStrings("hello: already paused, no change\n", world.out());
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "resume", "hello" }));
+    try expect_contains(world.out(), "hello: paused → progressing (decision ");
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "history", "nosuch" }));
+    try expect_contains(world.err(), "ZC-E0101");
+    const json_args: []const []const u8 = &.{ "rollout", "status", "hello", "-o", "json" };
+    try testing.expectEqual(@as(u8, 0), world.run(json_args));
+    try expect_contains(world.out(), "\"to\":2,\"phase\":\"progressing\"");
+}
+
+/// Runs `zcube rollout status <name>` until it shows a rollout; the output is the last run's.
+fn wait_rollout(world: *World, name: []const u8) !void {
+    for (0..400) |_| {
+        try testing.expectEqual(@as(u8, 0), world.run(&.{ "rollout", "status", name }));
+        if (std.mem.indexOf(u8, world.out(), "\nno rollout\n") == null) return;
+        try world.io.sleep(.fromMilliseconds(25), .awake);
+    }
+    std.debug.print("no rollout of {s} began: {s}{s}\n", .{ name, world.out(), world.err() });
+    return error.NoRollout;
+}
+
+/// A server from before C3 slice 11, played by the live one: every request goes to a path the
+/// live server does not serve either, so the refusal is its own text; a POST's refusal loses
+/// `/v1/services`, which the list of POST paths gained in slice 11.
+const OldServer = struct {
+    env: cli_env.Env,
+    client: cli_http.Client,
+    report: cli_report.Report,
+
+    fn exchange(
+        context: *anyopaque,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+    ) ?[]const u8 {
+        const old: *OldServer = @ptrCast(@alignCast(context));
+        assert(std.mem.startsWith(u8, path, "/v1/services/"));
+        const arena = old.env.arena;
+        old.report.reset();
+        const reply = old.client.attempt(method, "/v1/before-slice-11", body, &old.report) catch
+            return null;
+        const text = if (std.mem.eql(u8, method, "POST"))
+            std.mem.replaceOwned(u8, arena, reply.body, "/v1/services, ", "") catch return null
+        else
+            reply.body;
+        const format = "HTTP/1.1 {d} Reply\r\nContent-Length: {d}\r\n" ++
+            "X-Request-Id: {s}\r\n\r\n{s}";
+        const args = .{ reply.status, text.len, reply.request_id, text };
+        return std.fmt.allocPrint(arena, format, args) catch null;
+    }
+};
+
+test "against a server older than the rollout routes, zcube says to upgrade the server" {
+    // Goal: docs/cli.md, "Upgrading": a new command line and an old server is told apart from
+    // a missing service. Method: OldServer answers with the live server's own refusals of a
+    // path it does not serve; each command is ZC-E0101 naming itself and the fix.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+    const arena = world.arena_state.allocator();
+    var old: OldServer = undefined;
+    old.env = world.env_with(null);
+    old.report.reset();
+    try cli_http.Client.init(&old.client, &old.env, world.address, .{}, &old.report);
+    const commands = [_][]const []const u8{
+        &.{ "rollout", "status", "hello" },
+        &.{ "rollout", "pause", "hello" },
+        &.{ "rollout", "resume", "hello" },
+        &.{ "history", "hello" },
+    };
+    for (commands) |args| {
+        try testing.expectEqual(@as(u8, 1), world.run_over(args, .{
+            .context = &old,
+            .exchange = OldServer.exchange,
+        }));
+        try expect_contains(world.err(), "ZC-E0101");
+        const named = if (args.len == 3)
+            try std.fmt.allocPrint(arena, "does not serve `zcube {s} {s}`", .{ args[0], args[1] })
+        else
+            "does not serve `zcube history`";
+        try expect_contains(world.err(), named);
+        try expect_contains(world.err(), "upgrade zcube-server first");
+    }
+    // The live server, which serves these routes, is not mistaken for an old one.
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "history", "nosuch" }));
+    try expect_contains(world.err(), "service nosuch does not exist");
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "rollout", "pause", "nosuch" }));
+    try testing.expect(std.mem.indexOf(u8, world.err(), "upgrade zcube-server") == null);
+    // Nor is its refusal of a POST elsewhere, whose list of paths names /v1/services.
+    old.report.reset();
+    const refusal = try old.client.attempt("POST", "/v1/before-slice-11", "", &old.report);
+    try testing.expectEqual(@as(u16, 400), refusal.status);
+    try testing.expect(!cli_rollout.older_server(refusal));
 }

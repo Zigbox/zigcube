@@ -105,6 +105,7 @@ if (simCluster) {
     simC1 || worlds.includes("strong") ? 1 : 0,
     signed ? 1 : 0,
     worlds.includes("tenants") ? 1 : 0,
+    process.argv.slice(3).includes("--health") ? 1 : 0,
   );
   const label = simC1 ? (signed ? "sim-c1 --signed" : "sim-c1") : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);

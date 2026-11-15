@@ -177,6 +177,15 @@ pub const job_pass_break = declared("c1_teeth_job_pass_break");
 /// never learns of the stop and keeps renewing, so the fence never comes either (must break J6).
 pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
 
+/// The agent kills what a fence has not stopped `fence_stop_teeth_ms` after the fence, not
+/// `constants.fence_stop_ms` (`fencing.kill_at_ms`), while the server keeps the real constants.
+/// For the Jepsen lease test's negative control (zigcube-jepsen, slice 2): a replica on a node cut
+/// off from the server outlives the bound of I1b (1,900 ms): measured 3,335 ms. Only
+/// `zcube_agent_fence_teeth.zig` declares it, and it is not in `any`: the shipped server must not
+/// see it, and the agent's own check of the inequality reads the real constants.
+pub const fence_stop_teeth = declared("c1_teeth_fence_stop");
+pub const fence_stop_teeth_ms: u64 = if (fence_stop_teeth) 8_000 else 0;
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
@@ -193,6 +202,13 @@ pub const signed_world = job_untrusted;
 /// The teeth whose fault needs the tenant world (`Options.tenants`).
 pub const tenant_world = placement_exclusive or relabel_kept;
 
+/// The long soak's leak (`sim_cluster <seed> soak`, src/sim_soak.zig): every operation takes
+/// `soak_leak_bytes` from the run's allocator and never gives them back (must fail the soak's
+/// teardown check, "memory still held after the world was torn down"). Only
+/// `src/sim_soak_teeth_main.zig` declares it; `ops/sim-fleet/test-soak-loop.sh` runs it.
+pub const soak_leak = declared("c1_teeth_soak_leak");
+pub const soak_leak_bytes: usize = if (soak_leak) 16 * 1024 else 0;
+
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
@@ -200,7 +216,27 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
     job_untrusted or placement_exclusive or relabel_kept or job_pass_break or
-    job_runs_unread;
+    job_runs_unread or soak_leak;
+
+/// The replica controller spends the rollout budget on the plan it read, without comparing the
+/// counter or the rollout record, and ignores `max_unavailable` (C3 slice 7; must break R1).
+pub const rollout_budget = declared("c1_teeth_rollout_budget");
+/// The rollout controller keeps a progressing budget while a rollout is paused or failed (C3 slice
+/// 7; must break R4).
+pub const rollout_pause = declared("c1_teeth_rollout_pause");
+/// An apply also writes its history record over the newest older generation's (C3 slice 7; must
+/// break R6).
+pub const rollout_history = declared("c1_teeth_rollout_history");
+/// The automatic rollback copies the failed generation's image instead of the restored one's
+/// (C3 slice 8; must break R5).
+pub const rollout_exact = declared("c1_teeth_rollout_exact");
+/// The rollout controller remembers an owed automatic rollback and carries it out a pass later on
+/// the service as it is then, without the compare on the service revision its pass read (C3
+/// slice 8; must break R8).
+pub const rollout_race = declared("c1_teeth_rollout_race");
+/// The rollout controller never carries out an automatic rollback it owes, nor records it refused
+/// (C3 slice 8; must break R7).
+pub const rollout_stuck = declared("c1_teeth_rollout_stuck");
 
 /// The runner a replay line names: the runner a root names itself (`sim_runner`), else the
 /// fault-on runner whose root switched a tooth on (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe`
@@ -253,4 +289,10 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_relabel_kept", "sim_c1_teeth_relabel_kept" },
     .{ "c1_teeth_job_pass_break", "sim_c1_teeth_job_pass_break" },
     .{ "c1_teeth_job_runs_unread", "sim_c1_teeth_job_runs_unread" },
+    .{ "c1_teeth_rollout_budget", "sim_c1_teeth_rollout_budget" },
+    .{ "c1_teeth_rollout_pause", "sim_c1_teeth_rollout_pause" },
+    .{ "c1_teeth_rollout_history", "sim_c1_teeth_rollout_history" },
+    .{ "c1_teeth_rollout_exact", "sim_c1_teeth_rollout_exact" },
+    .{ "c1_teeth_rollout_race", "sim_c1_teeth_rollout_race" },
+    .{ "c1_teeth_rollout_stuck", "sim_c1_teeth_rollout_stuck" },
 };
