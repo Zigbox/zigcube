@@ -133,9 +133,9 @@ are sorted by key, with no key twice.
   also use `--listen`, on the P-256 path of "Browsers" below), the local mode (`zcube local up`,
   `local-smoke`, demo-c1's step 6) and the tests of this listener (`demo-b7`). The in-process API
   tests (`server_test`, `cli_test`, `agent_remote_test`) and `bench-watch` use it too: they test
-  the handlers and the watch fan-out, not the transport. `swarm-smoke` and `demo-c2` use it until
-  B7 slice 7 gives the agent's fetch child TLS. Every other harness (`agent-smoke`, `demo-c0`,
-  `demo-c1`, `demo-b1`, `demo-b3`, the failover runs of `test-store-faults`) talks to `--listen`
+  the handlers and the watch fan-out, not the transport. Every other harness (`agent-smoke`,
+  `demo-c0`, `demo-c1`, `demo-b1`, `demo-b3`, `demo-c2`, `swarm-smoke`, the failover runs of
+  `test-store-faults`) talks to `--listen`
   with certificates from `ca issue-client` and `ca issue-node` (`src/harness_tls.zig`, B7 slice 6)
   and checks that plain HTTP gets no answer there. A request on it is the caller `local`, which
   may call everything: whoever can reach loopback already runs on the server's host.
@@ -158,7 +158,7 @@ reply closes the connection.
 
 | Caller | May call |
 |---|---|
-| `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only |
+| `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only (its `fetchers/<digest>` answers node names only, B7 slice 7); and `GET /v1/list` with `prefix` exactly `/node-store/` and no parameter but `limit`, `at` and `continue` (the swarm fetch's discovery, B7 slice 7) |
 | `client`, scope `jobs` | `/v1/jobs` and below, and `GET /v1/why/job/<name>` |
 | `client`, scope `admin` | everything but the credential endpoint |
 | `local` (`--insecure-listen`) | everything |

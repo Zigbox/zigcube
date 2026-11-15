@@ -261,6 +261,62 @@ fn node_problem(
 const node_fix = "on the server host, run zcube-server ca issue-node NAME --replace for this " ++
     "node and give the agent the two files as --cert and --key (docs/agent.md)";
 
+/// Where an agent's identity is, for `present_node`: its stored `node.crt` over its `peer.key`
+/// (either null when absent) in the state directory `where`, and `--cert`/`--key` if given.
+pub const NodeIdentity = struct {
+    where: []const u8,
+    node: []const u8,
+    stored: ?*const x509.Der,
+    key_pair: ?Ed25519.KeyPair,
+    cert: ?[]const u8,
+    key: ?[]const u8,
+};
+
+/// What an agent presents (B7 slices 3 and 5, docs/agent.md "Node certificates"), after
+/// `load_ca`: its stored `node.crt` when it is usable at wall time `now_ms` (that CA's, for
+/// `node`, of `peer.key`, in its window), else `--cert` and `--key`, which must be a node
+/// certificate for `node` valid now. With neither, ZC-E0806 says why `node.crt` was refused and
+/// how to get back in. Null when the stored `node.crt` is presented; else why it was not, for
+/// the caller's note. Shared by the agent and its `fetch` child (B7 slice 7).
+pub fn present_node(
+    c: *Credentials,
+    io: std.Io,
+    identity: NodeIdentity,
+    now_ms: u64,
+    diag: *Diag,
+) LoadError!?[]const u8 {
+    assert(diag.code == null);
+    var stored_problem: []const u8 = "it does not exist";
+    if (identity.stored) |certificate| {
+        if (identity.key_pair) |key_pair| {
+            const problem = c.present(certificate, key_pair, identity.node, now_ms);
+            stored_problem = problem orelse return null;
+        } else stored_problem = "there is no usable peer.key beside it";
+    }
+    const cert = identity.cert orelse
+        return refuse_no_identity(diag, identity.where, stored_problem);
+    assert(identity.key != null); // `--cert` and `--key` come together (agent_config.zig).
+    c.load_identity(io, cert, identity.key.?, diag) catch |err| {
+        diag.cause("the stored node.crt was not used either: {s}", .{stored_problem});
+        return err;
+    };
+    c.require_node(cert, identity.node, now_ms, diag) catch |err| {
+        diag.cause("the stored node.crt was not used either: {s}", .{stored_problem});
+        return err;
+    };
+    return stored_problem;
+}
+
+/// Reads the PEM certificate at `path` into `out`; ZC-E0806 when it cannot be read or parsed.
+pub fn read_certificate_file(
+    io: std.Io,
+    path: []const u8,
+    out: *x509.Der,
+    diag: *Diag,
+) LoadError!void {
+    return read_certificate(io, path, out, diag);
+}
+
 /// The agent has no usable `node.crt` in `where` (`why` says what is wrong with it) and no
 /// `--cert`: one start-up error, with the way back in.
 pub fn refuse_no_identity(diag: *Diag, where: []const u8, why: []const u8) LoadError {

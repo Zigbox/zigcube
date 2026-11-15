@@ -116,6 +116,15 @@ truncated page; pass it back with the first page's `at`. **`reverse` is new** (s
 `prefix=/node-store/` and `limit=65` (agent.md, "The chunk store, the peer server and `fetch`").
 It adds no endpoint.
 
+Over `--listen` this endpoint needs a client of scope `admin`, with one exception (B7 slice 7,
+mtls.md "Scopes"): any node's certificate may `GET /v1/list` with `prefix` exactly
+`/node-store/` (percent-encoded or not) and no other parameter but `limit`, `at` and `continue`,
+each at most once. Any other prefix, `reverse`, a repeated parameter or another method is 403
+`ZC-E0822`: a node never reads `/replicas/`, `/assigned/` or `/services/` this way, since a
+spec holds its service's env. O5's fetchers come from `GET /v1/agent/nodes/{node}/fetchers/{digest}`
+instead (decisions/2026-11-14-b7-slice7-node-store-read.md,
+decisions/2026-11-14-b7-slice7-o5-over-tls.md).
+
 ### `GET /v1/watch?prefix=&prefix=&from=&timeout=`
 
 The long-poll watch of HANDOFF. Waits up to `timeout` milliseconds (default and maximum 25000;
@@ -807,6 +816,20 @@ endpoint's shape did not change, which is why it is a list of replicas and not o
 **A C0 agent cannot run against a C1 server.** The records are `"v": 2`, and a C0 agent refuses
 a value whose version is newer than it knows with `ZC-E0303`, naming the key and both versions
 (keys.md, "Versions"). Upgrade the agents with the server.
+
+### `GET /v1/agent/nodes/{node}/fetchers/{digest}` (B7 slice 7)
+
+The swarm fetch's O5 question (docs/briefs/c2.md): the names of the nodes assigned a replica
+whose image is `digest`, each once, in key order, computed by the server so that a node learns
+node names and nothing of the records (no service, replica, spec or env):
+
+```json
+{ "revision": 415, "nodes": ["node1", "node3"], "chain": { ... } }
+```
+
+`GET` only; no query but `known`. `digest` is `b3:` and 8 to 64 lower-case hex digits, else 400.
+Over `--listen` a node may ask under its own name only (mtls.md, "Scopes";
+decisions/2026-11-14-b7-slice7-o5-over-tls.md).
 
 ### `GET /v1/agent/nodes/{node}/assigned`
 
