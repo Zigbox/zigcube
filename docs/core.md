@@ -103,7 +103,8 @@ until a key under one of the prefixes changes, then call `handle` again with the
 A replica-count change does not bump `generation`; a failed start is held, not retried; a held
 replica is replaced when the service changes. Placement is the C0 scheduler: a node whose declared
 capacity fits the replica's resolved requests (its limits, else 250m CPU and 128 MiB, which the
-placing decision says), the fewest replicas of the service first. A replica no node fits waits,
+placing decision says), the fewest replicas of the service first, then (C3) the fewest of the
+replica's own generation, so a rollout spreads the new generation. A replica no node fits waits,
 unplaced, with no decision; `why` says "waiting for a node".
 
 ## What the simulation proves
