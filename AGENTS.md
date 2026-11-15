@@ -92,7 +92,7 @@ These arrive with the scaffold; keep this list current as they land.
   `pg_dev stop` / `pg_dev up` (`zig build pg-stop`, `pg-up`) or with `ZCUBE_DEMO_PG_STOP` / `ZCUBE_DEMO_PG_START`.
   `docs/demos/c0.md` says what it asserts. Not `zig build sim-c0`, which is a simulation.
 - `zig build check [-Dcheck-user=<user>|-]` runs every gate a slice must pass and ends in one line,
-  `check: PASS <commit> (build test tidy errors-site wasm-check wasm-test console-wasm mtls-teeth store:memory,sqlite sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth, test as tester)`
+  `check: PASS <commit> (build test tidy errors-site wasm-check wasm-test console-wasm mtls-teeth mac-cross store:memory,sqlite sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth, test as tester)`
   or `check: FAIL <commit> (what failed)`. The gates are build-step dependencies; then
   `src/testing/check.zig` runs the Postgres suite (only when `ZCUBE_TEST_POSTGRES` is set), `sim-c0` and
   `sim-cluster` (40 operations) each with a fresh seed (printed as `sim-c0: seed N`, `sim-cluster: seed N` first), `sim-teeth`, `sim-swarm` (100 operations, fresh seed, printed as `sim-swarm: seed N`), `sim-swarm-teeth` and, as root, `zig build test` as `tester` in a scratch
