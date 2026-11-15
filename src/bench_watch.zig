@@ -77,7 +77,7 @@ fn run(init: std.process.Init) !u8 {
     var diag: Diag = undefined;
     diag.reset();
     const config: config_mod.Config = .{
-        .listen = try config_mod.parse_listen("127.0.0.1:0", &diag),
+        .insecure_listen = try config_mod.parse_listen("127.0.0.1:0", &diag),
         .store = .{ .sqlite = db_path },
         .create_store = true,
         .verbose = false,

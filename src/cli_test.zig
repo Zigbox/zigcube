@@ -118,6 +118,9 @@ const World = struct {
         world.job_rounds_max = null;
         world.io = world.test_io.start();
         world.tmp = testing.tmpDir(.{});
+        // The server's state directory (the database's) must not be group-writable (ZC-E0806);
+        // `tmpDir` follows the runner's umask, which may be 002.
+        try world.tmp.dir.setFilePermissions(world.io, ".", .fromMode(0o700), .{});
         world.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         const arena = world.arena_state.allocator();
         world.dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{world.tmp.sub_path});
@@ -126,7 +129,7 @@ const World = struct {
         diag.reset();
         const listen = try config_mod.parse_listen("127.0.0.1:0", &diag);
         world.server = try server_mod.Server.start(testing.allocator, world.io, .{
-            .listen = listen,
+            .insecure_listen = listen,
             .store = .{ .sqlite = database },
             .create_store = true,
             .verbose = false,
@@ -732,7 +735,7 @@ test "a server can be restarted on its port right after zcube has used it" {
         world.dir,
     });
     world.server = try server_mod.Server.start(testing.allocator, world.io, .{
-        .listen = address,
+        .insecure_listen = address,
         .store = .{ .sqlite = database },
         .create_store = false,
         .verbose = false,

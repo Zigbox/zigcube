@@ -42,6 +42,12 @@ pub const Fetch = struct {
     server: []const u8 = "",
     /// `HOST:PORT` of the registry; empty: peers only.
     registry: []const u8 = "",
+    /// The agent's `--ca`, `--tls-name`, `--cert` and `--key`, by path (B7 slice 7): the fetch
+    /// reads `server` over TLS with them when `ca` is set. Empty: not given.
+    ca: []const u8 = "",
+    tls_name: []const u8 = "",
+    cert: []const u8 = "",
+    key: []const u8 = "",
 };
 
 /// What the supervisor is to run. `tree` is the locked Zigbox tree digest (`b3:...`, the
@@ -63,6 +69,16 @@ pub const Spec = struct {
     /// `HOST:PORT` of the job's one relay upstream; empty: none. The supervisor asks Zigbox for a
     /// listener on the container's loopback and relays it there (B3 slice 4, `relay.zig`).
     relay: []const u8 = "",
+    /// The upstream's TLS server name (B4); empty for B3's plain upstream. The zigbox
+    /// supervisor does not speak TLS to a relay until B4 slice 4, so it refuses any relay that
+    /// names one rather than connect in plaintext (fail closed, #228).
+    relay_server_name: []const u8 = "",
+    /// A Debug build's test-only plain upstream (`relay_tls.plain_allowed`).
+    relay_plain: bool = false,
+    /// The job's DSSE envelopes that counted under the node's policy (B5), one line each: the
+    /// supervisor keeps them in the node's Zigbox store before the start when the node's `zbx`
+    /// policy asks (`import_signatures`). Empty: nothing to keep.
+    signatures: []const []const u8 = &.{},
     /// `host.time_now()` (seconds) when the agent decided to start it: a Zigbox record older than
     /// this belongs to an earlier container of the same name.
     launched: u64,

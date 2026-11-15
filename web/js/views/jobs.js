@@ -30,6 +30,7 @@ export const CAUSE_TEXT = {
   fenced: "was stopped: its agent reported that it stopped the run",
   unreachable: "its node stopped being heard",
   not_started: "its node was lost before the run was claimed",
+  refused: "its node's trust policy refused it; nothing was started",
   unknown: "ended for a reason the agent could not tell",
 };
 

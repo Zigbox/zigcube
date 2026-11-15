@@ -1,4 +1,4 @@
-error[ZC-E0806]: a peer key or trust file can't be used
+error[ZC-E0806]: a peer key, certificate or trust file can't be used
   cause  the CA key file <state>/ca.key is readable by other users (mode 0644)
   fix    set its mode to 0600, or delete it so the server creates a new CA
   more   zcube explain E0806 · rerun with --verbose for the full cause chain

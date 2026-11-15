@@ -9,30 +9,75 @@
 //!     .create_store = false, // true on the first start: a mistyped path is an error otherwise
 //!     // The upstreams a job's `relay` may name (docs/briefs/b3.md): at most `relays_max`. A job
 //!     // names one; it never gives an address.
-//!     .relays = .{ .botpike = .{ .address = "broker.botpike.com:8443" } },
+//!     // B4: the relay connects with TLS, as the run (a certificate the cluster CA signs for
+//!     // `spiffe://<cluster>/job/<name>`), and checks the upstream's name against `server_ca`.
+//!     // `.cluster` has no default: until it is set the certificate endpoint answers 404, and a
+//!     // TLS relay without it is ZC-E0106 (docs/decisions/2026-11-13-b4-cluster-setting.md).
+//!     .cluster = "prod.example",
+//!     .relays = .{ .botpike = .{
+//!         .address = "broker.botpike.com:8443",
+//!         .server_name = "broker.botpike.com",
+//!         .server_ca = "/etc/zcube/botpike-ca.pem",
+//!     } },
+//!     // The Zigbox policy file `POST /v1/jobs` checks a job's signatures against (docs/briefs/
+//!     // b5.md), read once at start; without it nothing is checked.
+//!     .trust = .{ .policy = "/etc/zcube/trust.zon" },
 //! }
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
+const x509 = @import("x509.zig");
+const x509_identity = @import("x509_identity.zig");
 const fencing = @import("fencing.zig");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const zigbox = @import("zigbox");
+const trust_file = @import("trust_file.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const IpAddress = std.Io.net.IpAddress;
 
 pub const listen_default = "127.0.0.1:7070";
+/// The DNS name in the TLS listener's certificate, which clients check (`--tls-name`).
+pub const tls_name_default = "zcube-server";
 
 pub const usage =
-    \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--store SPEC] [--create-store]
-    \\                    [--new-ca] [--verbose] [--quiet]
+    \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--insecure-listen HOST:PORT]
+    \\                    [--tls-name NAME] [--tls-san NAME_OR_IP]... [--store SPEC]
+    \\                    [--create-store] [--new-ca]
+    \\                    [--verbose] [--quiet]
+    \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]
+    \\       zcube-server ca issue-client NAME --scope jobs|admin --p12 FILE [--password-file F]
+    \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
+    \\       zcube-server ca issue-node NAME [--out DIR] [--replace]
+    \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
     \\       zcube-server --version | --help
     \\
-    \\  --config FILE     a ZON file with .listen, .store, .create_store and .relays
-    \\                    (the upstreams a job's relay may name)
-    \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
+    \\  --config FILE     a ZON file with .listen, .insecure_listen, .tls_name, .store,
+    \\                    .create_store, .relays (the upstreams a job's relay may name),
+    \\                    .cluster (the trust domain of a relayed run's certificate,
+    \\                    spiffe://<cluster>/job/<name>; required with any TLS relay, and
+    \\                    runs get no certificate until it is set) and .trust = .{ .policy
+    \\                    = FILE } (the Zigbox policy file a job's signatures are checked
+    \\                    against)
+    \\  --listen ADDR     where to serve the API over TLS, an IP address and a port (default
+    \\                    127.0.0.1:7070 unless --insecure-listen is given). Every client
+    \\                    presents a certificate of this server's CA: an agent its node's
+    \\                    (from ca issue-node until it has joined), anyone else one from
+    \\                    ca issue-client
+    \\  --insecure-listen ADDR
+    \\                    also serve plain HTTP, with no certificate and every request
+    \\                    allowed, on a loopback address only (127.0.0.1:PORT or [::1]:PORT):
+    \\                    for zcube local, the console in a browser, and tests
+    \\  --tls-name NAME   the DNS name in the server's certificate, which clients check
+    \\                    (default zcube-server)
+    \\  --tls-san NAME_OR_IP
+    \\                    another DNS name or IP address in the certificate a browser gets
+    \\                    (from the browser CA, ca-browser.crt in the state directory);
+    \\                    repeatable, none by default
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
     \\  --lost-grace-ms N how long a lost node's replicas stay before they are replaced under
@@ -45,7 +90,25 @@ pub const usage =
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
     \\
-    \\Writes to the API are unauthenticated: listen on a loopback or private address.
+    \\ca issue-client signs a client certificate with the store's CA (on the server host; the
+    \\server need not run): NAME.key and NAME.crt, mode 0600, in --out (default: the working
+    \\directory). --scope is what the client may do: jobs, or admin. ca issue-node does the
+    \\same for a node's first certificate, which the operator copies to the node. Either is
+    \\valid for 7 days: run it again with --replace (by hand or from cron) to re-issue; without
+    \\--replace an existing NAME.key or NAME.crt is refused. A name in the revoked file is
+    \\refused.
+    \\
+    \\ca issue-client --p12 FILE writes one PKCS#12 file instead, for a browser to import: a P-256
+    \\key and a certificate from the store's browser CA (the server makes that CA when it starts),
+    \\with the same name, scope, revoked file and 7 days. Its password is read from
+    \\--password-file (mode 0600), else from stdin (one line); never from the command line. The
+    \\file is mode 0600 and never overwritten: remove it to re-issue. The browser also needs the
+    \\browser CA's certificate, <stem>-browser.crt in the state directory, as a trusted root.
+    \\
+    \\ca issue-node signs a node certificate the same way, for a new agent's --cert and --key:
+    \\it may join and act as NAME only. Once joined, the agent presents its own node.crt.
+    \\
+    \\The insecure listener allows anything to anyone who can reach it: keep it on loopback.
     \\
 ;
 
@@ -60,7 +123,14 @@ pub const Store = union(enum) {
 };
 
 pub const Config = struct {
-    listen: IpAddress,
+    /// The TLS listener (`--listen`); at least one of the two listeners is set.
+    listen: ?IpAddress = null,
+    /// The plain-HTTP listener (`--insecure-listen`): a loopback address only.
+    insecure_listen: ?IpAddress = null,
+    /// The DNS name of the TLS listener's certificate.
+    tls_name: []const u8 = tls_name_default,
+    /// More names for the browser path's certificate (`--tls-san`), after `tls_name`.
+    tls_sans: []const San = &.{},
     store: Store,
     create_store: bool,
     /// Where the remembered revision is kept; null: beside the SQLite file. A Postgres store
@@ -76,9 +146,44 @@ pub const Config = struct {
     lost_grace_ms: u32 = constants.lost_grace_ms,
     /// The relays a job may name, in the file's order; none by default.
     relays: []const Relay = &.{},
+    /// The SPIFFE trust domain of a relayed run's certificate (`spiffe://<cluster>/job/<name>`,
+    /// B4). Required when a relay has an upstream to check; empty otherwise.
+    cluster: []const u8 = "",
+    /// The policy a new job's signatures are checked against (B5); null checks nothing.
+    trust: ?Trust = null,
 };
 
-pub const Command = union(enum) { run: Config, version, help };
+/// The `trust` entry, its policy file read and parsed at start.
+pub const Trust = struct {
+    path: []const u8,
+    policy: *const Policy,
+};
+
+pub const Policy = zigbox.trust.policy.Policy;
+
+pub const Command = union(enum) { run: Config, ca_issue: Issue, version, help };
+
+/// `zcube-server ca issue-client NAME --scope jobs|admin` or `ca issue-node NAME`: the store
+/// settings find the CA key (`config`), and the files are written in `out_dir`.
+pub const Issue = struct {
+    config: Config,
+    /// What the certificate is for: a client (with `scope`) or a node.
+    subject: Subject,
+    name: []const u8,
+    out_dir: []const u8 = ".",
+    /// Replace an existing `NAME.key` and `NAME.crt` (`--replace`); refused otherwise.
+    replace: bool = false,
+    /// `--p12 FILE`: one PKCS#12 file from the browser CA instead of the pair (a client only).
+    p12: ?[]const u8 = null,
+    /// `--password-file F`: the PKCS#12 password; stdin without it.
+    password_file: ?[]const u8 = null,
+
+    pub const Subject = union(enum) { client: Scope, node };
+};
+
+pub const Scope = @import("x509.zig").Scope;
+const p256 = @import("x509_p256.zig");
+pub const San = p256.San;
 
 /// One relay: the name a job gives and the `host:port` the node agent connects to for it.
 pub const Relay = @import("records.zig").JobRelay;
@@ -87,29 +192,47 @@ pub const Relay = @import("records.zig").JobRelay;
 /// file's own and so are read from the syntax tree.
 const File = struct {
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: ?bool = null,
     lease_ttl_ms: ?u32 = null,
     lost_grace_ms: ?u32 = null,
     state_dir: ?[]const u8 = null,
+    cluster: ?[]const u8 = null,
+    trust: ?TrustField = null,
     relays: []const Relay = &.{},
+    /// Each relay's `server_ca` path, index for index with `relays`; read by `read_file`, which
+    /// puts the key it names in the relay's `server_anchor`.
+    relay_cas: []const []const u8 = &.{},
 };
+
+/// `.trust = .{ .policy = "<path>" }`; its field names are checked in `relays_of`.
+const TrustField = struct { policy: []const u8 };
 
 /// What a ZON file may set apart from `relays`. Unknown fields are refused (`parse_zon` checks
 /// the names itself, because it parses these with the relays left out).
 const Fields = struct {
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: ?bool = null,
     lease_ttl_ms: ?u32 = null,
     lost_grace_ms: ?u32 = null,
     state_dir: ?[]const u8 = null,
+    cluster: ?[]const u8 = null,
+    trust: ?TrustField = null,
 };
 
 /// The flags as typed, before they are merged over the file.
 const Flags = struct {
     config: ?[]const u8 = null,
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
+    /// Every `--tls-san`, parsed, in order (a flag only, not a key of the file).
+    tls_sans: []const San = &.{},
     store: ?[]const u8 = null,
     create_store: bool = false,
     lease_ttl_ms: ?u32 = null,
@@ -127,19 +250,172 @@ pub const Error = error{ BadConfig, OutOfMemory };
 /// Reads the flags and the file they name, merges them (flags win), and checks every setting.
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
-    const flags = try parse_flags(args, diag);
+    if (args.len > 0 and std.mem.eql(u8, args[0], "ca")) return load_ca(arena, io, args, diag);
+    const flags = try parse_flags(arena, args, diag);
     if (flags.version) return .version;
     if (flags.help) return .help;
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
-    return .{ .run = try merge(flags, file, diag) };
+    var config = try merge(flags, file, diag);
+    if (file.trust) |entry| config.trust = try read_policy(arena, io, entry.policy, diag);
+    config.tls_sans = try sans_valid(&config, flags.tls_sans, diag);
+    return .{ .run = config };
+}
+
+/// `sans` when the TLS listener serves them and they fit the browser path's certificate beside
+/// `--tls-name`, whatever key signs it (`x509_p256.server_names_bytes_max`, derived from
+/// `x509_cert_bytes_max`); ZC-E0106 otherwise, so the server never starts to fail at issuing.
+fn sans_valid(config: *const Config, sans: []const San, diag: *Diag) Error![]const San {
+    if (sans.len == 0) return sans;
+    if (config.listen == null) {
+        return bad(diag, "--tls-san names the browser certificate of the TLS listener, and " ++
+            "there is no --listen", .{}, "add --listen, or leave out --tls-san");
+    }
+    const used = p256.server_names_bytes(config.tls_name, sans);
+    const fit = p256.server_names_bytes_max(config.tls_name);
+    assert(fit < constants.x509_cert_bytes_max);
+    if (used > fit) {
+        return bad(diag, "--tls-name and the {d} --tls-san names take {d} bytes of the browser " ++
+            "certificate; at most {d} bytes of names fit", .{ sans.len, used, fit }, "drop " ++
+            "some --tls-san names (each takes its length plus 2 bytes)");
+    }
+    return sans;
+}
+
+fn san_of(arena: Allocator, text: []const u8, diag: *Diag) Error!San {
+    if (IpAddress.parse(text, 0)) |address| {
+        return switch (address) {
+            .ip4 => |ip4| .{ .ip = try arena.dupe(u8, &ip4.bytes) },
+            .ip6 => |ip6| .{ .ip = try arena.dupe(u8, &ip6.bytes) },
+        };
+    } else |_| {}
+    if (x509_identity.dns_problem(text, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "--tls-san {s} is not a DNS name or an IP address", .{text}, "use a " ++
+            "name like console.example.com, or an address like 192.0.2.7 or 2001:db8::7");
+    }
+    return .{ .dns = text };
+}
+
+/// `ca issue-client NAME --scope S` or `ca issue-node NAME`, `[--out DIR] [--replace]`, and the
+/// store flags of a run. `--help` anywhere after `ca` is the help.
+fn load_ca(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
+    assert(std.mem.eql(u8, args[0], "ca"));
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help")) return .help;
+        if (std.mem.eql(u8, arg, "-h")) return .help;
+    }
+    const node = args.len >= 2 and std.mem.eql(u8, args[1], "issue-node");
+    const client = args.len >= 2 and std.mem.eql(u8, args[1], "issue-client");
+    if (!node and !client) {
+        const problem = "zcube-server ca has two commands, issue-client and issue-node";
+        return bad(diag, problem, .{}, "run it with --help");
+    }
+    const what = if (node) "ca issue-node needs a node name" else "ca issue-client needs a name";
+    if (args.len < 3 or std.mem.startsWith(u8, args[2], "-")) {
+        return bad(diag, "{s}", .{what}, "run it with --help");
+    }
+    var request: Issue = .{ .config = undefined, .subject = .node, .name = args[2] };
+    var scope: ?Scope = null;
+    var out: ?[]const u8 = null;
+    var rest: std.ArrayList([]const u8) = .empty;
+    var index: usize = 3;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--scope")) {
+            if (scope != null) return bad(diag, "--scope is given twice", .{}, "give it once");
+            scope = try scope_of(args, &index, diag);
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            if (out != null) return bad(diag, "--out is given twice", .{}, "give it once");
+            out = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, args[index], "--replace")) {
+            request.replace = true;
+        } else if (std.mem.eql(u8, args[index], "--p12")) {
+            if (request.p12 != null) return bad(diag, "--p12 is given twice", .{}, "give it once");
+            request.p12 = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, args[index], "--password-file")) {
+            if (request.password_file != null) {
+                return bad(diag, "--password-file is given twice", .{}, "give it once");
+            }
+            request.password_file = try value_of(args, &index, diag);
+        } else {
+            try rest.append(arena, args[index]);
+        }
+    }
+    if (out) |directory| request.out_dir = directory;
+    request.subject = try subject_of(node, scope, diag);
+    try p12_check(&request, out != null, diag);
+    request.config = try issue_config(arena, io, rest.items, diag);
+    return .{ .ca_issue = request };
+}
+
+/// `--p12` is a client's alone, names its whole path (no `--out`) and never overwrites (no
+/// `--replace`); `--password-file` goes with it.
+fn p12_check(request: *const Issue, out: bool, diag: *Diag) Error!void {
+    const file = request.p12 orelse {
+        if (request.password_file == null) return;
+        return bad(diag, "--password-file goes with --p12", .{}, "add --p12 FILE");
+    };
+    if (request.subject == .node) {
+        const problem = "a node certificate has no --p12: it is for browsers";
+        return bad(diag, problem, .{}, "leave it out");
+    }
+    if (out) return bad(diag, "--p12 names the whole path: there is no --out", .{}, "drop --out");
+    if (request.replace) {
+        const problem = "--p12 never overwrites a file, so there is no --replace";
+        return bad(diag, problem, .{}, "remove the old file first");
+    }
+    if (file.len == 0) return bad(diag, "--p12 needs a file name", .{}, "give one");
+}
+
+fn scope_of(args: []const []const u8, index: *usize, diag: *Diag) Error!Scope {
+    const text = try value_of(args, index, diag);
+    return Scope.parse(text) orelse
+        bad(diag, "--scope is jobs or admin, not {s}", .{text}, "run it with --help");
+}
+
+/// A client needs a scope; a node has none (it may call the agent API for itself only).
+fn subject_of(node: bool, scope: ?Scope, diag: *Diag) Error!Issue.Subject {
+    if (node) {
+        if (scope != null) {
+            const problem = "a node certificate has no --scope: a node may act for itself only";
+            return bad(diag, problem, .{}, "leave out --scope");
+        }
+        return .node;
+    }
+    const given = scope orelse {
+        return bad(diag, "ca issue-client needs --scope jobs or --scope admin", .{}, "add one");
+    };
+    return .{ .client = given };
+}
+
+/// The store settings of a run, read as the server reads them, without the ones that make a CA.
+fn issue_config(arena: Allocator, io: std.Io, rest: []const []const u8, diag: *Diag) Error!Config {
+    const flags = try parse_flags(arena, rest, diag);
+    if (flags.version) {
+        return bad(diag, "--version is not a setting of ca", .{}, "run zcube-server --version");
+    }
+    assert(!flags.help); // `load_ca` answered it.
+    if (flags.new_ca or flags.create_store) {
+        const problem = "ca signs with the CA a server already made";
+        return bad(diag, problem, .{}, "leave out --new-ca and --create-store");
+    }
+    var file: File = .{};
+    if (flags.config) |path| file = try read_file(arena, io, path, diag);
+    return merge(flags, file, diag);
 }
 
 fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
-    const listen_text = flags.listen orelse file.listen orelse listen_default;
+    const insecure_text = flags.insecure_listen orelse file.insecure_listen;
+    // With neither listener named, the TLS one listens on the default address.
+    const listen_text = flags.listen orelse file.listen orelse
+        if (insecure_text == null) @as([]const u8, listen_default) else null;
     const store_text = flags.store orelse file.store orelse "memory";
     return .{
-        .listen = try parse_listen(listen_text, diag),
+        .listen = if (listen_text) |text| try parse_listen(text, diag) else null,
+        .insecure_listen = if (insecure_text) |t| try parse_insecure_listen(t, diag) else null,
+        .tls_name = try tls_name_of(
+            flags.tls_name orelse file.tls_name orelse tls_name_default,
+            diag,
+        ),
         .store = try parse_store(store_text, diag),
         .create_store = if (flags.create_store) true else (file.create_store orelse false),
         .state_dir = flags.state_dir orelse file.state_dir,
@@ -149,7 +425,27 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .lease_ttl_ms = try lease_ttl_of(flags.lease_ttl_ms orelse file.lease_ttl_ms, diag),
         .lost_grace_ms = try lost_grace_of(flags.lost_grace_ms orelse file.lost_grace_ms, diag),
         .relays = try relays_valid(file.relays, diag),
+        .cluster = try cluster_of(file.cluster, file.relays, diag),
     };
+}
+
+/// The trust domain, checked as a DNS name (ZC-E0106), and required when a relay checks its
+/// upstream: a relayed run's certificate names it.
+fn cluster_of(given: ?[]const u8, relays: []const Relay, diag: *Diag) Error![]const u8 {
+    const fix = "set .cluster = \"example.org\", the trust domain of relayed runs' certificates";
+    const cluster = given orelse "";
+    if (cluster.len == 0) {
+        for (relays) |relay| {
+            if (!relay.plain) {
+                return bad(diag, "relay {s} needs .cluster to be set", .{relay.name}, fix);
+            }
+        }
+        return "";
+    }
+    if (x509_identity.dns_problem(cluster, constants.x509_cluster_bytes_max)) {
+        return bad(diag, "the cluster {s} is not a DNS name of at most 63 bytes", .{cluster}, fix);
+    }
+    return cluster;
 }
 
 /// ZC-E0106 for a grace outside its range: at most `lost_grace_ms_max`.
@@ -178,8 +474,11 @@ fn lease_ttl_of(given: ?u32, diag: *Diag) Error!u32 {
 
 // ---- Flags -------------------------------------------------------------------------------------
 
-pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
+/// The flags as typed; `--tls-san` values are parsed (ZC-E0106 for one that is neither a DNS name
+/// nor an IP address) into a list in `arena`.
+pub fn parse_flags(arena: Allocator, args: []const []const u8, diag: *Diag) Error!Flags {
     var flags: Flags = .{};
+    var sans: std.ArrayList(San) = .empty;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -203,6 +502,12 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.config = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--listen")) {
             flags.listen = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--insecure-listen")) {
+            flags.insecure_listen = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--tls-name")) {
+            flags.tls_name = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--tls-san")) {
+            try sans.append(arena, try san_of(arena, try value_of(args, &index, diag), diag));
         } else if (std.mem.eql(u8, arg, "--store")) {
             flags.store = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
@@ -216,6 +521,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             return bad(diag, problem, .{arg}, "run it with --help");
         }
     }
+    flags.tls_sans = sans.items;
+    assert(flags.tls_sans.len <= args.len / 2);
     return flags;
 }
 
@@ -234,6 +541,32 @@ fn number_of(comptime T: type, args: []const []const u8, index: *usize, diag: *D
     return std.fmt.parseInt(T, text, 10) catch
         bad(diag, "{s} needs a whole number, not {s}", .{ flag, text }, "run it with --help");
 }
+
+// ---- The trust policy --------------------------------------------------------------------------
+
+/// Reads and parses the policy file of the `trust` entry, once, at start (`trust_file.zig`).
+/// Any problem is ZC-E0106 naming the file.
+fn read_policy(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error!Trust {
+    const loaded = try trust_file.read(arena, io, path, trust_options, diag);
+    return .{ .path = loaded.path, .policy = loaded.policy };
+}
+
+fn policy_of(arena: Allocator, source: []const u8, path: []const u8, diag: *Diag) Error!Trust {
+    const loaded = try trust_file.parse(arena, source, path, trust_options, diag);
+    return .{ .path = loaded.path, .policy = loaded.policy };
+}
+
+const trust_options: trust_file.Options = .{
+    .code = .E0106,
+    .setting = "trust.policy",
+    .user = "the server's user",
+    .fix = policy_fix,
+    .owner_fix = "chown it to root (or the server's user) and chmod go-w it: a policy that" ++
+        " others can rewrite gates nothing",
+};
+
+const policy_fix = "write it as .trust = .{ .policy = \"/etc/zcube/trust.zon\" }, naming a" ++
+    " readable Zigbox policy file";
 
 // ---- The file -----------------------------------------------------------------------------------
 
@@ -254,7 +587,61 @@ fn read_file(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error!
         error.StreamTooLong => bad(diag, "{s} is larger than 16384 bytes", .{path}, "trim it"),
         else => bad(diag, "can't read {s}", .{path}, "check that the file exists and is readable"),
     };
-    return parse_zon(arena, source, path, diag);
+    var file = try parse_zon(arena, source, path, diag);
+    try read_anchors(arena, io, &file, diag);
+    return file;
+}
+
+/// Puts the Ed25519 key of each relay's `server_ca` certificate in its `server_anchor`, as 64 hex
+/// digits. A file that cannot be read, or is not one PEM certificate with an Ed25519 key, is
+/// ZC-E0106 naming the relay.
+fn read_anchors(arena: Allocator, io: std.Io, file: *File, diag: *Diag) Error!void {
+    assert(file.relay_cas.len == file.relays.len);
+    const relays = arena.dupe(Relay, file.relays) catch return error.OutOfMemory;
+    for (relays, file.relay_cas) |*relay, path| {
+        if (path.len == 0) continue;
+        const limit: std.Io.Limit = .limited(constants.config_bytes_max);
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, limit) catch
+            return bad(diag, "relay {s}: can't read the server_ca file {s}", .{
+                relay.name, path,
+            }, "check that the file exists and is readable");
+        const anchor = pem_anchor(text) orelse
+            return bad(diag, "relay {s}: {s} is not a PEM certificate with an Ed25519 key", .{
+                relay.name, path,
+            }, "give the PEM certificate of the CA that signs the upstream's certificate");
+        relay.server_anchor = std.fmt.allocPrint(arena, "{x}", .{&anchor}) catch
+            return error.OutOfMemory;
+    }
+    file.relays = relays;
+}
+
+/// The subject key of the first certificate in a PEM text, or null. Any line length and either
+/// line ending; the key must be Ed25519 (the certificate is parsed as a foreign one).
+pub fn pem_anchor(text: []const u8) ?[32]u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    const start = (std.mem.find(u8, text, begin) orelse return null) + begin.len;
+    const stop = start + (std.mem.find(u8, text[start..], end) orelse return null);
+    var base64: [constants.x509_cert_bytes_max * 2]u8 = undefined;
+    var length: usize = 0;
+    for (text[start..stop]) |byte| {
+        if (byte == '\n' or byte == '\r' or byte == ' ' or byte == '\t') continue;
+        if (length == base64.len) return null;
+        base64[length] = byte;
+        length += 1;
+    }
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(base64[0..length]) catch return null;
+    var der_bytes: [constants.x509_cert_bytes_max * 2]u8 = undefined;
+    if (size > der_bytes.len) return null;
+    decoder.decode(der_bytes[0..size], base64[0..length]) catch return null;
+    var detail: x509.Detail = .{};
+    // A CA of the upstream's own (the foreign profile) or one made like the cluster CA.
+    const parsed = x509.parse_profile(der_bytes[0..size], .foreign_server, &detail) catch
+        x509.parse_profile(der_bytes[0..size], .cluster, &detail) catch return null;
+    const key = parsed.public_key.of(der_bytes[0..size]);
+    if (key.len != 32) return null;
+    return key[0..32].*;
 }
 
 pub fn parse_zon(arena: Allocator, source: [:0]const u8, name: []const u8, diag: *Diag) Error!File {
@@ -281,7 +668,7 @@ pub fn parse_zon(arena: Allocator, source: [:0]const u8, name: []const u8, diag:
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => return bad(diag, shape, .{name}, "see zcube-server --help"),
     };
-    var file: File = .{ .relays = relays };
+    var file: File = .{ .relays = relays.relays, .relay_cas = relays.cas };
     inline for (@typeInfo(Fields).@"struct".field_names) |field| {
         @field(file, field) = @field(fields, field);
     }
@@ -303,7 +690,9 @@ fn parse_tree(
 }
 
 const known_settings = [_][]const u8{
-    "listen", "store", "create_store", "lease_ttl_ms", "lost_grace_ms", "state_dir", "relays",
+    "listen",       "insecure_listen", "tls_name",  "store",  "create_store",
+    "lease_ttl_ms", "lost_grace_ms",   "state_dir", "relays", "cluster",
+    "trust",
 };
 
 /// The relays of the file's root struct, after its field names are checked. A relay is
@@ -313,11 +702,11 @@ fn relays_of(
     zoir: *const std.zig.Zoir,
     file_name: []const u8,
     diag: *Diag,
-) Error![]const Relay {
+) Error!RelayList {
     const root = std.zig.Zoir.Node.Index.root.get(zoir);
     const names, const values = switch (root) {
         .struct_literal => |literal| .{ literal.names, literal.vals },
-        .empty_literal => return &.{},
+        .empty_literal => return .{},
         else => return bad(diag, "{s} is not a struct of settings", .{file_name}, "see --help"),
     };
     var found: ?std.zig.Zoir.Node.Index = null;
@@ -331,9 +720,27 @@ fn relays_of(
             return bad(diag, reason, .{ file_name, text }, "see zcube-server --help");
         }
         if (std.mem.eql(u8, text, "relays")) found = values.at(@intCast(index));
+        if (std.mem.eql(u8, text, "trust")) try trust_names(zoir, values.at(@intCast(index)), diag);
     }
-    const node = found orelse return &.{};
+    const node = found orelse return .{};
     return relay_list(arena, zoir, node, diag);
+}
+
+const RelayList = struct { relays: []const Relay = &.{}, cas: []const []const u8 = &.{} };
+
+/// The typed parse ignores unknown fields, so the `trust` entry's names are checked here: it is
+/// `.{ .policy = "<path>" }` and nothing else.
+fn trust_names(zoir: *const std.zig.Zoir, node: std.zig.Zoir.Node.Index, diag: *Diag) Error!void {
+    const names = switch (node.get(zoir)) {
+        .struct_literal => |literal| literal.names,
+        else => return bad(diag, "trust is not .{{ .policy = \"<path>\" }}", .{}, policy_fix),
+    };
+    for (names) |name| {
+        const text = name.get(zoir);
+        if (!std.mem.eql(u8, text, "policy")) {
+            return bad(diag, "trust sets .{s}, which is not a trust setting", .{text}, policy_fix);
+        }
+    }
 }
 
 fn relay_list(
@@ -341,10 +748,10 @@ fn relay_list(
     zoir: *const std.zig.Zoir,
     node: std.zig.Zoir.Node.Index,
     diag: *Diag,
-) Error![]const Relay {
+) Error!RelayList {
     const names, const values = switch (node.get(zoir)) {
         .struct_literal => |literal| .{ literal.names, literal.vals },
-        .empty_literal => return &.{},
+        .empty_literal => return .{},
         else => return bad(diag, "relays is not a struct of relays", .{}, relay_fix),
     };
     // Checked before anything is read, so a file with a hundred relays is refused by its count.
@@ -354,42 +761,105 @@ fn relay_list(
         }, "name at most " ++ relays_max_text ++ " relays");
     }
     const list = arena.alloc(Relay, names.len) catch return error.OutOfMemory;
-    for (names, list, 0..) |name_node, *slot, index| {
+    const cas = arena.alloc([]const u8, names.len) catch return error.OutOfMemory;
+    for (names, list, cas, 0..) |name_node, *slot, *ca, index| {
         // The Zoir is freed when `parse_zon` returns, so the text is copied out of it.
         const name = arena.dupe(u8, name_node.get(zoir)) catch return error.OutOfMemory;
-        const address = try relay_address(zoir, values.at(@intCast(index)), name, diag);
-        const kept = arena.dupe(u8, address) catch return error.OutOfMemory;
-        slot.* = .{ .name = name, .address = kept };
         if (relay_name_problem(name)) |problem| {
             return bad(diag, "relay {s}: the name {s}", .{ name, problem }, relay_fix);
         }
+        const entry = try relay_entry(zoir, values.at(@intCast(index)), name, diag);
+        slot.* = .{
+            .name = name,
+            .address = arena.dupe(u8, entry.address) catch return error.OutOfMemory,
+            .server_name = arena.dupe(u8, entry.server_name) catch return error.OutOfMemory,
+            .plain = entry.plain,
+        };
+        ca.* = arena.dupe(u8, entry.server_ca) catch return error.OutOfMemory;
     }
-    return list;
+    return .{ .relays = list, .cas = cas };
 }
 
 const relays_max_text = "8";
-const relay_fix = "write it as .relays = .{ .name = .{ .address = \"host:port\" } }";
+const relay_fix = "write it as .relays = .{ .name = .{ .address = \"host:port\", " ++
+    ".server_name = \"upstream.example\", .server_ca = \"ca.pem\" } }";
 
-fn relay_address(
+const RelayEntry = struct {
+    address: []const u8 = "",
+    server_name: []const u8 = "",
+    server_ca: []const u8 = "",
+    plain: bool = false,
+};
+
+/// Whether a configuration may say `.plain = true`: only a Debug build's (the fake-runtime tests
+/// that predate B4). A release build refuses it, so no deployed relay is plain TCP.
+pub const relay_plain_allowed = builtin.mode == .debug;
+
+fn relay_entry(
     zoir: *const std.zig.Zoir,
     node: std.zig.Zoir.Node.Index,
     name: []const u8,
     diag: *Diag,
-) Error![]const u8 {
+) Error!RelayEntry {
     const fields = switch (node.get(zoir)) {
         .struct_literal => |literal| literal,
         else => return bad(diag, "relay {s} is not .{{ .address = ... }}", .{name}, relay_fix),
     };
-    if (fields.names.len != 1) {
-        return bad(diag, "relay {s} must have an .address and nothing else", .{name}, relay_fix);
+    var entry: RelayEntry = .{};
+    for (fields.names, 0..) |field_node, index| {
+        const field = field_node.get(zoir);
+        const value = fields.vals.at(@intCast(index)).get(zoir);
+        if (std.mem.eql(u8, field, "plain")) {
+            if (!relay_plain_allowed) {
+                return bad(diag, "relay {s}: .plain is for tests only", .{name}, relay_fix);
+            }
+            entry.plain = switch (value) {
+                .true => true,
+                .false => false,
+                else => return bad(diag, "relay {s}: .plain is not a bool", .{name}, relay_fix),
+            };
+            continue;
+        }
+        const text = switch (value) {
+            .string_literal => |text| text,
+            else => {
+                const format = "relay {s}: .{s} is not a string";
+                return bad(diag, format, .{ name, field }, relay_fix);
+            },
+        };
+        if (std.mem.eql(u8, field, "address")) {
+            entry.address = text;
+        } else if (std.mem.eql(u8, field, "server_name")) {
+            entry.server_name = text;
+        } else if (std.mem.eql(u8, field, "server_ca")) {
+            entry.server_ca = text;
+        } else {
+            return bad(diag, "relay {s} sets .{s}, which a relay does not have", .{
+                name, field,
+            }, relay_fix);
+        }
     }
-    if (!std.mem.eql(u8, fields.names[0].get(zoir), "address")) {
-        return bad(diag, "relay {s} must have an .address and nothing else", .{name}, relay_fix);
+    if (entry.address.len == 0) {
+        return bad(diag, "relay {s} has no .address", .{name}, relay_fix);
     }
-    return switch (fields.vals.at(0).get(zoir)) {
-        .string_literal => |text| text,
-        else => bad(diag, "relay {s}: .address is not a string", .{name}, relay_fix),
-    };
+    if (entry.plain) {
+        if (entry.server_name.len > 0 or entry.server_ca.len > 0) {
+            return bad(diag, "relay {s} is .plain and names a server", .{name}, relay_fix);
+        }
+        return entry;
+    }
+    if (entry.server_name.len == 0 or entry.server_ca.len == 0) {
+        return bad(diag, "relay {s} needs .server_name and .server_ca", .{name}, relay_fix);
+    }
+    if (x509_identity.dns_problem(entry.server_name, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "relay {s}: .server_name {s} is not a DNS name", .{
+            name, entry.server_name,
+        }, relay_fix);
+    }
+    if (entry.server_ca.len > constants.config_path_bytes_max) {
+        return bad(diag, "relay {s}: .server_ca is longer than 1024 bytes", .{name}, relay_fix);
+    }
+    return entry;
 }
 
 /// A relay name is what a job writes: lowercase letters, digits and '-', not at either end.
@@ -445,6 +915,32 @@ fn relays_valid(relays: []const Relay, diag: *Diag) Error![]const Relay {
 }
 
 // ---- Settings -----------------------------------------------------------------------------------
+
+/// An address of this machine's loopback interface: 127.0.0.0/8 or ::1. An IPv4-mapped address
+/// (`::ffff:127.0.0.1`) is not: the check names only the plain forms (refused, not guessed).
+pub fn is_loopback(address: IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| std.mem.eql(u8, &ip6.bytes, &(@as([15]u8, @splat(0)) ++ [1]u8{1})),
+    };
+}
+
+/// `--insecure-listen`: an address as for `--listen`, and on loopback (ZC-E0106 otherwise).
+pub fn parse_insecure_listen(text: []const u8, diag: *Diag) Error!IpAddress {
+    const address = try parse_listen(text, diag);
+    if (is_loopback(address)) return address;
+    return bad(diag, "--insecure-listen {s} is not a loopback address", .{text}, "serve plain " ++
+        "HTTP on 127.0.0.1 or [::1] only, and everything else with --listen (TLS)");
+}
+
+/// The TLS name: a DNS name the certificate can carry (ZC-E0106 otherwise).
+fn tls_name_of(name: []const u8, diag: *Diag) Error![]const u8 {
+    if (x509_identity.dns_problem(name, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "--tls-name {s} is not a DNS name", .{name}, "use letters, digits, " ++
+            "hyphens and dots, as zcube-server or api.example.com");
+    }
+    return name;
+}
 
 /// "127.0.0.1:7070" or "[::1]:7070": an IP address and a port. A name is refused, because
 /// resolving one at start-up could quietly choose a different interface than the user meant.
@@ -565,21 +1061,113 @@ test "flags win over the file, unknown flags and settings are refused" {
     const source = ".{ .listen = \"10.0.0.1:1\", .store = \"sqlite:/a\", .create_store = true }";
     const file = try parse_zon(arena, source, "server.zon", &diag);
     const typed = [_][]const u8{ "--listen", "127.0.0.1:9", "--store", "memory", "-v" };
-    const flags = try parse_flags(&typed, &diag);
+    const flags = try parse_flags(arena, &typed, &diag);
     const config = try merge(flags, file, &diag);
-    try testing.expectEqual(@as(u16, 9), config.listen.getPort());
+    try testing.expectEqual(@as(u16, 9), config.listen.?.getPort());
     try testing.expect(config.store == .memory);
     try testing.expect(config.create_store);
     try testing.expect(config.verbose);
 
     diag.reset();
-    try expect_bad(parse_flags(&.{"--bogus"}, &diag), &diag);
+    try expect_bad(parse_flags(arena, &.{"--bogus"}, &diag), &diag);
     diag.reset();
-    try expect_bad(parse_flags(&.{"--listen"}, &diag), &diag);
+    try expect_bad(parse_flags(arena, &.{"--listen"}, &diag), &diag);
     diag.reset();
     try expect_bad(parse_zon(arena, ".{ .listn = \"x\" }", "server.zon", &diag), &diag);
     diag.reset();
     try expect_bad(parse_zon(arena, "this is not zon", "server.zon", &diag), &diag);
+}
+
+test "ca issue-client and issue-node take a name, a scope (a client's), --out and --replace" {
+    // Goal: the subcommands' parsing. Method: full commands and their defaults, --help anywhere,
+    // then a missing name, a missing, repeated or unknown scope, a node given a scope, a repeated
+    // --out, an unknown subcommand and --new-ca, each ZC-E0106.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    var diag: Diag = undefined;
+    diag.reset();
+    const full = [_][]const u8{
+        "ca", "issue-client", "ops-1", "--store", "sqlite:/a", "--scope", "jobs", "--out", "/o",
+    };
+    const command = (try load(arena, io, &full, &diag)).ca_issue;
+    try testing.expectEqualStrings("ops-1", command.name);
+    try testing.expectEqual(Scope.jobs, command.subject.client);
+    try testing.expectEqualStrings("/o", command.out_dir);
+    try testing.expectEqualStrings("/a", command.config.store.sqlite);
+    try testing.expect(!command.replace);
+    const short = [_][]const u8{ "ca", "issue-client", "ops-1", "--scope", "admin", "--replace" };
+    const plain = (try load(arena, io, &short, &diag)).ca_issue;
+    try testing.expectEqualStrings(".", plain.out_dir);
+    try testing.expectEqual(Scope.admin, plain.subject.client);
+    try testing.expect(plain.replace);
+    const node = [_][]const u8{ "ca", "issue-node", "node-1", "--out", "/n" };
+    const for_node = (try load(arena, io, &node, &diag)).ca_issue;
+    try testing.expectEqual(Issue.Subject.node, for_node.subject);
+    try testing.expectEqualStrings("node-1", for_node.name);
+    try testing.expectEqualStrings("/n", for_node.out_dir);
+    try testing.expectEqual(null, for_node.p12);
+    // `--help` anywhere after `ca` is the help, not a refusal.
+    const helps = [_][]const []const u8{
+        &.{ "ca", "--help" },
+        &.{ "ca", "issue-client", "--help" },
+        &.{ "ca", "issue-node", "node-1", "-h" },
+    };
+    for (helps) |args| try testing.expectEqual(Command.help, try load(arena, io, args, &diag));
+
+    const refusals = [_][]const []const u8{
+        &.{ "ca", "issue-client" },
+        &.{ "ca", "issue-client", "--scope", "jobs" },
+        &.{ "ca", "issue-client", "ops-1" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "root" },
+        &.{ "ca", "issue-client", "ops-1", "--scope" },
+        &.{ "ca", "revoke", "ops-1" },
+        &.{"ca"},
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--new-ca" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--bogus" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--scope", "admin" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--out", "a", "--out", "b" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--version" },
+        &.{ "ca", "issue-node" },
+        &.{ "ca", "issue-node", "--out", "x" },
+        &.{ "ca", "issue-node", "node-1", "--scope", "jobs" },
+        &.{ "ca", "issue-node", "node-1", "--create-store" },
+    };
+    for (refusals) |args| {
+        diag.reset();
+        try expect_bad(load(arena, io, args, &diag), &diag);
+    }
+}
+
+test "ca issue-client --p12 takes a file and a password file, and nothing that conflicts" {
+    // Goal: --p12's parsing (B7 slice 6). Method: a full command, then a node given --p12, a
+    // password file without --p12, --p12 twice, with --out, with --replace and with no value,
+    // each ZC-E0106.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    var diag: Diag = undefined;
+    diag.reset();
+    const p12 = [_][]const u8{
+        "ca", "issue-client", "web-1", "--scope", "jobs", "--p12", "w.p12", "--password-file", "pw",
+    };
+    const for_browser = (try load(arena, io, &p12, &diag)).ca_issue;
+    try testing.expectEqualStrings("w.p12", for_browser.p12.?);
+    try testing.expectEqualStrings("pw", for_browser.password_file.?);
+    const refusals = [_][]const []const u8{
+        &.{ "ca", "issue-node", "node-1", "--p12", "n.p12" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--password-file", "pw" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--p12", "a", "--p12", "b" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--p12", "a", "--out", "o" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--p12", "a", "--replace" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--p12" },
+    };
+    for (refusals) |args| {
+        diag.reset();
+        try expect_bad(load(arena, io, args, &diag), &diag);
+    }
 }
 
 test "a lease ttl an agent cannot fence in time is ZC-E0121" {
@@ -613,7 +1201,7 @@ test "the lost grace is a flag, a file setting, and refused over an hour" {
     var diag: Diag = undefined;
     diag.reset();
     try testing.expectEqual(constants.lost_grace_ms, (try merge(.{}, .{}, &diag)).lost_grace_ms);
-    const flags = try parse_flags(&.{ "--lost-grace-ms", "30000" }, &diag);
+    const flags = try parse_flags(testing.allocator, &.{ "--lost-grace-ms", "30000" }, &diag);
     const both = try merge(flags, .{ .lost_grace_ms = 5 }, &diag);
     try testing.expectEqual(@as(u32, 30000), both.lost_grace_ms);
     const at_limit = try merge(.{ .lost_grace_ms = constants.lost_grace_ms_max }, .{}, &diag);
@@ -630,22 +1218,45 @@ test "relays are a table of names and addresses; every malformed entry is ZC-E01
     const arena = arena_state.allocator();
     var diag: Diag = undefined;
     diag.reset();
-    const good = ".{ .relays = .{ .botpike = .{ .address = \"broker.botpike.com:8443\" }," ++
-        " .b2 = .{ .address = \"127.0.0.1:9\" } } }";
+    // A release build (demo-b5-build's tests run ReleaseSafe) refuses `.plain`: the second relay
+    // is there only where it may be.
+    const plain_entry = if (relay_plain_allowed) ", .b2 = .{ .address = \"127.0.0.1:9\"," ++
+        " .plain = true }" else "";
+    const good = ".{ .cluster = \"prod.example\", .relays = .{ .botpike = .{" ++
+        " .address = \"broker.botpike.com:8443\", .server_name = \"broker.botpike.com\"," ++
+        " .server_ca = \"ca.pem\" }" ++ plain_entry ++ " } }";
     const file = try parse_zon(arena, good, "server.zon", &diag);
     const config = try merge(.{}, file, &diag);
-    try testing.expectEqual(@as(usize, 2), config.relays.len);
+    try testing.expectEqual(@as(usize, if (relay_plain_allowed) 2 else 1), config.relays.len);
     try testing.expectEqualStrings("botpike", config.relays[0].name);
     try testing.expectEqualStrings("broker.botpike.com:8443", config.relays[0].address);
+    try testing.expectEqualStrings("broker.botpike.com", config.relays[0].server_name);
+    try testing.expectEqualStrings("ca.pem", file.relay_cas[0]);
+    if (relay_plain_allowed) try testing.expect(config.relays[1].plain);
+    try testing.expectEqualStrings("prod.example", config.cluster);
     const none = try merge(.{}, try parse_zon(arena, ".{}", "server.zon", &diag), &diag);
     try testing.expectEqual(@as(usize, 0), none.relays.len);
 
     const bad_files = [_][:0]const u8{
         ".{ .relays = .{ .x = .{ .address = \"a:1\", .extra = 1 } } }",
+        // B4: a relay checks its upstream, and its runs' certificates name a cluster.
+        ".{ .cluster = \"c.example\", .relays = .{ .x = .{ .address = \"a:1\" } } }",
+        ".{ .cluster = \"c.example\", .relays = .{ .x = .{ .address = \"a:1\"," ++
+            " .server_name = \"a\" } } }",
+        ".{ .cluster = \"c.example\", .relays = .{ .x = .{ .address = \"a:1\"," ++
+            " .server_ca = \"ca.pem\" } } }",
+        ".{ .cluster = \"c.example\", .relays = .{ .x = .{ .address = \"a:1\"," ++
+            " .server_name = \"not a name\", .server_ca = \"ca.pem\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:1\", .server_name = \"a\"," ++
+            " .server_ca = \"ca.pem\" } } }",
+        ".{ .cluster = \"no cluster\", .relays = .{ .x = .{ .address = \"a:1\"," ++
+            " .server_name = \"a\", .server_ca = \"ca.pem\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:1\", .plain = true, .server_name = \"a\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:1\", .plain = 1 } } }",
         ".{ .relays = .{ .x = .{} } }",
-        ".{ .relays = .{ .x = .{ .address = \"no-port\" } } }",
-        ".{ .relays = .{ .x = .{ .address = \"a:0\" } } }",
-        ".{ .relays = .{ .x = .{ .address = \"\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"no-port\", .plain = true } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:0\", .plain = true } } }",
+        ".{ .relays = .{ .x = .{ .address = \"\", .plain = true } } }",
         ".{ .relays = 3 }",
         ".{ .relays = .{ .x = 3 } }",
         ".{ .relays = .{ .@\"a b\" = .{ .address = \"a:1\" } } }",
@@ -665,4 +1276,226 @@ test "relays are a table of names and addresses; every malformed entry is ZC-E01
         diag.reset();
         try expect_bad(merge(.{}, parsed, &diag), &diag);
     }
+}
+
+test "--insecure-listen is loopback only, and --tls-name is a DNS name (B7)" {
+    var diag: Diag = undefined;
+    diag.reset();
+    _ = try parse_insecure_listen("127.0.0.1:7070", &diag);
+    _ = try parse_insecure_listen("[::1]:7070", &diag);
+    _ = try parse_insecure_listen("127.0.0.2:7070", &diag); // All of 127.0.0.0/8.
+    const outside = [_][]const u8{
+        "0.0.0.0:7070",
+        "10.0.0.1:7070",
+        "[::]:7070",
+        "[::ffff:127.0.0.1]:7070", // IPv4-mapped: not taken for loopback.
+    };
+    for (outside) |input| {
+        diag.reset();
+        try expect_bad(parse_insecure_listen(input, &diag), &diag);
+    }
+    diag.reset();
+    try testing.expectEqualStrings("api.example.com", try tls_name_of("api.example.com", &diag));
+    for ([_][]const u8{ "", "has space", "-lead.example" }) |input| {
+        diag.reset();
+        try expect_bad(tls_name_of(input, &diag), &diag);
+    }
+}
+
+test "relay plain: only a Debug build's configuration may say .plain" {
+    // Goal: the plain test upstream demo-b3 relies on is never configurable in a release build.
+    // Method: the same file in each mode; `demo-b3-build` also runs this test in ReleaseSafe.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const text = ".{ .relays = .{ .botpike = .{ .address = \"127.0.0.1:9090\", .plain = true } } }";
+    const parsed = parse_zon(arena, text, "server.zon", &diag);
+    if (builtin.mode == .debug) {
+        const config = try merge(.{}, try parsed, &diag);
+        try testing.expect(config.relays[0].plain);
+    } else {
+        try testing.expectError(error.BadConfig, parsed);
+        try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0106), diag.code);
+    }
+}
+
+test "a relay's server_ca is a PEM certificate whose Ed25519 key becomes the anchor" {
+    // Goal: `pem_anchor` reads the subject key of a PEM certificate in any line layout, and
+    // refuses anything else. Method: a CA certificate encoded with 64- and 76-byte lines and
+    // CRLF; then a truncated block, no block, and garbage base64.
+    const x509_test = @import("x509_test.zig");
+    const pair = try x509_test.ca_pair();
+    var der_buffer: x509.Der = undefined;
+    try x509_test.make_ca(&der_buffer);
+    const der_bytes = der_buffer.slice();
+    var encoded: [constants.x509_cert_bytes_max * 2]u8 = undefined;
+    const base64 = std.base64.standard.Encoder.encode(&encoded, der_bytes);
+    inline for (.{ 64, 76 }) |width| {
+        var text: [constants.x509_cert_bytes_max * 3]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&text);
+        try writer.writeAll("-----BEGIN CERTIFICATE-----\r\n");
+        var at: usize = 0;
+        while (at < base64.len) : (at += width) {
+            try writer.print("{s}\r\n", .{base64[at..@min(at + width, base64.len)]});
+        }
+        try writer.writeAll("-----END CERTIFICATE-----\n");
+        const anchor = pem_anchor(writer.buffered()).?;
+        try testing.expectEqualSlices(u8, &pair.public_key.toBytes(), &anchor);
+    }
+    try testing.expect(pem_anchor("-----BEGIN CERTIFICATE-----\nMIIB\n") == null);
+    try testing.expect(pem_anchor("no certificate here") == null);
+    try testing.expect(pem_anchor("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----") ==
+        null);
+}
+
+test "trust names a policy file; a bad entry or a policy zbx refuses is ZC-E0106" {
+    // Goal: the `trust` setting of B5. Method: the entry parses, a good policy is read and its
+    // key is trusted; a typo in the entry, a missing file and each kind of bad policy are
+    // refused with ZC-E0106 naming the file.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const file = try parse_zon(arena, ".{ .trust = .{ .policy = \"p.zon\" } }", "s.zon", &diag);
+    try testing.expectEqualStrings("p.zon", file.trust.?.policy);
+    const none = try parse_zon(arena, ".{}", "s.zon", &diag);
+    try testing.expect(none.trust == null);
+    try testing.expect((try merge(.{}, none, &diag)).trust == null);
+
+    const public = zigbox.trust.key.public_text(zigbox.trust.key.public_of_seed(@splat(7)));
+    var policy_buffer: [256]u8 = undefined;
+    const good = try std.fmt.bufPrint(&policy_buffer, ".{{ .version = 1, .keys = .{{ .{{ " ++
+        ".name = \"botpike\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
+    const trust = try policy_of(arena, good, "p.zon", &diag);
+    try testing.expect(trust.policy.checks());
+    try testing.expectEqualStrings("p.zon", trust.path);
+
+    const bad_files = [_][:0]const u8{
+        ".{ .trust = .{ .policy = \"p.zon\", .polcy = \"q\" } }",
+        ".{ .trust = \"p.zon\" }",
+        ".{ .trust = .{} }",
+        ".{ .trusts = .{ .policy = \"p.zon\" } }",
+    };
+    for (bad_files) |source| {
+        diag.reset();
+        try expect_bad(parse_zon(arena, source, "s.zon", &diag), &diag);
+    }
+    const bad_policies = [_][]const u8{
+        "",
+        ".{ .keys = .{} }",
+        ".{ .version = 1, .keys = .{ .{ .name = \"k\", .public = \"nope\" } } }",
+        ".{ .version = 9, .keys = .{} }",
+        ".{ .version = 1, .keys = .{}, .extra = true }",
+    };
+    for (bad_policies) |source| {
+        diag.reset();
+        try expect_bad(policy_of(arena, source, "p.zon", &diag), &diag);
+    }
+    diag.reset();
+    const missing = read_policy(arena, testing.io, "/nonexistent/zcube-trust.zon", &diag);
+    try expect_bad(missing, &diag);
+    diag.reset();
+    try expect_bad(read_policy(arena, testing.io, "", &diag), &diag);
+}
+
+test "a trust policy others can rewrite is ZC-E0106; one only root or the server writes is read" {
+    // Goal: Zigbox's rule for its system policy, carried over (PR #241 review): a policy file
+    // that anyone but root or the server's user could rewrite gates nothing. Method: the rule on
+    // owners and modes, then a real file read at 0644 and refused at 0664, 0646 and as a
+    // directory, each naming the file and its mode.
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const public = zigbox.trust.key.public_text(zigbox.trust.key.public_of_seed(@splat(7)));
+    const good = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
+        ".name = \"botpike\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
+    try tmp.dir.writeFile(io, .{ .sub_path = "trust.zon", .data = good });
+    const path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/trust.zon", .{tmp.sub_path});
+    const file = try tmp.dir.openFile(io, "trust.zon", .{ .mode = .read_write });
+    defer file.close(io);
+    var diag: Diag = undefined;
+    diag.reset();
+    try file.setPermissions(io, .fromMode(0o644));
+    const trust = try read_policy(arena, io, path, &diag);
+    try testing.expect(trust.policy.checks());
+    for ([_]std.posix.mode_t{ 0o664, 0o646 }) |mode| {
+        try file.setPermissions(io, .fromMode(mode));
+        diag.reset();
+        try expect_bad(read_policy(arena, io, path, &diag), &diag);
+        const cause = diag.causes.slice()[0].slice();
+        try testing.expect(std.mem.indexOf(u8, cause, "written by its group or by others") != null);
+        try testing.expect(std.mem.indexOf(u8, cause, "trust.zon") != null);
+    }
+    try tmp.dir.createDir(io, "dir.zon", .default_dir);
+    const dir_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/dir.zon", .{tmp.sub_path});
+    diag.reset();
+    try expect_bad(read_policy(arena, io, dir_path, &diag), &diag);
+}
+
+test "--tls-san is repeatable, in order, a DNS name or an IP address (B7 slice 6)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const args = [_][]const u8{
+        "--tls-san", "console.example.com", "--tls-name", "api.example.com",
+        "--tls-san", "192.0.2.7",           "--tls-san",  "2001:db8::7",
+    };
+    const command = try load(arena, testing.io, &args, &diag);
+    const sans = command.run.tls_sans;
+    try testing.expectEqual(@as(usize, 3), sans.len);
+    try testing.expectEqualStrings("console.example.com", sans[0].dns);
+    try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 7 }, sans[1].ip);
+    try testing.expectEqual(@as(usize, 16), sans[2].ip.len);
+    const none = try load(arena, testing.io, &.{}, &diag);
+    try testing.expectEqual(@as(usize, 0), none.run.tls_sans.len);
+    for ([_][]const u8{ "has space", "-lead.example", "" }) |input| {
+        diag.reset();
+        try expect_bad(load(arena, testing.io, &.{ "--tls-san", input }, &diag), &diag);
+    }
+    diag.reset();
+    try expect_bad(load(arena, testing.io, &.{"--tls-san"}, &diag), &diag);
+}
+
+test "--tls-san is refused without --listen, and past what the certificate holds (B7 slice 6)" {
+    // Goal: names the browser certificate cannot carry, or that no listener serves, are refused
+    // at config time with ZC-E0106 and say why. Method: --insecure-listen alone; then 64-byte
+    // names added one at a time until they no longer fit, which must happen, with the count of
+    // bytes that fit in the cause.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const alone = [_][]const u8{ "--insecure-listen", "127.0.0.1:9", "--tls-san", "localhost" };
+    try expect_bad(load(arena, testing.io, &alone, &diag), &diag);
+    try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "no --listen") != null);
+    var long: [constants.x509_dns_name_bytes_max]u8 = @splat('a'); // The longest a name may be.
+    long[long.len - 2] = '.';
+    var args: std.ArrayList([]const u8) = .empty;
+    try args.appendSlice(arena, &.{ "--listen", "127.0.0.1:9" });
+    const fit = p256.server_names_bytes_max(tls_name_default);
+    var count: u32 = 0;
+    while (count < constants.x509_cert_bytes_max / long.len) : (count += 1) {
+        try args.appendSlice(arena, &.{ "--tls-san", &long });
+        diag.reset();
+        const used = 2 + tls_name_default.len + (count + 1) * (2 + long.len);
+        if (used <= fit) {
+            const command = try load(arena, testing.io, args.items, &diag);
+            try testing.expectEqual(@as(usize, count + 1), command.run.tls_sans.len);
+            continue;
+        }
+        try expect_bad(load(arena, testing.io, args.items, &diag), &diag);
+        var text: [32]u8 = undefined;
+        const at_most = try std.fmt.bufPrint(&text, "at most {d} bytes", .{fit});
+        try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, at_most) != null);
+        break;
+    } else return error.TestUnexpectedResult; // The names never stopped fitting.
 }

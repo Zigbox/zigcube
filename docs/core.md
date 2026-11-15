@@ -106,6 +106,13 @@ capacity fits the replica's resolved requests (its limits, else 250m CPU and 128
 placing decision says), the fewest replicas of the service first. A replica no node fits waits,
 unplaced, with no decision; `why` says "waiting for a node".
 
+B6 puts a filter ahead of fit: among the ready nodes, one is a candidate only if it carries every
+`placement.require` pair of the run as a `key=value` label and, for each `exclusive=K` label it
+has, the run's `require` names `K` with the node's value. The order is readiness, then that filter,
+then fit, spread, locality, least allocated, name. A run no node passes waits with the hold reason
+"no ready node has tenant=acme" (or "<node> is exclusive to tenant=acme"); a replica carries no
+`require`, so it never passes an exclusive node. Only the run's hold reason names the filter.
+
 ## What the simulation proves
 
 `zig build sim-c0 [-Dseed=N] [-Dops=N]` runs `sim_c0.zig` natively and as WebAssembly, for one
@@ -487,7 +494,7 @@ spread alone would choose, `scheduler.placement_problem`; every node holds a see
 the images and advertises it as `/node-store/<node>`).  The job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late|deadline_offline|gap`, and the later `stale|refused_loop|unclaimed|wipe|evicted|pass_break`): an
 agent that starts a stopped run again breaks J2; one that skips its claim breaks J7; a scheduler
 that leaves the run's compare out of a placement, with a `stop` committed between its read and its commit, breaks J5; a controller that rewrites a terminal status breaks J3; an
-agent that ignores a cancel breaks J6, and so does one whose job pass ends at the first failure of the server (`job_pass_break`, the agent before #247's fix: an orphan's committed stop waits for the next pass, seeds 225 and 44 of the `job_evicted` world), and so does a server that cuts a node's runs read while a stop is asked and answers its keepalives (`job_runs_unread`, not an agent fault but a gap, owner chose option B (not yet built), docs/decisions/2026-11-14-j6-runs-unread-gap.md; seeds 2, 4 and 7); one that ignores the deadline, enforces it 9 s late, or enforces it only when it can reach the server (with cuts of up to 33 s and short deadlines turned up, so that deadlines fall in them), breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
+agent that ignores a cancel breaks J6, and so does one whose job pass ends at the first failure of the server (`job_pass_break`, the agent before #247's fix: an orphan's committed stop waits for the next pass, seeds 225 and 180 of the `job_evicted` world), and so does a server that cuts a node's runs read while a stop is asked and answers its keepalives (`job_runs_unread`, not an agent fault but a gap, owner chose option B (not yet built), docs/decisions/2026-11-14-j6-runs-unread-gap.md; seeds 2, 4 and 7); one that ignores the deadline, enforces it 9 s late, or enforces it only when it can reach the server (with cuts of up to 33 s and short deadlines turned up, so that deadlines fall in them), breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
 `sim-c1-teeth-job_evicted`: a job controller that judges only the first 512 jobs of each sweep (test-only, `job_controller.zig`) never ends an unplaceable job past the 512th, which J8's second clause (read over `job_admitted_window_max` runs, and a refused list is a failure) catches in the burst world with `--strong`; seed 186 (seed 32 until B2.1 slice 6; the fleet canary runs 1..186; `docs/decisions/2026-11-11-job-evicted-tooth-sparse.md`). switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
 `zcube-agent` assert at compile time that none is on.
 
@@ -516,7 +523,99 @@ an agent restart keeps it with the container. Three checks, judged on every tick
 or replaced; sticky), so a relay is closed before its ending can be reported; **R2** (a restatement of J2 and R1 for listeners keyed by run id; no tooth of its own) no two listeners
 are open for one run (across nodes); **R3** (also: a started job's spec carries the relay the job asked for, judged against the job's name, not the spec's own field; `relay_dropped` blanks it and must fail R3) a running relayed container has its listener open. Only
 the `strong` world makes relayed jobs, so a run without `--strong` makes no relayed jobs and draws as before.
-`sim-c1-teeth-relay_leak` (`c1_teeth.relay_leak`, which implies `strong`) leaves the listener open at
+`sim-c1-teeth-relay_leak` (`c1_teeth.relay_leak`, which implies `--strong`) leaves the listener open at
 the ending and must fail R1, with or without `--c1`. The fleet's canary list gains `sim_c1_teeth_relay_leak`.
+
+**Certificates (B4 slice 3, `src/sim_certs.zig`).** In the `strong` world each running relayed
+container's supervisor asks for its workload certificate once a second until it has one, on any
+tick its link to the server is not cut. The issuer is `job_cert.decide` over the store as committed:
+the job, its status, and the claim and assignment of the node the status names. The issuer's `now`
+is the asking node's clock, because a run's `started_at_ms` is its node's reading and a simulated
+node's clock has an offset of its own. While the certificate is valid the container opens up to 4
+relayed connections. Its ending, or a stop, closes them. On 15 % of ticks a forged ask stands for
+O4's unauthenticated request: an earlier epoch, another node's name, another image, or a run that
+may have ended. The report adds `certs: asks=.. issued=.. refused=.. ..` and `certs: refused by ..`.
+There are four checks:
+
+- **R4.** A certificate goes only to the node holding the run's claim, at the epoch named by the
+  claim and the assignment, for the image the job pins, for a run that is assigned, started, not
+  terminal and not reported stopped; and no forged ask gets one. It is judged once, at each issue,
+  against the records the issuer read.
+- **R5.** No certificate's `not_after` passes the claim's start + `deadline_ms` + `grace_ms` +
+  `workload_cert_slack_ms`. It is judged once, at each issue.
+- **R6.** No relayed connection is open after the node's `/job-observed` record of that run (same
+  run id and epoch) says `stopped`, nor on a container the runtime forgot. It is judged from
+  `safety()` (every `check_interval_ms` and after every operation) with or without `--c1`, and
+  under `--c1` also at every committed revision.
+- **R7.** No relayed connection stays open more than `relay_cancel_ms_max` (2 x `relay_poll_ms`,
+  100 ms) after its container was told to stop, whether it is still in its grace or has since
+  ended (a sticky flag, so a stop and its end between two checks cannot hide a late close). Judged
+  from `safety()`. Half the relayed runs take their grace when told to stop (a hash of the job's name, no
+  draw), so R7 has a window to judge; a TERM, the fence's, still ends them at once.
+
+R6 and R7 test the simulated runtime's connection counters and the agent's ordering of stop, end
+and report, not slice 2's relay (`relay_pump.zig`), whose own tests do that.
+The checker reads the records itself rather than calling `job_cert` (it parses the job's
+`b3:<hex>` digest itself), so it does not judge the rule by the rule. Its generator is its own
+(seeded from the run's seed), so no other draw of the world changes. A world with relayed jobs
+differs only by the clock readings and store reads the model makes. The teeth are
+`sim-c1-teeth-job_cert_stale` (the issuer skips the epoch compare and must fail R4 with "a
+certificate was issued for a stale epoch"), `job_cert_image` (the issuer skips the image compare;
+R4, "a certificate names another image than the job pins"), `job_cert_long` (`not_after` counts
+the slack twice, R5), `relay_conn_leak` (connections are not closed at the ending, R6) and
+`relay_stop_leak` (connections are not closed when a slow container is told to stop, R7). All five
+imply `strong`, run with or without `--c1`, and are in the fleet's canary list. A failing tooth's
+replay line names its own runner and `--strong`.
+`docs/decisions/2026-11-13-b4-slice3-sim-certs.md`, `docs/decisions/2026-11-13-b4-slice3-fixes.md`.
+
+**Signed jobs (B5 slice 3).** `--signed` (`Options.signed`; `src/sim_trust.zig`) opens B5's
+trust world. Five Ed25519 keys come from the seed; the first four can be trusted, the fifth never
+is. Each node draws a Zigbox trust policy: one in eight has none (no `--trust-policy`), one in
+eight an open policy (`require_signature = false`), the rest require a signature from a subset of
+the four (the first key in seven of eight). Every job names one tree image (`sim_trust.image`) and
+carries up to three `zbx trust export` lines drawn from fifteen envelopes signed ahead of the run:
+tree-only statements of that tree, statements of another tree, and statements bound to a manifest
+(which count for no job: a sim job has no pinned `source`). The lines are a function of the seed
+and the job's number, so a name made again carries the same ones. The agent judges a run with the
+real `job_trust.judge_run` against its node's policy; the simulator keeps its own oracle (a
+`require` node admits a run only if some line is a tree-only statement of the job's tree by a key
+it trusts; a unit test holds it to the real verdict). **J12**: no run of a job that its node's
+policy refuses ever starts (judged at each start), and every refused run ends `refused` exactly
+once: judged on each terminal `/job-status/` put the tap sees (a run that ended refused never ends
+again; it was placed on a node whose policy refuses it) and at rest (a terminal run on a refusing
+node, not ended by a stop cause, ended `refused`). The report adds `jobs: trust nodes none=..
+open=.. require=.. starts=.. checked=.. refused endings=.. judged at rest=..`; without `--signed`
+nothing is drawn and every world is unchanged bit for bit. `sim-c1` runs its seed twice, without
+and with `--signed`, each natively and as WASM. `sim-c1-signed` runs seeds 1..20 at drawn shapes
+and profiles (CI's `sim-worlds` job). The tooth, `sim-c1-teeth-job_untrusted`
+(`c1_teeth.job_untrusted`, which opens the world on its own), has the agent skip the check and must
+fail J12, with or without `--c1`. The fleet's sim-c1 workers pass `--signed`; the canaries do not
+(the tooth's runner opens the world itself, and every other canary keeps the world it was measured
+in). `docs/decisions/2026-11-13-b5-slice3-handoff.md`.
+
+**P1** (B6 slice 2, docs/briefs/b6.md, as the supervisor ruled it on 2026-11-13: no exclusive node holds
+a job of another tenant or a service, across node loss, re-registration with other labels and partitions;
+`src/sim_tenancy.zig`, `docs/decisions/2026-11-13-b6-slice2-p1.md`). Only the tenant world (`--tenants`,
+which drawn `auto` operations switch on) has tenants, and draws none from the cluster's generator
+(`label_prng`, apart from `prng`): a run without `--tenants` is the world it was before, `--strong`
+included. Nodes carry `tenant=a` or `tenant=b`, and the nodes of odd index (the second, the fourth, ...)
+may also be `exclusive=tenant`; the nodes of even index never are, and `replicas_for` counts only those, so
+the services always fit. A restart of an agent, half the time, comes back configured with other labels, and
+before one operation in eight (until the heal) an operator reinstalls one node with a different set (a host
+crash that loses its disk; an odd node half the time, toggled between its shared and exclusive set;
+`relabels=` and `operator restarts` in the report). An agent sends new labels only with a new tenure (after a
+fence or a lost disk), which starts empty, so what a relabel leaves refused is the stale assignments of the
+old tenure, until the controllers act. Jobs name `tenant=a` or `b` (`job_tenant`, no draw), every fourth
+none (and only a non-exclusive node may run it), every eleventh `tenant=c`, which no node carries (it stays
+pending and ends `not_started`). The judge is independent: it records the labels each agent registered
+with (each new `/nodes/<n>` revision), each job's tenant from the simulation's own `job_tenant`, and decides
+with its own rule. **P1a** (`--c1`, in `before_commit`): no new assignment lands on a node whose registered
+labels refuse it, and a stored run's `require` is the job's. **P1b** (every simulated second the store is
+healthy): a hold its node's registration refuses is acted on (the replica removed, the run stopped, ended or
+replaced) within 5 s (`acted_ms_max`) of when it is first seen or the store last failed; at rest none remains. A node with
+no registration is I7's. `sim-c1-teeth-placement_exclusive` (`c1_teeth.placement_exclusive`, which implies
+`--tenants`) skips the scheduler's `exclusive` rule and must fail P1; `sim-c1-teeth-relabel_kept`
+(`c1_teeth.relabel_kept`, which implies `--tenants`) turns off the controllers' relabel eviction and must
+fail P1.
 
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.

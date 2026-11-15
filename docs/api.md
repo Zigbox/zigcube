@@ -28,6 +28,13 @@ each is an **Ask first**. The owner approved this document as written (endpoints
 | Auth | Out of scope here. SPEC says tokens are scoped; the console needs a read-only scope. A missing or insufficient token must be a diagnostic like any other. |
 | Versioning | The path carries the major version. Additive fields are not a new version, so clients ignore unknown fields. |
 
+### Callers and scopes (B7 slice 3)
+
+Over `--listen` (TLS) the caller is named by its client certificate: a node's agent may call only
+`/v1/agent/nodes/<its node>` and below, a `jobs` client only the jobs API and `GET
+/v1/why/job/<name>`, an `admin` client everything. Any other request is **403 `ZC-E0822`**, before
+it is read. `--insecure-listen` (loopback) may call everything. [mtls.md](mtls.md), "Scopes".
+
 ### Errors
 
 A failed request has a non-2xx status and this body:
@@ -109,6 +116,15 @@ truncated page; pass it back with the first page's `at`. **`reverse` is new** (s
 `prefix=/node-store/` and `limit=65` (agent.md, "The chunk store, the peer server and `fetch`").
 It adds no endpoint.
 
+Over `--listen` this endpoint needs a client of scope `admin`, with one exception (B7 slice 7,
+mtls.md "Scopes"): any node's certificate may `GET /v1/list` with `prefix` exactly
+`/node-store/` (percent-encoded or not) and no other parameter but `limit`, `at` and `continue`,
+each at most once. Any other prefix, `reverse`, a repeated parameter or another method is 403
+`ZC-E0822`: a node never reads `/replicas/`, `/assigned/` or `/services/` this way, since a
+spec holds its service's env. O5's fetchers come from `GET /v1/agent/nodes/{node}/fetchers/{digest}`
+instead (decisions/2026-11-14-b7-slice7-node-store-read.md,
+decisions/2026-11-14-b7-slice7-o5-over-tls.md).
+
 ### `GET /v1/watch?prefix=&prefix=&from=&timeout=`
 
 The long-poll watch of HANDOFF. Waits up to `timeout` milliseconds (default and maximum 25000;
@@ -174,7 +190,10 @@ terminal.
   each after the chain: `replace_replica (observed): 142 times since 2025-10-24 23:13:20Z`.
 - `why node`'s `state.text` names the judgement and the load:
   `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
-  8.0Gi memory in use`; a node with no `/node-status` is `registered, not yet judged`, one whose
+  8.0Gi memory in use; registered without a --trust-policy that checks: no job run is judged`
+  (B5: or
+  `registered with --trust-policy <path>: job runs (not replicas) are judged under the policy the
+  agent read at its start`); a node with no `/node-status` is `registered, not yet judged`, one whose
   status is for an earlier tenure says so, and one that is not registered says `not registered`
   and, if a status remains, `last judged <state> (tenure N)`. The `note` step is added when the
   node is `ready` for its current tenure and holds fewer replicas than another registered node:
@@ -368,17 +387,24 @@ shared network.
 The body is the job as JSON: `name`, `image`, `command`, `deadline_ms`, `submit_by_ms` (required),
 `source`, `env` (`[["NAME","value"]]`), `limits`, `labels`, `grace_ms`, `input` (UTF-8 text, at most
 64 KiB decoded) with `input_env` (the variable it is given in), `applied_by`, `relay` (B3: the name of a relay in the
-server's `relays` setting, see "Relays" below). `retries` above 0
-and `placement` are refused by name (ZC-E0130, not built yet); an unknown field is `400`
-ZC-E0104. Answers `201` for a new job, `200` when a job of that name with the same spec already
+server's `relays` setting, see "Relays" below), `signatures` (B5: an array of DSSE envelopes, each
+the text of one line of `zbx trust export <tree>`; see "Signatures" below). `retries` above 0
+is refused by name (ZC-E0130, not built yet); an unknown field is `400`
+ZC-E0104. `placement` (B6) is `{"require": {"key": "value"}}`: at most `job_require_max` (4) pairs,
+keys and values as a label's; the job runs only on a ready node that carries every pair as a
+`key=value` node label. A wrong shape, an unknown member, a repeated key or a pair over the bounds
+is ZC-E0130 naming `placement`; an empty `require` is the same job as none. A service (`POST
+/v1/apply`) has no `placement` (an unknown field, ZC-E0104), so it never lands on an exclusive node. Answers `201` for a new job, `200` when a job of that name with the same spec already
 exists (spec fields only: `submit_by_ms` and `applied_by` are not compared), `409` ZC-E0131 when
 it exists with another spec, `429` ZC-E0132 at `jobs_max` jobs in flight or `job_admitted_window_max`
 creations in `job_admission_window_h` hours, `410` ZC-E0134 when `submit_by_ms` has passed,
 `400` ZC-E0104 for a body that does not parse, with a cause that says which way (a missing field, an unknown
 one, a value of the wrong type or a number out of range for its field, JSON that ends too soon, not JSON),
+`403` ZBX-E0905 when the server's trust policy finds no trusted signature for the job (B5, below),
 `400` ZC-E0130 naming the field for everything else, including a job whose run record would take
-more than `job_run_bytes_max` (16 KiB) once its `command`, `env`, `labels`, `source` and `image`
-are escaped (a control character takes six bytes in JSON).
+more than `job_run_bytes_max` (16 KiB) once its `command`, `env`, `labels`, `source`, `image` and
+`signatures` are escaped (a control character takes six bytes in JSON, and each quote in an
+envelope two).
 
 - **Idempotency.** `env` and `labels` are compared as maps, in any order; a key given twice in either
   is `400` ZC-E0130. The expiry (`submit_by_ms`) is checked after the lookup: a retry of a job that
@@ -398,12 +424,13 @@ are escaped (a control character takes six bytes in JSON).
 
 **This is the one route whose body may exceed 64 KiB.** A 64 KiB input of control characters is
 about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_bytes_max`
-(`6 * job_input_bytes_max + 16 KiB`, 409,600 bytes); every other route keeps `http_body_bytes_max`
+(`6 * job_input_bytes_max + 16 KiB` plus twice the largest `signatures`, `2 * 4 * 2048`: 425,984
+bytes); every other route keeps `http_body_bytes_max`
 (64 KiB). A longer body is `413` ZC-E0108 and its cause names the limit of this route. The limit is
 decided on the decoded input, not the wire: an input within 64 KiB, with the rest of the job
 within 16 KiB as sent, is always stored. A body must arrive within `http_idle_timeout_ms` (10 s) of
 the request's start, so the slowest client the largest body allows is `job_request_bytes_max` over
-10 s, about 40 KB/s (40,960 bytes a second); a slower client, or one that stalls part way, is
+10 s, about 42 KB/s (42,598 bytes a second); a slower client, or one that stalls part way, is
 disconnected with no code. (`docs/decisions/2026-11-06-b1-slice-2-review-followups.md`.) The
 `state` of a `200` (same job) and of every cancel reply is the job's state now, `pending` only while
 it has no status.
@@ -456,6 +483,56 @@ the job's chain of decisions.
 | `ZC-E0132` | user | too many jobs | `429` |
 | `ZC-E0133` | user | no such job | `404` |
 | `ZC-E0134` | user | `submit_by_ms` has passed | `410` |
+| `ZBX-E0905` | user | no trusted signature covers the job (B5) | `403` |
+| `ZBX-E0906` | user | the policy's provenance requirement is not met (B5) | `403` |
+
+### Signatures (B5 slice 1)
+
+A job may carry `signatures`: at most `job_signatures_max` (4) DSSE envelopes, each 1 to
+`job_signature_bytes_max` (2048) bytes of printable ASCII, the text of one line of `zbx trust export
+<tree>`. Outside those bounds is `400` ZC-E0130 naming `signatures`, with or without a policy. They
+are kept with the job and its run (`docs/keys.md`), count toward `job_run_bytes_max`, are shown by
+`GET /v1/jobs/{name}` as submitted, and are part of the spec an idempotent resubmission compares. No
+registry is asked for signatures, and no field names a key or changes trust.
+
+The server checks them only when its configuration has `trust = .{ .policy = "<path>" }`, a Zigbox
+policy file (the format of `/etc/zbx/policy.zon`) read once at start; a file that cannot be read or
+parsed stops the server with ZC-E0106, and so does one that anyone but root or the server's own
+user could rewrite: the file must be a regular file owned by root or by that user, with neither
+group nor others allowed to write it (Zigbox's rule for its system policy; a policy others can
+rewrite gates nothing). With no `trust` entry, or a policy that asks for nothing,
+nothing is checked. Under a policy that asks for a signature, a new job (not a retry of a stored one)
+is judged with Zigbox's `verdict.judge` before anything is written. The subject is the job's `image`,
+which must then be a tree (`b3:` and 64 hex digits), and, when the job has a `source`, the manifest
+digest that `source` is pinned to: a tree-only signature counts for any job of the tree, a
+manifest-bound one only for a job pulled from that manifest. A job no trusted line covers is `403`
+with Zigbox's `ZBX-E0905`, its cause listing each line and why it does not count (`ZBX-E0906` when
+the policy's provenance requirement is not met); nothing is created. Under a policy, a line Zigbox
+cannot read as an envelope is `400` ZC-E0130 naming it.
+
+The policy judges admission only. Jobs stored before the policy was set, or before it changed, are
+not judged again: they are placed and run as they are, and a resubmission of one with the same spec
+answers `200` without being judged, which does not mean the policy accepted it. The file is read
+once at start, so a key removed from it still counts until the server restarts, and a stored job
+signed by that key still runs. When turning the policy on or tightening it, drain or cancel the
+jobs already stored (`GET /v1/jobs?state=pending`, `POST /v1/jobs/{name}/cancel`).
+
+**The node's own check (B5 slice 2).** An agent started with `--trust-policy FILE` (`docs/agent.md`)
+judges every run with the same `verdict.judge` before anything of it starts: no input is fetched,
+no supervisor or container is made. The file is the node's own: the API cannot name, change or
+switch it off, and the server's policy does not reach it. A run no trusted line of the node's policy
+covers ends with the new ending **`refused`**: the agent reports `exit {"kind":"refused"}` with
+`ZBX-E0905` (or `ZBX-E0906`) and its cause, the job controller ends the job `failed` with cause
+`refused` and that diagnostic, and the run is never retried and never placed on another node. A job
+stored before a policy changed, or written to the store around the API, is refused here. The watch
+shows the ending like any other (`/job-status/<name>`); `zcube why job` says `failed, refused by
+<node>'s trust policy` and its chain carries the diagnostic. The node publishes the path it registered
+with in `/nodes/<node>`'s `trust_policy`; `zcube why node` ends its state line with `registered with
+--trust-policy <path>: job runs (not replicas) are judged under the policy the agent read at its
+start`, or `registered without a --trust-policy that checks: no job run is judged`. The record
+carries the path only when the policy asks for a signature or a provenance (a policy that asks for
+nothing registers none), and it is the registration's: an agent
+restarted with another flag under a live lease keeps the old record (`docs/agent.md`).
 
 ### Relays (B3 slice 2)
 
@@ -466,7 +543,12 @@ configuration** names (`relays` in the ZON file, at most `relays_max` = 8, each 
 listener at `ZCUBE_RELAY` (`http://127.0.0.1:<port>`).
 
 Admission refuses, `400` ZC-E0130 naming the field: `relay` that is not a non-empty string, a name
-the server's configuration does not have, and an `env` that sets `ZCUBE_RELAY` (the relay owns it).
+the server's configuration does not have, an `env` that sets `ZCUBE_RELAY` (the relay owns it);
+and, because the job's relay certificate (B4) names its image and carries every label: an `image`
+that is not `b3:` and 64 lowercase hex digits, `labels` whose keys and values together are over
+`x509_labels_bytes_max` = 256 bytes, and `labels` with a key that is not printable ASCII without
+spaces (bytes 0x21 to 0x7E) or a value that is not UTF-8 or holds a control character (below 0x20,
+or 0x7F). A job without a relay is not held to these three.
 The relay is resolved once, at admission: the job record holds the name and the address the
 configuration gave then, so a later edit of the configuration changes jobs submitted afterwards and
 no job already admitted. `GET /v1/jobs/{name}` shows `relay` as the name only. The spec comparison
@@ -485,7 +567,7 @@ are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstrea
 | Code | Blame | Summary |
 | --- | --- | --- |
 | `ZC-E0701` | external | the upstream refused a connection |
-| `ZC-E0702` | environment | the relay could not listen |
+| `ZC-E0702` | environment | a job's relay could not be served |
 | `ZC-E0703` | environment | the agent's build cannot serve a relay |
 | `ZC-E0704` | external | the upstream did not answer in time |
 | `ZC-E0705` | environment | a relayed connection failed in the middle |
@@ -598,6 +680,7 @@ runs unchanged on the far side of HTTP:
 | `txn` of puts and deletes under `/observed/<node>/` | `POST /v1/agent/nodes/{node}/observed` |
 | `list(/job-runs/)`, filtered to the node's assignments (B1 slice 4) | `GET /v1/agent/nodes/{node}/runs` |
 | `get(/job-input/<name>)` | `GET /v1/agent/nodes/{node}/runs/{name}/input` |
+| (no store write: the CA signs a relayed run's key, B4) | `POST /v1/agent/nodes/{node}/runs/{name}/certificate` |
 | `list(/job-observed/<node>/)`; `txn` with one put there | `GET` / `POST /v1/agent/nodes/{node}/job-observed` |
 | (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
 
@@ -624,8 +707,24 @@ answers
 
 ```json
 { "credential": "<hex, 185 bytes>", "ca_public": "<64 hex digits>",
+  "node_certificate": "<hex DER>",
   "not_before_ms": 1767225600000, "not_after_ms": 1767312000000 }
 ```
+
+`node_certificate` (B7) is the node's X.509 certificate of kind `node` (docs/mtls.md) over the
+same key, valid as long as the credential. The agent requires it: a reply with one for another
+node, key, kind or CA is a bad reply and nothing is stored. A reply without it comes from a
+server older than the agent (`ZC-E0504`, "the answer has no node_certificate: the server is
+older than the agent; upgrade the server first"); the agent keeps the credential it holds.
+**Upgrade the server first,** then the agents.
+
+Until B7 slice 3 the endpoint is unauthenticated, and nothing accepts a node certificate yet.
+**Slice 3 acceptance item** (decisions/2026-11-13-node-cert-bootstrap.md): over `--listen` the
+endpoint issues a credential and node certificate for `{node}` only to a caller whose client
+certificate is of kind `node` and names `{node}`. It refuses no certificate, a client certificate
+of any scope, a workload or server certificate, and a node certificate for another node, each
+in a table test. A node's first certificate comes from `zcube-server ca issue-node NAME` on the
+server host. Over `--insecure-listen` (loopback only) the join stays as it is.
 
 The agent calls it again at half the credential's life. Refusals: `400` for a key that is not 64
 hex digits or not a point on the curve, or a node name that is not a node name; `ZC-E0807` for a
@@ -718,6 +817,20 @@ endpoint's shape did not change, which is why it is a list of replicas and not o
 a value whose version is newer than it knows with `ZC-E0303`, naming the key and both versions
 (keys.md, "Versions"). Upgrade the agents with the server.
 
+### `GET /v1/agent/nodes/{node}/fetchers/{digest}` (B7 slice 7)
+
+The swarm fetch's O5 question (docs/briefs/c2.md): the names of the nodes assigned a replica
+whose image is `digest`, each once, in key order, computed by the server so that a node learns
+node names and nothing of the records (no service, replica, spec or env):
+
+```json
+{ "revision": 415, "nodes": ["node1", "node3"], "chain": { ... } }
+```
+
+`GET` only; no query but `known`. `digest` is `b3:` and 8 to 64 lower-case hex digits, else 400.
+Over `--listen` a node may ask under its own name only (mtls.md, "Scopes";
+decisions/2026-11-14-b7-slice7-o5-over-tls.md).
+
 ### `GET /v1/agent/nodes/{node}/assigned`
 
 The node's assignments, as stored: `{"revision": R, "kvs": [...]}` in `/v1/list`'s shape for
@@ -797,6 +910,32 @@ report and ends the run on its node. An older
 server stores it; the answer shape is unchanged. An older agent fences on `applied: false`, so
 upgrade agents before the server.
 
+### `POST /v1/agent/nodes/{node}/runs/{name}/certificate` (B4 slice 2)
+
+A relayed run's workload certificate. Body `{"public_key": "<64 hex>", "epoch": N,
+"image_digest": "<64 hex>"}` (the run's Ed25519 key from `relay.pub`, the placement epoch and the
+image digest the node started; at most `peer_join_request_bytes_max` bytes, no unknown fields).
+The server reads the job, its status, the run's claim and its assignment at one revision, and
+`job_cert.decide` checks that the job has a relay, the run is claimed by `{node}` and started,
+has not ended, runs the pinned image under the current epoch. Then the cluster CA signs
+`spiffe://<cluster>/job/{name}` with the digest, epoch and labels, valid until the run's last
+legitimate moment, and answers
+
+```json
+{ "certificate": "<hex DER>", "not_before_ms": 1767225600000, "not_after_ms": 1767229200000 }
+```
+
+Refusals: `404` where the server has no CA or no `.cluster` is set (there is no default trust
+domain, docs/decisions/2026-11-13-b4-cluster-setting.md); `400` for a bad job name, key, digest or
+an `epoch` of 0; **`409` ZC-E0706** for a run the node may not have a certificate for (each cause
+names which check failed). A retry cannot change a 409: the agent marks the run refused and does
+not ask again. Two causes are not final, so they are **`503` ZC-E0706**: no node has claimed the
+run yet (also what a node without a claim of its own sees), and the claim has not started the run
+(its `running` report has not landed). The agent asks again after `peer_join_retry_ms` and never
+marks the run refused for a 503; it asks only for runs it knows the server holds as `running`, so
+a 503 is a narrow race. The call writes no store key. Like every agent endpoint it is unauthenticated
+until B7 (docs/mtls.md, "Issuance").
+
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 
 The long poll, the provisional transport of HANDOFF. `from` is a revision (at least 1) and
@@ -874,8 +1013,8 @@ rest are about the agent's own host.
 | `ZC-E0508` | user | the container's command can't be run | the supervisor, as `start_failed` |
 | `ZC-E0509` | environment | the container's supervisor is gone | `FakeRuntime`, as `lost` |
 | `ZC-W0501` | environment | the agent's lease ended and it registered again | the agent, a warning |
-| `ZC-E0806` | user | a peer key or trust file can't be used | `zcube-server` and the agent at start |
-| `ZC-E0807` | user | the node was removed from the cluster and is refused a credential | the credential endpoint |
+| `ZC-E0806` | user | a peer key, certificate or trust file can't be used | `zcube-server` and the agent at start, `ca issue-client`, `ca issue-node` |
+| `ZC-E0807` | user | a name on the removed list was refused a certificate | the credential endpoint, `ca issue-client`, `ca issue-node` |
 | `ZC-E0809` | external | a certificate is malformed or outside the bounds (the field named) | the X.509 parser, for a peer's certificate |
 | `ZC-E0810` | external | a certificate is not signed by the pinned anchor | certificate verification |
 | `ZC-E0811` | external | a certificate is expired or not yet valid (both times shown) | certificate verification |

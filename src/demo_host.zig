@@ -11,6 +11,7 @@ const net = std.Io.net;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const http = @import("agent_http.zig");
+const harness_tls = @import("harness_tls.zig");
 const host_procs = @import("host_procs.zig");
 
 const Allocator = std.mem.Allocator;
@@ -42,6 +43,12 @@ pub const Config = struct {
     lease_ttl_ms: ?[]const u8 = null,
     /// The server's `--config FILE` (a ZON file, for `.relays`); null passes none.
     server_config: ?[]const u8 = null,
+    /// `--listen` (TLS) as well as `--insecure-listen`, which the host's own calls use (demo-b7).
+    tls_listen: ?[]const u8 = null,
+    /// The server serves `--listen` (TLS) on the demo's port and no `--insecure-listen`: the
+    /// demo, its `zcube` commands and its agents present certificates of the server's CA
+    /// (B7 slice 6). `ca issue-client operator --scope admin` is the demo's own.
+    tls_only: bool = false,
 };
 
 /// What a `zcube` command did: its exit code (255 if a signal ended it) and both streams.
@@ -67,6 +74,10 @@ pub const Host = struct {
     /// The step being run, named in every failure.
     step: []const u8 = "setup",
     transcript: ?std.Io.File = null,
+    /// With `Config.tls_only`: the CA and the certificates issued from it, and the operator's
+    /// credentials once loaded.
+    pki: ?harness_tls.Pki = null,
+    credentials: ?*harness_tls.Credentials = null,
 
     pub fn arena(host: *Host) Allocator {
         return host.arena_state.allocator();
@@ -76,6 +87,8 @@ pub const Host = struct {
         return .{ .io = host.io, .arena = host.arena(), .state = host.state };
     }
 
+    /// Milliseconds since boot, for measuring durations. Never a time the server compares with
+    /// its own clock, which is Unix time (`server_store.RealClock`).
     pub fn now_ms(host: *const Host) u64 {
         return @intCast(std.Io.Clock.awake.now(host.io).toMilliseconds());
     }
@@ -127,6 +140,19 @@ pub const Host = struct {
         args: []const []const u8,
         log: []const u8,
     ) !std.process.Child {
+        return host.spawn_in(exe, args, log, .inherit);
+    }
+
+    /// `spawn` in the directory `cwd`. A demo starts an agent in its state directory so that
+    /// everything its containers start can be found by its working directory
+    /// (`host_procs.Procs.in_state`), even after the agent removed the container's directory.
+    pub fn spawn_in(
+        host: *Host,
+        exe: []const u8,
+        args: []const []const u8,
+        log: []const u8,
+        cwd: std.process.Child.Cwd,
+    ) !std.process.Child {
         const name = try host.path_in_work(log);
         const file = try std.Io.Dir.cwd().createFile(host.io, name, .{});
         defer file.close(host.io);
@@ -135,6 +161,7 @@ pub const Host = struct {
         @memcpy(argv[1..], args);
         return std.process.spawn(host.io, .{
             .argv = argv,
+            .cwd = cwd,
             .stdin = .ignore,
             .stdout = .{ .file = file },
             .stderr = .{ .file = file },
@@ -151,9 +178,21 @@ pub const Host = struct {
         // A Postgres store has no directory beside it, so the server needs one to remember the
         // highest revision it saw (ZC-E0106 without it); the same one serves every restart.
         const state_dir = try host.path_in_work("server-state");
+        // `tls_only` serves `--listen` on the demo's port; `tls_listen` adds one beside it.
+        if (host.config.tls_only) assert(host.config.tls_listen == null);
+        if (host.config.tls_listen != null) assert(!host.config.tls_only);
         var args: std.ArrayList([]const u8) = .empty;
+        const listener = if (host.config.tls_only) "--listen" else "--insecure-listen";
+        if (host.config.tls_only and host.pki == null) host.pki = .{
+            .io = host.io,
+            .arena = arena_allocator,
+            .server_exe = host.config.server_exe,
+            .store = host.config.store,
+            .state_dir = state_dir,
+            .certs = try host.path_in_work("certs"),
+        };
         try args.appendSlice(arena_allocator, &.{
-            "--listen",       listen,
+            listener,         listen,
             "--store",        host.config.store,
             "--state-dir",    state_dir,
             "--create-store", "--quiet",
@@ -167,9 +206,13 @@ pub const Host = struct {
         if (host.config.server_config) |path| {
             try args.appendSlice(arena_allocator, &.{ "--config", path });
         }
+        if (host.config.tls_listen) |address| {
+            try args.appendSlice(arena_allocator, &.{ "--listen", address });
+        }
         host.server = try host.spawn(host.config.server_exe, args.items, log);
         const ready = struct {
             fn check(_: void, h: *Host) !bool {
+                if (!try h.tls_ready()) return false;
                 const reply = h.call("GET", "/v1/status", "") catch return false;
                 return reply.status == 200;
             }
@@ -191,7 +234,49 @@ pub const Host = struct {
             "--images",       host.config.images,
             "--verbose",
         };
-        host.agent = try host.spawn(host.config.agent_exe, &args, log);
+        const tls = try host.agent_tls(node);
+        const all = try std.mem.concat(arena_allocator, []const u8, &.{ &args, tls });
+        host.agent = try host.spawn(host.config.agent_exe, all, log);
+    }
+
+    /// With `Config.tls_only`, whether the operator's credentials are loaded: once the server
+    /// wrote its CA, `ca issue-client operator --scope admin` (the first time), then loaded and
+    /// exported to the `zcube` commands. True at once without it. Only a CA not yet written is
+    /// waited for: a failing `ca issue-client` or a broken state directory fails the step at once.
+    fn tls_ready(host: *Host) !bool {
+        if (!host.config.tls_only) return true;
+        if (host.credentials != null) return true;
+        // start_server makes the Pki before it starts a tls_only server.
+        assert(host.pki != null);
+        const pki = &host.pki.?;
+        const ca = pki.find_ca() catch return host.fail("{s}", .{pki.said});
+        if (ca == null) return false;
+        const issued = pki.issue("operator", "admin") catch return host.fail("{s}", .{pki.said});
+        if (issued) {
+            host.say("$ zcube-server ca issue-client operator --scope admin " ++
+                "--store <the store> --state-dir server-state --out certs", .{});
+            host.print_indented(pki.said);
+        }
+        host.credentials = pki.load("operator") catch return host.fail("{s}", .{pki.said});
+        pki.export_to(&host.cli_environ, "operator") catch return host.fail("{s}", .{pki.said});
+        return true;
+    }
+
+    /// With `Config.tls_only`, an agent's `--ca`, `--cert` and `--key`: a node certificate
+    /// issued for `node` the first time (`ca issue-node`). Empty without it.
+    pub fn agent_tls(host: *Host, node: []const u8) ![]const []const u8 {
+        if (!host.config.tls_only) return &.{};
+        // An agent starts after the server, and start_server makes the Pki for a tls_only one.
+        assert(host.pki != null);
+        const pki = &host.pki.?;
+        const issued = pki.issue(node, null) catch return host.fail("{s}", .{pki.said});
+        if (issued) {
+            host.say("$ zcube-server ca issue-node {s} --store <the store> " ++
+                "--state-dir server-state --out certs", .{node});
+            host.print_indented(pki.said);
+        }
+        const flags = pki.flags(node) catch return host.fail("{s}", .{pki.said});
+        return host.arena().dupe([]const u8, &flags);
     }
 
     /// SIGTERM, then wait: a clean stop is exit 0.
@@ -210,8 +295,42 @@ pub const Host = struct {
     // ---- The API, for what the CLI does not show ----
 
     pub fn call(host: *Host, method: []const u8, path: []const u8, body: []const u8) !http.Reply {
+        const tls = if (host.config.tls_only) host.credentials orelse
+            return error.ApiUnreachable else null;
+        return host.call_with(tls, method, path, body);
+    }
+
+    /// How the transcript names the demo port's listener.
+    pub fn listener_text(host: *const Host) []const u8 {
+        return if (host.config.tls_only) "TLS, --listen" else "plain HTTP, --insecure-listen";
+    }
+
+    /// That the demo's port serves TLS only (B7 slice 6): a plain-HTTP `GET /v1/status` gets no
+    /// answer, and the same request with the operator's certificate gets 200. Fails the demo when
+    /// `Config.tls_only` is off, so a demo that calls it cannot quietly run over plain HTTP.
+    pub fn check_tls_only(host: *Host) !void {
+        const plain = host.call_with(null, "GET", "/v1/status", "");
+        const refused = if (plain) |reply| reply.status != 200 else |_| true;
+        try host.check(refused, "a plain-HTTP GET /v1/status on 127.0.0.1:{d} gets no answer", .{
+            host.port,
+        });
+        const credentials = host.credentials orelse
+            return host.fail("the demo holds no TLS credentials (Config.tls_only is off)", .{});
+        const reply = host.call_with(credentials, "GET", "/v1/status", "") catch |err|
+            return host.fail("GET /v1/status over TLS failed: {t}", .{err});
+        const what = "the same request over TLS, as operator, answers {d}";
+        try host.check(reply.status == 200, what, .{reply.status});
+    }
+
+    fn call_with(
+        host: *Host,
+        tls: ?*harness_tls.Credentials,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+    ) !http.Reply {
         const address = try net.IpAddress.parse("127.0.0.1", host.port);
-        const client: http.Client = .{ .io = host.io, .address = address };
+        const client: http.Client = .{ .io = host.io, .address = address, .tls = tls };
         var diag: Diag = undefined;
         diag.reset();
         return client.call(host.arena(), .{
@@ -361,16 +480,11 @@ pub const Host = struct {
         _ = host.procs().kill_supervisor_groups();
     }
 
-    /// What still runs after `cleanup`: supervisors and the commands of every container the
-    /// agent made. Settles first: a killed process disappears a moment later.
+    /// What still runs after `cleanup`: supervisors and every process of the session of every
+    /// container the agent made. Settles first: a killed process disappears a moment later.
     pub fn survivors(host: *Host) !u32 {
         try host.io.sleep(.fromMilliseconds(500), .awake);
-        const procs_now = host.procs();
-        var count = try procs_now.supervisors();
-        for (try procs_now.containers()) |pids| {
-            if (procs_now.alive(pids.command)) count += 1;
-        }
-        return count;
+        return host.procs().survivors();
     }
 
     pub fn dump_logs(host: *Host) void {

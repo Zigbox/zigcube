@@ -31,6 +31,7 @@ const agent_mod = @import("agent.zig");
 const build_options = @import("build_options");
 const clock_mod = @import("agent_clock.zig");
 const config_mod = @import("agent_config.zig");
+const job_trust = @import("job_trust.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const fake_runtime = @import("fake_runtime.zig");
@@ -42,6 +43,9 @@ const node_store = @import("node_store.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const agent_peer = @import("agent_peer.zig");
+const api_tls_client = @import("api_tls_client.zig");
+const agent_relay_certs = @import("agent_relay_certs.zig");
+const api_tls_guard = @import("api_tls_guard.zig");
 const dir_images = @import("dir_images.zig");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_server_mod = @import("peer_server.zig");
@@ -79,7 +83,8 @@ const Shell = struct {
     state_dir: []const u8,
     agent: *agent_mod.Agent,
     arena: BoundedArena,
-    diag: Diag,
+    /// Each step resets it before use.
+    diag: Diag = undefined,
     verbose: bool,
     policy: loop_mod.Loop,
     /// This boot's id, kept with the lease (`agent.Context.boot_id`).
@@ -91,6 +96,14 @@ const Shell = struct {
     /// The node's peer identity (docs/peer.md) and the transport its join calls use.
     peer: *agent_peer.Peer,
     peer_transport: remote_mod.client.Transport,
+    /// The API's TLS client when `--ca` is given; it presents the new `node.crt` after a join.
+    tls: ?*api_tls_client.Credentials = null,
+    /// Relayed runs' certificates (B4): asked for before every pass and watch.
+    relay_certs: agent_relay_certs.Asker,
+    /// When the current `relay_step` must be done, on the boot clock.
+    relay_step_end_ms: u64 = 0,
+    /// The check of `tls`'s certificate before each connection; told how each renewal went.
+    guard: ?*api_tls_guard.Guard = null,
 
     /// Joins the cluster CA or renews the credential when it is due. A failure never stops the
     /// agent: it is shown once per streak and tried again after `peer_join_retry_ms`.
@@ -114,7 +127,10 @@ const Shell = struct {
         shell.diag.reset();
         const had = shell.peer.credential != null;
         const arena = shell.arena.allocator();
-        shell.peer.step(shell.peer_transport, arena, lease, now_ms, timeout_ms, &shell.diag) catch {
+        const transport = shell.peer_transport;
+        const guard = shell.guard;
+        const diag = &shell.diag;
+        shell.peer.step_guarded(guard, transport, arena, lease, now_ms, timeout_ms, diag) catch {
             if (!shell.peer.reported) {
                 shell.peer.reported = true;
                 shell.show("\n", &shell.diag, "zcube-agent: running on; it will try again\n");
@@ -122,6 +138,12 @@ const Shell = struct {
             shell.diag.reset();
             return;
         };
+        if (shell.tls) |credentials| {
+            // The CA of `--ca` issued it (the server is pinned to it), so it is presented; one
+            // that is not usable keeps the certificate presented so far.
+            const node = shell.agent.config.node;
+            _ = credentials.present(&shell.peer.node_certificate.?, shell.peer.key, node, now_ms);
+        }
         const verb = if (had) "renewed" else "joined";
         var buffer: [128]u8 = undefined;
         const text = "zcube-agent: node {s} {s} the cluster CA\n";
@@ -130,9 +152,50 @@ const Shell = struct {
         std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
     }
 
+    /// Asks for the certificates relayed runs wait for. A failure is shown once per streak; the
+    /// relay of a run without one ends its connections at `relay_connect_timeout_ms`. The whole
+    /// step takes at most `relay_cert_step_ms_max` and never runs past the fence: each ask's
+    /// timeout is recomputed before it is made (`relay_left`), so a slow server cannot hold back
+    /// the keepalive.
+    fn relay_step(shell: *Shell) void {
+        if (shell.before_fence(constants.relay_cert_step_ms_max) == 0) return;
+        shell.relay_step_end_ms = shell.boot.now_ms() +| constants.relay_cert_step_ms_max;
+        shell.arena.reset();
+        shell.diag.reset();
+        const certs = &shell.relay_certs;
+        const state = shell.pair_state.interface();
+        const arena = shell.arena.allocator();
+        const now_ms = shell.clock.now_ms();
+        const host: agent_relay_certs.Host = .{
+            .context = shell,
+            .left_fn = relay_left,
+            .reported_fn = relay_reported,
+        };
+        switch (certs.step(state, shell.peer_transport, arena, now_ms, host, &shell.diag)) {
+            .idle, .asked => {},
+            .failed => if (!certs.reported) {
+                certs.reported = true;
+                shell.show("\n", &shell.diag, "zcube-agent: running on; it will ask again\n");
+            },
+        }
+        shell.diag.reset();
+    }
+
+    fn relay_left(context: *anyopaque) u32 {
+        const shell: *Shell = @ptrCast(@alignCast(context));
+        const left = shell.relay_step_end_ms -| shell.boot.now_ms();
+        return shell.before_fence(@intCast(@min(left, constants.relay_cert_step_ms_max)));
+    }
+
+    fn relay_reported(context: *anyopaque, run_id: []const u8) bool {
+        const shell: *Shell = @ptrCast(@alignCast(context));
+        return shell.agent.running_reported_known(run_id);
+    }
+
     /// One step of the core, with what the policy says to tell the person.
     fn pass(shell: *Shell) loop_mod.Outcome {
         shell.peer_step();
+        shell.relay_step();
         shell.arena.reset();
         shell.diag.reset();
         const ctx: agent_mod.Context = .{
@@ -189,6 +252,7 @@ const Shell = struct {
     /// Holds up to `slice_ms` for a replica change or a container event. `failed` if the server
     /// refused or could not be reached: the loop pauses, then steps (which reports and retries).
     fn watch(shell: *Shell, slice_ms: u32) Watched {
+        shell.relay_step();
         shell.diag.reset();
         const mono = shell.boot.now_ms();
         const held = shell.agent.watch_hold_ms(mono, slice_ms);
@@ -362,6 +426,43 @@ fn peer_address(buffer: *[64]u8, advertise: ?std.Io.net.IpAddress) []const u8 {
     return std.fmt.bufPrint(buffer, "{f}", .{address}) catch unreachable;
 }
 
+/// The agent, with the node's own trust policy and its scratch (a few MiB, so on the heap) when
+/// it has `--trust-policy`. `destroy_agent` frees both.
+fn new_agent(
+    gpa: std.mem.Allocator,
+    config: config_mod.Config,
+    peer_buffer: *[64]u8,
+) error{OutOfMemory}!*agent_mod.Agent {
+    const agent = try gpa.create(agent_mod.Agent);
+    errdefer gpa.destroy(agent);
+    var trust: ?*const job_trust.Trust = null;
+    if (config.trust) |loaded| {
+        const held = try gpa.create(NodeTrust);
+        held.trust = .{ .policy = loaded.policy, .path = loaded.path, .scratch = &held.scratch };
+        trust = &held.trust;
+    }
+    agent.init(.{
+        .node = config.node,
+        .capacity = config.capacity,
+        .address = config.address,
+        .peer = peer_address(peer_buffer, config.peer_advertise),
+        .agent_version = build_options.version,
+        .labels = config.labels,
+        .trust = trust,
+    });
+    return agent;
+}
+
+const NodeTrust = struct { trust: job_trust.Trust, scratch: job_trust.Scratch };
+
+fn destroy_agent(gpa: std.mem.Allocator, agent: *agent_mod.Agent) void {
+    if (agent.config.trust) |trust| {
+        const held: *const NodeTrust = @alignCast(@fieldParentPtr("trust", trust));
+        gpa.destroy(held);
+    }
+    gpa.destroy(agent);
+}
+
 /// Runs the agent until it is told to stop. Returns the process's exit code.
 pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const io = init.io;
@@ -384,27 +485,26 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     remote.set_deadline(boot.clock(), std.math.maxInt(u64));
     var boot_id_buffer: [64]u8 = undefined;
     const boot_id = read_boot_id(io, &boot_id_buffer);
-    var server_buffer: [remote_mod.client.remembered_server_bytes_max]u8 = undefined;
-    // An IP address and a port always fit.
-    const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
-    load_pair(gpa, &remote, backend.pair_state, config.state_dir, server, &diag) catch
+    if (refuse_relabel(io, gpa, &backend, config, boot_id, boot.clock(), &diag)) |code| return code;
+    load_pair(gpa, &remote, backend.pair_state, config.state_dir, config.server, &diag) catch
         return fail(io, &diag, config.verbose);
     var peer_identity = switch (open_peer(io, config, &diag)) {
         .opened => |opened| opened,
         .exit => |code| return code,
     };
     defer peer_identity.close();
-    const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
-    defer gpa.destroy(agent);
+    var credentials: api_tls_client.Credentials = undefined;
+    const now_ms = real.clock().now_ms();
+    const tls = open_tls(io, config, &peer_identity, &credentials, now_ms, &diag) catch
+        return fail(io, &diag, config.verbose);
+    http_transport.client.tls = tls;
+    defer if (config.tls != null) credentials.deinit();
+    var file_fallback: api_tls_guard.FileFallback = undefined;
+    var guard = tls_guard(io, config, real.clock(), &file_fallback);
+    if (tls != null) http_transport.client.guard = &guard;
     var peer_buffer: [64]u8 = undefined;
-    const peer_text = peer_address(&peer_buffer, config.peer_advertise);
-    agent.init(.{
-        .node = config.node,
-        .capacity = config.capacity,
-        .address = config.address,
-        .peer = peer_text,
-        .agent_version = build_options.version,
-    });
+    const agent = new_agent(gpa, config, &peer_buffer) catch return constants.exit_environment;
+    defer destroy_agent(gpa, agent);
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
     var swarm: Swarm = .{};
     defer swarm.stop(gpa); // Also after a start that failed with the store open.
@@ -421,16 +521,45 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .state_dir = config.state_dir,
         .agent = agent,
         .arena = BoundedArena.init(gpa, constants.request_arena_bytes_max),
-        .diag = undefined,
         .verbose = config.verbose,
         .policy = loop_mod.Loop.init(),
         .boot_id = boot_id,
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
+        .tls = http_transport.client.tls,
+        .relay_certs = .{ .node = config.node },
+        .guard = http_transport.client.guard,
     };
     defer shell.arena.deinit();
     announce(io, config);
     return serve(&shell, &diag, peer_identity.stored_problem);
+}
+
+/// Refuses to start (ZC-E0505) when the state directory holds a live lease that was taken
+/// under other labels: the agent would resume it, and the server would keep the old labels
+/// (`agent.kept_labels_allow`).
+fn refuse_relabel(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    backend: *Backend,
+    config: config_mod.Config,
+    boot_id: []const u8,
+    mono: @import("clock.zig").Clock,
+    diag: *Diag,
+) ?u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Absent is a first start; unreadable is the fence's to handle, as `Agent.restore` does.
+    const text = backend.pair_state.interface().read(arena, agent_mod.lease_file) catch return null;
+    const labels = config.labels;
+    if (agent_mod.kept_labels_allow(arena, text, labels, boot_id, mono.now_ms())) return null;
+    diag.raise(.E0505);
+    diag.cause("the node's labels differ from those it registered with, and its lease is " ++
+        "live", .{});
+    diag.fix(.{ .sentence = "to relabel the node, stop the agent for one lease ttl (the node " ++
+        "fences and registers again with the new labels) or empty --state-dir" });
+    return fail(io, diag, config.verbose);
 }
 
 /// Runs the agent's loop until it is told to stop, then saves the pair.
@@ -439,11 +568,28 @@ fn serve(shell: *Shell, diag: *Diag, stored_problem: bool) u8 {
         shell.show("\n", diag, "zcube-agent: ignoring it; the node joins the cluster CA again\n");
         diag.reset();
     }
+    if (shell.peer.node_certificate_missing) note_node_certificate_missing(shell);
     shell.notice_pair();
     install_signals();
     loop(shell);
     shell.save_pair(true);
     return constants.exit_ok;
+}
+
+/// Said once, at start: the stored credential is kept without its node certificate (an agent
+/// upgraded before its server, docs/agent.md). Not a failure: peer fetches go on.
+fn note_node_certificate_missing(shell: *Shell) void {
+    assert(shell.peer.credential != null);
+    assert(shell.peer.node_certificate == null);
+    var buffer: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "zcube-agent: {s}/{s} is missing beside a valid " ++
+        "{s}: the credential is kept, and the next renewal brings the node certificate " ++
+        "(a server older than this agent sends none: upgrade the server first)\n", .{
+        shell.peer.where,
+        agent_peer.node_certificate_file,
+        agent_peer.credential_file,
+    }) catch return; // A state directory path too long to quote: the renewal still runs.
+    std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
 }
 
 fn loop(shell: *Shell) void {
@@ -475,9 +621,12 @@ fn load_pair(
     remote: *remote_mod.RemoteStore,
     pair_state: *@import("fake_files.zig").DirState,
     state_dir: []const u8,
-    server: []const u8,
+    server_address: std.Io.net.IpAddress,
     diag: *Diag,
 ) error{BackendFailed}!void {
+    var server_buffer: [remote_mod.client.remembered_server_bytes_max]u8 = undefined;
+    // An IP address and a port always fit.
+    const server = std.fmt.bufPrint(&server_buffer, "{f}", .{server_address}) catch unreachable;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const state = pair_state.interface();
@@ -654,6 +803,57 @@ fn open_peer(io: std.Io, config: config_mod.Config, diag: *Diag) union(enum) {
     return .{ .opened = opened };
 }
 
+/// The check of the presented certificate before each connection (B7 slice 5), judged by `wall`.
+/// `--cert` and `--key`, if given, are read again from `file` when it is no longer valid.
+fn tls_guard(
+    io: std.Io,
+    config: config_mod.Config,
+    wall: @import("clock.zig").Clock,
+    file: *api_tls_guard.FileFallback,
+) api_tls_guard.Guard {
+    var guard: api_tls_guard.Guard = .{ .io = io, .wall = wall, .fallback = null, .silent = false };
+    const tls = config.tls orelse return guard;
+    const cert = tls.cert orelse return guard;
+    file.* = .{ .io = io, .cert = cert, .key = tls.key.?, .node = config.node };
+    guard.fallback = file.fallback();
+    return guard;
+}
+
+/// The API's TLS client (B7, docs/mtls.md): pins the CA of `--ca` and presents the node's own
+/// `node.crt` when it is usable now (that CA's, for `--node`, of `peer.key`, not expired), else
+/// `--cert` and `--key`, which must be a node certificate for `--node` valid now. With neither,
+/// one start-up error (ZC-E0806) says why `node.crt` was refused and how to get back in
+/// (docs/agent.md, "Node certificates"). Null when `--ca` is not given (plain HTTP).
+fn open_tls(
+    io: std.Io,
+    config: config_mod.Config,
+    peer: *const agent_peer.Peer,
+    credentials: *api_tls_client.Credentials,
+    now_ms: u64,
+    diag: *Diag,
+) api_tls_client.LoadError!?*api_tls_client.Credentials {
+    const tls = config.tls orelse return null;
+    try credentials.load_ca(io, tls.ca, tls.server_name, diag);
+    const identity: api_tls_client.NodeIdentity = .{
+        .where = peer.where,
+        .node = config.node,
+        .stored = if (peer.node_certificate) |*certificate| certificate else null,
+        .key_pair = peer.key,
+        .cert = tls.cert,
+        .key = tls.key,
+    };
+    const presented = api_tls_client.present_node(credentials, io, identity, now_ms, diag);
+    const stored_problem = try presented orelse return credentials;
+    if (peer.node_certificate != null) {
+        var buffer: [256]u8 = undefined;
+        const note = std.fmt.bufPrint(&buffer, "zcube-agent: the stored node.crt is not " ++
+            "presented ({s}); presenting --cert until the next renewal\n", .{stored_problem}) catch
+            "zcube-agent: the stored node.crt is not presented; presenting --cert\n";
+        std.Io.File.stderr().writeStreamingAll(io, note) catch {}; // Only a note.
+    }
+    return credentials;
+}
+
 /// Prints the diagnostic and returns the exit code its blame decides.
 pub fn fail(io: std.Io, diag: *const Diag, verbose: bool) u8 {
     assert(diag.code != null);
@@ -742,11 +942,33 @@ const Backend = struct {
     /// `server` (from `fetch_server_text`) and the config's strings.
     fn fetch_options(config: config_mod.Config, server: []const u8) ?fake_runtime.Fetch {
         const registry = config.registry orelse return null;
+        const tls = fetch_tls(config);
         return .{
             .node = config.node,
             .images_dir = config.images_dir.?,
             .registry = registry,
             .server = server,
+            .ca = tls.ca,
+            .tls_name = tls.tls_name,
+            .cert = tls.cert,
+            .key = tls.key,
+        };
+    }
+
+    /// The agent's TLS flags, by path, for the fetch child's read of the server's node list
+    /// (B7 slice 7); all empty without `--ca`. Never key bytes: the child reads the files.
+    fn fetch_tls(config: config_mod.Config) struct {
+        ca: []const u8 = "",
+        tls_name: []const u8 = "",
+        cert: []const u8 = "",
+        key: []const u8 = "",
+    } {
+        const tls = config.tls orelse return .{};
+        return .{
+            .ca = tls.ca,
+            .tls_name = tls.server_name,
+            .cert = tls.cert orelse "",
+            .key = tls.key orelse "",
         };
     }
 
@@ -776,6 +998,7 @@ const Backend = struct {
         var writer = std.Io.Writer.fixed(&box.server_text);
         writer.print("{f}", .{config.server}) catch return error.StartFailed;
         const server = writer.buffered();
+        const tls = fetch_tls(config);
         box.runtime.init(init.io, box.host_real.interface(), .{
             .gpa = gpa,
             .state_dir = config.state_dir,
@@ -786,6 +1009,10 @@ const Backend = struct {
                 .node = config.node,
                 .state_dir = config.state_dir,
                 .server = server,
+                .ca = tls.ca,
+                .tls_name = tls.tls_name,
+                .cert = tls.cert,
+                .key = tls.key,
             },
         }, diag) catch return error.StartFailed;
         errdefer box.runtime.deinit();

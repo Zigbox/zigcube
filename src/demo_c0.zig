@@ -133,6 +133,8 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
             .images = "",
             .store = "",
             .transcript_path = options.transcript,
+            // B7 slice 6: the demo talks to the TLS listener only, with certificates.
+            .tls_only = true,
             // Step 5's outage ends the node's lease, so the node is lost until it registers
             // again; a grace longer than the agent's reconnect (its backoff reaches 5 s) keeps
             // its replicas where they are, so the step's decisions do not depend on the race.
@@ -245,9 +247,10 @@ fn step_start(demo: *Demo) !void {
         return host.fail("could not empty the Postgres schema before the run", .{});
     };
     try host.start_server(state.start_wait_ms);
-    host.say("  zcube-server is up on 127.0.0.1:{d}, store {s}", .{
-        host.port, demo.backend.name(),
+    host.say("  zcube-server is up on 127.0.0.1:{d} ({s}), store {s}", .{
+        host.port, host.listener_text(), demo.backend.name(),
     });
+    try host.check_tls_only();
     try host.start_agent(state.node);
     const registered = struct {
         fn check(_: void, h: *Host) !bool {

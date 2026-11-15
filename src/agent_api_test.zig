@@ -68,6 +68,7 @@ const Rig = struct {
     ) api_mod.Response {
         const ctx = rig.world.controller_context();
         return rig.api.handle(&ctx, .{
+            .caller = .local,
             .method = method,
             .path = path,
             .query = query,
@@ -211,6 +212,54 @@ test "a lease that has ended is ZC-E0205, for a keepalive and for a registration
     var path: [96]u8 = undefined;
     const keepalive = try keepalive_path(&path, lease);
     try rig.refused(rig.call("POST", keepalive, "", ""), 503, "ZC-E0205");
+}
+
+test "a node may not renew or register on the lease of another node's registration (B7)" {
+    // Goal: a node certificate keeps its own node alive and no other. Method: node1 registers on
+    // its lease; node2 renews that lease (ZC-E0205: node2 is not registered on it) and registers
+    // on it (ZC-E0104); node1 renews it and registers on it again.
+    var rig = try Rig.start(3);
+    defer rig.stop();
+    const lease = try rig.grant("node1");
+    var buffer: [512]u8 = undefined;
+    const body = try register_text(&buffer, lease);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node1", "", body);
+    var path: [96]u8 = undefined;
+    const theirs = try keepalive_path(&path, lease); // Node2's path.
+    try rig.refused(rig.call("POST", theirs, "", ""), 503, "ZC-E0205");
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", body), 400, "ZC-E0104");
+    const own = try std.fmt.bufPrint(&path, "/v1/agent/nodes/node1/lease/{d}/keepalive", .{lease});
+    _ = try rig.ok("POST", own, "", "");
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node1", "", body);
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/", "");
+    try testing.expectEqual(@as(usize, 1), field(listed, "kvs").array.items.len);
+}
+
+test "registration refuses an exclusive label that names a key the node does not carry once" {
+    // Goal: B6's exclusive check. Method: register with `exclusive=tenant` and no tenant label,
+    // with two, then with exactly one; only the last is accepted, and the first two write nothing.
+    var rig = try Rig.start(2);
+    defer rig.stop();
+    const lease = try rig.grant("node2");
+    const before = try rig.revision();
+    var buffer: [768]u8 = undefined;
+    const head = "{{\"lease\":{d},\"capacity\":{{\"cpu_millis\":4000," ++
+        "\"memory_bytes\":8589934592}},";
+    const cases = [_][]const u8{
+        "\"labels\":[\"exclusive=tenant\"]}}",
+        "\"labels\":[\"tenant=a\",\"tenant=b\",\"exclusive=tenant\"]}}",
+    };
+    inline for (cases) |tail| {
+        const body = try std.fmt.bufPrint(&buffer, head ++ tail, .{lease});
+        try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", body), 400, "ZC-E0104");
+    }
+    try testing.expectEqual(before, try rig.revision());
+    const good = try std.fmt.bufPrint(
+        &buffer,
+        head ++ "\"labels\":[\"tenant=a\",\"exclusive=tenant\"]}}",
+        .{lease},
+    );
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", good);
 }
 
 test "a request the endpoints cannot understand is ZC-E0104 or ZC-E0101 and writes nothing" {
@@ -372,6 +421,17 @@ test "a report that is not this node's own, or not one transaction, is refused" 
         .{mine},
     );
     try rig.refused(rig.call("POST", path, "", elsewhere), 400, "ZC-E0104");
+    // `refused` is a job's exit kind only (B5); a replica never ends refused.
+    var refused_buffer: [384]u8 = undefined;
+    const refused = try std.fmt.bufPrint(&refused_buffer, "{{\"v\":2,\"replica\":\"hello-1\"," ++
+        "\"node\":\"node2\",\"generation\":1,\"tenure\":{d},\"status\":\"stopped\"," ++
+        "\"exit\":{{\"kind\":\"refused\"}},\"reported_at_ms\":2}}", .{rig.tenure});
+    const refused_put = try std.fmt.bufPrint(
+        &body,
+        "{{\"puts\":[{{\"key\":\"/observed/node2/hello-1\",\"value\":{s}}}]}}",
+        .{refused},
+    );
+    try rig.refused(rig.call("POST", path, "", refused_put), 400, "ZC-E0104");
     const twice = "{\"deletes\":[\"/observed/node2/a\",\"/observed/node2/a\"]}";
     try rig.refused(rig.call("POST", path, "", twice), 400, "ZC-E0104");
     const other_node = "{\"deletes\":[\"/observed/node3/a\"]}";
@@ -446,6 +506,7 @@ test "the watch says whether an assignment of the node changed, and holds when n
     // The shell asks again with `hold` false after a hold ended: no second hold.
     const ctx = rig.world.controller_context();
     const again = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = base,
         .query = hold_query,
@@ -688,6 +749,7 @@ const NoHashTransport = struct {
         const split = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
         const query = if (split < request.target.len) request.target[split + 1 ..] else "";
         const response = self.rig.api.handle(&ctx, .{
+            .caller = .local,
             .method = request.method,
             .path = request.target[0..split],
             .query = query,
@@ -715,6 +777,7 @@ test "a store with no hash at the agent's revision: no known_hash, and the agent
     var plain = rig.world.controller_context();
     plain.store = .{ .context = plain.store.context, .vtable = &no_hash_vtable };
     const response = rig.api.handle(&plain, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/agent/nodes/node1/replicas",
         .query = below,
@@ -1133,6 +1196,7 @@ test "a run's input is read at one revision" {
     vtable.get = GetSpy.get;
     ctx.store.vtable = &vtable;
     const response = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/agent/nodes/node2/runs/train/input",
         .query = "",

@@ -40,7 +40,10 @@ const agent_exe = "zcube-agent";
 /// The image digests the local agent's fake runtime has: `fixtures/images.zon`, which a person who
 /// installed the three executables does not have. A test keeps the two in step.
 const images_text =
-    \\.{ .images = .{ "b3:51aa9c03", "b3:9d20c4f1" } }
+    \\.{ .images = .{
+    \\    "b3:51aa9c03", "b3:9d20c4f1",
+    \\    "b3:51aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c03",
+    \\} }
     \\
 ;
 
@@ -460,7 +463,7 @@ const Local = struct {
         const database = std.fmt.allocPrint(local.arena, "sqlite:{s}/zcube.db", .{local.dir}) catch
             return local.out_of_memory();
         return local.spawn(.server, &.{
-            "--listen", address, "--store", database, "--create-store", "--quiet",
+            "--insecure-listen", address, "--store", database, "--create-store", "--quiet",
         });
     }
 
