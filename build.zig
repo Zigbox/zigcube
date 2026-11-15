@@ -601,9 +601,21 @@ fn add_bench_watch_step(b: *std.Build, options: ExecutablesOptions) void {
         .dependOn(&run.step);
 }
 
+/// The steps that boot QEMU guests need KVM and Zigbox's Linux `zbx`, which Zigbox's build does
+/// not define for a macOS host (asking for it panics while configuring). Off Linux they are
+/// registered as failing steps, so `zig build cli` configures on a Mac and `check` still finds
+/// its gates by name.
+fn add_linux_only_steps(b: *std.Build, names: []const []const u8) void {
+    for (names) |name| {
+        const why = b.fmt("{s} runs only on Linux: it boots QEMU guests with KVM", .{name});
+        b.step(name, why).dependOn(&b.addFail(why).step);
+    }
+}
+
 /// `zig build zigbox-smoke`: the Zigbox runtime on a real host, in a QEMU guest booted through
 /// Zigbox's exported `zigbox_vm` module (src/zigbox_smoke.zig). Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_zigbox_smoke_step(b: *std.Build, built: Built) void {
+    if (b.graph.host.result.os.tag != .linux) return add_linux_only_steps(b, &.{"zigbox-smoke"});
     const vm = b.dependency("zigbox", .{}).module("zigbox_vm");
     // The guest runs the host's architecture; Zigbox's zbx is static and libc-free, and the guest
     // gets it only to run `zbx doctor` for the log of a failure.
@@ -852,6 +864,7 @@ fn add_demo_b1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
 /// server on the host over SQLite, four QEMU guests booted through Zigbox's `zigbox_vm`, each
 /// with one `zcube-agent --runtime zigbox`. Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    if (b.graph.host.result.os.tag != .linux) return add_linux_only_steps(b, &.{"demo-c2"});
     const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
     const exe = b.addExecutable(.{
         .name = "demo_c2",
@@ -887,6 +900,9 @@ fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
 /// on the host with one relay, one QEMU guest with `zcube-agent --runtime zigbox`, a relayed job
 /// that tries to reach the world. Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    if (b.graph.host.result.os.tag != .linux) {
+        return add_linux_only_steps(b, &.{ "demo-b3", "demo-b3-build" });
+    }
     const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
     const exe = b.addExecutable(.{
         .name = "demo_b3",
@@ -940,6 +956,9 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
 /// SQLite on the host, three digest-pinned Alpine images, judged at every revision by
 /// `c3_witness.zig`. Skips unless `ZCUBE_REAL_HOST=1` (KVM).
 fn add_demo_c3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    if (b.graph.host.result.os.tag != .linux) {
+        return add_linux_only_steps(b, &.{ "demo-c3", "demo-c3-build" });
+    }
     const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
     const exe = b.addExecutable(.{
         .name = "demo_c3",
