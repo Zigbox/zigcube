@@ -154,6 +154,16 @@ const Fixture = struct {
 
     /// Reports every replica of generation `generation` that has no report yet as `status`.
     fn report(self: *Fixture, generation: u64, status: records.ObservedStatus) !u32 {
+        return self.report_health(generation, status, null);
+    }
+
+    /// `report`, with the health check's verdict (absent for a replica without a check).
+    fn report_health(
+        self: *Fixture,
+        generation: u64,
+        status: records.ObservedStatus,
+        health: ?records.HealthState,
+    ) !u32 {
         var ids: [constants.replicas_per_service_max][64]u8 = undefined;
         var lens: [constants.replicas_per_service_max]usize = undefined;
         var count: u32 = 0;
@@ -163,6 +173,7 @@ const Fixture = struct {
             lens[count] = replica.rec.id.len;
             count += 1;
         }
+        const failures: u32 = @intFromBool(health == .unhealthy);
         for (0..count) |index| {
             const id = ids[index][0..lens[index]];
             const observed: records.Observed = .{
@@ -171,6 +182,9 @@ const Fixture = struct {
                 .generation = generation,
                 .status = status,
                 .reported_at_ms = self.manual.ms,
+                .health = health,
+                .health_failures = if (health) |_| failures else null,
+                .last_probe_exit = if (health) |_| @intCast(failures) else null,
             };
             const key = records.observed_key("node1", id);
             try self.put(.{ .agent = "node1" }, key.slice(), observed);
@@ -432,6 +446,52 @@ test "a rolling update starts one new replica at a time and retires an old one o
     const done = try fixture.rollout();
     try testing.expectEqual(records.RolloutPhase.complete, done.phase);
     try testing.expectEqual(@as(u64, 2), done.to);
+}
+
+test "a replica with a health check is ready only while its report says healthy" {
+    // Goal: the brief's "a replica counts only when its health check passes" (demo-c3 step 3).
+    // A new replica that runs but is `unknown` or `unhealthy` is never ready, however long it
+    // runs, so no old replica is retired for it; once it reports `healthy`, `min_ready_ms`
+    // counts from then. Method: roll a service with a check to a new image, report the new
+    // replica running with each verdict, and count the old generation after each wait.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = .{
+        .command = &.{ "test", "-f", "/tmp/ready" },
+        .interval_ms = 1000,
+        .timeout_ms = 1000,
+        .failure_threshold = 2,
+        .success_threshold = 1,
+    };
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b11";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    for ([_]records.HealthState{ .unknown, .unhealthy }) |verdict| {
+        _ = try fixture.report_health(2, .running, verdict);
+        try fixture.settle();
+        fixture.manual.advance(min_ready_ms + 100);
+        try fixture.settle();
+        try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+        try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    }
+    _ = try fixture.report_health(2, .running, .healthy);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms / 2);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    fixture.manual.advance(min_ready_ms / 2 + 100);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
 }
 
 test "a kept replica that stops between the read and the commit fails the retirement" {
