@@ -33,6 +33,7 @@ const assert = std.debug.assert;
 const controller = @import("controller.zig");
 const records = @import("records.zig");
 const mesh_address = @import("mesh_address.zig");
+const runtime = @import("runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -613,6 +614,104 @@ fn service_of_replica(services: []const Service, replica: []const u8) ?[]const u
 }
 
 // ---- Tests ----
+
+// ---- One node's view, and one replica's rules (C4 slice 4) ----
+
+/// The part of `input` that `plan(_, node)` reads: every service, the replicas on `node`, and
+/// every replica of a service that grants one of those replicas' services. So
+/// `plan(input_for(x, n), n)` equals `plan(x, n)` (the test below), and what the server sends an
+/// agent (`GET /v1/agent/nodes/{node}/mesh`) names no replica the node has no use for.
+pub fn input_for(arena: Allocator, input: *const Input, node: []const u8) Allocator.Error!Input {
+    assert(node.len > 0);
+    assert_input(input);
+    var replicas: std.ArrayList(Replica) = .empty;
+    for (input.replicas) |replica| {
+        if (on_node(&replica, node) or grants_a_local_source(input, replica.service, node)) {
+            try replicas.append(arena, replica);
+        }
+    }
+    const result: Input = .{ .services = input.services, .replicas = replicas.items };
+    assert_input(&result);
+    return result;
+}
+
+fn on_node(replica: *const Replica, node: []const u8) bool {
+    const replica_node = replica.node orelse return false;
+    return std.mem.eql(u8, replica_node, node);
+}
+
+fn grants_a_local_source(input: *const Input, service: []const u8, node: []const u8) bool {
+    const destination = find_service(input, service) orelse return false;
+    for (destination.allow) |grant| {
+        for (input.replicas) |*replica| {
+            if (std.mem.eql(u8, replica.service, grant.from) and on_node(replica, node)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The rules of one local replica, as `Runtime.mesh_update` takes them: the destinations its
+/// listeners forward to, each with its endpoints in the order the replica tries them
+/// (`Destination.pick` from its `order_hash`), its listeners, and what it accepts. A replica the
+/// plan names nowhere gets empty rules: nothing to listen for, nothing accepted.
+pub fn rules_of(
+    arena: Allocator,
+    result: *const Plan,
+    replica: []const u8,
+) Allocator.Error!runtime.MeshRules {
+    assert(replica.len > 0);
+    // Plan destination index to rules destination index, for those this replica listens for.
+    const index_of = try arena.alloc(?u32, result.destinations.len);
+    @memset(index_of, null);
+    var destinations: std.ArrayList(runtime.MeshDestination) = .empty;
+    var listeners: std.ArrayList(runtime.MeshListener) = .empty;
+    for (result.listeners) |listener| {
+        if (!std.mem.eql(u8, listener.source, replica)) continue;
+        const slot = &index_of[listener.destination];
+        if (slot.* == null) {
+            slot.* = @intCast(destinations.items.len);
+            const destination = &result.destinations[listener.destination];
+            try destinations.append(arena, .{
+                .service = destination.service,
+                .address = destination.address,
+                .endpoints = try endpoints_in_order(arena, destination, listener.hash),
+            });
+        }
+        try listeners.append(arena, .{ .destination = slot.*.?, .port = listener.port });
+    }
+    var accepts: std.ArrayList(runtime.MeshAccept) = .empty;
+    for (result.accepts) |accept| {
+        if (!std.mem.eql(u8, accept.replica, replica)) continue;
+        try accepts.append(arena, .{
+            .from = accept.from,
+            .port = accept.port,
+            .open = accept.open,
+        });
+    }
+    const rules: runtime.MeshRules = .{
+        .destinations = destinations.items,
+        .listeners = listeners.items,
+        .accepts = accepts.items,
+    };
+    assert(runtime.mesh_rules_problem(&rules) == null);
+    return rules;
+}
+
+fn endpoints_in_order(
+    arena: Allocator,
+    destination: *const Destination,
+    hash: u64,
+) Allocator.Error![]const runtime.MeshEndpoint {
+    const endpoints = try arena.alloc(runtime.MeshEndpoint, destination.count());
+    for (endpoints, 0..) |*slot, attempt| {
+        const picked = destination.pick(hash, @intCast(attempt)).?;
+        slot.* = .{ .replica = picked.replica, .endpoint = picked.endpoint };
+    }
+    assert(destination.pick(hash, @intCast(endpoints.len)) == null);
+    return endpoints;
+}
 
 const testing = std.testing;
 

@@ -328,8 +328,43 @@ fn plan_once(faults: mesh_plan.Faults, seed: u64) !void {
         const plan = try mesh_plan.plan_with(arena, &input, node, faults);
         try listeners_hold(&input, &plan, node);
         try accepts_hold(&input, &plan, node);
+        // C4 slice 4: the node's view plans the same, and each replica's rules are its share.
+        const view = try mesh_plan.input_for(arena, &input, node);
+        try std.testing.expectEqualDeep(plan, try mesh_plan.plan_with(arena, &view, node, faults));
+        try rules_hold(arena, &input, &plan, node);
     }
     try checks_hold(arena, &input);
+}
+
+/// Each local replica's rules hold exactly its listeners and accepts, every destination of them
+/// with all of its endpoints, each once.
+fn rules_hold(
+    arena: std.mem.Allocator,
+    input: *const mesh_plan.Input,
+    plan: *const mesh_plan.Plan,
+    node: []const u8,
+) !void {
+    for (input.replicas) |*replica| {
+        if (!on(replica, node)) continue;
+        const rules = try mesh_plan.rules_of(arena, plan, replica.id);
+        var listeners: usize = 0;
+        for (plan.listeners) |listener| {
+            if (!std.mem.eql(u8, listener.source, replica.id)) continue;
+            const kept = rules.listeners[listeners];
+            try std.testing.expectEqual(listener.port, kept.port);
+            const planned = &plan.destinations[listener.destination];
+            const destination = &rules.destinations[kept.destination];
+            try std.testing.expectEqualStrings(planned.service, destination.service);
+            try std.testing.expectEqual(planned.count(), destination.endpoints.len);
+            listeners += 1;
+        }
+        try std.testing.expectEqual(listeners, rules.listeners.len);
+        var accepts: usize = 0;
+        for (plan.accepts) |accept| {
+            accepts += @intFromBool(std.mem.eql(u8, accept.replica, replica.id));
+        }
+        try std.testing.expectEqual(accepts, rules.accepts.len);
+    }
 }
 
 fn plan_sound(seed: u64) !void {
