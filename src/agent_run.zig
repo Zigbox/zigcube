@@ -428,7 +428,9 @@ fn agent_settings(config: config_mod.Config, buffer: *[64]u8) agent_mod.Config {
         .capacity = config.capacity,
         .address = config.address,
         .peer = peer_text,
-        .mesh = mesh_config(peer_text, config.mesh_ports),
+        // The Zigbox runtime has no mesh yet and refuses a spec with one (ZC-E0711): a Zigbox
+        // node that serves peers would fail every replica start, so its replicas get none.
+        .mesh = if (config.runtime == .zigbox) null else mesh_config(peer_text, config.mesh_ports),
         .agent_version = build_options.version,
     };
 }

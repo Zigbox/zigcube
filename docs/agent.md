@@ -352,6 +352,30 @@ builds two agents with each fail-closed check removed and passes only if the tes
 
 The Zigbox runtime's relay is still plain TCP until B4 slice 4.
 
+## The mesh (C4 slice 4)
+
+`agent_mesh.zig`. When the agent advertises a peer address (the host of the address it gives
+C2's chunk server) it runs the mesh: each replica container that starts is given the lowest free
+port of `--mesh-ports A-B` (default 30000-30999, `mesh_ports` in a ZON file), kept in its
+`zcube.mesh-port` label so it survives an agent restart, and publishes `<host>:<port>` as its
+`endpoint` in `/observed`. Each step the agent reads the node's view
+(`GET /v1/agent/nodes/{node}/mesh`, docs/api.md), plans it with `mesh_plan.plan` and
+
+- hands a replica that starts its port and rules in `Runtime.Spec.mesh`;
+- sends each running replica whose rules changed its whole rule set through
+  `Runtime.mesh_update` (non-blocking; the supervisor applies the difference). The last hash
+  sent per replica is kept in memory, so a restarted agent sends each replica its rules once.
+
+A view that cannot be read is noted and holds nothing back: replicas start with empty rules
+and get theirs at the next step that reads it. A replica the range has no port for, and a port
+the supervisor cannot bind, are start failures with ZC-E0710 (blame: environment); the replica
+controller replaces such a replica, so a spent range on a one-node cluster churns (see
+docs/decisions/2026-11-15-c4-slice4-mesh-view.md). Without an advertised peer address there is
+no mesh. `FakeRuntime`'s supervisor binds the replica's port on all addresses (no
+`SO_REUSEPORT`, so a collision fails the start) and its listeners on the services' mesh
+addresses with `SO_REUSEPORT`. The Zigbox runtime has no mesh yet (it refuses a mesh spec with `ZC-E0711`), so a `--runtime zigbox` agent runs none. The simulator
+gives its agents no mesh source, so its worlds are unchanged.
+
 ## What survives what
 
 | Event | Containers | The agent's work |

@@ -12,6 +12,7 @@ const constants = @import("constants.zig");
 const agent_client = @import("agent_client.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
+const mesh_plan = @import("mesh_plan.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
 const Diag = @import("diag.zig").Diag;
@@ -1391,4 +1392,34 @@ test "a report of a retired or superseded run is applied: false and writes nothi
     const retired = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", late);
     try testing.expect(!field(retired, "applied").bool);
     try testing.expectEqual(after, try rig.revision());
+}
+
+test "a node's mesh view names every service and its replicas, and takes only `known`" {
+    // Goal: the read behind `agent_mesh` (C4 slice 4). Method: apply a service, let node1's
+    // replicas run, read node1's view, parse it as the agent does (`agent_client.mesh_input`
+    // reads the same fields) and check the plan's input rules; then the refusals.
+    var rig = try Rig.start(4);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const answer = rig.call("GET", "/v1/agent/nodes/node1/mesh", "", "");
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    const View = struct {
+        revision: u64,
+        services: []const mesh_plan.Service,
+        replicas: []const mesh_plan.Replica,
+    };
+    const arena = rig.parsed.allocator();
+    const body = try arena.dupe(u8, answer.body);
+    const view = try std.json.parseFromSliceLeaky(View, arena, body, .{
+        .ignore_unknown_fields = true,
+    });
+    try testing.expect(view.revision > 0);
+    try testing.expectEqual(@as(usize, 1), view.services.len);
+    try testing.expectEqualStrings("hello", view.services[0].name);
+    const input: mesh_plan.Input = .{ .services = view.services, .replicas = view.replicas };
+    try testing.expectEqual(@as(?[]const u8, null), mesh_plan.input_problem(&input));
+    try expect_chain(&rig, try rig.json(answer), null);
+    try rig.refused(rig.call("GET", "/v1/agent/nodes/node1/mesh", "from=1", ""), 400, "ZC-E0104");
+    try rig.refused(rig.call("POST", "/v1/agent/nodes/node1/mesh", "", "{}"), 400, "ZC-E0104");
 }

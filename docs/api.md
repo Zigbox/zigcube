@@ -693,6 +693,7 @@ runs unchanged on the far side of HTTP:
 | `get(/job-input/<name>)` | `GET /v1/agent/nodes/{node}/runs/{name}/input` |
 | (no store write: the CA signs a relayed run's key, B4) | `POST /v1/agent/nodes/{node}/runs/{name}/certificate` |
 | (no store write: the CA signs a service replica's key, C4 slice 3) | `POST /v1/agent/nodes/{node}/replicas/{id}/certificate` |
+| `list` of `/services/`, `/replicas/`, `/assigned/`, `/observed/` and `/nodes/` at one revision, narrowed to the node's view (C4 slice 4) | `GET /v1/agent/nodes/{node}/mesh` |
 | `list(/job-observed/<node>/)`; `txn` with one put there | `GET` / `POST /v1/agent/nodes/{node}/job-observed` |
 | (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
 
@@ -944,6 +945,34 @@ cause is a 503: the paragraph above on causes that are not final is about runs o
 the server has not yet assigned to `{node}` is refused like one assigned elsewhere (a supervisor asks
 only for a replica its node runs). A newer assignment or digest is a new ask. The call writes no
 store key, and is unauthenticated until B7 (docs/mtls.md, "Issuance").
+
+### `GET /v1/agent/nodes/{node}/mesh` (C4 slice 4)
+
+The node's view of the mesh, from one snapshot: every service (`name`, `mesh_address`, `allow`)
+and the replicas whose rules on this node depend on (`mesh_plan.input_for`: the node's own
+replicas and the replicas of every service they may reach), each with the readiness the plan
+judges and the endpoint its node published in `/observed`. The agent plans from it as the server
+would (`mesh_plan.plan`) and hands each local replica's supervisor its rules
+(`Runtime.mesh_update`, docs/agent.md, "The mesh").
+
+```json
+{ "revision": 512,
+  "services": [ {"name": "api", "mesh_address": "10.77.0.1",
+                 "allow": [{"from": "hello", "port": 8080}]},
+                {"name": "hello", "mesh_address": "10.77.0.2", "allow": []} ],
+  "replicas": [ {"id": "api-1", "service": "api", "node": "node2",
+                 "endpoint": "10.0.0.2:30000", "readiness": "ready", "draining": false},
+                {"id": "hello-1", "service": "hello", "node": "node1",
+                 "endpoint": "10.0.0.1:30000", "readiness": "ready", "draining": false} ],
+  "chain": { ... } }
+```
+
+`readiness` is one of `ready`, `not_assigned`, `not_reported`, `stale_report`, `node_not_ready`,
+`starting`, `stopped`, `not_healthy`. `GET` only; no query but `known`. The agent refuses an
+answer that breaks the plan's input rules (services in order of name, each replica's service
+listed) as a store failure (`ZC-E0213`) and gives its replicas empty rules until a read succeeds.
+The server reads the whole snapshot for each call; a grant or readiness change does not wake the
+agent's watch, so new rules reach a supervisor within the agent's step period.
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 
