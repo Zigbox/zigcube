@@ -4627,7 +4627,7 @@ test "a placed replica's wait accrues while its agent works, not while it fences
     var report: Report = .{};
     const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
     defer c.destroy();
-    c.apply("hello", hello_digest, 2);
+    c.apply("hello", hello_digest, 2, specs[0]);
     c.advance(5_000);
     try testing.expect(!report.failed);
     const node = c.nodes[0];
