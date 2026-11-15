@@ -32,6 +32,7 @@ const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
+const rollback = @import("rollback.zig");
 const rollout_steer = @import("rollout_steer.zig");
 const secure_random = @import("secure_random.zig");
 const testpeer = @import("tls_testpeer.zig");
@@ -178,13 +179,13 @@ fn no_hash(diag: *diag_mod.Diag) void { // store_failures.zig
 }
 
 fn backwards(diag: *diag_mod.Diag) void { // store_failures.zig
-    const rollback: failures.Rollback = .{
+    const went: failures.Rollback = .{
         .remembered_revision = 412,
         .remembered_hash = @splat(0xa1),
         .now_revision = 398,
         .now_hash = @splat(0xe5),
     };
-    assert(failures.went_backwards(diag, rollback) == error.BackendFailed);
+    assert(failures.went_backwards(diag, went) == error.BackendFailed);
 }
 
 fn unusable_file(diag: *diag_mod.Diag) void { // store_failures.zig
@@ -284,13 +285,12 @@ fn rollout_invalid(diag: *diag_mod.Diag) void { // apply.zig
 }
 
 fn rollback_nothing(diag: *diag_mod.Diag) void { // C3 slice 8: the rollback handler
-    const cause = "service hello has run only generation 1";
-    sample(diag, .E0127, &.{cause}, "apply the service file you want to run");
+    // The server's own text (rollback.zig), not a copy of it.
+    rollback.raise_nothing(diag, "hello", 1, null);
 }
 
 fn rollback_compacted(diag: *diag_mod.Diag) void { // C3 slice 8: the rollback handler
-    const cause = "generation 3 of hello is not in its history (it keeps generations 7 to 22)";
-    sample(diag, .E0128, &.{cause}, "list the generations that can be restored");
+    rollback.raise_not_in_history(diag, "hello", 23, 3, 7, 22);
 }
 
 fn rollout_none(diag: *diag_mod.Diag) void { // C3 slice 11: pause and resume

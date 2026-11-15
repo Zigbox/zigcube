@@ -67,7 +67,7 @@ the layout.
 
 | Prefix | Sole writer | Holds | Lifetime |
 | --- | --- | --- | --- |
-| `/services/<name>` | API (`apply`, `delete`) | desired service | until deleted |
+| `/services/<name>` | API (`apply`, `delete`, `rollback`; the rollout controller's automatic rollback calls the same handler in the `api` role, C3 slice 8, owner question O3, `src/rollback.zig`) | desired service | until deleted |
 | `/jobs/<name>`, `/job-input/<name>`, `/job-admission` | API | B1 (§7): the job's spec, its input, and the aggregate of creations | until retention |
 | `/job-runs/<name>`, `/job-status/<name>`, `/job-endings` | job controller | B1 (§7): the run, how it is going and how it ended, the aggregate of endings | until retention |
 | `/job-observed/<node>/<name>` | that node's agent | B1 (§7): a run's claim and what the agent saw | until retention |

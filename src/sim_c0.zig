@@ -721,7 +721,7 @@ fn converged(run: *Run) Failure!void {
     try run.check(.fuzz, world.sim.running_count() == running_total, "containers left behind");
 }
 
-/// A service whose rollout failed or was paused (C3, until slice 8 rolls back): it keeps at least
+/// A service whose rollout was paused or failed owing no rollback (C3): it keeps at least
 /// what it asks for and at most `max_surge` more; replicas of the broken image do not run, and
 /// every other replica does.
 fn halted_converged(run: *Run, service: *const controller.Entry(records.Service)) Failure!void {

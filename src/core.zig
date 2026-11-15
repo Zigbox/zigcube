@@ -28,6 +28,7 @@ pub const modules = .{
     @import("apply.zig"),
     @import("history.zig"),
     @import("rollout_plan.zig"),
+    @import("rollback.zig"),
     @import("rollout_steer.zig"),
     @import("chunk_summary.zig"),
     @import("mtls_smoke.zig"),

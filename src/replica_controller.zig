@@ -313,7 +313,7 @@ const Run = struct {
                 item.lost = run.lost_placement(replica.rec.id);
                 if (item.lost != null) item.class = .dead;
             }
-            item.running = if (observed) |found| found.rec.status == .running else false;
+            item.running = running_healthy(&replica.rec, observed, item.class == .stale);
             plan.items[plan.count] = item;
             plan.count += 1;
         }
@@ -1205,6 +1205,31 @@ pub fn admissible_in(
     const status = snap.status_of(entry.rec.node) orelse return null;
     if (status.rec.state != .ready) return null;
     return entry;
+}
+
+/// Whether the report says the replica runs and, if it has a health check, is healthy: the
+/// rollout controller's "running" (`rollout_controller.update`), so the two agree on which old
+/// replicas are ready (retired within `budget.retire`, counted by the R1 floor) and which are not
+/// (`budget.retire_unready`): an unhealthy replica of a failed rollout is not ready. A `stale`
+/// (old) replica whose health is `unknown` counts as running: an agent restart reports every
+/// replica `unknown` until it probes again, and that must not make old replicas free to retire
+/// (docs/decisions/2026-11-15-c3-rollout-health-gate.md). Counting it running is the cautious
+/// side here: it is retired only within `budget.retire` and above the floor. The rollout
+/// controller's `update` counts an old `unknown` replica running too, even one never healthy, so
+/// the two agree and a rollback over checks that never settle still ends.
+fn running_healthy(
+    replica: *const records.Replica,
+    observed: ?*const Entry(records.Observed),
+    stale: bool,
+) bool {
+    const found = observed orelse return false;
+    if (found.rec.status != .running) return false;
+    if (replica.health == null) return true;
+    return switch (records.observed_health(&found.rec)) {
+        .healthy => true,
+        .unknown => stale,
+        .unhealthy => false,
+    };
 }
 
 fn by_number(context: void, first: Item, second: Item) bool {

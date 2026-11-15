@@ -35,6 +35,7 @@ const codes = @import("diag/codes.zig");
 const agent_api = @import("agent_api.zig");
 const apply_mod = @import("apply.zig");
 const history = @import("history.zig");
+const rollback = @import("rollback.zig");
 const rollout_steer = @import("rollout_steer.zig");
 const job_api = @import("job_api.zig");
 const constants = @import("constants.zig");
@@ -591,6 +592,24 @@ const RolloutReply = struct {
     revision: ?store.Revision = null,
     decision: ?[]const u8 = null,
 };
+
+const RollbackReply = struct {
+    request_id: []const u8,
+    action: []const u8 = "rollback",
+    name: []const u8,
+    /// The new generation, which holds the restored spec.
+    generation: u64,
+    restores: u64,
+    change: []const u8,
+    revision: store.Revision,
+    decision: []const u8,
+};
+
+fn rollback_reply(ctx: *const Context, reply: RollbackReply) Failure!Reply {
+    const out = Out.create(ctx) catch return no_memory(ctx);
+    try out.value(reply);
+    return out.finish();
+}
 
 fn rollout_reply(ctx: *const Context, reply: RolloutReply) Failure!Reply {
     const out = Out.create(ctx) catch return no_memory(ctx);
@@ -1689,12 +1708,14 @@ const Call = struct {
         return out.finish();
     }
 
-    /// POST /v1/services/{name}/rollout/pause|resume, body empty or `{"applied_by": "..."}`.
+    /// POST /v1/services/{name}/rollout/pause|resume, body empty or `{"applied_by": "..."}`;
+    /// POST /v1/services/{name}/rollback[?to=N] (`rollback_post`).
     fn rollout_post(call: Call, body: []const u8, id: []const u8) Failure!Reply {
         const ctx = call.ctx;
-        try call.query.allow(ctx, &.{});
         const name = call.parts.next() orelse return no_such(ctx, "/v1/services");
         const what = call.parts.next() orelse return no_such(ctx, "/v1/services/<name>");
+        if (std.mem.eql(u8, what, "rollback")) return call.rollback_post(name, body, id);
+        try call.query.allow(ctx, &.{});
         const verb = call.parts.next() orelse return no_such(ctx, "/v1/services/<name>/rollout");
         try call.no_more();
         if (!std.mem.eql(u8, what, "rollout")) {
@@ -1742,6 +1763,46 @@ const Call = struct {
                 .change = "no change",
             }),
             .conflict => rollout_conflict(ctx, name),
+        };
+    }
+
+    /// POST /v1/services/{name}/rollback[?to=N], body empty or `{"applied_by": "..."}`: applies
+    /// the spec of a stored generation as a new one (`rollback.zig`).
+    fn rollback_post(call: Call, name: []const u8, body: []const u8, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        try call.query.allow(ctx, &.{"to"});
+        try call.no_more();
+        const to = try call.query.number(ctx, "to");
+        if (to) |wanted| {
+            if (wanted == 0) return bad_request(ctx, "to", "is not a generation (they start at 1)");
+        }
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid service name");
+        }
+        var by: []const u8 = anonymous;
+        if (body.len > 0) {
+            const parsed = std.json.parseFromSliceLeaky(CancelBody, ctx.arena, body, .{}) catch
+                return bad_request(ctx, "body", "is not {\"applied_by\": \"...\"} or empty");
+            by = parsed.applied_by;
+        }
+        try check_applied_by(ctx, by);
+        const result = rollback.rollback(ctx, &call.api.source, .{
+            .name = name,
+            .to = to,
+            .applied_by = by,
+            .request_id = id,
+        }) catch return propagate(ctx);
+        return switch (result) {
+            .written => |done| rollback_reply(ctx, .{
+                .request_id = id,
+                .name = name,
+                .generation = done.generation,
+                .restores = done.restores,
+                .change = done.change,
+                .revision = done.revision,
+                .decision = done.decision,
+            }),
+            .conflict => conflict(ctx, name),
         };
     }
 

@@ -580,14 +580,28 @@ failed too), R3 (every replica created runs a
 generation in the service's history), R4 (a paused rollout starts and retires nothing; a scale
 down the user asked for is exempt, counted as the replica controller counts it: held replicas and
 replicas on a node not yet lost count, `docs/decisions/2026-11-14-c3-paused-scale-down.md`) and R6 (a history record never changes under its generation).
-R5 (auto-rollback) waits for slice 8. Each check is a little weaker than its sentence in the
+Slice 8 adds R5, R7 and R8. R5: a history record with `restores` copies the spec (image,
+source, command, env, limits, health) of the generation it names, which must be in the history;
+and a rollout of reason `rollback` that completes leaves no live replica (not stopped, not on a
+lost node) of its service running another spec. R8: an `auto_rollback` lands only over the
+service whose rollout failed (the service still at the generation after the failed one's, its
+rollout still `failed`), so it never overwrites a newer apply; and it answers that rollout: it
+restores the rollout's `from` and its `rollback` decision names the rollout's `cause_decision`
+as its cause (`resync` when that is empty). R7 is judged at the liveness
+stage, after the heal (`rollouts_settle` in `src/sim_cluster.zig`): no service's rollout is still
+active past its deadline plus a slack of 30 s (the controller's resync), and no failed rollout
+still owes its automatic rollback. A service with no rollout record of its current generation
+is not R7's (`converged`, judged just before, covers its replicas). Under `--c3` an apply also
+draws its command, env and limits from three specs (`rollout_prng`), so a rollback that fails to
+copy one of them fails R5; health stays the world's (`--health`). `completed=` counts each
+rollback once, though R5 judges every write of its complete rollout record. Each check is a little weaker than its sentence in the
 brief, never stronger. Readiness is observed `running`: slices 9 and 10 (probes, health) replace
 it in `rollout_controller.Track`.
 
 With `--c3` the world also pauses and resumes rollouts (`rollout_prng`, a stream of its own, so a
 run without `--c3` draws as before), and resumes any paused rollout at the heal. The report adds
-`sim-c3 R1 retirements=.. doubted=.. R2 surges=.. R3 versions=.. R4 paused=.. R6 history=..; pauses=..
-resumes=..` (`doubted` counts the replicas R1 gave that benefit; the simulator's controllers
+`sim-c3 R1 retirements=.. doubted=.. R2 surges=.. R3 versions=.. R4 paused=.. R5 rollbacks=..
+completed=.. R6 history=.. R7 settled=.. R8 auto=..; pauses=.. resumes=..` (`doubted` counts the replicas R1 gave that benefit; the simulator's controllers
 read and commit with nothing between, so it is 0 there, and the unit tests in
 `src/rollout_controller_test.zig` write between the read and the commit instead). The race the
 floor's compares close (a kept replica that stops between a retirement's read and its commit,
@@ -601,4 +615,7 @@ controller spends the budget on the plan it read, comparing neither the replica 
 rollout record, and ignores `max_unavailable`: R1), `rollout_pause` (the replica controller keeps
 a progressing budget while a rollout is paused or failed: R4) and
 `rollout_history` (`history.put` also writes the new record over the previous generation's key:
-R6). They are not yet in the canary manifest: the fleet has no `sim-c3` kind.
+R6), and slice 8's `rollout_exact` (a rollback keeps the current image: R5), `rollout_race` (the
+controller remembers an owed rollback and carries it out a pass later on the service as it is
+then, without comparing the service revision its pass read: R8) and `rollout_stuck` (the
+controller never carries out an owed rollback: R7). They are not yet in the canary manifest: the fleet has no `sim-c3` kind.

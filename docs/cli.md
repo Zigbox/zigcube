@@ -241,7 +241,7 @@ restarts the listing (up to 8 times, then `ZC-E0103`); a list of more than 1,024
 
 `job logs` is not here: slice 8 is cut.
 
-## rollout, history and rollback (C3 slice 11; rollback planned for slice 8)
+## rollout, history and rollback (C3 slices 11 and 8)
 
 `zcube history <service>` lists the stored generations (at most 16, newest first), the current one
 marked `*`, with its image (shortened past 15 bytes), why it was made (`apply`, or `rollback of N`),
@@ -267,8 +267,12 @@ policy: rolling, surge 1, unavailable 0, min ready 5s, deadline 600s, on failure
 `zcube rollout pause|resume <service>` steers it and prints `hello: progressing → paused (decision
 d-7)`, or `hello: already paused, no change`. Without a rollout, or once it is complete, both are
 `ZC-E0129`, as is a resume of a failed rollout (pause it first). `-o json` prints the server's answer; `-o wide` is not taken. `zcube rollback <service>
-[--to GENERATION]` (slice 8) will apply one of the stored generations again as a new generation
-(users address versions by generation, owner 2026-11-05). The codes these relay, `ZC-E0125` to
+[--to GENERATION]` (slice 8) applies one of the stored generations again as a new generation
+(users address versions by generation, owner 2026-11-05): without `--to`, the newest stored one
+below the current. It prints `hello: generation 7 → 8, restoring 6 (decision d-9)`; `-o json` prints
+the server's answer. After an automatic rollback (say generation 7 failed and generation 8 restored
+6), a bare `zcube rollback` restores 7, the newest below the current: the broken one. Name the
+generation you want with `--to` (`zcube history` lists them). `--to` is refused on any other command. The codes these relay, `ZC-E0125` to
 `E0129`, are in [api.md](api.md), "Rollouts and history".
 
 ### Upgrading

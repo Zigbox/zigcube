@@ -1,8 +1,10 @@
-//! `zcube rollout status|pause|resume <service>` and `zcube history <service>` (docs/cli.md,
-//! C3 slice 11), over `GET /v1/services/{name}/rollout`, `POST .../rollout/pause|resume` and
-//! `GET /v1/services/{name}/history` (docs/api.md, "Rollouts and history"). Status and history
-//! are reads; pause and resume are writes the server makes as the rollout controller
-//! (src/rollout_steer.zig). The text functions are pure, so each shape is a unit test.
+//! `zcube rollout status|pause|resume <service>`, `zcube history <service>` (docs/cli.md,
+//! C3 slice 11) and `zcube rollback <service> [--to N]` (slice 8), over
+//! `GET /v1/services/{name}/rollout`, `POST .../rollout/pause|resume`,
+//! `GET /v1/services/{name}/history` and `POST /v1/services/{name}/rollback` (docs/api.md,
+//! "Rollouts and history"). Status and history are reads; pause and resume are writes the server
+//! makes as the rollout controller (src/rollout_steer.zig), a rollback one it makes as the API
+//! (src/rollback.zig). The text functions are pure, so each shape is a unit test.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -56,6 +58,31 @@ pub fn rollout(
     } catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Contract => return cli_data.contract(report, reply.request_id, "is not a rollout"),
+    };
+    try cli_commands.emit(env, .stdout, out, report);
+}
+
+/// `zcube rollback <service> [--to N]`: `POST /v1/services/{name}/rollback[?to=N]` (C3 slice 8).
+pub fn rollback(
+    env: *const Env,
+    client: *Client,
+    options: Options,
+    name: []const u8,
+    report: *Report,
+) Error!void {
+    const arena = env.arena;
+    report.subject = .{ .kind = .service, .name = name };
+    const path = if (options.to) |to|
+        try service_path(arena, name, try std.fmt.allocPrint(arena, "/rollback?to={d}", .{to}))
+    else
+        try service_path(arena, name, "/rollback");
+    const reply = try ask(client, "POST", path, try steer_body(env), "zcube rollback", report);
+    if (options.output == .json) return emit_json(env, reply.body, report);
+    const body = try cli_data.parse(arena, reply, report);
+    if (cli_data.number(body, "revision")) |revision| report.revision = revision;
+    const out = rollback_text(arena, body) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Contract => return cli_data.contract(report, reply.request_id, "is not a rollback"),
     };
     try cli_commands.emit(env, .stdout, out, report);
 }
@@ -231,6 +258,14 @@ pub fn steer_text(arena: Allocator, body: Value) TextError![]const u8 {
     return std.fmt.allocPrint(arena, "{s}: {s} (decision {s})\n", .{ name, change, decision });
 }
 
+/// `hello: generation 7 → 8, restoring 6 (decision d-...)`.
+pub fn rollback_text(arena: Allocator, body: Value) TextError![]const u8 {
+    const name = cli_data.text(body, "name") orelse return error.Contract;
+    const change = cli_data.text(body, "change") orelse return error.Contract;
+    const decision = cli_data.text(body, "decision") orelse return error.Contract;
+    return std.fmt.allocPrint(arena, "{s}: {s} (decision {s})\n", .{ name, change, decision });
+}
+
 /// One row per stored generation, newest first; `*` marks the one the service runs now.
 pub fn history_text(arena: Allocator, body: Value) TextError![]const u8 {
     const current = cli_data.number(body, "generation") orelse return error.Contract;
@@ -312,6 +347,21 @@ test "rollout status: none, progressing, paused by a user" {
     try testing.expect(std.mem.indexOf(u8, paused_text, line) != null);
     const broken = try parse_test(arena, "{\"service\":\"hello\"}");
     try testing.expectError(error.Contract, status_text(arena, broken, 0));
+}
+
+test "rollback: the change and its decision" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const done = try parse_test(arena, "{\"name\":\"hello\",\"action\":\"rollback\"," ++
+        "\"generation\":8,\"restores\":6,\"change\":\"generation 7 → 8, restoring 6\"," ++
+        "\"revision\":40,\"decision\":\"d-9\"}");
+    try testing.expectEqualStrings(
+        "hello: generation 7 → 8, restoring 6 (decision d-9)\n",
+        try rollback_text(arena, done),
+    );
+    const bare = try parse_test(arena, "{\"name\":\"hello\"}");
+    try testing.expectError(error.Contract, rollback_text(arena, bare));
 }
 
 test "rollout pause and resume: the change, or no change" {

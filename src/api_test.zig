@@ -1374,6 +1374,116 @@ test "GET .../rollout answers null, then the record; pause and resume write it, 
     }
 }
 
+fn rollback_post(rig: *Rig, query: []const u8, body: []const u8) api_mod.Response {
+    return rig.call(.{
+        .method = "POST",
+        .path = "/v1/services/hello/rollback",
+        .query = query,
+        .body = body,
+    });
+}
+
+test "POST /v1/services/{name}/rollback applies a stored generation as a new one" {
+    // Goal: the C3 slice 8 endpoint of docs/api.md. Method: one generation (nothing to restore),
+    // a second, a rollback (generation 3 restores 1), then each refusal; nothing is written by a
+    // refusal, so the generation stays 3.
+    var rig = try Rig.start(36);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    try rig.refused(rollback_post(&rig, "", ""), 400, "ZC-E0127");
+    _ = try rig.json(post(&rig, "", hello_v2_json));
+    const done = rollback_post(&rig, "", "{\"applied_by\":\"alex@laptop\"}");
+    const body = try rig.json(done);
+    try testing.expectEqual(@as(u16, 200), done.status);
+    try testing.expectEqualStrings("rollback", field(body, "action").string);
+    try testing.expectEqual(@as(i64, 3), field(body, "generation").integer);
+    try testing.expectEqual(@as(i64, 1), field(body, "restores").integer);
+    try testing.expectEqualStrings("generation 2 → 3, restoring 1", field(body, "change").string);
+    try testing.expect(field(body, "decision").string.len > 0);
+    const listed = try rig.ok("/v1/services/hello/history", "");
+    try testing.expectEqual(@as(i64, 3), field(listed, "generation").integer);
+    const newest = field(field(listed, "generations").array.items[0], "value");
+    try testing.expectEqualStrings("b3:51aa9c03", field(newest, "image").string);
+    try testing.expectEqualStrings("rollback", field(newest, "reason").string);
+    try testing.expectEqual(@as(i64, 1), field(newest, "restores").integer);
+    try testing.expectEqualStrings("alex@laptop", field(newest, "applied_by").string);
+    try expect_hello_spec(&rig);
+
+    try rig.refused(rollback_post(&rig, "to=3", ""), 400, "ZC-E0127");
+    try rig.refused(rollback_post(&rig, "to=99", ""), 400, "ZC-E0128");
+    try rig.refused(rollback_post(&rig, "to=0", ""), 400, "ZC-E0104");
+    try rig.refused(rollback_post(&rig, "to=x", ""), 400, "ZC-E0104");
+    try rig.refused(rollback_post(&rig, "at=1", ""), 400, "ZC-E0104");
+    try rig.refused(rollback_post(&rig, "", "[1]"), 400, "ZC-E0104");
+    try rig.refused(rollback_post(&rig, "", "{\"applied_by\":\"\"}"), 400, "ZC-E0104");
+    const missing = rig.call(.{ .method = "POST", .path = "/v1/services/nope/rollback" });
+    try rig.refused(missing, 404, "ZC-E0101");
+    const invalid = rig.call(.{ .method = "POST", .path = "/v1/services/Nope/rollback" });
+    try rig.refused(invalid, 400, "ZC-E0104");
+    const deeper = rig.call(.{ .method = "POST", .path = "/v1/services/hello/rollback/x" });
+    try testing.expect(deeper.status >= 400);
+    // `to` names an older generation: 2 again, as generation 4.
+    const named = try rig.json(rollback_post(&rig, "to=2", ""));
+    try testing.expectEqual(@as(i64, 4), field(named, "generation").integer);
+    try testing.expectEqual(@as(i64, 2), field(named, "restores").integer);
+    // With no `to`, the newest generation below the current one: 3, not the oldest, 1.
+    const newer = try rig.json(rollback_post(&rig, "", ""));
+    try testing.expectEqual(@as(i64, 5), field(newer, "generation").integer);
+    try testing.expectEqual(@as(i64, 3), field(newer, "restores").integer);
+    try expect_hello_spec(&rig);
+}
+
+/// `hello_json`'s generation 2: every field a rollback restores differs.
+const hello_v2_json =
+    \\{"name":"hello","image":"b3:77bb0d14","replicas":2,
+    \\ "command":["sh","-c","exec ./serve"],"env":[["API_TOKEN","t0k3n"],["MODE","v2"]],
+    \\ "limits":{"cpu_millis":200,"memory_bytes":67108864},
+    \\ "source":"ghcr.io/zigbox/hello@sha256:
+++ "77bb0d1477bb0d1477bb0d1477bb0d14" ++ "77bb0d1477bb0d1477bb0d1477bb0d14" ++
+    \\",
+    \\ "health":{"command":["true"],"interval_ms":1000,"timeout_ms":500,
+    \\  "failure_threshold":3,"success_threshold":1},"applied_by":"alex@laptop"}
+;
+
+/// Whether the stored `hello` runs `hello_json`'s spec in every field a rollback restores.
+fn expect_hello_spec(rig: *Rig) !void {
+    const ctx = rig.world.controller_context();
+    const found = try ctx.store.get(ctx.arena, "/services/hello", null, ctx.diag);
+    const service = try records.read(records.Service, ctx.arena, found.kv.?, ctx.diag);
+    try testing.expectEqualStrings("b3:51aa9c03", service.image);
+    try testing.expectEqualStrings("", service.source);
+    const command: []const []const u8 = &.{ "sh", "-c", "sleep 1" };
+    try testing.expect(records.strings_equal(command, service.command));
+    const env: []const records.Pair = &.{.{ "API_TOKEN", "s3cr3t" }};
+    try testing.expect(records.pairs_equal(env, service.env));
+    try testing.expectEqual(records.Limits{}, service.limits);
+    try testing.expect(service.health == null);
+}
+
+test "a rollback that loses its race to an apply is 409 ZC-E0105 and writes nothing" {
+    // Goal: the compare on the service key: a rollback never lands over an apply it did not see,
+    // and it is not retried (the user asked for the newest generation below the one they saw).
+    const rollout_steer = @import("rollout_steer.zig");
+    var rig = try Rig.start(37);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    const second =
+        try std.mem.replaceOwned(u8, rig.parsed.allocator(), hello_json, "51aa9c03", "77bb0d14");
+    _ = try rig.json(post(&rig, "", second));
+    var ctx = rig.world.controller_context();
+    ctx.store = rollout_steer.Race.wrap(ctx.store, .reapply, "hello", 1);
+    const response = rig.api.handle(&ctx, .{
+        .method = "POST",
+        .path = "/v1/services/hello/rollback",
+    });
+    try rig.refused(response, 409, "ZC-E0105");
+    try testing.expectEqual(@as(u32, 1), rollout_steer.Race.transactions());
+    const listed = try rig.ok("/v1/services/hello/history", "");
+    try testing.expectEqual(@as(i64, 2), field(listed, "generation").integer);
+    const newest = field(field(listed, "generations").array.items[0], "value");
+    try testing.expectEqualStrings("b3:77bb0d14", field(newest, "image").string);
+}
+
 /// `{"applied_by": "aaa..."}` with a name of `length` bytes.
 fn applied_by_body(arena: std.mem.Allocator, length: u32) ![]const u8 {
     const name = try arena.alloc(u8, length);
