@@ -594,7 +594,13 @@ simulated runtime receives them (`SimRuntime.on_mesh`). `src/sim_mesh_conns.zig`
 supervisors' connections: each tick a supervisor with listeners may open one, trying its
 destination's endpoints in order; the destination accepts by its own rules; connections last
 10 ms to 10 s and close when an end stops or loses its rules, when a cut between two
-supervisors falls, or when a rule update removes their grant. Its checks, at every tick:
+supervisors falls, or when a rule update removes their grant. One request in four is instead a
+direct dial: a workload that skips its own listeners and connects to a peer's mesh port, a peer
+its view holds ready, on a drawn port, which only the destination's grant check can refuse (M1's
+tooth needs it: listeners exist only for granted destinations). In the mesh world a started
+container reports `starting` for 1 to 4 s (`SimNode.warmup_ms`, drawn from the seed), so views
+hold replicas with an endpoint that are not ready yet (M4's tooth needs them). Its checks, at
+every tick:
 
 - **M1**: an accepted connection's grant is in the destination's view.
 - **M2**: an open connection whose grant its destination's rules dropped is closed within
@@ -606,7 +612,7 @@ supervisors falls, or when a rule update removes their grant. Its checks, at eve
 M5 and `mesh_no_drain` come with slice 6 (docs/demos/c4.md, "Cuts"). `--c4` is `--c1 --strong
 --mesh`; `auto` operations turn `--mesh` on too, and the `mesh` fault profile (weight 2:
 supervisor cuts of 1 to 10 s, slow agents, more grant churn) implies it, so auto worlds drawn
-before slice 5 differ (docs/decisions/2026-11-15-c4-sim-c4-worlds.md). The report adds two
+before slice 5 differ (docs/decisions/2026-11-15-c4-sim-c4-worlds.md). The report adds three
 `mesh conns:` lines. `zig build sim-c4` runs it natively and as WASM; `sim-c4-teeth` runs
 `mesh_no_dst_check` (the destination skips its grant lookup; M1), `mesh_revoke_late` (connections
 outlive a revocation; M2) and `mesh_route_unready` (the plan routes to unready replicas; M4).

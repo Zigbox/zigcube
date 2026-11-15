@@ -461,10 +461,11 @@ fn close_why(state: *State, nodes: anytype, conn: *Conn, true_ms: u64) bool {
 
 /// One request from `source` on a listener drawn from its rules.
 fn request(state: *State, nodes: anytype, source: *const Held, true_ms: u64) void {
+    // Every draw is over u32, never usize: WASM's usize is 32 bits and would draw otherwise.
     const random = state.prng.random();
     if (random.uintLessThan(u32, 4) == 0) return rogue(state, nodes, source, true_ms);
     const rules = &source.rules;
-    const listener = rules.listeners[random.uintLessThan(usize, rules.listeners.len)];
+    const listener = rules.listeners[random.uintLessThan(u32, @intCast(rules.listeners.len))];
     const destination = &rules.destinations[listener.destination];
     const from = source.service orelse return;
     const to = service_index(destination.service) orelse return;
@@ -500,11 +501,12 @@ fn rogue(state: *State, nodes: anytype, source: *const Held, true_ms: u64) void 
     const random = state.prng.random();
     const from = source.service orelse return;
     if (source.peers.len == 0) return;
-    const peer = &source.peers[random.uintLessThan(usize, source.peers.len)];
+    const peer = &source.peers[random.uintLessThan(u32, @intCast(source.peers.len))];
     const to = service_index(peer.service) orelse return;
     if (to == from or !peer.ready or peer.draining) return;
     const endpoint_text = peer.endpoint orelse return;
-    const grant: Grant = .{ .from = from, .to = to, .port = ports[random.uintLessThan(usize, 2)] };
+    const port = ports[random.uintLessThan(u32, ports.len)];
+    const grant: Grant = .{ .from = from, .to = to, .port = port };
     state.rogues += 1;
     const endpoint: runtime.MeshEndpoint = .{ .replica = peer.id, .endpoint = endpoint_text };
     const reached = reach(state, nodes, source, endpoint, true_ms) orelse return;

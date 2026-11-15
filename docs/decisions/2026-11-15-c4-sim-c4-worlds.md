@@ -14,6 +14,15 @@ Date: 2026-11-15. C4 slice 5.
   agents, grant churn). Appending it to `sim_shape.ClusterProfile` with weight 2 changes the
   total weight from 11 to 13, so `--profile=auto` draws other profiles for some seeds than it
   did. Replay lines name the drawn profile, so they are unaffected.
+- **Containers warm up in the mesh world.** A started container reports `starting` (its
+  supervisor up, the command not yet) for 1 to 4 s, drawn per node from the seed
+  (`SimNode.warmup_ms`); without it the simulated runtime reports `running` at once, no view ever
+  holds a replica with an endpoint that is not ready, and M4's tooth (`mesh_route_unready`) can
+  never fail. The controllers see the same `starting` that real nodes report.
+- **Direct dials.** One request in four skips the source's listeners and dials a peer's mesh port
+  on a drawn port. Listeners exist only for granted destinations, so without these M1's tooth
+  (`mesh_no_dst_check`) failed on one seed of ten; with them, on every seed. An accepted dial is
+  counted, not kept as a connection: the source's supervisor never held it, so M2 does not apply.
 - **Worlds without `--mesh` are unchanged:** the hooks are unset, no grant is drawn and the model
   is never ticked.
 - C4 slice 3's teeth (M3, M3r, M6) stay in `sim-c1-teeth` and its canaries; sim-c4 adds the
