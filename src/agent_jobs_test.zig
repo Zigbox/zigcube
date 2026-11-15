@@ -1242,7 +1242,8 @@ const FailingPut = struct {
     poisoned: []const u8,
     armed: bool = false,
     refused: u32 = 0,
-    /// A read of the poisoned name fails (`error.Io`), as a state directory that cannot be read.
+    /// A read of the poisoned name fails with `error.Crashed`, a state directory that cannot be
+    /// read (`error.Io` would read as a damaged record, `agent_jobs.read_record`).
     read_failing: bool = false,
 
     const vtable: agent_state.AgentState.VTable = .{
@@ -1281,7 +1282,7 @@ const FailingPut = struct {
     ) agent_state.Error![]const u8 {
         const self = from(context);
         if (self.read_failing and std.mem.indexOf(u8, name, self.poisoned) != null) {
-            return error.Io;
+            return error.Crashed;
         }
         return self.inner.read(arena, name);
     }
