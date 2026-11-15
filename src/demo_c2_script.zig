@@ -3,7 +3,7 @@
 //!
 //!   1. python-app v1, 3 replicas on three empty nodes: one per node, and the image's bytes come
 //!      from the registry once, the rest from peers;
-//!   2. v2 (app.py only): each node transfers under `v2_bytes_max`;
+//!   2. v2 (app.py only): each node fetching through peers transfers under `v2_bytes_max`;
 //!   3. node3 cannot reach any registry and node1 corrupts what it serves: node3 starts its first
 //!      replica of a new image from peers alone, and strikes node1 (ZC-W0601);
 //!   4. node4 joins empty: a new service on v2 is placed where v2 already is, and `zcube why`
@@ -56,7 +56,7 @@ fn deploy_v1(demo: *Demo) !void {
     }, steps.pulls_recorded, "v1's pull records of node1-3", steps.record_ms);
     const pulls = try demo.pulls(demo.v1_tree);
     for (pulls) |pull| steps.say_pull(demo, pull);
-    const evidence = try demo.o5_evidence(&steps.first_three);
+    const evidence = try demo.o5_evidence(&steps.first_three, null);
     const read = check.registry_read(pulls, evidence, constants.fetch_peer_wait_ms);
     steps.say_registry_readers(demo, pulls, evidence);
     switch (read.kind) {
@@ -101,11 +101,37 @@ fn roll_to_v2(demo: *Demo) !void {
     const pulls = try demo.pulls(demo.v2_tree);
     for (pulls) |pull| {
         steps.say_pull(demo, pull);
-        const bytes = check.transferred(pull);
-        demo.expect(bytes <= steps.v2_bytes_max, "{s} transferred {d} B for v2 (at most {d})", .{
-            pull.node, bytes, steps.v2_bytes_max,
-        });
+        switch (check.roll_pull(pull, steps.v2_bytes_max)) {
+            // Not bounded: docs/decisions/2026-11-15-c2-step2-registry-reader.md.
+            .registry_reader => demo.host.say("  {s} read v2 from the registry: registry {d} B, " ++
+                "cached {d} B (not bounded: a registry pull reuses only layers this node pulled " ++
+                "from the registry itself; the Zigbox gap of the decision of 2026-11-15)", .{
+                pull.node, pull.registry_bytes, pull.cached_bytes,
+            }),
+            .within, .over => |verdict| demo.expect(
+                verdict == .within,
+                "{s} fetched v2 through peers: {d} B (at most {d})",
+                .{ pull.node, check.transferred(pull), steps.v2_bytes_max },
+            ),
+        }
     }
+    const rolled = try v2_containers(demo);
+    const evidence = try demo.o5_evidence(&steps.first_three, rolled);
+    steps.say_registry_readers(demo, pulls, evidence);
+    const read = check.registry_read(pulls, evidence, constants.fetch_peer_wait_ms);
+    if (read.kind == .repeated) demo.host.say("  not explained by an overrun: {s}", .{read.why});
+    demo.expect(read.passes(), "v2 came from the registry on one node only (or the elected " ++
+        "pull overran the O5 cap), as step 1 judges it", .{});
+}
+
+/// The ids of python-app's replicas now running v2: their fetch.logs hold v2's O5 evidence.
+fn v2_containers(demo: *Demo) ![]const []const u8 {
+    const rows = try demo.replicas("python-app");
+    var names: std.ArrayList([]const u8) = .empty;
+    for (rows) |row| {
+        if (std.mem.eql(u8, row.image, demo.v2_tree)) try names.append(demo.arena(), row.id);
+    }
+    return names.items;
 }
 
 // ---- 3. node3 behind a firewall, node1 corrupting ----
