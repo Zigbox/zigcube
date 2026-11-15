@@ -44,6 +44,7 @@ const diag_mod = @import("diag.zig");
 const node_store = @import("node_store.zig");
 const records = @import("records.zig");
 const rollout_controller = @import("rollout_controller.zig");
+const rollout_plan = @import("rollout_plan.zig");
 const agent_jobs = @import("agent_jobs.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
@@ -1026,12 +1027,14 @@ pub const Cluster = struct {
 
     /// The sim-c3 line: how often each rollout check judged, and the pauses and resumes asked.
     fn report_c3(c: *const Cluster, report: anytype) void {
+        const tally = &c.c3_tally;
         report.print("sim-c3 R1 retirements={d} doubted={d} R2 surges={d} R3 versions={d} " ++
-            "R4 paused={d} R6 history={d}; pauses={d} resumes={d}\n", .{
-            c.c3_tally.retirements_judged, c.c3_tally.retirements_doubted,
-            c.c3_tally.surges_judged,      c.c3_tally.versions_judged,
-            c.c3_tally.paused_judged,      c.c3_tally.history_judged,
-            c.rollout_pauses,              c.rollout_resumes,
+            "R4 paused={d} R5 rollbacks={d} completed={d} R6 history={d} R7 settled={d} " ++
+            "R8 auto={d}; pauses={d} resumes={d}\n", .{
+            tally.retirements_judged,    tally.retirements_doubted, tally.surges_judged,
+            tally.versions_judged,       tally.paused_judged,       tally.rollbacks_judged,
+            tally.rollbacks_completed,   tally.history_judged,      tally.rollouts_settled,
+            tally.auto_rollbacks_judged, c.rollout_pauses,          c.rollout_resumes,
         });
     }
 
@@ -3135,7 +3138,7 @@ fn converged(c: *Cluster) Failure!void {
             null,
             constants.replicas_max,
         ) catch return check(c, false, "the replicas cannot be read");
-        // A halted rollout (failed or paused; C3, until slice 8 rolls back) keeps the old
+        // A halted rollout (paused, or failed owing no rollback: R7) keeps the old
         // replicas beside the new, up to its surge: each replica then runs if its own image is
         // good.
         const halted = rollout_controller.halted(&ctx, &service) catch
@@ -3509,6 +3512,7 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         c.enter("convergence");
         try converged(c);
         try fencing_settles(c);
+        if (c.c3) try rollouts_settle(c);
         if (c.jobs_on) try reports_settle(c);
     } else {
         c.fault_totals = c.phase_totals();
@@ -3588,6 +3592,55 @@ fn fencing_settles(c: *Cluster) Failure!void {
     for (c.nodes) |node| worst = @max(worst, node.fences - node.fences_at_heal);
     try check(c, worst <= fences_after_heal_per_node_max, "agents kept fencing after the " ++
         "cluster healed (a lease renewal that cannot beat its fence)");
+}
+
+/// Slack on R7's deadline: a rollout is judged on the controller's passes, and one that is woken
+/// at its deadline may be seen a resync later (`rollout_controller`'s `resync_ms`).
+const rollout_settle_slack_ms: u64 = 30_000;
+
+/// R7 (C3 slice 8): once the faults healed and `liveness_bound_ms` passed, every rollout of a
+/// service's current generation has settled: none is active past its deadline, and none ended
+/// `failed` owing a rollback the controller neither carried out nor recorded as refused. A
+/// rollout paused by a failure waits for an operator, which counts as settled; the heal resumed
+/// every rollout a user paused, and a resume moves the deadline by the time it was paused.
+fn rollouts_settle(c: *Cluster) Failure!void {
+    var scratch = std.heap.ArenaAllocator.init(c.gpa);
+    defer scratch.deinit();
+    c.diag.reset();
+    const ctx: controller.Context = .{
+        .store = c.store_handle(),
+        .clock = c.manual.clock(),
+        .arena = scratch.allocator(),
+        .diag = &c.diag,
+    };
+    const services = controller.list_all(
+        records.Service,
+        &ctx,
+        records.prefix_services,
+        null,
+        constants.services_max,
+    ) catch return check(c, false, "the services cannot be read");
+    const now = c.manual.ms;
+    for (services.items) |*service| {
+        const key = records.rollout_key(service.rec.name);
+        const got = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch
+            return check(c, false, "the rollouts cannot be read");
+        const kv = got.kv orelse continue;
+        const rollout = records.read(records.Rollout, ctx.arena, kv, ctx.diag) catch
+            return check(c, false, "R7: a rollout record cannot be read");
+        if (!records.rollout_of(&rollout, service.kv.create_revision)) continue;
+        if (rollout.to != service.rec.generation) continue;
+        c.c3_tally.rollouts_settled += 1;
+        const state = rollout_controller.state_of(&rollout) orelse
+            return check(c, false, "R7: a rollout record holds no state the plan could write");
+        const policy = service.rec.rollout_policy();
+        try check(c, !rollout_plan.rollback_owed(&policy, &state), "R7: a failed rollout " ++
+            "still owes its automatic rollback");
+        if (rollout_plan.active(state.phase)) {
+            try check(c, now <= state.deadline_at_ms + rollout_settle_slack_ms, "R7: a " ++
+                "rollout is still active past its deadline");
+        }
+    }
 }
 
 fn job_refusals(c: *const Cluster) u64 {

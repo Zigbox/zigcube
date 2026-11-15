@@ -86,7 +86,11 @@ pub const Result = union(enum) {
 /// Rolls `input.name` back. No such service is ZC-E0101; nothing below the current generation to
 /// restore is ZC-E0127; a named generation that is not a usable record of this service is
 /// ZC-E0128. Nothing is written on any of them.
-pub fn rollback(ctx: *const Context, source: *controller.DecisionSource, input: Input) Error!Result {
+pub fn rollback(
+    ctx: *const Context,
+    source: *controller.DecisionSource,
+    input: Input,
+) Error!Result {
     assert(ctx.diag.code == null);
     if (input.expect != null) assert(input.reason == .auto_rollback);
     if (input.reason == .auto_rollback) assert(input.expect != null);
@@ -224,7 +228,7 @@ fn put_decision(
     const reason = if (input.expect) |expect| try controller.format(ctx, "ZC-W0305 the rollout " ++
         "of {s} to generation {d} failed (decision {s}); {s} was rolled back to generation {d} " ++
         "as generation {d}", .{
-        input.name, service.generation - 1, expect.failed_decision, input.name,
+        input.name,          service.generation - 1, expect.failed_decision, input.name,
         restored.generation, service.generation,
     }) else try controller.format(ctx, "{s} rolled {s} back to generation {d} as generation " ++
         "{d} (request {s})", .{

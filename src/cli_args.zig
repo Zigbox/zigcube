@@ -49,6 +49,8 @@ pub const Options = struct {
     no_redact: bool = false,
     /// store accept-rollback, repair allocations: the operator has looked and means it.
     confirm: bool = false,
+    /// rollback: `--to GENERATION`; null means the newest stored generation below the current.
+    to: ?u64 = null,
 };
 
 /// `zcube local`: the one command that starts processes (src/cli_local.zig).
@@ -77,6 +79,8 @@ pub const Command = union(enum) {
     rollout: struct { action: cli_rollout.Action, name: []const u8 },
     /// `history <service>`: the service.
     history: []const u8,
+    /// `rollback <service> [--to GENERATION]`: the service (the generation is `Options.to`).
+    rollback: []const u8,
     /// `job run|get|list|cancel|watch`.
     job: cli_job_args.Job,
     help,
@@ -118,6 +122,7 @@ pub const help_text =
     \\  rollout pause <service>      hold a rollout where it is; nothing new starts or retires
     \\  rollout resume <service>     continue a paused rollout, with a fresh deadline
     \\  history <service>            the stored generations, newest first, and who applied each
+    \\  rollback <service> [--to N]  apply a stored generation's spec again, as a new generation
     \\  local up                     start a server and an agent on this machine (SQLite)
     \\  local down                   stop them; the state and the containers are kept
     \\  help                         show this text
@@ -230,6 +235,9 @@ fn split(
             options.no_redact = true;
         } else if (std.mem.eql(u8, arg, "--confirm")) {
             options.confirm = true;
+        } else if (std.mem.eql(u8, arg, "--to")) {
+            index += 1;
+            options.to = try generation_value(args, index, diag);
         } else if (!std.mem.eql(u8, arg, "--last")) {
             return refuse(diag, "{s} is not a flag zcube has", .{arg});
         } else {
@@ -297,6 +305,9 @@ fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
     if (std.mem.eql(u8, name, "rollout")) return rollout_of(diag, rest);
     if (std.mem.eql(u8, name, "history")) return .{
         .history = try one_argument(diag, name, rest, "a service"),
+    };
+    if (std.mem.eql(u8, name, "rollback")) return .{
+        .rollback = try one_argument(diag, name, rest, "a service"),
     };
     if (std.mem.eql(u8, name, "job")) return .{ .job = try cli_job_args.parse(rest, diag) };
     if (std.mem.eql(u8, name, "store")) {
@@ -430,6 +441,9 @@ fn check_options(options: *const Options, command: Command, diag: *Diag) Error!v
     if (options.confirm and command != .accept_rollback and command != .repair_allocations) {
         return refuse(diag, "--confirm is for zcube store accept-rollback and repair", .{});
     }
+    if (options.to != null and command != .rollback) {
+        return refuse(diag, "--to is for zcube rollback", .{});
+    }
     if (options.dry_run and command != .apply) {
         return refuse(diag, "--dry-run is for zcube apply", .{});
     }
@@ -447,6 +461,16 @@ fn takes_wide(command: Command) bool {
         .job => |job| job == .list,
         else => false,
     };
+}
+
+/// `--to N`: a generation, 1 or more.
+fn generation_value(args: []const []const u8, index: usize, diag: *Diag) Error!u64 {
+    if (index >= args.len) return missing_value(diag, "--to", "a generation, 1 or more");
+    const number = std.fmt.parseInt(u64, args[index], 10) catch 0;
+    if (number == 0) {
+        return refuse(diag, "--to needs a generation, 1 or more, not {s}", .{args[index]});
+    }
+    return number;
 }
 
 fn missing_value(diag: *Diag, flag: []const u8, what: []const u8) Error {
@@ -615,6 +639,30 @@ test "check and repair allocations, and --confirm for repair only" {
             .line = &.{ "check", "allocations", "-o", "wide" },
             .cause = "--output wide is for zcube get",
         },
+    };
+    for (cases) |case| {
+        var diag: Diag = undefined;
+        diag.reset();
+        var parsed: Parsed = undefined;
+        try testing.expectError(error.Failed, parse(case.line, &parsed, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, case.cause) != null);
+    }
+}
+
+test "rollback takes a service and, optionally, --to a generation" {
+    // Goal: the C3 slice 8 surface. Method: the accepted lines, then one refusal per rule.
+    const newest = try parse_text(&.{ "rollback", "hello" });
+    try testing.expectEqualStrings("hello", newest.command.rollback);
+    try testing.expectEqual(@as(?u64, null), newest.options.to);
+    const named = try parse_text(&.{ "rollback", "hello", "--to", "3" });
+    try testing.expectEqual(@as(?u64, 3), named.options.to);
+    const cases = [_]struct { line: []const []const u8, cause: []const u8 }{
+        .{ .line = &.{"rollback"}, .cause = "rollback needs a service" },
+        .{ .line = &.{ "rollback", "a", "b" }, .cause = "rollback" },
+        .{ .line = &.{ "rollback", "a", "--to" }, .cause = "--to needs a value" },
+        .{ .line = &.{ "rollback", "a", "--to", "0" }, .cause = "--to needs a generation" },
+        .{ .line = &.{ "rollback", "a", "--to", "x" }, .cause = "--to needs a generation" },
+        .{ .line = &.{ "history", "a", "--to", "2" }, .cause = "--to is for zcube rollback" },
     };
     for (cases) |case| {
         var diag: Diag = undefined;

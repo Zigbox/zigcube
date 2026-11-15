@@ -192,8 +192,8 @@ pub const rollout_history = declared("c1_teeth_rollout_history");
 /// (C3 slice 8; must break R5).
 pub const rollout_exact = declared("c1_teeth_rollout_exact");
 /// The rollout controller remembers an owed automatic rollback and carries it out a pass later on
-/// the service as it is then, without the compare on the service and rollout revisions its pass
-/// read (C3 slice 8; must break R8).
+/// the service as it is then, without the compare on the service revision its pass read (C3
+/// slice 8; must break R8).
 pub const rollout_race = declared("c1_teeth_rollout_race");
 /// The rollout controller never carries out an automatic rollback it owes, nor records it refused
 /// (C3 slice 8; must break R7).

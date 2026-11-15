@@ -689,7 +689,10 @@ const Run = struct {
     ) Error!void {
         const ctx = run.ctx;
         const code = ctx.diag.code.?;
-        assert(code == .E0127 or code == .E0128);
+        assert(switch (code) {
+            .E0127, .E0128 => true,
+            else => false,
+        });
         const why = try controller.format(ctx, "{s}", .{ctx.diag.last_cause() orelse "refused"});
         ctx.diag.reset();
         const after = plan_mod.rollback_refused(policy, state);

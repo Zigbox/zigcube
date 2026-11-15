@@ -209,10 +209,13 @@ const Fixture = struct {
         try self.settle();
     }
 
-    /// Rolls `web` to generation 2 and fails its first new replica's start by the user's fault:
-    /// the rollout fails (ZC-E0304) with three old replicas and the held new one.
-    fn fail(self: *Fixture) !void {
+    /// Rolls `web` to generation 2 and fails its first new replica's start by the user's fault
+    /// (ZC-E0304). `.roll_back`: the controller then rolls back to generation 1 as generation 3.
+    /// `.refuse`: generation 1's history record is deleted first, so the rollback is refused
+    /// (ZC-E0128) and the rollout stays failed with three old replicas and the held new one.
+    fn fail(self: *Fixture, then: Then) !void {
         try self.roll();
+        if (then == .refuse) try self.forget(1);
         var collector: Diag = undefined;
         collector.reset();
         collector.raise(.E0206);
@@ -240,7 +243,57 @@ const Fixture = struct {
         try self.settle();
         self.manual.advance(min_ready_ms);
         try self.settle();
-        try testing.expectEqual(records.RolloutPhase.failed, (try self.rollout()).phase);
+        switch (then) {
+            .refuse => {
+                const failed = try self.rollout();
+                try testing.expectEqual(records.RolloutPhase.failed, failed.phase);
+                try testing.expectEqual(@as(?bool, true), failed.rollback_refused);
+            },
+            .roll_back => try testing.expectEqual(@as(u64, 3), (try self.service()).generation),
+        }
+    }
+
+    const Then = enum { roll_back, refuse };
+
+    /// Deletes `/history/web/<generation>`, as the API (which owns the history).
+    fn forget(self: *Fixture, generation: u64) !void {
+        const ctx = self.context();
+        const key = records.history_key(web.name, generation);
+        const op: store.Op = .{ .delete = key.slice() };
+        const done = try writers.txn(ctx.store, .api, .{ .on_success = &.{op} }, &self.diag);
+        try testing.expect(done.succeeded);
+    }
+
+    fn service(self: *Fixture) !records.Service {
+        const ctx = self.context();
+        const key = records.service_key(web.name);
+        const got = try ctx.store.get(ctx.arena, key.slice(), null, &self.diag);
+        return records.read(records.Service, ctx.arena, got.kv.?, &self.diag);
+    }
+
+    fn history(self: *Fixture, generation: u64) !records.History {
+        const ctx = self.context();
+        const key = records.history_key(web.name, generation);
+        const got = try ctx.store.get(ctx.arena, key.slice(), null, &self.diag);
+        return records.read(records.History, ctx.arena, got.kv.?, &self.diag);
+    }
+
+    /// The decisions whose action is `action` and whose reason holds `text`.
+    fn decisions(self: *Fixture, action: []const u8, text: []const u8) !u32 {
+        const ctx = self.context();
+        const list = try controller.list_all(
+            records.Decision,
+            &ctx,
+            records.prefix_decisions,
+            null,
+            4096,
+        );
+        var found: u32 = 0;
+        for (list.items) |entry| {
+            if (!std.mem.eql(u8, entry.rec.action, action)) continue;
+            if (std.mem.indexOf(u8, entry.rec.reason, text) != null) found += 1;
+        }
+        return found;
     }
 
     fn request(self: *Fixture, what: rollout_controller.Request) !rollout_controller.Outcome {
@@ -598,17 +651,74 @@ test "an old replica that dies during a pause is replaced at its own generation"
 
 test "a held new replica fails the rollout with ZC-E0304 and nothing more starts" {
     // Goal: `hold_failed_replica` feeds the rollout's failure. Method: the first new replica's
-    // start fails by the user's fault; the rollout fails, its old replicas stay, and a resume is
-    // refused (a failed rollout is not continued; slice 8 adds the rollback).
+    // start fails by the user's fault and its rollback is refused; the rollout fails, its old
+    // replicas stay, and a resume is refused (a failed rollout is not continued).
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
-    try fixture.fail();
+    try fixture.fail(.refuse);
     try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
     try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
     try testing.expect(try fixture.request(.resume_rollout) == .refused);
     try testing.expect(fixture.diag.code.? == .E0129);
     fixture.diag.reset();
+}
+
+test "C3 slice 8: a failed rollout rolls back through the API's handler (O3)" {
+    // Goal: the automatic rollback. Method: fail generation 2; the controller applies generation
+    // 1's spec as generation 3, applied by `rollout-controller`, with an `auto_rollback` history
+    // record and a `rollback` decision caused by the failure's, then rolls onto it.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.fail(.roll_back);
+    const service = try fixture.service();
+    try testing.expectEqualStrings(web.image, service.image);
+    try testing.expectEqualStrings("rollout-controller", service.applied_by);
+    const record = try fixture.history(3);
+    try testing.expectEqual(records.HistoryReason.auto_rollback, record.reason);
+    try testing.expectEqual(@as(?u64, 1), record.restores);
+    try testing.expectEqual(@as(u32, 1), try fixture.decisions("rollback", "ZC-W0305"));
+    const rollout = try fixture.rollout();
+    try testing.expectEqual(@as(u64, 3), rollout.to);
+    try testing.expectEqual(records.RolloutReason.rollback, rollout.reason);
+    // Generation 3 runs generation 1's spec: its replicas come up one by one (max_surge 1) and
+    // the rollout completes.
+    for (0..3) |_| {
+        _ = try fixture.report(3, .running);
+        try fixture.settle();
+        fixture.manual.advance(min_ready_ms);
+        try fixture.settle();
+    }
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(3));
+    try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+}
+
+test "C3 slice 8: a refused automatic rollback is asked again after pause, resume, new failure" {
+    // Goal: docs/decisions/2026-11-15-c3-pause-clears-rollback-refused.md. A refusal is recorded
+    // once and not asked again while the rollout stays failed; a pause clears the mark, and once
+    // resumed and failed again the controller asks the handler again (refused again here).
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.fail(.refuse);
+    const refusal = "the automatic rollback of web to generation 1 was refused";
+    try testing.expectEqual(@as(u32, 1), try fixture.decisions("rollout_fail", refusal));
+    fixture.manual.advance(10 * min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.decisions("rollout_fail", refusal));
+    try testing.expect(try fixture.request(.pause) == .done);
+    try testing.expect((try fixture.rollout()).rollback_refused != true);
+    try testing.expect(try fixture.request(.resume_rollout) == .done);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    const failed = try fixture.rollout();
+    try testing.expectEqual(records.RolloutPhase.failed, failed.phase);
+    try testing.expectEqual(@as(?bool, true), failed.rollback_refused);
+    try testing.expectEqual(@as(u32, 2), try fixture.decisions("rollout_fail", refusal));
+    try testing.expectEqual(@as(u64, 2), (try fixture.service()).generation);
 }
 
 /// Applies `web` again at generation 2's spec with `replicas` replicas (no new generation).
@@ -627,7 +737,7 @@ test "a pause between the read and the commit fails a scale-up of a failed rollo
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
-    try fixture.fail();
+    try fixture.fail(.refuse);
     try rescale(&fixture, 5);
     fixture.interleave = .pause_create;
     try fixture.settle();
@@ -644,7 +754,7 @@ test "a pause between the read and the commit fails a scale-down of a failed rol
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
-    try fixture.fail();
+    try fixture.fail(.refuse);
     try rescale(&fixture, 1);
     fixture.interleave = .pause;
     try fixture.settle();
@@ -957,6 +1067,9 @@ test "new replicas that die more than rollout_restarts_max times fail the rollou
     try fixture.start();
     defer fixture.stop();
     try fixture.roll();
+    // Without generation 1 in the history the automatic rollback is refused, so the rollout
+    // stays failed (the rollback itself is the slice 8 tests' subject).
+    try fixture.forget(1);
     for (0..constants.rollout_restarts_max + 1) |round| {
         try testing.expectEqual(records.RolloutPhase.progressing, (try fixture.rollout()).phase);
         try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));

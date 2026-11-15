@@ -142,6 +142,7 @@ pub fn execute(
             try cli_rollout.rollout(env, client, options, what.action, what.name, report);
         },
         .history => |name| try cli_rollout.history(env, client, options, name, report),
+        .rollback => |name| try cli_rollout.rollback(env, client, options, name, report),
         .repair_allocations => |node| {
             try cli_allocations.repair(env, client, options, node, report);
         },

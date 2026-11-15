@@ -1,5 +1,6 @@
 //! C3's rollout checks over the cluster simulation (docs/briefs/c3.md, "Simulation: checks and
-//! teeth"), R1 R2 R3 R4 R5 R6 and R8 (R7, a liveness check, is `sim_cluster`'s), judged at the head of the store as `sim_c1`'s are: `before_commit`
+//! teeth"), R1 R2 R3 R4 R5 R6 and R8 (R7, a liveness check, is `sim_cluster`'s), judged at the
+//! head of the store as `sim_c1`'s are: `before_commit`
 //! over the head a transaction is about to commit over, `at_revision` over the revision it made.
 //! Each check reads only the store, so it judges what was written, not what the controllers
 //! meant; each is a little weaker than its sentence in the brief, as its comment says, and never
@@ -44,6 +45,8 @@ pub const Tally = struct {
     auto_rollbacks_judged: u64 = 0,
     /// Rollbacks that completed, their live replicas compared with the restored spec (R5).
     rollbacks_completed: u64 = 0,
+    /// Rollouts of a current generation R7 judged at the end of a run with liveness on.
+    rollouts_settled: u64 = 0,
 };
 
 /// R1, R4, R5, R6 and R8 over the head `request` is about to commit over.
@@ -538,7 +541,12 @@ fn health_equal(first: ?records.Health, second: ?records.Health) bool {
 
 /// `value` written at `key` as a `T`, or null if it is not one.
 fn decode(comptime T: type, ctx: *const Context, key: []const u8, value: []const u8) ?T {
-    const kv: store.KeyValue = .{ .key = key, .value = value, .create_revision = 1, .mod_revision = 1 };
+    const kv: store.KeyValue = .{
+        .key = key,
+        .value = value,
+        .create_revision = 1,
+        .mod_revision = 1,
+    };
     return records.read(T, ctx.arena, kv, ctx.diag) catch {
         ctx.diag.reset();
         return null;
