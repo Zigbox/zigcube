@@ -18,6 +18,9 @@ in the order the supervisor gave. None was already an ancestor of `main`.
 | 8 | `origin/main` (#247, #248) | ebfbac5 | 9806d67 |
 | 9 | `claude/b6-slice3` | 2120075 | 40a9729 |
 | 10 | `claude/b7-slice6-browser` | 05ed287 | af991b6 |
+| 11 | `origin/main` (#254, #255; after the `b3` tag) | 65e6ece | 3c3bed1 |
+| 12 | `claude/b7-slice5` | 75c4d25 | 2f7b75e |
+| 13 | `claude/b7-slice7` (holds B7 slice 6, part 2, 5bdde4b) | 5466944 | 8a6102b |
 
 Every merge commit's message lists its conflicts. The summary is below. Each conflict was resolved on
 its merits, and both behaviours were kept. A whole file was never taken from one side.
@@ -127,6 +130,33 @@ its merits, and both behaviours were kept. A whole file was never taken from one
    - **CI.** The bundle's twelve columns, plus slice 6's run-everything row for
      `src/harness_tls.zig`. `ci-changes-test.sh` passes 79 cases.
 
+11. **`main` at 65e6ece, after the `b3` tag (00f35c1).**
+   - **The `job_runs_unread` tooth.** Main added it (the J6 gap, owner option B). It joins the
+     bundle's teeth: `c1_teeth.any`, and an entry in `c1_teeth.runners` so its replay line names
+     its own runner. `build.zig` counts 34 roots, one fault-on runner each.
+   - **`job_pass_break`.** The bundle's seeds stay (225 and 180 in the bundle's world; main's
+     44 was measured in main's world). The docs and the fleet's README say so, and add main's row
+     for the new tooth.
+
+12. **B7 slice 5 (the certificate guard).**
+   - **The agent's Shell.** It holds both B4's relay-certificate asker and B7's guard. `run()`
+     keeps the bundle's `new_agent`, not slice 5's `gpa.create`.
+   - **Two fixes the merge needed.** Slice 5's new `server_tls_test.zig` calls `Setup.init`
+     without B7 slice 6's browser argument, so it passes `null`. `run()` was 71 lines, so
+     `Shell.diag` now defaults to `undefined` (each step resets it before use).
+   - **Tests.** `mtls_teeth_runner.zig` expects 45: 26 at the base, 15 from the bundle, 4 from
+     slice 5. `zig build mtls-teeth` counts 45.
+
+13. **B7 slice 7 (the fetch child over TLS), with slice 6 part 2.**
+   - **Part 2 was already in.** 5bdde4b is an ancestor of slice 6 part 1 (05ed287), merged as 10.
+   - **The agent's settings.** `merge` makes the TLS paths absolute (slice 7) and keeps B6's
+     labels. Both sides' tests are kept.
+   - **`api_test.zig`.** B4's relay-certificate tests and slice 7's fetchers tests are both kept.
+   - **ZC-E0814.** Slice 7 carries an early copy of slice 5 ("rereads it within a second"). The
+     merge keeps slice 5's reviewed text, "within 5 seconds" (its S6, one reload bound).
+   - **Tests.** `mtls_teeth_runner.zig` expects 51: 6 more from slice 7. `zig build mtls-teeth`
+     counts 51.
+
 ## Diagnostic codes
 
 There is no collision.
@@ -136,6 +166,9 @@ There is no collision.
 - B6 adds none. Slice 3 only rewords ZC-E0505.
 - B7 slice 6, part 1 adds none. It only adds to ZC-E0814's text, which now names the browser CA.
 - #615 only rewords ZC-E0806.
+- B7 slices 5 and 7 add none. They only add to ZC-E0814's text: the reread revoked file and
+  the per-request check.
+- `main` at 65e6ece adds none.
 
 No bound, limit or default was changed by the integration itself.
 
