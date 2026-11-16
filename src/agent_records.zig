@@ -66,6 +66,10 @@ pub const file_relay_log = "relay.log";
 pub const file_relay_public = "relay.pub";
 pub const file_relay_certificate = "relay.crt";
 pub const file_relay_refused = "relay.refused";
+/// Written (empty) by the runtime before it signals a running container to stop, under either
+/// runtime: the relay sees it within `relay_poll_ms` and closes every connection and its listener,
+/// so a cancelled run relays nothing during its grace (0.5.2 review, MUST B).
+pub const file_relay_stop = "relay.stop";
 /// A fake-runtime test fault for the relay (B4 slice 2): `open` makes the supervisor fail to
 /// open the relay. Written by `FakeRuntime.start` from `<state>/faults/<name>` = `relay_open`.
 pub const file_relay_fault = "relay.fault";
@@ -176,6 +180,7 @@ pub const relay_files = [_][]const u8{
     file_relay_public,
     file_relay_certificate,
     file_relay_refused,
+    file_relay_stop,
     file_relay_fault,
 };
 

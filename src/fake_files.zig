@@ -36,6 +36,7 @@ pub const file_relay_port = agent_records.file_relay_port;
 pub const file_relay_log = agent_records.file_relay_log;
 pub const file_relay_public = agent_records.file_relay_public;
 pub const file_relay_fault = agent_records.file_relay_fault;
+pub const file_relay_stop = agent_records.file_relay_stop;
 pub const file_pull = agent_records.file_pull;
 pub const FetchFile = agent_records.FetchFile;
 
@@ -52,6 +53,15 @@ pub const ReadError = error{ Absent, Unreadable, OutOfMemory };
 /// fsynced before the rename (so a host crash cannot leave the new name on empty contents) and
 /// the directory after it (so the rename itself survives). Names are at most
 /// `agent_state.name_bytes_max` long, the same limit `SimState` enforces.
+/// Tells a container's relay that its run is being stopped (`relay.stop`, empty, so a reader can
+/// never see it half written; nothing reads it after a crash, so it is not synced). Before any
+/// stop signal, under either runtime; false if it could not be made.
+pub fn mark_relay_stop(io: std.Io, dir: Dir) bool {
+    const file = dir.createFile(io, file_relay_stop, .{}) catch return false;
+    file.close(io);
+    return true;
+}
+
 pub fn write_atomic(io: std.Io, dir: Dir, name: []const u8, data: []const u8) WriteError!void {
     assert(name.len > 0);
     assert(name.len <= agent_state.name_bytes_max);

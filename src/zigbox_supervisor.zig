@@ -838,7 +838,8 @@ fn open_relay(
 }
 
 /// Gives a TLS relay the run's key and writes `relay.pub` (B4); a plain one (Debug only, see
-/// `relay_plan`) needs nothing. Null when done, else why the relay cannot be served.
+/// `relay_plan`) needs no key. Either way the relay watches the container's directory for
+/// `relay.stop` (0.5.2 review, MUST B). Null when done, else why the relay cannot be served.
 fn secure_relay(
     ctx: RelayContext,
     relay: *relay_module.Relay,
@@ -849,7 +850,10 @@ fn secure_relay(
     assert(relay.credential == null);
     switch (plan) {
         .refused => unreachable, // Asserted above: a refused plan never opens a relay.
-        .plain => return null,
+        .plain => {
+            relay.watch(ctx.dir.handle); // For `relay.stop` (the TLS path's `secure` does it).
+            return null;
+        },
         .tls => |tls| {
             const cause = relay_secure.secure(
                 ctx.io,
@@ -1514,10 +1518,13 @@ test "the supervisor secures a TLS relay with the run's key and relay.pub, a pla
     try std.testing.expect(secure_relay(rig.context(), rig.relay, .plain, &spec) == null);
     try std.testing.expect(rig.relay.credential == null);
     try std.testing.expect(!has_relay_public(rig.tmp.dir));
+    // Either plan watches the directory for `relay.stop` (0.5.2 review, MUST B).
+    try std.testing.expectEqual(rig.tmp.dir.handle, rig.relay.dir_fd);
     const tls: relay_tls.Tls = .{ .server_name = "broker.botpike.test", .anchor = @splat(7) };
     try std.testing.expect(secure_relay(rig.context(), rig.relay, .{ .tls = tls }, &spec) == null);
     try std.testing.expect(rig.relay.credential != null);
     try std.testing.expect(has_relay_public(rig.tmp.dir));
+    try std.testing.expectEqual(rig.tmp.dir.handle, rig.relay.dir_fd);
 }
 
 test "a relay started for a command kills it when its listener stops (#228)" {

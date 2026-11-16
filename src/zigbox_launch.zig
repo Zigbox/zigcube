@@ -265,7 +265,8 @@ test "a relaunch clears the last run's relay files" {
     defer dir.close(io);
     // Named here, not taken from `relay_files`: a file dropped from that list must fail this.
     const written = [_][]const u8{
-        "relay.port", "relay.log", "relay.pub", "relay.crt", "relay.refused", "relay.fault",
+        "relay.port",  "relay.log", "relay.pub", "relay.crt", "relay.refused", "relay.stop",
+        "relay.fault",
     };
     for (written) |stale| {
         try dir.writeFile(io, .{ .sub_path = stale, .data = "an earlier run's\n" });

@@ -371,7 +371,13 @@ ZC-E0701, E0704, E0705, W0701 and W0702.
 The listener belongs to the supervisor, which outlives the agent, so an agent restart changes
 nothing and the adopting agent finds the relay as it was. The supervisor closes it, and every
 connection, when the command ends, however it ends (a stop, the deadline, a cancel); `kill -9` of
-the supervisor kills the process and the kernel closes the listener. `agent-smoke` runs one relayed
+the supervisor kills the process and the kernel closes the listener. A stop does not wait for the
+command's end: before either runtime signals a running container (`stop`, or `signal` TERM or
+KILL) it writes an empty `relay.stop` into the container's directory, and the relay, which looks
+for it every `relay_poll_ms`, closes every connection and its listener within
+`relay_cancel_ms_max` (100 ms), so a command that sits out its grace relays nothing meanwhile. A
+runtime that cannot write the file kills the command at once instead (0.5.2 review, MUST B;
+docs/decisions/2026-11-16-relay-stop-file.md). `agent-smoke` runs one relayed
 job against an upstream of its own and asserts the port refuses connections after the job's end.
 The real adapter (B3 slice 4) serves a relay too, inside the container's namespace. `supervise-zigbox`
 starts the container with `network = .none` and Zigbox's `listen` (`.{ .port = 8080 }`, M8b): Zigbox
@@ -400,6 +406,7 @@ files in the container's directory:
 | `relay.pub` | the supervisor, at start | `<key hex> <epoch> <digest hex> <job>`: the run's fresh Ed25519 public key (the private key never leaves the supervisor's memory) |
 | `relay.crt` | the agent | the DER certificate the server signed for that key (`agent_relay_certs.zig`) |
 | `relay.refused` | the agent | the ZC-E0706 refusal line; the agent asks no more |
+| `relay.stop` | the runtime, before a stop's signal | nothing: the run is being stopped, and the relay closes every connection and its listener |
 | `relay.fault` | the fake runtime | the test fault `relay_open` (below) |
 
 The agent asks for the certificate once per run, and only once it knows the server holds the

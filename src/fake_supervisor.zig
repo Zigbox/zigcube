@@ -373,6 +373,7 @@ fn open_relay(
             return relay_failed(cause);
         }
     }
+    relay.watch(dir.handle); // For `relay.stop`, plain or TLS.
     var text: [64]u8 = undefined;
     const address = std.fmt.bufPrint(&text, "http://127.0.0.1:{d}", .{relay.port}) catch
         unreachable; // 64 bytes hold a port.

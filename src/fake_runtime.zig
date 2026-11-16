@@ -512,6 +512,9 @@ pub const FakeRuntime = struct {
             self.kill_group(dir);
             return;
         };
+        // The relay ends now, not when the command does (0.5.2 review, MUST B); a run whose
+        // relay cannot be told has no grace.
+        if (!files.mark_relay_stop(self.io, dir)) return self.kill_and_wait(dir, child);
         if (grace_ms == 0) return self.kill_and_wait(dir, child);
         signal_command(child, .TERM);
         const waited = @min(grace_ms, stop_wait_ms);
@@ -539,7 +542,11 @@ pub const FakeRuntime = struct {
             self.kill_group(dir);
             return;
         };
-        signal_command(child, if (number == runtime.signal_kill) .KILL else .TERM);
+        // Both signals end the run, so its relay ends now (0.5.2 review, MUST B); a run whose
+        // relay cannot be told has no grace.
+        const told = files.mark_relay_stop(self.io, dir);
+        const kill = number == runtime.signal_kill or !told;
+        signal_command(child, if (kill) .KILL else .TERM);
     }
 
     fn kill_and_wait(self: *FakeRuntime, dir: Dir, child: i32) void {

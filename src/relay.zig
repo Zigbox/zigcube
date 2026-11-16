@@ -25,6 +25,7 @@ const linux = std.os.linux;
 const constants = @import("constants.zig");
 const Pipe = @import("relay_pump.zig").Pipe;
 const relay_tls = @import("relay_tls.zig");
+const agent_records = @import("agent_records.zig");
 const tls_conn = @import("tls_conn.zig");
 const diag_mod = @import("diag.zig");
 const peer_stream = @import("peer_stream.zig");
@@ -235,6 +236,17 @@ pub const Relay = struct {
         credential.* = .init(key);
         relay.tls = tls;
         relay.credential = credential;
+        relay.watch(dir_fd);
+    }
+
+    /// Has the relay look in `dir_fd`, the container's directory, for `relay.stop`: the runtime
+    /// writes it before it signals a stop, and the relay then closes every connection and its
+    /// listener within `relay_cancel_ms_max`, whatever the command's grace (0.5.2 review, MUST B:
+    /// the supervisor stops the relay only once it has reaped the command). Before `run`.
+    pub fn watch(relay: *Relay, dir_fd: fd_t) void {
+        assert(relay.acceptor == null);
+        assert(dir_fd >= 0);
+        if (relay.dir_fd >= 0) assert(relay.dir_fd == dir_fd);
         relay.dir_fd = dir_fd;
     }
 
@@ -278,6 +290,10 @@ pub const Relay = struct {
     fn accept_loop(relay: *Relay) void {
         while (!relay.stopping.load(.acquire)) {
             relay.reap_finished();
+            if (relay.stop_asked()) {
+                relay.cut();
+                break;
+            }
             relay.look_for_credential();
             var fds = [1]linux.pollfd{
                 .{ .fd = relay.listener, .events = linux.POLL.IN, .revents = 0 },
@@ -321,6 +337,21 @@ pub const Relay = struct {
         // Cleared by the supervisor once it has reaped the command: a reaped pid may be reused.
         const pid = @atomicLoad(i32, &relay.command_pid, .acquire);
         if (pid > 1) _ = linux.kill(pid, .KILL);
+    }
+
+    /// True once the runtime has written `relay.stop` into the container's directory.
+    fn stop_asked(relay: *const Relay) bool {
+        if (relay.dir_fd < 0) return false;
+        return relay_tls.exists(relay.dir_fd, agent_records.file_relay_stop);
+    }
+
+    /// The run is being stopped: every connection ends now and the listener closes when the
+    /// acceptor returns, so nothing new is relayed during the command's grace. The command is
+    /// the runtime's to stop, so `command_pid` is left alone.
+    fn cut(relay: *Relay) void {
+        assert(!relay.stopping.load(.acquire));
+        relay.stopping.store(true, .release);
+        for (&relay.slots) |*slot| slot.shut_down();
     }
 
     fn look_for_credential(relay: *Relay) void {
@@ -897,6 +928,44 @@ test "a relay copies both ways to its upstream and stop closes every connection"
     // The relay is gone: its connection reads an end, and nothing listens on its port.
     try testing.expectEqual(@as(?usize, 0), receive(fd, &buffer, 2000));
     try testing.expectError(error.ConnectFailed, dial(port));
+}
+
+test "relay.stop in the container's directory ends every connection and the listener" {
+    // Goal: a stopped run relays nothing during its grace (0.5.2 review, MUST B). The runtime
+    // writes `relay.stop` before it signals; the supervisor stops the relay only after the reap,
+    // which a command that ignores TERM puts off by the whole grace. Method: a relay watching a
+    // directory, one live connection, then the file: the connection reads an end within
+    // `relay_cancel_ms_max`, nothing listens on the port, and `stop` afterwards is still safe.
+    const echo = try Echo.start();
+    defer echo.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(testing.io, &path);
+    const log_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/relay.log", .{
+        path[0..length],
+    }, 0);
+    defer testing.allocator.free(log_path);
+    const upstream: Upstream = .{ .host = "127.0.0.1", .port = echo.bound.port };
+    const relay = try Relay.open(testing.allocator, testing.io, upstream, log_path);
+    defer relay.stop();
+    relay.watch(tmp.dir.handle);
+    try relay.run();
+    const fd = try dial(relay.port);
+    defer _ = linux.close(fd);
+    var buffer: [64]u8 = undefined;
+    _ = linux.write(fd, "hello", 5);
+    try testing.expectEqual(@as(?usize, 5), receive(fd, &buffer, 2000));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = agent_records.file_relay_stop, .data = "" });
+    const began = monotonic_ms();
+    try testing.expectEqual(@as(?usize, 0), receive(fd, &buffer, 2000));
+    const took = monotonic_ms() - began;
+    try testing.expect(took <= constants.relay_cancel_ms_max);
+    for (0..100) |_| {
+        const again = dial(relay.port) catch break;
+        _ = linux.close(again);
+        sleep_ms(10);
+    } else return error.StillListening;
 }
 
 test "an adopted listener is served, marked close-on-exec, and closed by stop" {
