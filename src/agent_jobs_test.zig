@@ -2266,6 +2266,22 @@ test "a run signed by a key the node does not trust is refused; one it trusts st
     try testing.expectEqual(records.JobObservedStatus.running, seen.status);
 }
 
+test "a run written around the server with a malformed source is refused, never a trap" {
+    // Goal: the 0.5.2 release review's MUST A. A row written straight into the store with a
+    // source that names no manifest used to trip `binding_of`'s assert in every agent with a
+    // trust policy, again after each restart. Method: a run signed by the trusted key, with
+    // the source `reg/x`, assigned straight into the store; three passes start nothing and
+    // report `refused` with ZBX-E0905.
+    var case: TrustCase = undefined;
+    try case.start();
+    defer case.stop();
+    const line = try case.sign(1);
+    defer testing.allocator.free(line);
+    _ = try case.assign_signed(&.{line}, "reg/x");
+    for (0..3) |_| case.rig.step();
+    try expect_refused(&case);
+}
+
 /// What the last start handed the runtime as the run's signatures: their count and a copy of
 /// the first (the spec lives in the step's arena).
 var kept_count: usize = 0;
