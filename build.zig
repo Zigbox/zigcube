@@ -319,9 +319,13 @@ fn add_agent_smoke_step(b: *std.Build, built: Built, options: ExecutablesOptions
 /// against the real agent, where they must pass. Never cached, not in `check`.
 fn add_relay_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
     const step = b.step("relay-teeth", "Run the relay fail-closed tests against broken agents");
-    const teeth = [_][2][]const u8{
-        .{ "outlive", "a relay that stops while the job runs" },
-        .{ "unrelayed", "a relay that cannot be opened" },
+    // The third field is the symptom the test must fail with: a test that fails for another
+    // reason (a setup error, a timeout of its own) does not count as the tooth biting.
+    const teeth = [_][3][]const u8{
+        // The command outlives its relay: the container never stops.
+        .{ "outlive", "a relay that stops while the job runs", "error.StillRunning" },
+        // The command ran without its relay: it wrote its file.
+        .{ "unrelayed", "a relay that cannot be opened", "expected error.FileNotFound" },
     };
     // Always Debug: the fail-closed tests relay to a plain test upstream, which only a Debug
     // build serves (`relay_tls.plain_allowed`). Under ReleaseSafe each test would fail on that
@@ -370,6 +374,7 @@ fn add_relay_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
         // A test binary's run speaks the build protocol; checking its exit code needs plain
         // stdio, where a failing test exits 1.
         run.stdio = .{ .check = .empty };
+        run.addCheck(.{ .expect_stderr_match = tooth[2] });
         run.expectExitCode(1);
         run.has_side_effects = true;
         step.dependOn(&run.step);
