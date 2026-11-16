@@ -50,6 +50,8 @@ const Storage = struct {
     pull_facts: Facts,
     pull_result: zigbox.pull.Result,
     network_memory: NetworkMemory,
+    /// The memory of `zigbox.start`'s trust gate (Zigbox 0.5.2; about 17 MiB).
+    gate_workspace: zigbox.GateWorkspace,
 };
 
 /// How much of `ZBX_REGISTRY_MIRRORS` is read: more than Zigbox's 1024 (not exported), so that a
@@ -121,7 +123,9 @@ const Real = struct {
             .detached = true,
             .image_workspace = &self.storage.image_workspace,
         };
-        zigbox.start(self.host, self.spec, options, &self.storage.handle, diag) catch
+        const storage = self.storage;
+        const gate = &storage.gate_workspace;
+        zigbox.start(self.host, self.spec, options, &storage.handle, gate, diag) catch
             return error.StartFailed;
     }
 

@@ -813,8 +813,12 @@ fn sim_container(sim: *HostSim, name: []const u8, replica: ?[]const u8) !void {
         .command = &.{ "/bin/sh", "-c", "sleep 1000" },
         .labels = labels,
     };
-    try zigbox.start(sim.interface(), &spec, .{ .detached = true }, &sim_handle, &diagnostic);
+    const options: zigbox.StartOptions = .{ .detached = true };
+    try zigbox.start(sim.interface(), &spec, options, &sim_handle, &sim_gate, &diagnostic);
 }
+
+/// The trust gate's memory for `sim_container`'s starts (about 17 MiB, so static).
+var sim_gate: zigbox.GateWorkspace = undefined;
 
 test {
     _ = process_session; // Its tests, which no other root reaches.
