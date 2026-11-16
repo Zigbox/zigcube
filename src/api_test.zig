@@ -1339,10 +1339,10 @@ const ScopeRow = struct {
 const scope_none: Allowed = .{ .node1 = false, .jobs = false };
 const scope_jobs: Allowed = .{ .node1 = false, .jobs = true };
 const scope_own: Allowed = .{ .node1 = true, .jobs = false };
-/// The credential endpoint: node1's own certificate and nothing else, no admin bootstrap
-/// (decisions/2026-11-13-node-cert-bootstrap.md).
+/// The credential and run-certificate endpoints: node1's own certificate and nothing else, no
+/// admin bootstrap (decisions/2026-11-13-node-cert-bootstrap.md; 0.5.2 review).
 const scope_own_only: Allowed = .{ .node1 = true, .jobs = false, .admin = false };
-/// Every endpoint, and who may call it besides an admin (who may call all but the credential).
+/// Every endpoint, and who may call it besides an admin (who may call all but the two issuers).
 const scope_rows = [_]ScopeRow{
     .{ .method = "GET", .path = "/v1/status", .allowed = scope_none },
     .{ .method = "GET", .path = "/v1/list", .allowed = scope_none },
@@ -1380,7 +1380,7 @@ const scope_rows = [_]ScopeRow{
     .{
         .method = "POST",
         .path = "/v1/agent/nodes/node1/runs/build/certificate",
-        .allowed = scope_own,
+        .allowed = scope_own_only,
     },
     .{ .method = "GET", .path = "/v1/agent/nodes/node1/job-observed", .allowed = scope_own },
     .{
@@ -1408,7 +1408,7 @@ const scope_rows = [_]ScopeRow{
     .{
         .method = "POST",
         .path = "/v1/agent/nodes/node2/runs/build/certificate",
-        .allowed = scope_none,
+        .allowed = .{ .node1 = false, .jobs = false, .admin = false },
     },
     .{
         .method = "GET",

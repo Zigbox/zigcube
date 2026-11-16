@@ -10,9 +10,11 @@
 //! - A client of scope `jobs` may create, read, cancel and watch jobs: `/v1/jobs` and below, and
 //!   `GET /v1/why/job/<name>`. Nothing else.
 //! - A client of scope `admin`, and the loopback `--insecure-listen` listener, may call
-//!   everything but one path: `POST /v1/agent/nodes/<name>/credential`, which issues a node
-//!   certificate, is the node's own (and `local`'s). No client certificate may call it, admin
-//!   included: there is no admin bootstrap (decisions/2026-11-13-node-cert-bootstrap.md).
+//!   everything but two paths: `POST /v1/agent/nodes/<name>/credential`, which issues a node
+//!   certificate, and `POST /v1/agent/nodes/<name>/runs/<job>/certificate`, which issues a job's,
+//!   are the node's own (and `local`'s). No client certificate may call them, admin included:
+//!   there is no admin bootstrap (decisions/2026-11-13-node-cert-bootstrap.md), and an admin
+//!   must not mint a job's identity for a key of its own (0.5.2 review).
 //! - Any node's certificate may also read the peers' summaries, the swarm fetch's discovery:
 //!   `GET /v1/list` with `prefix` exactly `/node-store/` and no parameter but `limit`, `at` and
 //!   `continue` (B7 slice 7, decisions/2026-11-14-b7-slice7-node-store-read.md). Nothing else
@@ -129,6 +131,7 @@ fn need_of(method: []const u8, path: []const u8, query: []const u8) Need {
         if (end == 0) return .admin;
         const node = rest[0..end];
         if (std.mem.eql(u8, rest[end..], "/credential")) return .{ .node_only = node };
+        if (run_certificate(rest[end..])) return .{ .node_only = node };
         return .{ .node = node };
     }
     if (std.mem.eql(u8, path, "/v1/jobs")) return .jobs;
@@ -138,6 +141,19 @@ fn need_of(method: []const u8, path: []const u8, query: []const u8) Need {
         if (path.len > why_job.len) return .jobs;
     }
     return .admin;
+}
+
+/// Whether `tail` is `/runs/<job>/certificate`: it signs a job's identity
+/// (`spiffe://<cluster>/job/<job>`) for any key it is given, so, like `/credential`, it is the
+/// node's own and no client's (0.5.2 review).
+fn run_certificate(tail: []const u8) bool {
+    const runs = "/runs/";
+    const certificate = "/certificate";
+    if (!std.mem.startsWith(u8, tail, runs)) return false;
+    if (!std.mem.endsWith(u8, tail, certificate)) return false;
+    if (tail.len <= runs.len + certificate.len) return false;
+    const job = tail[runs.len .. tail.len - certificate.len];
+    return std.mem.indexOfScalar(u8, job, '/') == null;
 }
 
 /// Whether `query` is a read of `/node-store/` and nothing more: `prefix` once, exactly
@@ -200,6 +216,22 @@ test "need_of: the agent API by node, the jobs API, and everything else is admin
             .node = "node1",
         } },
         .{
+            .method = "POST",
+            .path = "/v1/agent/nodes/node1/runs/job-a/certificate",
+            .need = .{ .node_only = "node1" },
+        },
+        .{
+            .method = "POST",
+            .path = "/v1/agent/nodes/node1/runs//certificate",
+            .need = .{ .node = "node1" },
+        },
+        .{
+            .method = "POST",
+            .path = "/v1/agent/nodes/node1/runs/a/b/certificate",
+            .need = .{ .node = "node1" },
+        },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs", .need = .{ .node = "node1" } },
+        .{
             .method = "GET",
             .path = "/v1/agent/nodes/node1/fetchers/b3:51aa9c03",
             .need = .{ .node = "node1" },
@@ -255,6 +287,13 @@ test "refusal: a node only under its own name, jobs only jobs, admin and local e
     try testing.expect(refusal(.{ .node = "node2" }, "POST", credential, "") != null);
     try testing.expect(refusal(jobs, "POST", credential, "") != null);
     try testing.expect(refusal(admin, "POST", credential, "") != null);
+    // So is a run's certificate: an admin must not mint a job's identity for its own key.
+    const job_cert = "/v1/agent/nodes/node1/runs/job-a/certificate";
+    try testing.expect(refusal(node1, "POST", job_cert, "") == null);
+    try testing.expect(refusal(.local, "POST", job_cert, "") == null);
+    try testing.expect(refusal(.{ .node = "node2" }, "POST", job_cert, "") != null);
+    try testing.expect(refusal(jobs, "POST", job_cert, "") != null);
+    try testing.expect(refusal(admin, "POST", job_cert, "") != null);
     for ([_]Caller{ admin, .local }) |caller| {
         try testing.expect(refusal(caller, "PUT", "/v1/agent/nodes/node2", "") == null);
         try testing.expect(refusal(caller, "POST", "/v1/services", "") == null);

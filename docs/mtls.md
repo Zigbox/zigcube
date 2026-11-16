@@ -160,13 +160,16 @@ reply closes the connection.
 |---|---|
 | `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only (its `fetchers/<digest>` answers node names only, B7 slice 7); and `GET /v1/list` with `prefix` exactly `/node-store/` and no parameter but `limit`, `at` and `continue` (the swarm fetch's discovery, B7 slice 7) |
 | `client`, scope `jobs` | `/v1/jobs` and below, and `GET /v1/why/job/<name>` |
-| `client`, scope `admin` | everything but the credential endpoint |
+| `client`, scope `admin` | everything but the two issuing endpoints, `credential` and a run's `certificate` |
 | `local` (`--insecure-listen`) | everything |
 
 `POST /v1/agent/nodes/<name>/credential` signs a node's peer key and returns its `node.crt`, so
 over TLS only node `<name>`'s own certificate may call it: every client certificate, `admin`
 included, gets 403 `ZC-E0822` there (an admin cannot mint a node's identity through the API;
-`ca issue-node` on the server host is the only bootstrap). A node renews and registers only on
+`ca issue-node` on the server host is the only bootstrap). `POST
+/v1/agent/nodes/<name>/runs/<job>/certificate`, which signs a job's identity for the key it is
+given, is node `<name>`'s own the same way: an admin client must not mint a job's identity for a
+key of its own (0.5.2 review). A node renews and registers only on
 the lease of its own registration: a keepalive of another node's lease is `ZC-E0205`, and a
 registration on a lease another node is registered on is `ZC-E0104` (`agent_api.zig`).
 
