@@ -160,6 +160,9 @@ const LeaseFile = struct {
     tenure: u64,
     /// The boot the send time was read in (`Context.boot_id`).
     boot_id: []const u8 = "",
+    /// When the last successful read of the runs was sent, monotonic, in `boot_id`: the job
+    /// fence's start (`Agent.runs_read_mono_ms`). 0 in a file an agent before it wrote.
+    runs_read_ms: u64 = 0,
     /// A fence had begun: a restarted agent finishes it, whatever the lease says, so that it
     /// never starts again what the fence stopped.
     fencing: bool = false,
@@ -239,6 +242,11 @@ pub const Agent = struct {
     sent_ms: u64,
     /// When the next keepalive is due, monotonic.
     renew_at_ms: u64,
+    /// When the last successful read of the runs (`/job-runs`, where a run's stop is) was sent,
+    /// monotonic. The job fence counts from it (`job_fence_at_ms`), as the fence counts from
+    /// `sent_ms`: a node that renews its lease but cannot read its runs stops its runs anyway
+    /// (docs/decisions/2026-11-14-j6-runs-unread-gap.md, option B).
+    runs_read_mono_ms: u64,
     fence: Fence,
     /// How many times the agent has fenced itself; the shell says so when it grows.
     fences: u32,
@@ -352,6 +360,7 @@ pub const Agent = struct {
         agent.tenure = 0;
         agent.sent_ms = 0;
         agent.renew_at_ms = 0;
+        agent.runs_read_mono_ms = 0;
         agent.fence = .{};
         agent.fences = 0;
         agent.job_reports_refused = 0;
@@ -416,6 +425,14 @@ pub const Agent = struct {
 
     /// When the fence falls, on the monotonic clock; null if the agent holds no lease or is
     /// already fencing.
+    /// When the job fence stops this node's runs: the fence's term, counted from the last
+    /// successful read of the runs instead of the last keepalive. Null with no lease (no ttl;
+    /// the fence has stopped everything) or while fencing.
+    pub fn job_fence_at_ms(agent: *const Agent) ?u64 {
+        if (agent.lease == store.lease_none or agent.fence.active) return null;
+        return fencing.fence_at_ms(agent.runs_read_mono_ms, agent.lease_ttl_ms);
+    }
+
     pub fn fence_at_ms(agent: *const Agent) ?u64 {
         if (agent.lease == store.lease_none or agent.fence.active) return null;
         return fencing.fence_at_ms(agent.sent_ms, agent.lease_ttl_ms);
@@ -883,6 +900,7 @@ pub const Agent = struct {
             .sent_ms = agent.sent_ms,
             .tenure = agent.tenure,
             .boot_id = ctx.boot_id,
+            .runs_read_ms = agent.runs_read_mono_ms,
             .fencing = agent.fence.active,
             .kill_at_ms = agent.fence.kill_at_ms,
             .labels = agent.config.labels,
@@ -906,6 +924,8 @@ pub const Agent = struct {
     fn restore(agent: *Agent, ctx: *const Context, mono: u64) Error!void {
         assert(!agent.restored);
         agent.restored = true;
+        // No earlier read to count from: the job fence counts from the agent's start.
+        agent.runs_read_mono_ms = mono;
         const state = ctx.state orelse return;
         const text = state.read(ctx.arena, lease_file) catch |err| switch (err) {
             error.Absent => return,
@@ -933,6 +953,10 @@ pub const Agent = struct {
         agent.lease_ttl_ms = parsed.ttl_ms;
         agent.sent_ms = parsed.sent_ms;
         agent.renew_at_ms = parsed.sent_ms + fencing.renew_after_ms(parsed.ttl_ms);
+        // A read the previous run made, else (a file from before the job fence) its last send:
+        // either is no later than any read that run made after it kept the file.
+        const read = if (parsed.runs_read_ms > 0) parsed.runs_read_ms else parsed.sent_ms;
+        agent.runs_read_mono_ms = @min(read, mono);
     }
 
     /// Starts the fence: `nominal_ms` is when it should have begun, on the monotonic clock.

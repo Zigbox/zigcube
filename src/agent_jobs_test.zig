@@ -510,6 +510,84 @@ test "the deadline stops the run while the server cannot be reached, before the 
     try testing.expectEqual(@as(?records.StopCause, .deadline), seen.stop_cause);
 }
 
+test "a stop the agent cannot read is enforced by the job fence while keepalives go on (#143)" {
+    // Goal: #143 on ad4c6ca (seed 2107486098): a slow store failed the node's read of its runs on
+    // every step while its keepalives were answered, so a committed cancel was never seen and the
+    // lease never fenced; the run kept executing 12.6 s after its stop, past J6's bound of 12 s.
+    // Method: cancel a running run, then fail every read of the runs and nothing else. Before
+    // `ttl - margin` from the last read that succeeded the run runs on; after it the agent stops
+    // it with cause `unreachable` and a grace of at most `fence_stop_ms`, while the lease, the
+    // tenure and the fence are untouched (option B, docs/decisions/2026-11-15-j6-143-job-fence.md).
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    try rig.ask_stop(.cancel, 600_000);
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    const read_ms = world.agent.runs_read_mono_ms;
+    const tenure = world.agent.tenure;
+    const fence_at = read_ms + world.agent.lease_ttl_ms - constants.fence_margin_ms;
+    try testing.expectEqual(fence_at, world.agent.job_fence_at_ms().?);
+    world.advance(fence_at - world.now_ms() - 500);
+    try testing.expect(rig.running());
+    world.advance(500 + constants.fence_stop_ms + 1_000);
+    try testing.expect(!rig.running());
+    try testing.expect(!world.agent.fence.active);
+    try testing.expectEqual(tenure, world.agent.tenure);
+    try testing.expectEqual(read_ms, world.agent.runs_read_mono_ms);
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), kept.stop_cause);
+    try testing.expect(kept.grace_ms <= constants.fence_stop_ms);
+    world.switched.down_list_prefix = null;
+    world.advance(2_000);
+    try testing.expect(world.agent.runs_read_mono_ms > read_ms);
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+}
+
+test "an agent restart does not move the job fence later (#143)" {
+    // Goal: the job fence counts from the last runs read that succeeded, so a restart in the same
+    // boot must not count it from the restart. Method: as above, but the agent restarts halfway
+    // to the fence; the run is still stopped by the first read's fence, not one ttl later.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    rig.step();
+    try rig.ask_stop(.cancel, 600_000);
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    const fence_at = world.agent.job_fence_at_ms().?;
+    world.advance((fence_at - world.now_ms()) / 2);
+    try testing.expect(rig.running());
+    world.restart_agent();
+    world.advance(fence_at - world.now_ms() + constants.fence_stop_ms + 1_000);
+    try testing.expect(!rig.running());
+    try testing.expect(world.agent.job_fence_at_ms().? <= fence_at);
+    world.switched.down_list_prefix = null;
+}
+
+test "an idle node's job fence keeps up, so a run adopted after a restart runs on (#143)" {
+    // Goal: agent-smoke on PR #270: a node with no job made no read of the runs, so the job fence
+    // counted from the agent's start; the lease file kept that stamp, and the agent restarted
+    // (kill -9) just after a job's start stopped it at once as `unreachable`.
+    // Method: idle for two ttls, assign a run, step once, restart the agent: the run runs on.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    world.advance(2 * world.agent.lease_ttl_ms);
+    try testing.expect(world.agent.job_fence_at_ms().? > world.now_ms());
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    world.restart_agent();
+    world.advance(1_000);
+    try testing.expect(rig.running());
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, null), kept.stop_cause);
+}
+
 test "a deadline of another boot is not compared: the run is stopped by the host's loss" {
     // The monotonic clock restarts with the boot, so a deadline from an earlier boot says
     // nothing. The container is gone with the reboot, and the run ends lost, not `deadline`.
