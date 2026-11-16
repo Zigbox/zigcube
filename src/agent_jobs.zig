@@ -244,6 +244,14 @@ fn note_deadline_wake(agent: *Agent, at_mono_ms: u64) void {
     agent.deadline_wake_mono_ms = @min(agent.deadline_wake_mono_ms, at_mono_ms);
 }
 
+/// No run here, assigned, running or recorded: no stop this node could miss, so the job fence
+/// counts from now. Else an idle node's fence counts from its start, and the first run after a
+/// restart (the lease file keeps the stamp) is stopped at once as `unreachable` (agent-smoke).
+fn idle(agent: *Agent, ctx: *const Context) u32 {
+    agent.runs_read_mono_ms = @max(agent.runs_read_mono_ms, ctx.mono_ms());
+    return 0;
+}
+
 /// One reconcile step's work on runs. Returns how many store writes were committed.
 pub fn pass(
     agent: *Agent,
@@ -256,7 +264,7 @@ pub fn pass(
     const state = ctx.state orelse return 0;
     var work: Work = .{ .agent = agent, .ctx = ctx, .state = state, .listings = listings };
     const subjects = try work.subjects(assigned);
-    if (subjects.len == 0) return 0;
+    if (subjects.len == 0) return idle(agent, ctx);
 
     const cctx = ctx.as_controller();
     // The job fence counts from when a read that succeeded was sent: a stop committed before

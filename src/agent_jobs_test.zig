@@ -568,6 +568,26 @@ test "an agent restart does not move the job fence later (#143)" {
     world.switched.down_list_prefix = null;
 }
 
+test "an idle node's job fence keeps up, so a run adopted after a restart runs on (#143)" {
+    // Goal: agent-smoke on PR #270: a node with no job made no read of the runs, so the job fence
+    // counted from the agent's start; the lease file kept that stamp, and the agent restarted
+    // (kill -9) just after a job's start stopped it at once as `unreachable`.
+    // Method: idle for two ttls, assign a run, step once, restart the agent: the run runs on.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    world.advance(2 * world.agent.lease_ttl_ms);
+    try testing.expect(world.agent.job_fence_at_ms().? > world.now_ms());
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    world.restart_agent();
+    world.advance(1_000);
+    try testing.expect(rig.running());
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, null), kept.stop_cause);
+}
+
 test "a deadline of another boot is not compared: the run is stopped by the host's loss" {
     // The monotonic clock restarts with the boot, so a deadline from an earlier boot says
     // nothing. The container is gone with the reboot, and the run ends lost, not `deadline`.
