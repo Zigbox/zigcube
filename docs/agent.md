@@ -71,7 +71,9 @@ node's labels differ from those it registered with, and its lease is live"), sin
 resume the old tenure under the old labels. To relabel a node, stop its agent for one lease ttl
 (the node fences, and the next start registers a new tenure with the new labels), or empty its
 `--state-dir` (which stops what it ran: a wiped node, as in B2). A lease file written before
-labels were recorded is accepted. Label keys are at most 32 bytes, at most 8 labels.
+labels were recorded (by an agent before 0.5.2) is accepted, but an agent given labels does not
+resume its lease: the node fences at start and registers a new tenure with the labels, so an
+upgrade that adds `--label` stops what the node ran, as a relabel does. Label keys are at most 32 bytes, at most 8 labels.
 
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
 the exit code of their blame. While it runs, a server that cannot be reached is `ZC-E0503`, shown

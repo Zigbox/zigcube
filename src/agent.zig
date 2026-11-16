@@ -178,7 +178,8 @@ const LeaseFile = struct {
 /// node's labels reach the server only when it registers, so resuming would keep the old ones
 /// in force (docs/decisions/2026-11-14-b6-agent-labels-flag-and-file.md). Any file the agent
 /// would not resume (unreadable, another boot, a fence begun, past its fence time, labels not
-/// recorded) is fine: the agent fences and registers again with `labels`. Order does not count.
+/// recorded) is fine: the agent fences and registers again with `labels` (`Agent.restore`
+/// fences on a file with no labels when `labels` is not empty). Order does not count.
 pub fn kept_labels_allow(
     arena: Allocator,
     text: []const u8,
@@ -948,6 +949,13 @@ pub const Agent = struct {
         const usable = parsed.lease != store.lease_none and parsed.tenure > 0 and
             fencing.inequality_problem(parsed.ttl_ms) == null and same_boot;
         if (!usable) return agent.begin_fence(ctx, mono);
+        // A file an agent before B6's labels wrote (no `labels`) under an agent configured with
+        // labels: the lease was registered without them, and resuming would keep the node
+        // unlabelled (not exclusive) at the server. Fence and register again with them (0.5.2
+        // review; `kept_labels_allow` lets the agent start for this).
+        if (parsed.labels == null and agent.config.labels.len > 0) {
+            return agent.begin_fence(ctx, mono);
+        }
         agent.lease = parsed.lease;
         agent.tenure = parsed.tenure;
         agent.lease_ttl_ms = parsed.ttl_ms;
