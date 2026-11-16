@@ -1388,7 +1388,7 @@ test "no raw errors: no output of any case shows a trace or a Zig error name" {
         for (std.enums.values(Style)) |style| {
             const output = try run_case(arena, case, style, state_root);
             try testing.expect(!shows_trace(try stable(arena, output.stderr, state_root)));
-            try testing.expect(!shows_trace(output.stdout));
+            try testing.expect(!shows_trace(try stable(arena, output.stdout, state_root)));
         }
     }
     try testing.expect(shows_trace("error.AccessDenied"));
