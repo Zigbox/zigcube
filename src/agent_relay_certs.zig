@@ -43,6 +43,9 @@ pub const Host = struct {
 
 pub const Asker = struct {
     node: []const u8,
+    /// Where the runtime keeps its containers' directories: `containers/` (the fake runtime) or
+    /// `zigbox/` (`--runtime zigbox`).
+    dir: []const u8 = agent_records.dir_containers,
     /// A failure was shown and nothing has worked since.
     reported: bool = false,
     /// Containers whose last ask failed, and when each may be asked again: one container's
@@ -69,14 +72,14 @@ pub const Asker = struct {
         diag: *Diag,
     ) Outcome {
         assert(diag.code == null);
-        const names = state.list(arena, agent_records.dir_containers) catch return .idle;
+        const names = state.list(arena, asker.dir) catch return .idle;
         var outcome: Outcome = .idle;
         var asks: u32 = 0;
         for (names) |entry| {
             if (asks == constants.relay_cert_asks_per_step_max) break;
-            const name = container_of(entry) orelse continue;
+            const name = container_of(asker.dir, entry) orelse continue;
             if (now_ms < asker.retry_at(name)) continue;
-            const request = wanted(state, arena, name) orelse continue;
+            const request = wanted(state, arena, asker.dir, name) orelse continue;
             if (records.name_problem(request.job, constants.service_name_bytes_max) != null) {
                 continue; // Not a job's name: the server would refuse it, the relay waits.
             }
@@ -164,7 +167,9 @@ pub const Asker = struct {
             }
             return error.Failed;
         };
-        if (reply.status != 200) return refused(state, arena, name, request.job, reply, diag);
+        if (reply.status != 200) {
+            return refused(state, arena, asker.dir, name, request.job, reply, diag);
+        }
         const der = certificate_of(arena, reply.body) orelse
             return bad_reply(diag, "the certificate answer is not what the server sends");
         var detail: x509.Detail = .{};
@@ -175,14 +180,13 @@ pub const Asker = struct {
         {
             return bad_reply(diag, "the run's certificate is not for the run's key");
         }
-        put(state, name, agent_records.file_relay_certificate, der, diag) catch
+        put(state, asker.dir, name, agent_records.file_relay_certificate, der, diag) catch
             return error.Failed;
     }
 };
 
-/// The container's name in a listing entry, `containers/<name>/`; null for anything else.
-fn container_of(entry: []const u8) ?[]const u8 {
-    const prefix = agent_records.dir_containers;
+/// The container's name in a listing entry, `<dir><name>/`; null for anything else.
+fn container_of(prefix: []const u8, entry: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, entry, prefix)) return null;
     if (!std.mem.endsWith(u8, entry, "/")) return null;
     const name = entry[prefix.len .. entry.len - 1];
@@ -191,18 +195,23 @@ fn container_of(entry: []const u8) ?[]const u8 {
 }
 
 /// The container's request, if it has one and no answer yet.
-fn wanted(state: AgentState, arena: Allocator, name: []const u8) ?relay_tls.Request {
+fn wanted(
+    state: AgentState,
+    arena: Allocator,
+    dir: []const u8,
+    name: []const u8,
+) ?relay_tls.Request {
     var buffer: [agent_state.name_bytes_max]u8 = undefined;
     const answers = [_][]const u8{
         agent_records.file_relay_certificate,
         agent_records.file_relay_refused,
     };
     for (answers) |file| {
-        if (state.read(arena, agent_records.path(&buffer, name, file))) |_| {
+        if (state.read(arena, agent_records.path_in(&buffer, dir, name, file))) |_| {
             return null;
         } else |_| {} // Absent, or unreadable: the relay sees the same and waits.
     }
-    const path = agent_records.path(&buffer, name, agent_records.file_relay_public);
+    const path = agent_records.path_in(&buffer, dir, name, agent_records.file_relay_public);
     const text = state.read(arena, path) catch return null;
     return relay_tls.Request.parse(text);
 }
@@ -236,6 +245,7 @@ fn certificate_of(arena: Allocator, body: []const u8) ?[]const u8 {
 fn refused(
     state: AgentState,
     arena: Allocator,
+    dir: []const u8,
     name: []const u8,
     job: []const u8,
     reply: client_mod.Reply,
@@ -254,20 +264,21 @@ fn refused(
         .{ job, cause },
     ) catch return no_memory(diag);
     var buffer: [agent_state.name_bytes_max]u8 = undefined;
-    const log = agent_records.path(&buffer, name, agent_records.file_relay_log);
+    const log = agent_records.path_in(&buffer, dir, name, agent_records.file_relay_log);
     state.append(log, line) catch {}; // The marker below is what the relay acts on.
-    try put(state, name, agent_records.file_relay_refused, line, diag);
+    try put(state, dir, name, agent_records.file_relay_refused, line, diag);
 }
 
 fn put(
     state: AgentState,
+    dir: []const u8,
     name: []const u8,
     file: []const u8,
     data: []const u8,
     diag: *Diag,
 ) error{Failed}!void {
     var buffer: [agent_state.name_bytes_max]u8 = undefined;
-    state.put_atomic(agent_records.path(&buffer, name, file), data) catch |err| {
+    state.put_atomic(agent_records.path_in(&buffer, dir, name, file), data) catch |err| {
         _ = agent_records.state_failed(diag, err, "write a relayed run's certificate") catch {};
         return error.Failed;
     };

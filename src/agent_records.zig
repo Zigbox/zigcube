@@ -42,6 +42,10 @@ const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 
 pub const dir_containers = "containers/";
+/// Where `--runtime zigbox` keeps a container's directory (`zigbox_launch.dir_name`): the
+/// supervisor's relay files (`relay.pub`, `relay.crt`, `relay.log`) are there, not under
+/// `containers/` (B4 slice 4).
+pub const dir_zigbox = "zigbox/";
 pub const file_spec = "spec.json";
 pub const file_run = "run.json";
 pub const file_child = "child.pid";
@@ -127,9 +131,20 @@ pub fn path(
     container: []const u8,
     file: []const u8,
 ) []const u8 {
+    return path_in(buffer, dir_containers, container, file);
+}
+
+/// `path` under `dir`, one of `dir_containers` and `dir_zigbox`.
+pub fn path_in(
+    buffer: *[agent_state.name_bytes_max]u8,
+    dir: []const u8,
+    container: []const u8,
+    file: []const u8,
+) []const u8 {
     assert(runtime.name_problem(container) == null);
     assert(file.len > 0);
-    return std.fmt.bufPrint(buffer, "{s}{s}/{s}", .{ dir_containers, container, file }) catch
+    assert(dir.len <= dir_containers.len);
+    return std.fmt.bufPrint(buffer, "{s}{s}/{s}", .{ dir, container, file }) catch
         unreachable; // The comptime check above sizes the buffer for the longest file name.
 }
 
@@ -151,6 +166,19 @@ pub fn has_image(fixtures: []const []const u8, image: []const u8) bool {
     return false;
 }
 
+/// The relay's files of an earlier run, which a new launch removes under either runtime
+/// (`zigbox_launch.write_spec` too): a stale `relay.crt` is another key's certificate, which the
+/// relay never takes, so its run would wait for one to ZC-E0705; a stale `relay.refused` would
+/// end it with ZC-E0706.
+pub const relay_files = [_][]const u8{
+    file_relay_port,
+    file_relay_log,
+    file_relay_public,
+    file_relay_certificate,
+    file_relay_refused,
+    file_relay_fault,
+};
+
 /// The files of an older container of the name that a start removes before it puts the spec.
 const stale_files = [_][]const u8{
     file_run,
@@ -159,13 +187,7 @@ const stale_files = [_][]const u8{
     file_forced,
     file_fetch,
     file_fetch_log,
-    file_relay_port,
-    file_relay_log,
-    file_relay_public,
-    file_relay_certificate,
-    file_relay_refused,
-    file_relay_fault,
-};
+} ++ relay_files;
 
 /// Starts the container's record: clears what an older container of the name left (a stopped
 /// container's directory has no spec by now, see `remove_container`), then puts the spec.

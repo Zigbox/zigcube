@@ -46,6 +46,7 @@ const agent_peer = @import("agent_peer.zig");
 const api_tls_client = @import("api_tls_client.zig");
 const agent_relay_certs = @import("agent_relay_certs.zig");
 const api_tls_guard = @import("api_tls_guard.zig");
+const agent_records = @import("agent_records.zig");
 const dir_images = @import("dir_images.zig");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_server_mod = @import("peer_server.zig");
@@ -53,6 +54,12 @@ const failures = @import("store_failures.zig");
 const store = @import("store.zig");
 
 const Diag = diag_mod.Diag;
+
+comptime {
+    // The certificate step finds `--runtime zigbox`'s relay files where its supervisor puts them.
+    const launch_dir = @import("zigbox_launch.zig").dir_name ++ "/";
+    std.debug.assert(std.mem.eql(u8, agent_records.dir_zigbox, launch_dir));
+}
 
 /// Set by the signal handler, read by the loop.
 var stop_requested: std.atomic.Value(bool) = .init(false);
@@ -463,6 +470,18 @@ fn destroy_agent(gpa: std.mem.Allocator, agent: *agent_mod.Agent) void {
     gpa.destroy(agent);
 }
 
+/// Where the certificate step finds the runtime's relay files.
+fn relay_dir(kind: RuntimeKind) []const u8 {
+    return if (kind == .zigbox) agent_records.dir_zigbox else agent_records.dir_containers;
+}
+
+const RuntimeKind = @TypeOf(@as(config_mod.Config, undefined).runtime);
+
+/// The certificate step for node `node`'s runs under runtime `kind`.
+fn relay_asker(node: []const u8, kind: RuntimeKind) agent_relay_certs.Asker {
+    return .{ .node = node, .dir = relay_dir(kind) };
+}
+
 /// Runs the agent until it is told to stop. Returns the process's exit code.
 pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const io = init.io;
@@ -527,7 +546,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
         .tls = http_transport.client.tls,
-        .relay_certs = .{ .node = config.node },
+        .relay_certs = relay_asker(config.node, config.runtime),
         .guard = http_transport.client.guard,
     };
     defer shell.arena.deinit();
@@ -1040,6 +1059,19 @@ const Backend = struct {
 };
 
 // ---- Tests ------------------------------------------------------------------------------------
+
+test "the certificate step looks for relay files where each runtime keeps its containers" {
+    // Goal: a `--runtime zigbox` agent asks for its runs' certificates (B4): its supervisors
+    // write relay.pub under `zigbox/`, and an asker looking under `containers/` never finds one.
+    // The end-to-end proof is demo-b4, which this cloud container cannot run.
+    const zigbox_asker = relay_asker("node1", .zigbox);
+    try std.testing.expectEqualStrings(agent_records.dir_zigbox, zigbox_asker.dir);
+    try std.testing.expectEqualStrings("node1", zigbox_asker.node);
+    const fake_asker = relay_asker("node1", .fake);
+    try std.testing.expectEqualStrings(agent_records.dir_containers, fake_asker.dir);
+    const dirs_differ = !std.mem.eql(u8, agent_records.dir_zigbox, agent_records.dir_containers);
+    try std.testing.expect(dirs_differ);
+}
 
 test "a cancelled task while the node key is made exits quietly, with no diagnostic" {
     // Goal: the agent's first start draws the node key; a cancel there is no failure and must not

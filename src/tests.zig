@@ -88,6 +88,7 @@ comptime {
     _ = @import("relay_fuzz.zig");
     _ = @import("relay.zig");
     _ = @import("relay_tls_test.zig");
+    _ = @import("relay_secure.zig");
     _ = @import("agent_relay_certs_test.zig");
     _ = @import("tls_fuzz.zig"); // The same.
     _ = @import("tls_server_fuzz.zig"); // The same.

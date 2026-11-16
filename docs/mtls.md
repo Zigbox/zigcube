@@ -551,6 +551,13 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   The client is not authenticated, so that close keeps its connection slot at most
   `tls_alert_flush_ms` (1 s) after the refusal, not the idle timeout
   (decisions/2026-11-14-b7-linger-bound.md).
+  Its workload-certificate row (B4 slice 4) puts the real relay
+  between the harness (the job) and each server, with a job certificate the cluster CA issued
+  through the server's issuance code: both servers read the job's SPIFFE id and extension; the
+  JDK server pins the job's id and refuses another job's certificate, while `openssl s_server`,
+  which has no SPIFFE allow-list, is shown to see the other job's id; both refuse an expired
+  certificate and one from another CA (ZC-E0814 in `relay.log`, the job's connection closed);
+  without a certificate the relay never dials (ZC-E0705) and neither server sees a connection.
 
 ## Issuance (B4 slice 2)
 

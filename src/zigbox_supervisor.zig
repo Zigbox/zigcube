@@ -27,6 +27,7 @@ const pull_report = @import("pull_report.zig");
 const records = @import("records.zig");
 const relay_module = @import("relay.zig");
 const relay_tls = @import("relay_tls.zig");
+const relay_secure = @import("relay_secure.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -552,7 +553,13 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     };
     // The relay's threads connect upstream with `init.io`, after the start: the single-threaded
     // `io` above is for the namespace work only.
-    const relay_ctx: RelayContext = .{ .gpa = init.gpa, .io = init.io, .dir_path = dir_path };
+    const relay_ctx: RelayContext = .{
+        .gpa = init.gpa,
+        .io = init.io,
+        .dir_io = io,
+        .dir = dir,
+        .dir_path = dir_path,
+    };
     return supervise(io, dir, real.interface(), storage, &spec, arena_state.allocator(), relay_ctx);
 }
 
@@ -706,8 +713,15 @@ fn import_refused(collector: *zigbox.diag.Diag, cause: []const u8) Kept {
 }
 
 /// What the job's relay needs that the start does not: memory, an `Io` for the upstream
-/// connections, and where `relay.log` goes.
-const RelayContext = struct { gpa: Allocator, io: std.Io, dir_path: []const u8 };
+/// connections and the run's key, and the container's directory (`dir`, opened with `dir_io`),
+/// where `relay.log`, `relay.pub` and the agent's `relay.crt` go.
+const RelayContext = struct {
+    gpa: Allocator,
+    io: std.Io,
+    dir_io: std.Io,
+    dir: Dir,
+    dir_path: []const u8,
+};
 
 fn supervise(
     io: std.Io,
@@ -756,6 +770,8 @@ fn supervise(
     }
     const relay = open_relay(relay_ctx, spec, &storage.handle);
     _ = zigbox.wait(&storage.handle);
+    // PID 1 is reaped, so its pid may name another process from here: the relay must not kill it.
+    if (relay) |open| @atomicStore(i32, &open.command_pid, 0, .release);
     // `wait` has already written Zigbox's run record, which is how the agent learns of the
     // ending, so the relay outlives the report by this call: Zigbox gives no hook between the
     // reap and the record (docs/demos/b3.md). Nothing new can come in, since the container's
@@ -778,9 +794,10 @@ fn open_relay(
     const taken = handle.session.take_listener() orelse
         return kill_unrelayed(ctx, handle, "the container gave no listener");
     const listener: std.os.linux.fd_t = @intCast(taken);
-    if (relay_refused(spec)) |cause| {
+    const plan = relay_plan(spec);
+    if (plan == .refused) {
         _ = std.os.linux.close(listener);
-        return kill_unrelayed(ctx, handle, cause);
+        return kill_unrelayed(ctx, handle, plan.refused);
     }
     const upstream = relay_module.Upstream.parse(spec.relay) orelse {
         _ = std.os.linux.close(listener);
@@ -799,26 +816,84 @@ fn open_relay(
         constants.relay_port,
         log_path,
     ) catch return kill_unrelayed(ctx, handle, "there was no memory for the relay");
-    relay.run() catch {
+    if (secure_relay(ctx, relay, plan, spec)) |cause| {
         relay.stop();
-        return kill_unrelayed(ctx, handle, "the relay's thread could not start");
+        return kill_unrelayed(ctx, handle, cause);
+    }
+    // A run never outlives its relay (#228): if the relay's listener stops while the container
+    // lives, the relay kills the container's PID 1, which takes every process of its namespace.
+    assert(handle.pid > 1);
+    start_relay(relay, @intCast(handle.pid)) catch |err| {
+        relay.stop();
+        return kill_unrelayed(ctx, handle, switch (err) {
+            error.PlainRefused => "a release build serves no plain-TCP relay upstream",
+            else => "the relay's thread could not start",
+        });
     };
     return relay;
 }
 
-/// Why this supervisor will not serve the relay, or null. It speaks only B3's plain TCP to an
-/// upstream until B4 slice 4 brings TLS here, and a release build serves no plain upstream: a
-/// relay that names a TLS server, or that is not a Debug build's plain one, is refused rather
-/// than connected in plaintext without the run's identity (fail closed, #228).
-fn relay_refused(spec: *const launch.Spec) ?[]const u8 {
+/// Gives a TLS relay the run's key and writes `relay.pub` (B4); a plain one (Debug only, see
+/// `relay_plan`) needs nothing. Null when done, else why the relay cannot be served.
+fn secure_relay(
+    ctx: RelayContext,
+    relay: *relay_module.Relay,
+    plan: RelayPlan,
+    spec: *const launch.Spec,
+) ?[]const u8 {
+    assert(plan != .refused);
+    assert(relay.credential == null);
+    switch (plan) {
+        .refused => unreachable, // Asserted above: a refused plan never opens a relay.
+        .plain => return null,
+        .tls => |tls| {
+            const cause = relay_secure.secure(
+                ctx.io,
+                ctx.dir_io,
+                ctx.dir,
+                relay,
+                tls,
+                spec.labels,
+                spec.tree,
+            ) orelse {
+                assert(relay.credential != null);
+                return null;
+            };
+            return cause;
+        },
+    }
+}
+
+/// Starts the relay's threads for the command whose PID is `pid` (the container's PID 1): the
+/// relay must know it before its acceptor runs, or a listener that stops would leave the command
+/// running (#228).
+fn start_relay(relay: *relay_module.Relay, pid: i32) relay_module.Relay.RunError!void {
+    assert(pid > 1);
+    assert(relay.acceptor == null);
+    relay.command_pid = pid;
+    assert(relay.command_pid == pid);
+    try relay.run();
+}
+
+/// How this supervisor serves a job's relay: over TLS to the server its relay entry names, with
+/// the run's own key and certificate (B4); over plain TCP only in a Debug build that asked for
+/// the test-only plain upstream; else not at all, and why (fail closed, #228: a relay is never
+/// connected in plaintext without the run's identity).
+const RelayPlan = union(enum) { tls: relay_tls.Tls, plain, refused: []const u8 };
+
+fn relay_plan(spec: *const launch.Spec) RelayPlan {
     assert(spec.relay.len > 0);
     if (spec.relay_server_name.len > 0) {
-        return "the zigbox runtime does not speak TLS to a relay's upstream yet (B4 slice 4)";
+        const tls = relay_tls.tls_of(spec.relay_server_name, spec.relay_server_anchor) orelse
+            return .{ .refused = "the relay's upstream CA is not 64 hex digits" };
+        return .{ .tls = tls };
     }
-    if (!spec.relay_plain) return "the relay names no upstream server name and CA " ++
-        "(a job submitted before B4: submit it again)";
-    if (!relay_tls.plain_allowed) return "a release build serves no plain-TCP relay upstream";
-    return null;
+    if (!spec.relay_plain) return .{ .refused = "the relay names no upstream server name and " ++
+        "CA (a job submitted before B4: submit it again)" };
+    if (!relay_tls.plain_allowed) {
+        return .{ .refused = "a release build serves no plain-TCP relay upstream" };
+    }
+    return .plain;
 }
 
 fn relay_log_path(buffer: *[std.fs.max_path_bytes:0]u8, ctx: RelayContext) ?[:0]const u8 {
@@ -950,11 +1025,12 @@ test "a job with a relay gets no network, one listener on the relay port and ZCU
     try std.testing.expectEqualStrings(constants.relay_env_name, relayed.env_names[1]);
 }
 
-test "relay plain: the zigbox supervisor refuses a TLS relay and a release build's plain one" {
+test "relay plain: the zigbox supervisor serves TLS, and plain only in a Debug build" {
     // #228. `demo-b3-build` also runs this test in ReleaseSafe, where the plain one is refused.
-    // Goal: fail closed until B4 slice 4 brings TLS here. Method: a relay naming a server name is
-    // refused (never connected in plaintext), so is one that is neither TLS nor plain, and a
-    // plain one only in a build that admits plain upstreams.
+    // Goal: a relay is never connected in plaintext without the run's identity. Method: a relay
+    // naming a server name and a CA is TLS; one whose CA is not 64 hex digits is refused, so is
+    // one that is neither TLS nor plain, and a plain one is served only in a build that admits
+    // plain upstreams. The server name wins over `plain`: TLS is never downgraded.
     var spec: launch.Spec = .{
         .name = "job-1",
         .tree = "b3:aa",
@@ -965,13 +1041,20 @@ test "relay plain: the zigbox supervisor refuses a TLS relay and a release build
         .relay = "botpike:443",
         .launched = 1,
     };
-    try std.testing.expect(relay_refused(&spec) != null);
+    try std.testing.expect(relay_plan(&spec) == .refused);
     spec.relay_server_name = "broker.botpike.test";
     spec.relay_plain = true;
-    const tls = relay_refused(&spec).?;
-    try std.testing.expect(std.mem.indexOf(u8, tls, "TLS") != null);
+    try std.testing.expect(relay_plan(&spec) == .refused); // No CA.
+    var anchor: [64]u8 = @splat('a');
+    spec.relay_server_anchor = &anchor;
+    const tls = relay_plan(&spec);
+    try std.testing.expectEqualStrings("broker.botpike.test", tls.tls.server_name);
+    try std.testing.expectEqual(@as(u8, 0xaa), tls.tls.anchor[31]);
+    anchor[63] = 'z';
+    try std.testing.expect(relay_plan(&spec) == .refused);
     spec.relay_server_name = "";
-    try std.testing.expectEqual(relay_tls.plain_allowed, relay_refused(&spec) == null);
+    spec.relay_server_anchor = "";
+    try std.testing.expectEqual(relay_tls.plain_allowed, relay_plan(&spec) == .plain);
 }
 
 test "a relay that cannot be served is written to relay.log after what is there (ZC-E0702)" {
@@ -1362,4 +1445,117 @@ test "runs signed past signatures_per_tree_max on one tree all start; no policy 
     // A line the full tree already holds is not added, so it is kept, not refused.
     spec.signatures = &.{first};
     try std.testing.expect(import_signatures(host, &spec, arena) == .kept);
+}
+
+/// A relay to a port nothing serves, with `relay.log` in a scratch directory, for the tests of
+/// `secure_relay` and `start_relay`.
+const RelayRig = struct {
+    tmp: std.testing.TmpDir,
+    path: [std.fs.max_path_bytes]u8,
+    path_length: u32,
+    log_path: [std.fs.max_path_bytes:0]u8,
+    relay: *relay_module.Relay,
+
+    fn open(rig: *RelayRig) !void {
+        rig.tmp = std.testing.tmpDir(.{});
+        errdefer rig.tmp.cleanup();
+        rig.path_length = @intCast(try rig.tmp.dir.realPath(std.testing.io, &rig.path));
+        const log = try std.fmt.bufPrintSentinel(&rig.log_path, "{s}/relay.log", .{
+            rig.path[0..rig.path_length],
+        }, 0);
+        const upstream: relay_module.Upstream = .{ .host = "127.0.0.1", .port = 9 };
+        rig.relay = try .open(std.testing.allocator, std.testing.io, upstream, log);
+    }
+
+    fn context(rig: *RelayRig) RelayContext {
+        return .{
+            .gpa = std.testing.allocator,
+            .io = std.testing.io,
+            .dir_io = std.testing.io,
+            .dir = rig.tmp.dir,
+            .dir_path = rig.path[0..rig.path_length],
+        };
+    }
+
+    fn close(rig: *RelayRig) void {
+        rig.relay.stop();
+        rig.tmp.cleanup();
+    }
+};
+
+fn has_relay_public(dir: Dir) bool {
+    dir.access(std.testing.io, agent_records.file_relay_public, .{}) catch return false;
+    return true;
+}
+
+test "the supervisor secures a TLS relay with the run's key and relay.pub, a plain one not" {
+    // Goal: `open_relay`'s TLS branch is taken (a mutant that skips it would serve a relay with
+    // no key: every connection refused, but no relay.pub for the agent to send either). Method:
+    // a run whose labels and image name a certificate; the plain plan leaves the relay as it was,
+    // the TLS plan gives it a credential and writes relay.pub.
+    const image_digest = "b3:" ++ @as([64]u8, @splat('a'));
+    const spec: launch.Spec = .{
+        .name = "job-1",
+        .tree = image_digest,
+        .reference = "ghcr.io/o/r@sha256:00",
+        .command = &.{"true"},
+        .env = &.{},
+        .labels = &.{ .{ "zcube.job", "job-1" }, .{ "zcube.created", "42" } },
+        .relay = "botpike:443",
+        .launched = 1,
+    };
+    var rig: RelayRig = undefined;
+    try rig.open();
+    defer rig.close();
+    try std.testing.expect(secure_relay(rig.context(), rig.relay, .plain, &spec) == null);
+    try std.testing.expect(rig.relay.credential == null);
+    try std.testing.expect(!has_relay_public(rig.tmp.dir));
+    const tls: relay_tls.Tls = .{ .server_name = "broker.botpike.test", .anchor = @splat(7) };
+    try std.testing.expect(secure_relay(rig.context(), rig.relay, .{ .tls = tls }, &spec) == null);
+    try std.testing.expect(rig.relay.credential != null);
+    try std.testing.expect(has_relay_public(rig.tmp.dir));
+}
+
+test "a relay started for a command kills it when its listener stops (#228)" {
+    // Goal: `start_relay` tells the relay the command's pid before its acceptor runs (a mutant
+    // that drops `command_pid` leaves the command running). Method: a `sleep` stands for the
+    // container's PID 1; the relay's listener is shut down as if the relay had died; the sleep
+    // must end by SIGKILL. Plain upstreams run only in a Debug build, so elsewhere `start_relay`
+    // must refuse instead.
+    const linux = std.os.linux;
+    const io = std.testing.io;
+    var rig: RelayRig = undefined;
+    try rig.open();
+    defer rig.close();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const pid = child.id.?;
+    child.id = null; // Reaped below, never by `Child`.
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        var status: i32 = 0;
+        _ = linux.waitpid(pid, &status, 0);
+    };
+    if (!relay_tls.plain_allowed) {
+        try std.testing.expectError(error.PlainRefused, start_relay(rig.relay, pid));
+        return;
+    }
+    try start_relay(rig.relay, pid);
+    _ = linux.shutdown(rig.relay.listener, linux.SHUT.RDWR);
+    var status: i32 = 0;
+    const started = awake_ms(io);
+    while (true) {
+        const rc = linux.waitpid(pid, &status, linux.W.NOHANG);
+        if (rc == @as(usize, @intCast(pid))) break;
+        try std.testing.expect(awake_ms(io) - started < 5000);
+        io.sleep(.fromMilliseconds(20), .awake) catch {}; // Cancelation only ends the wait early.
+    }
+    reaped = true;
+    try std.testing.expect(linux.W.IFSIGNALED(@bitCast(status)));
+    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(@bitCast(status)));
 }

@@ -1,8 +1,8 @@
 #!/bin/sh
-# Tests guest.sh's `relay-logs` against fake state directories (run by `zig build test`): it must
-# read the layout `--runtime zigbox` writes (<state>/zigbox/<name>/relay.log), print what the logs
-# say, and fail when there is no relay.log at all, so the demo's "no ZC-E07xx line" check cannot
-# pass for lack of a log.
+# Tests guest.sh's `relay-logs [<job>]` against fake state directories (run by `zig build test`):
+# it must read the layout `--runtime zigbox` writes (<state>/zigbox/<name>/relay.log), print
+# what the logs say (one job's alone when named), and fail when there is no relay.log at all, so
+# the demo's "no ZC-E07xx line" check cannot pass for lack of a log.
 set -u
 here=$(dirname "$0")
 tmp=$(mktemp -d)
@@ -30,6 +30,17 @@ grep -q "ZC-E0701 upstream refused" "$tmp/out"
 check "its lines are printed" $?
 grep -q "ok: 2 relay.log files" "$tmp/out"
 check "both logs are counted" $?
+
+# One job's log: only its own lines, never another job's, and a job with none fails.
+STATE="$tmp/real" sh "$here/guest.sh" relay-logs bystander >"$tmp/out" 2>&1
+check "one job's log passes" $?
+grep -q "ZC-E0701" "$tmp/out"
+check "another job's lines are not printed" $((! $? ))
+STATE="$tmp/real" sh "$here/guest.sh" relay-logs job >"$tmp/out" 2>&1
+grep -q "ZC-E0701 upstream refused" "$tmp/out"
+check "the named job's lines are printed" $?
+STATE="$tmp/real" sh "$here/guest.sh" relay-logs nobody >"$tmp/out" 2>&1
+check "a job with no relay.log fails" $((! $? ))
 
 [ "$failures" -eq 0 ] && echo "test-guest: ok"
 exit "$failures"
