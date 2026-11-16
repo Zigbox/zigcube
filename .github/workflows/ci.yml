@@ -111,7 +111,8 @@ jobs:
         with:
           name: check
       - name: Formatting
-        run: zig fmt --check .
+        # zig-pkg/ holds the fetched Zigbox package (ignored by git), not our source.
+        run: zig fmt --check --exclude zig-pkg .
       - name: Tidy (style rules)
         run: zig build tidy
       # Before the build: zcube-server links both client libraries.

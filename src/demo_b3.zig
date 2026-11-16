@@ -93,8 +93,6 @@ pub fn main(init: std.process.Init) u8 {
         .peer_ports = @splat(0),
         .out = &vm_out.interface,
         .limit = 1,
-        // build.zig gzips the Debug agent: it is over the 8 MiB a route may serve.
-        .agent_gzipped = true,
     };
     // Only guest 1 boots, and it forwards its peer port: a free host port, unused by the demo.
     guests.peer_ports[0] = demo_host.free_port(init.io, @as(u64, host.port) * 31 + 1) catch
