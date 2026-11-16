@@ -140,7 +140,10 @@ pub const Setup = struct {
         const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable; // Any
         // seed makes a key pair: only the identity element fails, and a seed never hashes to it.
         const now_ms = setup.ca.wall.now_ms();
-        setup.ca.issue_server_certificate(&setup.certificate, &.{
+        // Into a local: the key, the certificate and the browser's pair change together or not
+        // at all, so a failed renewal leaves the old, matching pair serving (0.5.2 review).
+        var certificate: x509.Der = .{};
+        setup.ca.issue_server_certificate(&certificate, &.{
             .dns_name = setup.dns_name,
             .subject_key = key_pair.public_key.toBytes(),
             .ttl_ms = constants.x509_leaf_ttl_ms_max,
@@ -152,6 +155,7 @@ pub const Setup = struct {
             return error.Refused;
         };
         if (setup.browser) |*browser| try setup.renew_browser(browser, diag);
+        setup.certificate = certificate;
         setup.key_pair = key_pair;
         setup.not_after_ms = now_ms + constants.x509_leaf_ttl_ms_max;
     }
@@ -547,3 +551,34 @@ pub const Conn = struct {
         return taken;
     }
 };
+
+test "a renewal that fails leaves the old key and certificate together (0.5.2 review)" {
+    // Goal: the certificate served is always for the key served. Method: a setup with a browser
+    // identity renews; then a SAN that cannot be issued makes the browser half fail: the renewal
+    // is refused and the cluster certificate still names the kept key.
+    const testing = std.testing;
+    const ManualClock = @import("clock.zig").ManualClock;
+    var clock: ManualClock = .{ .ms = 1_700_000_000_000 };
+    var ca: peer_ca.Ca = .{
+        .key = try Ed25519.KeyPair.generateDeterministic(@splat(0xCA)),
+        .revoked = .{},
+        .wall = clock.clock(),
+    };
+    var diag: Diag = undefined;
+    diag.reset();
+    var seed: [32]u8 = undefined;
+    const browser_key = try server_browser_ca.make_key(testing.io, &seed, &diag);
+    var setup: Setup = undefined;
+    try setup.init(testing.io, &ca, "api.test", .{ .ca_key = browser_key, .sans = &.{} }, &diag);
+    defer setup.deinit();
+    const kept = setup.key_pair.public_key.toBytes();
+    const bad = [_]p256.San{.{ .ip = "abc" }}; // Neither 4 nor 16 bytes.
+    setup.browser.?.sans = &bad;
+    clock.ms += 1000;
+    try testing.expectError(error.Refused, setup.renew(&diag));
+    try testing.expectEqualSlices(u8, &kept, &setup.key_pair.public_key.toBytes());
+    var detail: x509.Detail = .{};
+    const der = setup.certificate.slice();
+    const parsed = try x509.parse_profile(der, .cluster, &detail);
+    try testing.expectEqualSlices(u8, &kept, parsed.public_key.of(der));
+}

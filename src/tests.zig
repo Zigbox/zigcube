@@ -111,6 +111,7 @@ comptime {
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
     _ = @import("server_revoked.zig");
+    _ = @import("server_tls.zig");
     _ = @import("server_tls_test.zig");
     _ = @import("api_tls_guard_test.zig");
     _ = @import("server_issue.zig");
