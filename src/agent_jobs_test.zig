@@ -2439,12 +2439,17 @@ fn misplaced_run_started() !bool {
     starts_seen = 0;
     rig.world.sim.on_start = count_start;
     for (0..4) |_| rig.step();
-    return starts_seen != 0 or rig.running();
+    if (starts_seen != 0 or rig.running()) return true;
+    // Not started, and reported so at once: left `claiming`, it would stay open (J8).
+    const seen = (try rig.observed()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(records.StopCause.not_started, seen.stop_cause.?);
+    return false;
 }
 
 test "a run whose placement the node's labels refuse is not started (0.5.2 review)" {
     // Goal: P1 holds at the node too: an assignment written for a node that has since been
-    // relabelled (or written around the scheduler) starts nothing. Method: a run requiring
-    // tenant=a is assigned to a node labelled tenant=b; four passes are run.
+    // relabelled (or written around the scheduler) starts nothing and is reported
+    // `not_started`. Method: a run requiring tenant=a is assigned to a node labelled tenant=b;
+    // four passes are run.
     try testing.expect(!try misplaced_run_started());
 }

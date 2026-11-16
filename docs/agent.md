@@ -77,7 +77,8 @@ upgrade that adds `--label` stops what the node ran, as a relabel does. Label ke
 
 **What labels isolate.** The node checks a run's `placement.require` against its own labels
 before it starts it, as the scheduler did when it placed it: a run assigned before a relabel, or
-written around the scheduler, is not started, and the job controller stops it (0.5.2 review).
+written around the scheduler, is not started and is reported at once with `stop_cause`
+`not_started` (0.5.2 review).
 Labels are the node's own declaration, though, sent by its agent: they keep one tenant's work off
 another tenant's nodes when every node is honest, and are not a boundary against a node whose
 agent lies about them. A hostile node can claim any tenant's labels; what limits it is its node

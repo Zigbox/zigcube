@@ -896,11 +896,12 @@ const Work = struct {
         if (try work.trust_refusal(run)) |refusal| {
             return work.report_refused(subject.id, record.epoch, refusal);
         }
-        // B6 (P1): labels this node registered that refuse the job's `require` (the run was
-        // placed before a relabel) start nothing. The record stays `claiming`; the job controller
-        // stops the run for the relabel (`job_controller.refused`), and the stop ends it as any
-        // stop of an unstarted run does (0.5.2 review).
-        if (work.placement_refused(run)) return;
+        // B6 (P1): a run whose `require` this node's labels refuse (placed before a relabel, or
+        // written around the scheduler) is not started, and is reported as not started at once
+        // (0.5.2 review). Waiting for the job controller's stop is not enough: it judges the
+        // labels the node registered, which can still be the old ones, and a run left
+        // `claiming` would stay open past its `start_by_ms` (J8).
+        if (work.placement_refused(run)) return work.not_started(subject, record, run);
         if (past_bound(ctx, record)) return work.not_started(subject, record, run);
         const input = work.input_of(subject, run) catch |err| switch (err) {
             error.InputAbsent => return work.cannot_start(subject, record, .{ .input = .absent }),
