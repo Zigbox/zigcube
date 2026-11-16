@@ -201,15 +201,15 @@ fn enforce_one(
     const mono = ctx.mono_ms();
     var record = found;
     if (record.stop_cause == null) {
-        const at = record.deadline_mono_ms orelse return;
-        const due = at +| c1_teeth.job_deadline_late_ms;
-        if (c1_teeth.job_deadline) return;
-        if (mono < due) return note_deadline_wake(agent, due);
-        record.stop_cause = .deadline;
+        record.stop_cause = due_cause(agent, &record, mono) orelse return;
+        // The job fence stops as the fence does: the grace is the fence's, at most.
+        if (record.stop_cause == .@"unreachable") {
+            record.grace_ms = @min(record.grace_ms, constants.fence_stop_ms);
+        }
         // The cause is in `record` for the stop below; if the write fails the stop still goes
-        // out, and the next step finds the same deadline passed and writes it again.
+        // out, and the next step finds the same cause due and writes it again.
         write_record(ctx, state, &record) catch
-            agent.note_enforce_failure(ctx, "record a run's deadline");
+            agent.note_enforce_failure(ctx, "record a run's stop cause");
     }
     // Any recorded cause is a stop under way: send it, or the kill once the grace has passed.
     agent.stop_listing(ctx, listing, record.grace_ms) catch {
@@ -221,8 +221,35 @@ fn enforce_one(
     if (pending.deadline_ms > now) note_deadline_wake(agent, mono + (pending.deadline_ms - now));
 }
 
+/// The stop a running run is due now from this node's records and clock alone: its deadline,
+/// else the job fence (`Agent.job_fence_at_ms`: no read of the runs has succeeded for the
+/// fence's term, so a stop may be committed that this node cannot see; it stops the run as
+/// `unreachable`, docs/decisions/2026-11-14-j6-runs-unread-gap.md). Null if neither is due yet;
+/// each that is not is noted as a wake.
+fn due_cause(agent: *Agent, record: *const StartRecord, mono: u64) ?records.StopCause {
+    if (record.deadline_mono_ms) |at| {
+        const due = at +| c1_teeth.job_deadline_late_ms;
+        if (!c1_teeth.job_deadline) {
+            if (mono >= due) return .deadline;
+            note_deadline_wake(agent, due);
+        }
+    }
+    const fence_at = agent.job_fence_at_ms() orelse return null;
+    if (mono >= fence_at) return .@"unreachable";
+    note_deadline_wake(agent, fence_at);
+    return null;
+}
+
 fn note_deadline_wake(agent: *Agent, at_mono_ms: u64) void {
     agent.deadline_wake_mono_ms = @min(agent.deadline_wake_mono_ms, at_mono_ms);
+}
+
+/// No run here, assigned, running or recorded: no stop this node could miss, so the job fence
+/// counts from now. Else an idle node's fence counts from its start, and the first run after a
+/// restart (the lease file keeps the stamp) is stopped at once as `unreachable` (agent-smoke).
+fn idle(agent: *Agent, ctx: *const Context) u32 {
+    agent.runs_read_mono_ms = @max(agent.runs_read_mono_ms, ctx.mono_ms());
+    return 0;
 }
 
 /// One reconcile step's work on runs. Returns how many store writes were committed.
@@ -237,9 +264,12 @@ pub fn pass(
     const state = ctx.state orelse return 0;
     var work: Work = .{ .agent = agent, .ctx = ctx, .state = state, .listings = listings };
     const subjects = try work.subjects(assigned);
-    if (subjects.len == 0) return 0;
+    if (subjects.len == 0) return idle(agent, ctx);
 
     const cctx = ctx.as_controller();
+    // The job fence counts from when a read that succeeded was sent: a stop committed before
+    // then is in what it returned.
+    const runs_sent = ctx.mono_ms();
     work.runs = (try controller.list_all(
         records.JobRun,
         &cctx,
@@ -247,6 +277,7 @@ pub fn pass(
         null,
         constants.agent_node_runs_max,
     )).items;
+    agent.runs_read_mono_ms = @max(agent.runs_read_mono_ms, runs_sent);
     // A stage before this one failed with a failure that is not the runtime's (the server): no
     // report goes out, but every stop the runs' records already decide still does (#247). A
     // failed read of the reports is kept the same way: the runs above already say which stops

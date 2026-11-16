@@ -171,10 +171,11 @@ pub const relabel_kept = declared("c1_teeth_relabel_kept");
 /// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
 pub const job_pass_break = declared("c1_teeth_job_pass_break");
 
-/// Not an agent fault but a gap shown (pending the owner, docs/decisions/
-/// 2026-11-14-j6-runs-unread-gap.md): the server fails a node's read of its runs whenever one of
-/// them has a stop asked, while its keepalives and every other call are answered. The agent
-/// never learns of the stop and keeps renewing, so the fence never comes either (must break J6).
+/// Not an agent fault but a world (docs/decisions/2026-11-14-j6-runs-unread-gap.md): the server
+/// fails a node's read of its runs whenever one of them has a stop asked, while its keepalives and
+/// every other call are answered. The agent never learns of the stop and keeps renewing; its job
+/// fence (option B, docs/decisions/2026-11-15-j6-143-job-fence.md) must stop the run within J6's
+/// bound (`sim-c1-runs-unread`, a positive run).
 pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
 
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
@@ -252,5 +253,5 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_placement_exclusive", "sim_c1_teeth_placement_exclusive" },
     .{ "c1_teeth_relabel_kept", "sim_c1_teeth_relabel_kept" },
     .{ "c1_teeth_job_pass_break", "sim_c1_teeth_job_pass_break" },
-    .{ "c1_teeth_job_runs_unread", "sim_c1_teeth_job_runs_unread" },
+    .{ "c1_teeth_job_runs_unread", "sim_c1_runs_unread" },
 };

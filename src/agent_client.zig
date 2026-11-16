@@ -152,8 +152,9 @@ pub const RemoteStore = struct {
     saved_ms: u64 = 0,
     /// The state directory as the person running the agent named it, for the fix line.
     state_dir: []const u8 = "<state dir>",
-    /// The server address the agent was given, borrowed (`load`); saved with the pair.
-    server: []const u8 = "",
+    /// The server address the agent was given (`load`), copied: saved with the pair.
+    server: [remembered_server_bytes_max]u8 = undefined,
+    server_len: u32 = 0,
     /// What to tell the person, taken by `take_notice`.
     notice: ?Notice = null,
     /// `Notice.unverified` is raised once per process.
@@ -218,6 +219,11 @@ pub const RemoteStore = struct {
         const notice = remote.notice;
         remote.notice = null;
         return notice;
+    }
+
+    /// The address the agent was given, which the pair is saved for.
+    pub fn server_name(remote: *const RemoteStore) []const u8 {
+        return remote.server[0..remote.server_len];
     }
 
     /// For `Notice.server_changed`: the address the file named.
@@ -958,7 +964,7 @@ pub const RemoteStore = struct {
     /// directory from before 10b) is nothing remembered; a file that does not parse is
     /// `ZC-E0216`, and the agent does not start on a guess.
     ///
-    /// `server` is the address the agent was given, borrowed: it is saved with the pair, and a
+    /// `server` is the address the agent was given, copied: it is saved with the pair, and a
     /// pair saved for another address is not loaded (`Notice.server_changed`). A version 1 file
     /// names no address and is loaded as it is.
     pub fn load(
@@ -973,7 +979,9 @@ pub const RemoteStore = struct {
         assert(remote.known == null);
         assert(server.len <= remembered_server_bytes_max);
         remote.state_dir = state_dir;
-        remote.server = server;
+        // A copy: the caller's buffer may not outlive the load (agent-smoke saw a dangling one).
+        @memcpy(remote.server[0..server.len], server);
+        remote.server_len = @intCast(server.len);
         const text = state.read(arena, remembered_file) catch |err| switch (err) {
             error.Absent => return,
             else => return remote.unusable(diag, @errorName(err)),
@@ -1049,7 +1057,7 @@ pub const RemoteStore = struct {
         const File = struct { v: u32, server: []const u8, revision: u64, hash: []const u8 };
         const file: File = .{
             .v = remembered_version,
-            .server = remote.server,
+            .server = remote.server_name(),
             .revision = known.revision,
             .hash = &hex,
         };

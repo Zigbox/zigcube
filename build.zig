@@ -1740,24 +1740,6 @@ const c1_teeth_roots = [_]struct {
         .seeds = 225,
         .ops = 300,
     },
-    .{
-        .name = "job_runs_unread",
-        .root = "src/sim_c1_teeth_job_runs_unread_main.zig",
-        .symptom = "J6",
-        // A gap shown, not an agent fault (docs/decisions/2026-11-14-j6-runs-unread-gap.md): the
-        // server cuts a node's runs read while a stop is asked. Measured 2026-11-14 over seeds 1
-        // to 40 at 100 operations: J6 first at 11 seeds with `--c1` (2 4 7 14 17 18 22 23 25 30
-        // 32) and 13 plain; 6 others fail first on other checks (the cut also hides new runs and
-        // ended jobs), so the canary is pinned to known J6 hits, as a sparse tooth's is. Each
-        // passes with the fault off.
-        .canary_seeds = 1,
-        .canary_first = 2,
-        .also_seeds = &.{ 4, 7 },
-        .first_seed = 2,
-        .seeds = 2,
-        .plain_symptom = "J6",
-        .plain_seeds = 2,
-    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1828,6 +1810,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
+    add_runs_unread_step(b, sim);
     add_burst_step(b, sim);
     add_worlds_step(b, sim);
     add_reuse_step(b, sim);
@@ -2221,8 +2204,46 @@ fn add_offline_step(b: *std.Build, sim: SimStepOptions) void {
         .dependOn(&run.step);
 }
 
+/// Seeds of `sim-c1-runs-unread`: each failed J6 in this world before the job fence (2026-11-15,
+/// seeds 1 to 40 at 100 operations with `--c1`: J6 first at 12 seeds) and passes every check with
+/// it. The world is not healthy: the server fails a node's whole runs read while any of its runs
+/// has a stop asked, so the node can never report that run's end, and other seeds fail J8 or see
+/// a container no replica assigns (as they did before the fence); none fails J6 any more.
+const runs_unread_seeds = [_][]const u8{ "2..2", "18..18", "30..30", "32..32" };
+
+/// `zig build sim-c1-runs-unread`: the world that showed the J6 gap (the server fails a node's
+/// runs read while a stop is asked and answers its keepalives;
+/// docs/decisions/2026-11-14-j6-runs-unread-gap.md) with the job fence of option B on
+/// (docs/decisions/2026-11-15-j6-143-job-fence.md). It passes only if no seed fails.
+fn add_runs_unread_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_runs_unread",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c1_runs_unread_world_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const step = b.step("sim-c1-runs-unread", "Run sim-c1 in the runs-unread world (J6 holds)");
+    for (runs_unread_seeds) |range| {
+        const run = b.addRunArtifact(exe);
+        run.addArgs(&.{ "--seeds", range, b.fmt("{d}", .{c1_teeth_operations}), "--c1" });
+        run.expectExitCode(0);
+        step.dependOn(&run.step);
+    }
+}
+
 /// Replays of sim-c1 runs that once failed, each a fixed command line; each must pass.
 const c1_regressions = [_][]const []const u8{
+    // #143 recurred on the 0.5.2 candidate (ad4c6ca): a slow store failed the node's runs read
+    // every step for 12 s while its keepalives were answered, so the cancel was never seen and
+    // the lease never fenced. The agent's job fence (2026-11-15-j6-143-job-fence.md) stops it.
+    &.{
+        "2107486098",           "43",                 "1",
+        "--strong",             "--tenants",          "--profile=slow_store",
+        "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=111",
+    },
     // B2 re-review: before the fix the agent re-reported runs the store refused on every pass,
     // and a step 31 ms before a deadline ran 4.7 s, past J8's bound. The run the review named
     // was `240 798 2 ... --heal-at=487` (43 s); 310 operations fail the same way in 8 s.

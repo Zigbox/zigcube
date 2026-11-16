@@ -312,7 +312,7 @@ const Shell = struct {
                 .{
                     remote_mod.client.remembered_file,
                     shell.remote.previous_server_name(),
-                    shell.remote.server,
+                    shell.remote.server_name(),
                 },
             ),
             .unverified => std.fmt.bufPrint(

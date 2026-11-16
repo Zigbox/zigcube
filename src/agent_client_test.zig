@@ -320,6 +320,30 @@ test "a server that keeps no pair: the agent neither refuses nor keeps one, and 
     try testing.expectEqualStrings(after, try read_file(&files, rig.arena.allocator()));
 }
 
+test "the server address is kept past the buffer it was loaded from" {
+    // Goal: agent-smoke on PR #270: `zcube-agent` formats the address into a buffer that ends with
+    // the load, and the pair was saved for (and compared with) whatever later reused it, so every
+    // restart started fresh. Method: load from a buffer, overwrite it, save: the file names the
+    // address as given.
+    var b: [1][384]u8 = undefined;
+    const bodies = [_][]const u8{
+        answer(&b[0], 2, "{\"revision\":2,\"hash\":\"" ++ hash_b ++ "\"}"),
+    };
+    var files = agent_state.SimState.init(testing.allocator, 4);
+    defer files.deinit();
+    var rig: Rig = undefined;
+    rig.init(bodies[0..]);
+    defer rig.deinit();
+    var buffer = "10.0.0.2:7070".*;
+    try rig.load(&files, &buffer);
+    @memset(&buffer, 'x');
+    try testing.expectEqualStrings("10.0.0.2:7070", rig.remote.server_name());
+    _ = try rig.list();
+    try rig.remote.save(files.interface(), 0);
+    const saved = try read_file(&files, rig.arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, saved, "\"server\":\"10.0.0.2:7070\",") != null);
+}
+
 test "a pair saved for another server is not compared; a version 1 file is kept as it is" {
     // Goal: the file names the server it was saved for, so an agent pointed at another server
     // starts fresh instead of refusing it; a file from before the address (version 1) is kept.

@@ -460,6 +460,10 @@ jobs:
       # The positive run of the deadline-offline tooth's world: long cuts, short deadlines, fix on.
       - name: sim-c1 offline-deadline world
         run: zig build sim-c1-offline --summary all
+      # The runs-unread world (runs read cut while a stop is asked, keepalives answered): the
+      # job fence must hold J6 (#143).
+      - name: sim-c1 runs-unread world
+        run: zig build sim-c1-runs-unread --summary all
       # One node, bursts of short jobs (#198): J8 must hold on a correct agent.
       - name: sim-c1 burst world
         run: zig build sim-c1-burst --summary all
