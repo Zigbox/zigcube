@@ -560,6 +560,9 @@ after a `stop`" is a store fact and not a race.
 **Node loss is judged by the run's tenure,** the tenure recorded at its claim. When that tenure has
 ended and `lost_grace_ms` has passed, the run ends `failed unreachable`; if the agent comes back and
 reports it stopped the run, `failed fenced`; a run that was never claimed ends `failed not_started`.
+`failed unreachable` is also what the agent reports when its job fence stopped the run: the node
+kept its lease but could not read its runs for `ttl − fence_margin` (#143,
+decisions/2026-11-15-j6-143-job-fence.md), so it can end a run whose node was never lost.
 An ending written for a lost node rests on the agent having fenced itself first (the bound of I1b),
 and a wedged node breaks it, as for services.
 

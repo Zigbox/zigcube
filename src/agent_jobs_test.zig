@@ -2428,3 +2428,23 @@ test "teeth: with the node's check skipped, an unsigned run written around the s
     defer job_trust.set_test_fault(.skip_node_check, false);
     if (unsigned_run_refused()) |_| return error.TestToothMissed else |_| {}
 }
+
+fn misplaced_run_started() !bool {
+    var rig = try Rig.start();
+    defer rig.stop();
+    rig.world.agent.config.labels = &.{ "tenant=b", "exclusive=tenant" };
+    var run = rig.run_record(null, 60_000);
+    run.placement = .{ .require = &[_]records.Pair{.{ "tenant", "a" }} };
+    _ = try rig.assign_run(run);
+    starts_seen = 0;
+    rig.world.sim.on_start = count_start;
+    for (0..4) |_| rig.step();
+    return starts_seen != 0 or rig.running();
+}
+
+test "a run whose placement the node's labels refuse is not started (0.5.2 review)" {
+    // Goal: P1 holds at the node too: an assignment written for a node that has since been
+    // relabelled (or written around the scheduler) starts nothing. Method: a run requiring
+    // tenant=a is assigned to a node labelled tenant=b; four passes are run.
+    try testing.expect(!try misplaced_run_started());
+}

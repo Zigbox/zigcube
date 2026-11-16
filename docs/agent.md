@@ -75,6 +75,14 @@ labels were recorded (by an agent before 0.5.2) is accepted, but an agent given 
 resume its lease: the node fences at start and registers a new tenure with the labels, so an
 upgrade that adds `--label` stops what the node ran, as a relabel does. Label keys are at most 32 bytes, at most 8 labels.
 
+**What labels isolate.** The node checks a run's `placement.require` against its own labels
+before it starts it, as the scheduler did when it placed it: a run assigned before a relabel, or
+written around the scheduler, is not started, and the job controller stops it (0.5.2 review).
+Labels are the node's own declaration, though, sent by its agent: they keep one tenant's work off
+another tenant's nodes when every node is honest, and are not a boundary against a node whose
+agent lies about them. A hostile node can claim any tenant's labels; what limits it is its node
+certificate (it may act as its own name only) and, for jobs, the trust policy.
+
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
 the exit code of their blame. While it runs, a server that cannot be reached is `ZC-E0503`, shown
 once and again every 30 seconds, with a backoff from 250 ms to 5 s. SIGINT or SIGTERM ends the
@@ -351,11 +359,18 @@ is one pass of `reconcile`, after the replicas. It wants a run when the node hol
    deadline or kill is a wake, and every call and backoff is capped at it as at the fence, so a cut
    link, a hung call or a run whose report keeps failing delays no run's stop. The pass reports the
    ending once the server answers.
-4. **`stop_cause`** (`cancel`, `deadline`, `fence`, `not_started`) is written to the start record
-   before the container is signalled and reported with the exit. An exit the agent saw first
+4. **`stop_cause`** (`cancel`, `deadline`, `fence`, `not_started`, `unreachable`) is written to
+   the start record before the container is signalled and reported with the exit. An exit the agent saw first
    carries none. A fence under a replaced tenure is reported under the next tenure, once it holds.
+   `unreachable` is the job fence's (below).
 5. **Adoption.** After `kill -9` the new agent lists the runtime, reads the start records, and adopts
    a `claimed` run without a second start.
+6. **The job fence** (#143, decisions/2026-11-15-j6-143-job-fence.md). A stop is seen only in a
+   successful read of the node's runs, and keepalives can succeed while those reads fail. So the
+   agent keeps `runs_read_ms`, the send time of its last successful runs read (in `lease.json`,
+   on the boot clock; 0 in a file written before 0.5.2), and stops every running job with
+   `stop_cause` `unreachable` at `runs_read_ms + ttl − fence_margin`, as the lease fence stops
+   everything at the keepalive's. Services are not touched; the run ends `failed unreachable`.
 
 ### A run's relay (B3 slice 2)
 
@@ -491,6 +506,7 @@ runtimes ignore the envelopes.
 | server down or restarted | keep running | the agent backs off, reports `ZC-E0503` once, carries on when it returns |
 | the lease cannot be kept (the server is away, or the lease is gone) | stopped at `s + ttl − fence_margin` (the agent fences itself; `s` is the send time of the last acknowledged keepalive, on `CLOCK_BOOTTIME`), or at once if the server says the lease is gone | grants a new lease, registers again empty under a new tenure, prints `ZC-W0501` |
 | an observed write is refused (`ZC-E0510`: its tenure was replaced) | stopped at once | as above |
+| the node's runs cannot be read (keepalives may still succeed) | running jobs stopped at `r + ttl − fence_margin`, cause `unreachable` (`r` is the send time of the last successful runs read); services keep running | the lease is kept; the endings are reported once the server answers |
 | a command is killed | the supervisor records it | reported; the controller replaces the replica |
 | a supervisor is killed | the command is killed by the agent | reported `lost` with `ZC-E0509`; replaced |
 | the host restarts | none | everything is `lost`; replaced; a kept lease of another boot (`/proc/sys/kernel/random/boot_id` in `lease.json`) fences |

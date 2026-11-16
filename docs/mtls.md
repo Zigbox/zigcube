@@ -75,6 +75,9 @@ Both commands follow the same rules:
   revokes the node NAME only and `client/NAME` the client NAME only; a bare `NAME` revokes both
   kinds, as before (decisions/2026-11-14-revoked-names-by-kind.md, which supersedes
   2026-11-13-revoked-names-shared.md). A revoked name stops being issued at once.
+  Revocation is by name only: a certificate replaced with `--replace` stays valid until it
+  expires (at most 7 days) unless its name is revoked, so a leaked key is cut off by revoking the
+  name, not by re-issuing.
 
 A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`). The server
 rereads `revoked` without a restart (B7 slice 5): on each HTTP watchdog tick (500 ms) it looks

@@ -2230,6 +2230,9 @@ fn add_runs_unread_step(b: *std.Build, sim: SimStepOptions) void {
             .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
         }),
     });
+    // A failing seed's replay line names this runner; `sim-c1-runs-unread-exe` installs it.
+    b.step("sim-c1-runs-unread-exe", "Install the runs-unread world's runner")
+        .dependOn(&b.addInstallArtifact(exe, .{}).step);
     const step = b.step("sim-c1-runs-unread", "Run sim-c1 in the runs-unread world (J6 holds)");
     for (runs_unread_seeds) |range| {
         const run = b.addRunArtifact(exe);

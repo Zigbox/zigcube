@@ -23,6 +23,7 @@ const agent_state = @import("agent_state.zig");
 const compare_sets = @import("compare_sets.zig");
 const constants = @import("constants.zig");
 const c1_teeth = @import("c1_teeth.zig");
+const scheduler = @import("scheduler.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
@@ -895,6 +896,11 @@ const Work = struct {
         if (try work.trust_refusal(run)) |refusal| {
             return work.report_refused(subject.id, record.epoch, refusal);
         }
+        // B6 (P1): labels this node registered that refuse the job's `require` (the run was
+        // placed before a relabel) start nothing. The record stays `claiming`; the job controller
+        // stops the run for the relabel (`job_controller.refused`), and the stop ends it as any
+        // stop of an unstarted run does (0.5.2 review).
+        if (work.placement_refused(run)) return;
         if (past_bound(ctx, record)) return work.not_started(subject, record, run);
         const input = work.input_of(subject, run) catch |err| switch (err) {
             error.InputAbsent => return work.cannot_start(subject, record, .{ .input = .absent }),
@@ -937,6 +943,13 @@ const Work = struct {
         // slow ones) at its deadline (#202).
         work.agent.arm_run_deadline(ctx, record.deadline_mono_ms.?);
         try work.start(subject, record, run, input);
+    }
+
+    /// Whether this node's labels refuse the run's `placement.require`.
+    fn placement_refused(work: *const Work, run: *const records.JobRun) bool {
+        if (c1_teeth.relabel_kept) return false; // Test-only: the node starts it (P1's tooth).
+        const require = if (run.placement) |placement| placement.require else &.{};
+        return scheduler.refuses(work.agent.config.labels, require);
     }
 
     /// The node's own check (B5): with a trust policy, the run's signatures are judged before
