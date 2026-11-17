@@ -57,9 +57,8 @@ const keys_python =
     \\g=lambda p:u.urlopen(os.environ["ZCUBE_RELAY"]+p,timeout=15).read()
     \\g("/whoami")
     \\while not(c:=g("/candidates")):time.sleep(1)
-    \\K=[bytes.fromhex(x)for x in c.split()]
     \\
-++ keys_search_python ++
+++ keys_parse_python ++ keys_search_python ++
     \\s("environ",open("/proc/self/environ","rb").read())
     \\n=0
     \\X=("/proc","/sys","/dev")
@@ -71,6 +70,14 @@ const keys_python =
     \\   if o.isfile(p)and not o.islink(p)and o.getsize(p)<1<<26:s(p,open(p,"rb").read());n+=1
     \\  except OSError:pass
     \\g("/keys?candidates=%d&files=%d&found=%d&first=%s"%(len(K),n,len(H),u.quote(str(H[:1]))))
+;
+
+/// `keys` parses the upstream's `/candidates` body `c`, as `urlopen().read()` returns it: bytes,
+/// the seeds' hex separated by spaces (`guest.sh key-candidates`). `bytes.fromhex` takes only
+/// `str` before Python 3.14, so the body is decoded first.
+const keys_parse_python =
+    \\K=[bytes.fromhex(x)for x in c.decode().split()]
+    \\
 ;
 
 /// The search of `keys`, given the candidate seeds `K`: `s(name, data)` adds `name` to `H` once
@@ -455,12 +462,16 @@ test "each job's script fits one command-line argument" {
     }
 }
 
-/// Drives `keys_search_python` over encodings of a test seed; exits 0 only if each is found and
-/// a file without the key is not.
+/// Drives `keys_parse_python` over a `/candidates` body as bytes (the job's TypeError before
+/// Python 3.14, demo-b4 step 2), then `keys_search_python` over encodings of a test seed; exits 0 only if the
+/// body parses, each encoding is found and a file without the key is not.
 const keys_search_check_python =
     \\import base64
     \\k = bytes(range(1, 33))
-    \\K = [k]
+    \\c = (bytes(32).hex() + " " + k.hex()).encode()
+    \\
+++ keys_parse_python ++
+    \\assert K == [bytes(32), k], "the candidates were parsed as %r" % K
     \\
 ++ keys_search_python ++
     \\der = bytes.fromhex("302e020100300506032b657004220420") + k
