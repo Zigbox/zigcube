@@ -18,6 +18,8 @@
 #   demo_b4       demo-b4 (demo-b3's rig and driver, B4's script)
 #   jepsen        the Jepsen battery's tarball (`zig build dist`) and its recipe against a real
 #                 Postgres pair (ops/jepsen/test-postgres.sh, which runs test-recipe.sh on it)
+#   release       the release workflow's build and check, publishing nothing (`zig build release`
+#                 for x86_64 and aarch64, .github/release-check.sh; docs/releases/automation.md)
 #
 # Environment: EVENT (github.event_name), HEAD_REF (the PR's head branch), LABELS (the PR's labels,
 # space separated). See docs/decisions/2026-11-04-ci-affected-demos.md.
@@ -28,7 +30,7 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 demo_b7 demo_b5 demo_b6 demo_b4 jepsen)
+jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop demo_b3 demo_b7 demo_b5 demo_b6 demo_b4 jepsen release)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -51,6 +53,10 @@ is_docs() {
 
 classify() {
   case "$1" in
+    # The release workflow, its scripts and its own actions: the release job only (it runs what
+    # the workflow builds and checks, without publishing). Before `.github/*`, which runs all.
+    .github/workflows/release.yml | .github/release-*.sh | .github/actions/setup-gh/* | \
+      .github/actions/find-draft/*) want_one release; return ;;
     # What every job is built from, or CI itself, and what a demo's start scripts run.
     build.zig | build.zig.zon | .github/* | fixtures/* | demo/*) want_all; return ;;
     # The shared driver of both demos.
@@ -85,8 +91,9 @@ classify() {
     ops/zigbox-smoke/*) want_one zigbox_smoke; return ;;
     # The Jepsen battery: its deployment recipe, the tool that packs the tarball, and its client
     # (in the tarball). The code job also builds the client and runs test-recipe.sh as root.
-    ops/jepsen/* | src/dist.zig | src/jepsen_*.zig | src/zcube_jepsen_client.zig)
-      want_one jepsen; return ;;
+    # src/dist.zig also packs the release tarballs and SHA256SUMS.
+    src/dist.zig) want_one jepsen; want_one release; return ;;
+    ops/jepsen/* | src/jepsen_*.zig | src/zcube_jepsen_client.zig) want_one jepsen; return ;;
     # The store suites' own files (the backends themselves are the server and run everything).
     src/store_conformance.zig | src/store_harness.zig | src/store_mutant.zig | \
       src/store_faults.zig | src/store_failover.zig) want_one store; return ;;

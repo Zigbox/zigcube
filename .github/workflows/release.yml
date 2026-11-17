@@ -1,0 +1,355 @@
+# Zigcube release: one run from the merged release commit to the public release
+# (docs/releases/automation.md; decisions docs/decisions/2026-11-17-zigcube-release-workflow.md
+# and docs/decisions/2026-11-17-release-workflow-built.md). Every action is pinned to a full
+# commit SHA (the tag is in the comment), as in ci.yml. Cut down from Zigbox's release.yml.
+#
+# The order is: draft first, publish last. When `ci` is green on a merged release commit (the one
+# that added docs/releases/<version>.md, with that version in build.zig.zon), `plan` decides, and:
+#
+#   plan      everything that can refuse, before anything is written
+#   draft     a DRAFT GitHub release at the release commit (no tag exists yet)
+#   build     zig build release (x86_64 and aarch64 Linux, ReleaseSafe) and SHA256SUMS, checked,
+#             attached to the draft
+#   publish   the owner's ONE approval (environment `release`); the draft's assets are checked
+#             again, and the draft becomes the release, which makes the tag
+#
+# A failure before `publish` leaves a draft and nothing else: no tag, no public release. Every job
+# is idempotent: re-running a failed run, or running this workflow by hand with the version, from
+# main, finishes a half-done release (the draft is reused and its assets replaced).
+#
+# No secret is used: GITHUB_TOKEN alone, and nothing is signed (SHA256SUMS is not signed; see the
+# runbook). ci.yml's `release` job runs the same build and checks on pull requests that touch
+# this file or what it runs, and publishes nothing.
+name: release
+
+on:
+  # The release path: `ci` finished on a push to main.
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  # Finish a release by hand: the version, from main (Use workflow from: main).
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The version to release or to finish, such as 0.6.0 (run from main)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# One release run per commit: a run for a later commit of main must never replace a waiting run
+# for the release commit, and the automatic run and a manual dispatch from the same commit take
+# turns. A dispatch that finishes an older release from a later main commit is in another group;
+# `find-draft` fails closed if two drafts of one tag exist.
+concurrency:
+  group: release-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  # What can be decided without writing anything: is this a release commit, is it green, what
+  # state is the tag in. Quiet stops (exit 0, with a notice) are for commits that are not
+  # releases; everything else that is wrong fails here, before anything is written.
+  plan:
+    name: plan the release
+    # Only a push to main of this repository: a pull request from a fork whose branch is named
+    # `main` also reports head_branch `main`, and its commit must never be released.
+    if: >-
+      ${{ (github.event_name == 'workflow_run'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_repository.full_name == github.repository)
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      go: ${{ steps.plan.outputs.go }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVENT: ${{ github.event_name }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      INPUT_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Local actions and the release scripts load from the workflow's own commit, not the
+      # release commit, so a fix to release tooling reaches a release commit made before it.
+      - name: Check out the release tools at the workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/actions/
+            /.github/release-*.sh
+          sparse-checkout-cone-mode: false
+      - uses: ./.release-tools/.github/actions/setup-gh
+      - name: Plan
+        id: plan
+        run: |
+          set -euo pipefail
+          re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          fail() { echo "::error::release: $1"; exit 1; }
+          stop() { echo "::notice::release: $1"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          zon_version() {
+            git show "$1:build.zig.zon" | sed -n 's/^ *\.version = "\([^"]*\)",.*/\1/p' | head -n 1
+          }
+          if [ "$EVENT" = workflow_dispatch ]; then
+            version="$INPUT_VERSION"
+            [[ "$version" =~ $re ]] || fail "'$version' is not a version such as 0.6.0"
+            # The release commit is the one that ADDED the notes (an edit of them does not count);
+            # --first-parent makes a merged pull request's merge commit, which ci ran on, the
+            # release commit, as workflow_run does.
+            sha=$(git log --first-parent --diff-filter=A --format=%H origin/main \
+              -- "docs/releases/$version.md" | tail -n 1)
+            [ -n "$sha" ] || fail "no commit of main added docs/releases/$version.md"
+            [ "$(zon_version "$sha")" = "$version" ] || fail "build.zig.zon at $sha is not $version"
+            git merge-base --is-ancestor "$sha" origin/main || fail "$sha is not on main"
+          else
+            sha="$HEAD_SHA"
+            version=$(zon_version "$sha")
+            [[ "$version" =~ $re ]] ||
+              fail "build.zig.zon has no version such as 0.6.0 (read '$version')"
+            git cat-file -e "$sha:docs/releases/$version.md" 2> /dev/null ||
+              stop "no docs/releases/$version.md at $sha, so $version is not a release"
+            added=$(git diff --name-only --diff-filter=A "$sha^" "$sha")
+            grep -qxF "docs/releases/$version.md" <<< "$added" ||
+              stop "$sha did not add docs/releases/$version.md, so it is not the release commit of $version; to finish that release, run this workflow with the version"
+          fi
+          tag="v$version"
+          conclusion=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$sha" -f event=push --jq \
+            '.workflow_runs | sort_by(.created_at) | last | .conclusion // "none"')
+          echo "release: ci at $sha: $conclusion"
+          [ "$conclusion" = success ] || fail "ci is not green on $sha ($conclusion)"
+          # A published release has a tag; a draft has none, and the tags endpoint never shows it.
+          err="$RUNNER_TEMP/releasecheck"
+          status=0
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id > /dev/null 2> "$err" ||
+            status=$?
+          if [ "$status" = 0 ]; then
+            stop "$tag is already published; nothing to do"
+          fi
+          grep -q 'HTTP 404' "$err" ||
+            fail "could not look up the release $tag: $(head -c 200 "$err")"
+          # A tag at another commit is never touched.
+          at=$(.release-tools/.github/release-tag.sh "$tag")
+          if [ "$at" != absent ] && [ "$at" != "$sha" ]; then
+            fail "the tag $tag exists at $at, not at $sha; nothing is released"
+          fi
+          prerelease=false
+          if [[ "$version" == *-* ]]; then prerelease=true; fi
+          {
+            echo "go=true"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "release: $tag at $sha (tag: $at, prerelease: $prerelease)"
+
+  draft:
+    name: draft the release
+    needs: [plan]
+    if: ${{ needs.plan.outputs.go == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - name: Check out the release tools at the workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/actions/
+            /.github/release-*.sh
+          sparse-checkout-cone-mode: false
+      - uses: ./.release-tools/.github/actions/setup-gh
+      - uses: ./.release-tools/.github/actions/find-draft
+        id: found
+        with:
+          tag: ${{ needs.plan.outputs.tag }}
+          sha: ${{ needs.plan.outputs.sha }}
+      - name: Create the draft, or refresh the notes of the one that exists
+        env:
+          ID: ${{ steps.found.outputs.id }}
+        run: |
+          set -euo pipefail
+          notes="docs/releases/$VERSION.md"
+          if [ -n "$ID" ]; then
+            # tag_name and target_commitish are passed again: a PATCH of a draft without them
+            # turns its tag into an "untagged-..." placeholder, and every later find-draft,
+            # upload and download by tag then misses it (Zigbox 0.5.1).
+            "$GH" api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -f name="zigcube $VERSION" \
+              -f tag_name="$TAG" -f target_commitish="$SHA" \
+              -F body=@"$notes" -F prerelease="$PRERELEASE" > /dev/null
+            echo "draft: refreshed the notes of release $ID"
+            exit 0
+          fi
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          "$GH" release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$SHA" \
+            --title "zigcube $VERSION" --notes-file "$notes" "${flags[@]}"
+          echo "draft: created the draft $TAG at $SHA"
+
+  # Builds and checks the assets and attaches them to the draft, which only people with write
+  # access to the repository can see. The owner looks at the draft before approving `publish`.
+  build:
+    name: build and attach (x86_64 and aarch64 Linux)
+    needs: [plan, draft]
+    if: ${{ needs.plan.outputs.go == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    outputs:
+      sums: ${{ steps.check.outputs.sums }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          # Nothing here pushes; the token must not sit in .git/config for the build to read.
+          persist-credentials: false
+      - name: Check out the release tools at the workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/actions/
+            /.github/release-*.sh
+          sparse-checkout-cone-mode: false
+      # No build cache (.github/actions/zig-cache): the release is built from nothing. The
+      # toolchain is checked against its SHA-256 before it is ever cached.
+      - uses: ./.release-tools/.github/actions/setup-zig
+      - uses: ./.release-tools/.github/actions/setup-gh
+      - name: The aarch64 libraries and qemu-user
+        run: |
+          set -euo pipefail
+          sudo .release-tools/.github/release-libs.sh "$RUNNER_TEMP/aarch64-libs"
+          echo "LIBS_AARCH64=$RUNNER_TEMP/aarch64-libs" >> "$GITHUB_ENV"
+      - name: Build
+        run: zig build release -Drelease-lib-dir-aarch64="$LIBS_AARCH64" --summary all
+      - name: Check
+        id: check
+        run: |
+          set -euo pipefail
+          .release-tools/.github/release-check.sh zig-out/release "$VERSION" "$SHA"
+          echo "sums=$(sha256sum zig-out/release/SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: ./.release-tools/.github/actions/find-draft
+        with:
+          tag: ${{ needs.plan.outputs.tag }}
+          sha: ${{ needs.plan.outputs.sha }}
+          require: 'true'
+      - name: Attach the tarballs and SHA256SUMS to the draft
+        run: |
+          set -euo pipefail
+          cd zig-out/release
+          files=(*)
+          "$GH" release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+
+  # The one step that makes a release public, and so makes the tag (at the release commit, by
+  # the draft's target), after the owner's one approval. GITHUB_TOKEN with contents: write is
+  # enough; the environment holds no secret.
+  publish:
+    name: publish the release
+    needs: [plan, build]
+    if: ${{ needs.plan.outputs.go == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+      SUMS: ${{ needs.build.outputs.sums }}
+    steps:
+      - name: Check out the release tools at the workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/actions/
+            /.github/release-*.sh
+          sparse-checkout-cone-mode: false
+      - uses: ./.release-tools/.github/actions/setup-gh
+      - uses: ./.release-tools/.github/actions/find-draft
+        id: found
+        with:
+          tag: ${{ needs.plan.outputs.tag }}
+          sha: ${{ needs.plan.outputs.sha }}
+          require: 'true'
+      # The approval can wait for hours: the draft must still hold exactly what `build` checked.
+      - name: The draft holds the checked assets
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/assets"
+          cd "$RUNNER_TEMP/assets"
+          "$GH" release download "$TAG" --repo "$GITHUB_REPOSITORY"
+          want=$(printf '%s\n' SHA256SUMS "zigcube-$VERSION-x86_64-linux.tar.gz" \
+            "zigcube-$VERSION-aarch64-linux.tar.gz" | sort)
+          got=$(find . -mindepth 1 -maxdepth 1 -printf '%P\n' | sort)
+          [ "$got" = "$want" ] || { echo "release: the draft holds: $got" >&2; exit 1; }
+          [ "$(sha256sum SHA256SUMS | cut -d' ' -f1)" = "$SUMS" ] ||
+            { echo "release: the draft's SHA256SUMS is not the one build checked" >&2; exit 1; }
+          sha256sum --strict -c SHA256SUMS
+      - name: Publish the draft
+        env:
+          ID: ${{ steps.found.outputs.id }}
+        run: |
+          set -euo pipefail
+          latest=true
+          if [ "$PRERELEASE" = true ]; then latest=false; fi
+          # The tag must still be absent, or at this commit, now: publishing under a tag that
+          # someone made meanwhile elsewhere would pair it with assets built from $SHA.
+          at=$(.release-tools/.github/release-tag.sh "$TAG")
+          if [ "$at" != absent ] && [ "$at" != "$SHA" ]; then
+            echo "release: the tag $TAG is at $at now, not $SHA; refusing to publish" >&2
+            exit 1
+          fi
+          # tag_name is passed again: without it the draft publishes under its placeholder
+          # "untagged-..." name and no tag is made (Zigbox's draft-test found it).
+          "$GH" api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false \
+            -f tag_name="$TAG" -f target_commitish="$SHA" \
+            -F prerelease="$PRERELEASE" -f make_latest="$latest" > /dev/null
+          at=$(.release-tools/.github/release-tag.sh "$TAG")
+          [ "$at" = "$SHA" ] ||
+            { echo "release: the new tag $TAG is at $at, not $SHA" >&2; exit 1; }
+          echo "publish: $TAG is public, at $SHA"
