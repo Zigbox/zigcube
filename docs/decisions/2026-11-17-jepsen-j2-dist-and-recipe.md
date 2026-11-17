@@ -38,3 +38,8 @@ J2 (docs/briefs/c5.md, "Jepsen on Google Cloud", items 1, 2 and 4) adds `zig bui
     scripts in a scratch directory. The scripts refuse to run as anyone but root, so the test
     skips as `tester` and runs only in a root `zig build test`. CI's `check` job runs it under
     `sudo` (allowed on a runner, never on a developer's host).
+    `ops/jepsen/test-postgres.sh` runs `postgres.sh` (a primary and a synchronous standby on two
+    ports, a crash, a promotion, the old primary refused and rebuilt as a standby) and
+    `fault.sh pause postgres`, then `test-recipe.sh` against that pair; CI's `jepsen` job runs it
+    under `sudo` on the executables of a `zig build dist` tarball (routed by `ops/jepsen/*`,
+    `src/dist.zig` and the client's sources, `.github/ci-changes.sh`).

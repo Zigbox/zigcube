@@ -41,6 +41,8 @@ pub fn main(init: std.process.Init) u8 {
         entries[index] = .{ .archive_path = arg[0..split], .source_path = arg[split + 1 ..] };
     }
     run(init, args[1], args[2], args[3], entries[0 .. args.len - 4]) catch |err| {
+        // A failure that names its path or command has been printed already.
+        if (err == error.Reported) return constants.exit_user;
         const text = std.fmt.allocPrint(arena, "dist: {s}", .{@errorName(err)}) catch "dist";
         return fail(init.io, text);
     };
@@ -53,24 +55,47 @@ fn fail(io: std.Io, text: []const u8) u8 {
     return constants.exit_user;
 }
 
+/// Prints `dist: ` and the formatted text, and returns `error.Reported`.
+fn report(init: std.process.Init, comptime format: []const u8, args: anytype) error{Reported} {
+    const text = std.fmt.allocPrint(init.arena.allocator(), "dist: " ++ format, args) catch
+        "dist: out of memory while reporting a failure";
+    _ = fail(init.io, text);
+    return error.Reported;
+}
+
 /// The commit of the build root, `+dirty` appended when tracked files differ from it, or
-/// `unknown` when the source is not a git checkout (a source tarball).
+/// `unknown` when the build root has no `.git` (a source tarball). Inside a checkout, a git that
+/// fails (not installed, or refusing a checkout another user owns) fails the build with its
+/// reason: a tarball named `unknown` would hide which commit, and whether a dirty tree, it holds.
 fn commit_of(init: std.process.Init, root: []const u8) ![]const u8 {
     const arena = init.arena.allocator();
-    const head = git(init, &.{ "git", "-C", root, "rev-parse", "HEAD" }) orelse return "unknown";
-    assert(head.len >= commit_short_len);
+    const dot_git = try std.fs.path.join(arena, &.{ root, ".git" });
+    std.Io.Dir.cwd().access(init.io, dot_git, .{}) catch |err| switch (err) {
+        error.FileNotFound => return "unknown",
+        else => return report(init, "can't read {s}: {t}", .{ dot_git, err }),
+    };
+    const head = try git(init, &.{ "git", "-C", root, "rev-parse", "HEAD" });
+    if (head.len < commit_short_len) return report(init, "git rev-parse HEAD said '{s}'", .{head});
     const porcelain = &.{ "git", "-C", root, "status", "--porcelain", "--untracked-files=no" };
-    const status = git(init, porcelain) orelse return error.GitStatusFailed;
+    const status = try git(init, porcelain);
     const dirty: []const u8 = if (status.len > 0) "+dirty" else "";
     return std.fmt.allocPrint(arena, "{s}{s}", .{ head, dirty });
 }
 
-fn git(init: std.process.Init, argv: []const []const u8) ?[]const u8 {
-    const result = std.process.run(init.arena.allocator(), init.io, .{ .argv = argv }) catch
-        return null;
-    switch (result.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
+/// git's standard output, trimmed. A git that cannot run or exits other than 0 is reported with
+/// its command and what it wrote on standard error.
+fn git(init: std.process.Init, argv: []const []const u8) ![]const u8 {
+    assert(argv.len >= 4);
+    const command = argv[3];
+    const result = std.process.run(init.arena.allocator(), init.io, .{ .argv = argv }) catch |err|
+        return report(init, "git {s} did not run: {t}", .{ command, err });
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        const said = std.mem.trim(u8, result.stderr, " \n");
+        return report(init, "git {s} in {s} failed: {s}", .{ command, argv[2], said });
     }
     return std.mem.trim(u8, result.stdout, " \n");
 }
@@ -169,11 +194,15 @@ fn write_entry(init: std.process.Init, tar: *std.tar.Writer, entry: Entry) !void
     const executable = std.mem.startsWith(u8, entry.archive_path, "bin/") or
         std.mem.endsWith(u8, entry.archive_path, ".sh");
     const mode: u32 = if (executable) 0o755 else 0o644;
-    const file = try std.Io.Dir.cwd().openFile(io, entry.source_path, .{});
+    const file = std.Io.Dir.cwd().openFile(io, entry.source_path, .{}) catch |err|
+        return report(init, "can't open {s} (for {s}): {t}", .{
+            entry.source_path, entry.archive_path, err,
+        });
     defer file.close(io);
     var buffer: [64 * 1024]u8 = undefined;
     var reader = file.reader(io, &buffer);
-    const size = try reader.getSize();
+    const size = reader.getSize() catch |err|
+        return report(init, "can't read the size of {s}: {t}", .{ entry.source_path, err });
     try tar.writeFileStream(entry.archive_path, size, &reader.interface, .{
         .mode = mode,
         .mtime = 0,

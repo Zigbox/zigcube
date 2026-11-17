@@ -323,6 +323,9 @@ fn add_jepsen_client_step(b: *std.Build, options: ExecutablesOptions, built: Bui
     recipe.addArtifactArg(client);
     for (jepsen_recipe_files) |name| recipe.addFileInput(b.path(b.fmt("ops/jepsen/{s}", .{name})));
     recipe.expectExitCode(0);
+    // Whether it runs or skips depends on the uid, which is no input of the cache: a skip as
+    // another user must not be remembered as a pass for root.
+    recipe.has_side_effects = true;
     b.top_level_steps.get("test").?.step.dependOn(&recipe.step);
 }
 
@@ -350,14 +353,15 @@ const jepsen_recipe_files = [_][]const u8{
     "zcube-agent.service",
 };
 
-/// `zig build dist`: the release tarball the Jepsen battery deploys (docs/jepsen.md, "The
-/// tarball"): zcube, zcube-server, zcube-agent and zcube-jepsen-client for x86_64 Linux (baseline
-/// CPU, glibc 2.39 or later), ReleaseSafe whatever `-Doptimize` says, and `ops/jepsen/`, written by
-/// src/dist.zig into `zig-out/dist/` with its SHA-256. The server links the host's libsqlite3 and
-/// libpq (`-Ddist-lib-dir`, default Debian's and Ubuntu's directory); the hosts that run it need
-/// libsqlite3-0 and libpq5, which `ops/jepsen/zigcube.sh install` installs. glibc 2.39 is
-/// Ubuntu 24.04's, the build host's and CI's: its libsqlite3 needs symbols of glibc 2.38
-/// (`fmod@GLIBC_2.38`), so an older floor does not link there.
+/// `zig build dist`: the release tarball the Jepsen battery deploys (AGENTS.md, "Commands", and
+/// docs/decisions/2026-11-17-jepsen-j2-dist-and-recipe.md): zcube, zcube-server, zcube-agent and
+/// zcube-jepsen-client for x86_64 Linux (baseline CPU, glibc 2.39 or later), ReleaseSafe whatever
+/// `-Doptimize` says, and `ops/jepsen/`, written by src/dist.zig into `zig-out/dist/` with its
+/// SHA-256. The server links the host's libsqlite3 and libpq (`-Ddist-lib-dir`, default Debian's
+/// and Ubuntu's directory); the hosts that run it need libsqlite3-0 and libpq5, which
+/// `ops/jepsen/zigcube.sh install` installs. glibc 2.39 is Ubuntu 24.04's, the build host's and
+/// CI's: its libsqlite3 needs symbols of glibc 2.38 (`fmod@GLIBC_2.38`), so an older floor does not
+/// link there.
 fn add_dist_step(
     b: *std.Build,
     version: []const u8,

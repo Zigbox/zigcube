@@ -35,8 +35,8 @@ main_pid() {
     echo "$pid"
 }
 
-# The pids a target names, one per line.
-pids_of() {
+# The pid a target names (postgres: the postmaster).
+pid_of() {
     case $1 in
         server | agent) main_pid "$1" ;;
         postgres)
@@ -45,18 +45,48 @@ pids_of() {
             postmaster=$(head -n 1 "$pg_dir/data/postmaster.pid")
             kill -0 "$postmaster" 2>/dev/null || die "the postmaster ($postmaster) is not running"
             echo "$postmaster"
-            pgrep -P "$postmaster" || true
             ;;
         *[!0-9]* | '') die "not server, agent, postgres or a pid: $1" ;;
         *) kill -0 "$1" 2>/dev/null || die "no process $1"; echo "$1" ;;
     esac
 }
 
+# Postgres is the postmaster and every child. Paused, the postmaster stops first, so it forks
+# nothing more, and its children are listed and stopped until a listing finds none not yet
+# stopped (one forked before the postmaster stopped may show up a moment late). Resumed, the
+# children go on first and the postmaster last, so it never sees a stopped child.
+signal_postgres() {
+    local name=$1 postmaster children pid tries=0
+    postmaster=$(pid_of postgres)
+    if [ "$name" = STOP ]; then
+        kill -STOP "$postmaster"
+        local -A stopped=()
+        while true; do
+            local fresh=()
+            for pid in $(pgrep -P "$postmaster" || true); do
+                [ -n "${stopped[$pid]:-}" ] || fresh+=("$pid")
+            done
+            [ ${#fresh[@]} -gt 0 ] || break
+            kill -STOP "${fresh[@]}" 2>/dev/null || true
+            for pid in "${fresh[@]}"; do stopped[$pid]=1; done
+            tries=$((tries + 1))
+            [ $tries -le 100 ] || die "the postmaster's children kept changing"
+        done
+    else
+        children=$(pgrep -P "$postmaster" || true)
+        # shellcheck disable=SC2086 # One pid per word.
+        if [ -n "$children" ]; then kill -"$name" $children 2>/dev/null || true; fi
+        kill -"$name" "$postmaster"
+    fi
+}
+
 signal() {
-    local name=$1 target=$2 pids
-    pids=$(pids_of "$target")
-    # shellcheck disable=SC2086 # One pid per word.
-    kill -"$name" $pids
+    local name=$1 target=$2
+    if [ "$target" = postgres ] && [ "$name" != KILL ]; then
+        signal_postgres "$name"
+        return
+    fi
+    kill -"$name" "$(pid_of "$target")"
 }
 
 chain_up() {
@@ -95,9 +125,10 @@ cmd_ntp() {
 
 cmd_clock_shift() {
     [ $# -eq 1 ] || die "clock-shift needs SECONDS"
-    case $1 in -[0-9]* | [0-9]* | +[0-9]*) ;; *) die "not a number of seconds: $1" ;; esac
+    # The whole value, before anything changes: it goes into shell arithmetic.
+    [[ $1 =~ ^[+-]?[0-9]+$ ]] || die "not a whole number of seconds: $1"
     cmd_ntp stop
-    date -s "@$(( $(date +%s) + $1 ))" >/dev/null
+    date -s "@$(( $(date +%s) + 10#${1#[+-]} * ${1%%[0-9]*}1 ))" >/dev/null
 }
 
 cmd_clock_set() {

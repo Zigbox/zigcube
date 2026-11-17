@@ -36,6 +36,14 @@ host, and the scripts from it (`tar -xzf T --strip-components=2 '*/share/jepsen'
 The client and node certificates live 7 days; `client-cert jepsen --replace` and
 `node-cert nI --replace` re-issue them.
 
+Every step may be run again. `install` of another tarball (another name, or the same name with
+another `.sha256`) unpacks it afresh, points `/opt/zigcube/current` at it and restarts whichever
+of `zcube-server` and `zcube-agent` is running; the same tarball again changes nothing.
+`server` with another STORE or LISTEN rewrites its configuration and re-issues `jepsen`'s
+certificate from the CA of the new store (each store has its own CA: `ca.crt` for Postgres and
+memory, `ca-<hash>.crt` for SQLite). `ops/jepsen/test-recipe.sh` and `test-postgres.sh` test
+these scripts on one host (CI's `jepsen` job runs both, on the tarball's executables).
+
 ## Postgres failover
 
 `postgres.sh crash` on the primary kills it (SIGKILL: no checkpoint, no shutdown). Then, on the

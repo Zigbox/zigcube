@@ -4,11 +4,16 @@
 # non-interactive: run again, it changes nothing unless its arguments changed.
 #
 #   zigcube.sh install TARBALL               check TARBALL against TARBALL.sha256, unpack it to
-#                                            /opt/zigcube/<top>, point /opt/zigcube/current at
-#                                            it, install the units and images.zon
+#                                            /opt/zigcube/<top> (again if that tree came from a
+#                                            tarball of another digest), point
+#                                            /opt/zigcube/current at it, install the units and
+#                                            images.zon; a unit already running is restarted
+#                                            when the executables changed
 #   zigcube.sh server STORE LISTEN           write server.zon (--listen LISTEN, store STORE)
 #                                            and (re)start zcube-server if it changed or is not
 #                                            running; then ca.crt and the admin client `jepsen`
+#                                            (issued again when server.zon changed: another
+#                                            store may have another CA)
 #   zigcube.sh client-cert NAME [--replace]  an admin client certificate in $etc/client
 #   zigcube.sh node-cert NAME [--replace]    a node certificate in $etc/nodes, to copy to NAME
 #   zigcube.sh agent NAME SERVER CPU_MILLIS MEMORY_BYTES
@@ -82,18 +87,35 @@ cmd_install() {
         DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${packages[@]}" >/dev/null
     fi
     install -d "$opt" "$etc"
-    if [ ! -d "$opt/$top" ]; then
-        rm -rf "$opt/$top.new"
+    # The tree is unpacked again unless it came from this very tarball: two `-dirty` builds of
+    # one commit share a top directory. `$top.sha256` beside it says which tarball it came from.
+    local previous changed=false
+    previous=$(readlink "$opt/current" 2>/dev/null || true)
+    if [ ! -d "$opt/$top" ] || ! cmp -s "$tarball.sha256" "$opt/$top.sha256"; then
+        rm -rf "$opt/$top.new" "$opt/$top.old"
         install -d "$opt/$top.new"
         tar -xzf "$tarball" -C "$opt/$top.new"
+        if [ -d "$opt/$top" ]; then mv "$opt/$top" "$opt/$top.old"; fi
         mv "$opt/$top.new/$top" "$opt/$top"
         rmdir "$opt/$top.new"
+        rm -rf "$opt/$top.old"
+        cp "$tarball.sha256" "$opt/$top.sha256"
+        changed=true
     fi
+    [ "$previous" = "$top" ] || changed=true
     ln -sfn "$top" "$opt/current"
     install -m 0644 "$opt/current/share/jepsen/images.zon" "$etc/images.zon"
     install -m 0644 "$opt/current/share/jepsen/zcube-server.service" "$unit_dir/"
     install -m 0644 "$opt/current/share/jepsen/zcube-agent.service" "$unit_dir/"
     $systemctl daemon-reload
+    # A unit already running runs the executables of the tree it started from: restart it, so
+    # the commit in $opt/current/COMMIT is the one that runs. A unit not running is left alone.
+    if $changed; then
+        local unit
+        for unit in zcube-server zcube-agent; do
+            if $systemctl is-active --quiet "$unit"; then $systemctl restart "$unit"; fi
+        done
+    fi
 }
 
 server_config() {
@@ -114,16 +136,35 @@ cmd_server() {
     converge zcube-server "$changed"
     local tries=0 ca
     while true; do
-        # The cluster CA: `ca-` and 16 hex digits (server_ca.zig), not `ca-<hash>-browser.crt`.
-        ca=$(find "$server_state" -maxdepth 1 -regextype posix-extended \
-            -regex '.*/ca-[0-9a-f]{16}\.crt' | head -n 1)
+        ca=$(ca_file "$1")
         [ -z "$ca" ] || break
         tries=$((tries + 1))
         [ $tries -le $ca_wait_tenths ] || die "no CA certificate in $server_state after 30 s"
         sleep 0.1
     done
     install -m 0644 "$ca" "$etc/ca.crt"
-    issue client jepsen
+    # A changed server.zon may name another store, whose CA did not sign the old certificate.
+    if [ "$changed" = changed ]; then issue client jepsen --replace; else issue client jepsen; fi
+}
+
+# The cluster CA certificate of STORE in the state directory, or nothing yet. server_ca.zig
+# (key_name_for, cert_name_for) names it `ca.crt` for a store with no file of its own (memory,
+# Postgres) and `ca-<16 hex digits of a hash of the database's path>.crt` for SQLite; the
+# browser CA's `ca-browser.crt` is neither. Two SQLite CAs (another database was served from
+# this directory) are refused: which one is STORE's cannot be told from here.
+ca_file() {
+    case $1 in
+        sqlite:*)
+            local found
+            found=$(find "$server_state" -maxdepth 1 -regextype posix-extended \
+                -regex '.*/ca-[0-9a-f]{16}\.crt')
+            if [ "$(printf '%s' "$found" | grep -c '')" -gt 1 ]; then
+                die "two SQLite CAs in $server_state; remove the one of the old database"
+            fi
+            printf '%s' "$found"
+            ;;
+        *) if [ -f "$server_state/ca.crt" ]; then printf '%s' "$server_state/ca.crt"; fi ;;
+    esac
 }
 
 # issue client|node NAME [--replace]: skips a certificate already there unless --replace.

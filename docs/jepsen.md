@@ -218,7 +218,10 @@ Zigcube, with the constants of authority.md (lease ttl 10 s, `fence_margin_ms` 3
 
 `SIGSTOP`, then `SIGCONT`. `server` and `agent` are the units' main processes; `postgres` is the
 postmaster and every child. `ops/jepsen/test-recipe.sh` (in `zig build test`, as root) pauses a
-real server: a client's `get` gets no answer until the resume, then succeeds.
+real server: a client's `get` gets no answer until the resume, then succeeds. Postgres is paused
+postmaster first (it forks no new backend once stopped), then its children until a pass finds no
+new one, and resumed children first; `ops/jepsen/test-postgres.sh` (CI's `jepsen` job) checks
+that every process is stopped and a query hangs until the resume.
 
 - **The server.** Clients' requests hang: the client is killed by the harness and records
   nothing, or the request ends `info` (unknown) after its timeout; L1 treats either as open. No
