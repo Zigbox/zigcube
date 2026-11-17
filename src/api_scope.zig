@@ -244,6 +244,8 @@ test "need_of: the agent API by node, the jobs API, and everything else is admin
         .{ .method = "POST", .path = "/v1/jobs/a/cancel", .need = .jobs },
         .{ .method = "GET", .path = "/v1/jobs/watch", .need = .jobs },
         .{ .method = "GET", .path = "/v1/jobsx", .need = .admin },
+        .{ .method = "GET", .path = "/v1/replicas", .need = .admin },
+        .{ .method = "GET", .path = "/v1/nodes", .need = .admin },
         .{ .method = "GET", .path = "/v1/why/job/a", .need = .jobs },
         .{ .method = "GET", .path = "/v1/why/job/", .need = .admin },
         .{ .method = "POST", .path = "/v1/why/job/a", .need = .admin },

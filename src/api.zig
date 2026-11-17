@@ -4,7 +4,8 @@
 //! calls it directly. Nothing here opens a socket, waits or reads a clock but the injected one.
 //!
 //! Endpoints: `GET /v1/status`, `/v1/list`, `/v1/watch`, `/v1/leases`, `/v1/why/{kind}/{name}`,
-//! `/v1/codes`, `/v1/explain/{code}`. A failure is a DIAGNOSTICS.md diagnostic in
+//! `/v1/codes`, `/v1/explain/{code}`, and `/v1/replicas` and `/v1/nodes` (`state_view.zig`: the
+//! state at one revision, for an outside checker). A failure is a DIAGNOSTICS.md diagnostic in
 //! `{"request_id", "diagnostics": [...]}`, with the HTTP status the blame decides.
 //!
 //! **Watch is a long poll, and the wait is the shell's.** The handler answers what is ready now,
@@ -47,6 +48,7 @@ const runtime_codes = @import("runtime_codes.zig");
 const store = @import("store.zig");
 const failures = @import("store_failures.zig");
 const store_verified = @import("store_verified.zig");
+const state_view = @import("state_view.zig");
 const text_util = @import("text.zig");
 const why_mod = @import("why.zig");
 
@@ -207,6 +209,8 @@ pub const Api = struct {
         if (std.mem.eql(u8, first, "status")) return call.status();
         if (std.mem.eql(u8, first, "list")) return call.list();
         if (std.mem.eql(u8, first, "jobs")) return call.jobs_get();
+        if (std.mem.eql(u8, first, "replicas")) return call.replicas_view();
+        if (std.mem.eql(u8, first, "nodes")) return call.nodes_view();
         if (std.mem.eql(u8, first, "watch")) return call.watch();
         if (std.mem.eql(u8, first, "leases")) return call.leases();
         if (std.mem.eql(u8, first, "why")) return call.why();
@@ -1071,6 +1075,17 @@ fn write_kv(api: *const Api, out: *Out, kv: store.KeyValue, deleted: bool) Failu
     try out.end_object();
 }
 
+fn write_kv_or_null(api: *const Api, out: *Out, kv: ?store.KeyValue) Failure!void {
+    if (kv) |present| return write_kv(api, out, present, false);
+    try out.value(null);
+}
+
+fn write_kvs(api: *const Api, out: *Out, kvs: []const store.KeyValue) Failure!void {
+    try out.begin_array();
+    for (kvs) |kv| try write_kv(api, out, kv, false);
+    try out.end_array();
+}
+
 // ---- Endpoints ---------------------------------------------------------------------------
 
 const watch_events_max: u32 = 256;
@@ -1812,6 +1827,70 @@ const Call = struct {
         try out.member("revision", listing.revision);
         try out.member("jobs", listing.rows);
         try out.member("continue", listing.continue_after);
+        try out.end_object();
+        return out.finish();
+    }
+
+    // ---- /v1/replicas and /v1/nodes: the state at one revision ----
+
+    fn view_at(call: Call) Failure!?store.Revision {
+        try call.no_more();
+        try call.query.allow(call.ctx, &.{"at"});
+        return call.query.number(call.ctx, "at");
+    }
+
+    fn replicas_view(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        const at = try call.view_at();
+        const view = state_view.replicas(ctx, at) catch return propagate(ctx);
+        if (at) |wanted| assert(view.revision == wanted);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        try out.begin_object();
+        try out.member("revision", view.revision);
+        try out.member("truncated", view.truncated);
+        try out.field("replicas");
+        try out.begin_array();
+        for (view.rows) |row| {
+            try out.begin_object();
+            try out.member("id", row.id);
+            try out.field("replica");
+            try write_kv_or_null(call.api, out, row.replica);
+            try out.field("assigned");
+            try write_kvs(call.api, out, row.assigned);
+            try out.field("observed");
+            try write_kvs(call.api, out, row.observed);
+            try out.end_object();
+        }
+        try out.end_array();
+        try out.end_object();
+        return out.finish();
+    }
+
+    fn nodes_view(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        const at = try call.view_at();
+        const view = state_view.nodes(ctx, at) catch return propagate(ctx);
+        if (at) |wanted| assert(view.revision == wanted);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        try out.begin_object();
+        try out.member("revision", view.revision);
+        try out.member("truncated", view.truncated);
+        try out.field("nodes");
+        try out.begin_array();
+        for (view.rows) |row| {
+            try out.begin_object();
+            try out.member("name", row.name);
+            try out.field("node");
+            try write_kv_or_null(call.api, out, row.node);
+            try out.field("status");
+            try write_kv_or_null(call.api, out, row.status);
+            try out.field("allocation");
+            try write_kv_or_null(call.api, out, row.allocation);
+            try out.field("assigned");
+            try write_kvs(call.api, out, row.assigned);
+            try out.end_object();
+        }
+        try out.end_array();
         try out.end_object();
         return out.finish();
     }
