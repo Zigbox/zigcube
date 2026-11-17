@@ -8,7 +8,7 @@ the read-only views a checker reads, and the properties a history is checked aga
 PR `J` is split in two (supervisor, 2026-11-17; docs/decisions/2026-11-17-jepsen-j-split.md).
 **J1** (this file's first version) builds the client, the views and the properties. **J2** adds
 `zig build dist`, the deployment recipe in `ops/jepsen/` and the fault surfaces, and fills in
-"Faults" below.
+"Faults" below (docs/decisions/2026-11-17-jepsen-j2-dist-and-recipe.md).
 
 ## The client: `zcube-jepsen-client`
 
@@ -113,7 +113,7 @@ before the server compacts past them (`410`, `ZC-E0203`).
 
 Each property names the source it is judged from: the **history** (the client's lines), a
 **view** at a revision, or **host** observation (processes on the nodes, which the harness reads
-over SSH; J2 says how). The sim's checks of the same name (authority.md §4 and §7, core.md
+over SSH; "Observing the hosts over SSH" below says how). The sim's checks of the same name (authority.md §4 and §7, core.md
 "sim-c1") are the definitions; these are what an outside observer can see of them.
 
 ### Services (the history)
@@ -189,5 +189,110 @@ I8a and I8b (authority.md §7) are J3, J5 and J7, and J1 and J6, seen this way.
 
 ## Faults
 
-J2 fills this in: `SIGSTOP`/`SIGCONT` on any process, `iptables` partitions between any two hosts,
-clock faults with `date -s` and NTP stopped, and killing and promoting Postgres.
+`ops/jepsen/fault.sh` makes each fault on one host, as root (`ops/jepsen/README.md` deploys the
+cluster); `ops/jepsen/postgres.sh` crashes and promotes the database. What each fault does to
+Zigcube, with the constants of authority.md (lease ttl 10 s, `fence_margin_ms` 3 s,
+`lost_grace_ms` 1 s, clock skew 1 %), and what the checker must excuse:
+
+### Pausing a process: `fault.sh pause|resume server|agent|postgres|PID`
+
+`SIGSTOP`, then `SIGCONT`. `server` and `agent` are the units' main processes; `postgres` is the
+postmaster and every child. `ops/jepsen/test-recipe.sh` (in `zig build test`, as root) pauses a
+real server: a client's `get` gets no answer until the resume, then succeeds.
+
+- **The server.** Clients' requests hang: the client is killed by the harness and records
+  nothing, or the request ends `info` (unknown) after its timeout; L1 treats either as open. No
+  agent can renew its lease: each fences at `ttl - fence_margin_ms` (7 s) after its last renewal
+  on its own boot clock, stopping its replicas and jobs (jobs with cause `unreachable`). On
+  Postgres the lease deadlines are the database's time (`clock_timestamp()`), which keeps
+  running, so a pause longer than the ttl leaves every lease expired at the resume: the server
+  finds every node lost and, after `lost_grace_ms`, replaces their replicas. Nothing overlaps (the
+  old processes were fenced first); the checker sees replacements, not violations.
+- **An agent** is a *wedged* node (authority.md §4): its lease runs out at the server, which
+  replaces its replicas, while its own processes run on, since the paused agent cannot fence. I1b
+  and I8b's overlaps on that node are excused, and so are J1, J6 and J8 for its runs, from the
+  pause until `ttl - fence_margin_ms` after the resume (the agent then finds its lease gone and
+  stops everything). The containers' supervisors are separate processes, not paused.
+- **Postgres**: as the server, seen from the clients (every store call waits; after the store's
+  timeout it fails with ZC-E0213 and is retried).
+
+`fault.sh kill server|agent` sends `SIGKILL`. A killed agent leaves its containers running (each
+under its own supervisor, and the unit has `KillMode=process`); started again
+(`zigcube.sh agent ...` starts a unit that is not running), it adopts them. The units have
+`Restart=no`: the harness decides when a killed process comes back.
+
+### Partitions: `fault.sh partition HOST...` and `fault.sh heal`
+
+Drops every packet to and from each HOST on this host (an `iptables` chain, `ZCUBE_JEPSEN`,
+hooked first in `INPUT` and `OUTPUT`); `heal` empties the chain. For a cut between A and B, run
+it on either (or both, for symmetry against stale conntrack state). The cuts that matter:
+
+- **Client and server**: requests end `info` or the client is killed; L1 keeps them open.
+- **Agent and server**: the agent fences at 7 s (replicas stopped; jobs stopped, cause
+  `unreachable`); the server replaces after the lease expires plus `lost_grace_ms`. Fence before
+  expiry is I1b's argument: no overlap is excused here.
+- **Server and Postgres** (both hosts): every store call fails with ZC-E0213; leases are not
+  renewed, so the effect is the server's pause, with errors instead of hangs.
+- **Postgres primary and standby**: commits wait for the synchronous standby (`remote_apply`), so
+  every write stalls and times out as ZC-E0213 until the heal; nothing acknowledged is lost.
+
+### Clocks: `fault.sh clock-shift SECONDS`, `clock-set EPOCH`, `ntp-stop`, `ntp-start`
+
+Each clock command stops NTP first (`timedatectl set-ntp false` and the NTP units), then steps
+the wall clock with `date -s`; `ntp-start` lets it converge back. A step is not a rate skew: the
+1 % bound of authority.md is on rates, and a step on the hosts below is outside it. Which clock
+each host's step reaches:
+
+- **The Postgres primary's host**: lease deadlines are the database's time. A forward step
+  expires leases early (a jump past the ttl expires every lease at once: replacements while the
+  old nodes still run until their own fences, so I1b's overlaps are excused from the step to
+  `ttl - fence_margin_ms` after it); a backward step lengthens leases, delaying replacement of a
+  dead node (no violation, only latency).
+- **The server's host**: its wall clock times `lost_grace_ms`, job deadlines and `start_by`
+  judgments, decision timestamps, and the check of client certificates' validity. A forward step
+  makes jobs miss deadlines early (J8 holds: the bound is on the late side), and past 7 days
+  every certificate looks expired (ZC-E0814 at the handshake): keep server steps well under the
+  certificates' remaining life, or re-issue (`ops/jepsen/README.md`).
+- **A node's host**: nothing. The agent's fence and its jobs' deadlines run on `CLOCK_BOOTTIME`
+  (its start records keep the boot id with them). A run's `started_at_ms` in its report is wall
+  time and may look wrong; no property reads it.
+- **The control host**: nothing. The client's history times are `CLOCK_BOOTTIME`.
+
+### Postgres: `postgres.sh crash`, then `promote`
+
+On the primary, `postgres.sh crash` kills the postmaster and its children with `SIGKILL` (no
+checkpoint). On the standby, `postgres.sh promote` makes it a primary that runs alone. The
+server's store names both hosts (`host=pg1,pg2 ... target_session_attrs=read-write`), so libpq
+reaches the new primary: the calls in flight fail with ZC-E0213 (`info` to clients) and are
+retried, and the server stays up. With the standby synchronous, no acknowledged write is lost (L1
+and L2 hold across the failover; `zig build test-store-faults`' `sync` run checks the same).
+The old primary rejoins as the new one's standby (`postgres.sh standby pg2 --allow CIDR
+--rebuild`, then `sync-on` on `pg2`); `postgres.sh primary` refuses to start it as a second
+primary.
+
+### Observing the hosts over SSH
+
+The host checks (I1b, J1, J2, J6, J8, J10) read each node's agent state directory,
+`/var/lib/zcube-agent`, as root over SSH, by polling (every 200 ms, say) while the test runs and
+once at rest. A container, replica or run, is `containers/<name>/` (a run's name is its run id):
+
+- `supervisor.pid`: the supervisor, also the process group and session of the container.
+- `child.pid`: the container's process, once started.
+- `run.json`: present once the container has ended (its exit code or signal).
+
+A process is alive when `kill -0 PID` succeeds and `/proc/PID/stat`'s start time is the one first
+seen for that pid (pids are reused). Read the start time with the pid, as one observation:
+`for d in containers/*/; do p=$(cat $d/child.pid 2>/dev/null) && echo "$d $p $(cut -d' ' -f22
+/proc/$p/stat 2>/dev/null)"; done`, with the host's boot-clock time (`cat /proc/uptime`) as the
+observation's time. The harness maps each observation to the control host's timeline by the
+SSH round trip.
+
+- **I1b, J1, J6, J8** compare the alive intervals of `child.pid` with the views' revisions (a
+  replacement's commit, a terminal status, a stop's commit, a deadline), each with its bound.
+  Excuse the windows of the faults above (a paused agent, a clock step on the primary's host).
+- **J2**: `jobs/<run>.json` is the start record (`run`, `epoch`, `phase` `claiming` or `claimed`,
+  `boot_id`). A run's record seen on two nodes, or with two `epoch`s, or a run's `child.pid`
+  whose (pid, start time) changes, is a second start. A start that begins and ends between two
+  polls can be missed: polling bounds what J2 can see.
+- **J10** (at rest, after the heal and a few ttls): every `jobs/<run>.json` names a run that
+  `/v1/jobs` still shows assigned to that node.

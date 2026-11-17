@@ -29,10 +29,7 @@ pub fn build(b: *std.Build) void {
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
     const zigbox_module = zigbox.module("zigbox");
 
-    // libpq's C header lives under /usr/include/postgresql on Debian and Ubuntu (libpq-dev);
-    // `-Dpq-include=` names another directory.
-    const pq_include = b.option([]const u8, "pq-include", "Directory of libpq-fe.h") orelse
-        "/usr/include/postgresql";
+    const pq_include = pq_include_option(b);
     const c_modules = add_c_modules(b, target, optimize, .{ .pq_include = pq_include });
     const sqlite = c_modules.sqlite;
     const libpq_module = c_modules.libpq;
@@ -193,6 +190,13 @@ fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
 }
 
 const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
+
+/// libpq's C header lives under /usr/include/postgresql on Debian and Ubuntu (libpq-dev);
+/// `-Dpq-include=` names another directory. One option for the build's target and dist's.
+fn pq_include_option(b: *std.Build) []const u8 {
+    return b.option([]const u8, "pq-include", "Directory of libpq-fe.h") orelse
+        "/usr/include/postgresql";
+}
 
 const CPaths = struct {
     pq_include: []const u8,
