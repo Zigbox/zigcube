@@ -821,12 +821,22 @@ const relay_module = @import("relay.zig");
 /// A relayed container whose upstream is `echo`'s port; its supervisor's relay port is read from
 /// `relay.port`.
 fn launch_relayed(rig: *Rig, name: []const u8, echo: *relay_module.Echo) !runtime.Handle {
-    var script: [3 * constants.state_path_bytes_max + 120]u8 = undefined;
+    return launch_relayed_after(rig, name, echo, "");
+}
+
+/// `launch_relayed` with `prefix` run first by the command's shell.
+fn launch_relayed_after(
+    rig: *Rig,
+    name: []const u8,
+    echo: *relay_module.Echo,
+    prefix: []const u8,
+) !runtime.Handle {
+    var script: [3 * constants.state_path_bytes_max + 160]u8 = undefined;
     const text = try std.fmt.bufPrint(
         &script,
-        "echo \"$ZCUBE_RELAY\" > {s}/relay.env.tmp && mv {s}/relay.env.tmp {s}/relay.env;" ++
+        "{s}echo \"$ZCUBE_RELAY\" > {s}/relay.env.tmp && mv {s}/relay.env.tmp {s}/relay.env;" ++
             " while true; do sleep 1; done",
-        .{ rig.path, rig.path, rig.path },
+        .{ prefix, rig.path, rig.path, rig.path },
     );
     var upstream: [32]u8 = undefined;
     const address = try std.fmt.bufPrint(&upstream, "127.0.0.1:{d}", .{echo.bound.port});
@@ -926,6 +936,34 @@ test "a relay's listener is closed when the command is killed, stopped, or its s
     std.posix.kill(supervisor, .KILL) catch unreachable; // It is running: it echoed.
     _ = try rig.wait_stopped(lost);
     try expect_closed(lost_port);
+}
+
+test "a stopped run's relay ends at the stop, not when its command does (MUST B)" {
+    // Goal: a cancelled run relays nothing during its grace (0.5.2 review, MUST B). The
+    // supervisor stops the relay only after the reap, and a command that ignores TERM puts the
+    // reap off by the whole grace. Method: a relayed command that ignores TERM, one live
+    // connection, then `stop` with a grace of a minute, which returns after its bounded wait:
+    // the connection has read an end and nothing listens, while the command still runs.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const echo = try relay_module.Echo.start();
+    defer echo.stop();
+    const handle = try launch_relayed_after(rig, "relay-g", echo, "trap '' TERM; ");
+    const port = try relay_port_of(rig, "relay-g");
+    const fd = try relay_module.dial(port);
+    defer _ = std.os.linux.close(fd);
+    _ = std.os.linux.write(fd, "ping", 4);
+    var buffer: [8]u8 = undefined;
+    try testing.expectEqual(@as(?usize, 4), relay_module.receive(fd, &buffer, 2000));
+    var local: Diag = undefined;
+    local.reset();
+    try rig.fake.interface().stop(handle, 60_000, &local);
+    try testing.expect(try rig.status(handle) == .running);
+    try testing.expectEqual(@as(?usize, 0), relay_module.receive(fd, &buffer, 0));
+    try expect_closed(port);
+    local.reset();
+    try rig.fake.interface().stop(handle, 0, &local);
+    _ = try rig.wait_stopped(handle);
 }
 
 test "a restarted agent adopts a relayed container, and its relay still works" {

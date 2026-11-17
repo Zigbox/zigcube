@@ -22,6 +22,7 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const constants = @import("constants.zig");
+const apply = @import("apply.zig");
 
 const trust = zigbox.trust;
 pub const Diagnostic = zigbox.diagnostic.Diagnostic;
@@ -186,9 +187,10 @@ pub fn counted_lines(
         _ = scratch.record.add(line) catch unreachable; // Bounded by the shape.
     }
     const tree = tree_of(job.image) orelse return &.{};
+    const binding = binding_of(job.source) orelse return &.{};
     const subject: trust.verdict.Subject = .{
         .tree = tree,
-        .binding = binding_of(job.source),
+        .binding = binding,
         .derives = false,
     };
     const report = &scratch.report;
@@ -213,9 +215,13 @@ fn judge_lines(
 ) error{OutOfMemory}!?*const Diagnostic {
     const scratch = config.scratch;
     const tree = tree_of(job.image) orelse return try refusal(config, arena, job, .no_tree);
+    // A row written around the API can hold any source: one that names no manifest is refused,
+    // never judged (release 0.5.2 review, MUST A).
+    const binding = binding_of(job.source) orelse
+        return try refusal(config, arena, job, .bad_source);
     var subject: trust.verdict.Subject = .{
         .tree = tree,
-        .binding = binding_of(job.source),
+        .binding = binding,
         // A job's image is a tree, never a build result: a result-bound line is another binding.
         .derives = false,
     };
@@ -239,9 +245,12 @@ pub fn tree_of(image: []const u8) ?trust.statement.Digest {
 }
 
 /// The binding of a job's `source` (`registry/name@sha256:<64 lowercase hex>`, as
-/// `apply.source_problem` admits it): its manifest digest; none for a job without one.
-pub fn binding_of(source: []const u8) trust.statement.Binding {
+/// `apply.source_problem` admits it): its manifest digest; none for a job without one. Null
+/// for a source `source_problem` refuses: the API checks it, but a row written straight into
+/// the store is not checked, and the agent judges what it reads.
+pub fn binding_of(source: []const u8) ?trust.statement.Binding {
     if (source.len == 0) return .none;
+    if (apply.source_problem(source) != null) return null;
     assert(source.len > 64);
     const digest = digest_of_hex(source[source.len - 64 ..]).?; // source_problem checked it.
     return .{ .manifest = digest };
@@ -268,7 +277,7 @@ fn subject_of_first(scratch: *Scratch) ?trust.verdict.Subject {
 
 // ---- The refusal -------------------------------------------------------------------------------
 
-const Why = enum { unsigned, no_tree, no_provenance };
+const Why = enum { unsigned, no_tree, bad_source, no_provenance };
 
 /// How many lines the refusal names, one cause each; the rest are counted (as Zigbox does).
 const signatures_named_max: u32 = 4;
@@ -291,6 +300,10 @@ fn refusal(
             "(b3: and 64 hex digits) that a signature can name", .{
             path, asks(policy), digest,
         }),
+        .bad_source => diag.cause("{s} requires {s}, and the job's source names no manifest " ++
+            "a signature can bind: {s}", .{
+            path, asks(policy), apply.source_problem(job.source).?,
+        }),
         .unsigned => if (config.scratch.report.count == 0) {
             diag.cause("{s} requires a signature (require_signature), and nothing has " ++
                 "signed {s}", .{ path, digest });
@@ -301,12 +314,15 @@ fn refusal(
         .no_provenance => diag.cause("{s} requires signed provenance (require_provenance), " ++
             "and no trusted provenance statement on {s} counts", .{ path, digest }),
     }
-    if (why != .no_tree) name_lines(diag, config);
+    if (why != .no_tree and why != .bad_source) name_lines(diag, config);
     diag.context("digest", "{s}", .{digest});
     diag.context("policy", "{s}", .{path});
     if (job.source.len > 0) diag.context("source", "{s}", .{job.source});
     if (why == .no_tree) {
         diag.fix(.{ .sentence = "submit the job with its image's tree digest (b3:...)" });
+    } else if (why == .bad_source) {
+        diag.fix(.{ .sentence = "submit the job through the API, with a source of the form " ++
+            "registry/name@sha256:<64 lowercase hex digits>, or with none" });
     } else {
         diag.fix_with("sign it with a key the policy lists:", "zbx sign {s}", .{digest});
         diag.fix(.{ .sentence = "or add the signer's key to the policy file" });
@@ -535,6 +551,31 @@ test "a line that is not an envelope is malformed; an image that is not a tree i
     try testing.expectEqual(Admission{ .malformed = 2 }, admission);
     const job_value: Job = .{ .image = "alpine", .source = "", .signatures = &.{good} };
     try expect_refused(try case.judge(job_value), "is not a tree");
+}
+
+test "a source written around the API is refused, never asserted on (0.5.2 review, MUST A)" {
+    // Goal: a row written straight into the store with a source `source_problem` refuses
+    // (no digest, a short one, upper-case hex) is refused by the node's check and keeps no
+    // line, where `binding_of` used to assert, trapping every agent with a trust policy.
+    // Method: judge_run and counted_lines over a tree-signed job with each bad source.
+    var case = try Case.init();
+    defer case.deinit();
+    const good = try case.sign_tree(trusted_seed, 7);
+    var config = case.fixture.config();
+    const arena = case.arena.allocator();
+    const upper = "reg/x@sha256:" ++ @as([64]u8, @splat('A'));
+    const short = "reg/x@sha256:" ++ @as([63]u8, @splat('a'));
+    const long: [70]u8 = @splat('b');
+    const bad_sources = [_][]const u8{ "reg/x", "x", short, upper, &long };
+    for (bad_sources) |source| {
+        var job_value = case.job(7, null, &.{good});
+        job_value.source = source;
+        const refused = (try judge_run(&config, arena, job_value)) orelse
+            return error.TestExpectedRefusal;
+        try expect_refused(.{ .refused = refused }, "names no manifest");
+        try testing.expectEqual(@as(usize, 0), (try counted_lines(&config, arena, job_value)).len);
+        try expect_refused(try case.judge(job_value), "names no manifest");
+    }
 }
 
 test "the refusal names each line and the fixes, as Zigbox's run gate does" {

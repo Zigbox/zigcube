@@ -2266,6 +2266,22 @@ test "a run signed by a key the node does not trust is refused; one it trusts st
     try testing.expectEqual(records.JobObservedStatus.running, seen.status);
 }
 
+test "a run written around the server with a malformed source is refused, never a trap" {
+    // Goal: the 0.5.2 release review's MUST A. A row written straight into the store with a
+    // source that names no manifest used to trip `binding_of`'s assert in every agent with a
+    // trust policy, again after each restart. Method: a run signed by the trusted key, with
+    // the source `reg/x`, assigned straight into the store; three passes start nothing and
+    // report `refused` with ZBX-E0905.
+    var case: TrustCase = undefined;
+    try case.start();
+    defer case.stop();
+    const line = try case.sign(1);
+    defer testing.allocator.free(line);
+    _ = try case.assign_signed(&.{line}, "reg/x");
+    for (0..3) |_| case.rig.step();
+    try expect_refused(&case);
+}
+
 /// What the last start handed the runtime as the run's signatures: their count and a copy of
 /// the first (the spec lives in the step's arena).
 var kept_count: usize = 0;
@@ -2411,4 +2427,29 @@ test "teeth: with the node's check skipped, an unsigned run written around the s
     job_trust.set_test_fault(.skip_node_check, true);
     defer job_trust.set_test_fault(.skip_node_check, false);
     if (unsigned_run_refused()) |_| return error.TestToothMissed else |_| {}
+}
+
+fn misplaced_run_started() !bool {
+    var rig = try Rig.start();
+    defer rig.stop();
+    rig.world.agent.config.labels = &.{ "tenant=b", "exclusive=tenant" };
+    var run = rig.run_record(null, 60_000);
+    run.placement = .{ .require = &[_]records.Pair{.{ "tenant", "a" }} };
+    _ = try rig.assign_run(run);
+    starts_seen = 0;
+    rig.world.sim.on_start = count_start;
+    for (0..4) |_| rig.step();
+    if (starts_seen != 0 or rig.running()) return true;
+    // Not started, and reported so at once: left `claiming`, it would stay open (J8).
+    const seen = (try rig.observed()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(records.StopCause.not_started, seen.stop_cause.?);
+    return false;
+}
+
+test "a run whose placement the node's labels refuse is not started (0.5.2 review)" {
+    // Goal: P1 holds at the node too: an assignment written for a node that has since been
+    // relabelled (or written around the scheduler) starts nothing and is reported
+    // `not_started`. Method: a run requiring tenant=a is assigned to a node labelled tenant=b;
+    // four passes are run.
+    try testing.expect(!try misplaced_run_started());
 }

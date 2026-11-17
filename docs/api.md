@@ -32,7 +32,8 @@ each is an **Ask first**. The owner approved this document as written (endpoints
 
 Over `--listen` (TLS) the caller is named by its client certificate: a node's agent may call only
 `/v1/agent/nodes/<its node>` and below, a `jobs` client only the jobs API and `GET
-/v1/why/job/<name>`, an `admin` client everything. Any other request is **403 `ZC-E0822`**, before
+/v1/why/job/<name>`, an `admin` client everything but the node's two issuing endpoints
+(`credential` and a run's `certificate`, the node's own). Any other request is **403 `ZC-E0822`**, before
 it is read. `--insecure-listen` (loopback) may call everything. [mtls.md](mtls.md), "Scopes".
 
 ### Errors
@@ -912,7 +913,8 @@ upgrade agents before the server.
 
 ### `POST /v1/agent/nodes/{node}/runs/{name}/certificate` (B4 slice 2)
 
-A relayed run's workload certificate. Body `{"public_key": "<64 hex>", "epoch": N,
+A relayed run's workload certificate; over TLS only node `{node}`'s own certificate may ask
+(an admin client gets 403 `ZC-E0822`). Body `{"public_key": "<64 hex>", "epoch": N,
 "image_digest": "<64 hex>"}` (the run's Ed25519 key from `relay.pub`, the placement epoch and the
 image digest the node started; at most `peer_join_request_bytes_max` bytes, no unknown fields).
 The server reads the job, its status, the run's claim and its assignment at one revision, and

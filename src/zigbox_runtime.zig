@@ -224,6 +224,7 @@ pub const ZigboxRuntime = struct {
             .pids = spec.limits.pids,
             .relay = spec.relay,
             .relay_server_name = spec.relay_server_name,
+            .relay_server_anchor = spec.relay_server_anchor,
             .relay_plain = spec.relay_plain,
             .signatures = spec.signatures,
             .launched = self.host.time_now(),
@@ -360,9 +361,13 @@ pub const ZigboxRuntime = struct {
         // Zigbox saves the record with pid 0 before the container exists: it is still starting,
         // and the only thing to stop is the supervisor. Nothing is ever signalled with pid 0.
         if (ref.pid == 0) return self.kill_supervisor(handle.name());
+        // The relay ends now, not when the container does (0.5.2 review, MUST B): the supervisor
+        // stops it only after the reap, which a TERM can put off by the whole grace. A run whose
+        // relay cannot be told has no grace.
+        const told = self.mark_relay_stop(handle.name());
         // `lifecycle.signal` forwards only the terminating signals zbx catches (TERM among them,
         // and SIGKILL in its place for a PID 1 with no handler); a hard kill goes to the host.
-        const sent = if (number == runtime.signal_term)
+        const sent = if (number == runtime.signal_term and told)
             lifecycle.signal(&ref, map.bounds.signal_term)
         else
             self.host.signal(ref.pid, map.bounds.signal_kill);
@@ -373,6 +378,15 @@ pub const ZigboxRuntime = struct {
         // One bounded wait for `stop`; a grace that is not over is the caller's to ask again,
         // with none, to kill. A signal does not wait: the caller reads `list`.
         if (wait == .wait) _ = self.wait_gone(&ref, stop_wait_ms);
+    }
+
+    /// `relay.stop` in the container's launch directory, which its relay polls; false if the
+    /// file could not be made. A container with no launch directory has no supervisor of ours,
+    /// so no relay to tell.
+    fn mark_relay_stop(self: *ZigboxRuntime, name: []const u8) bool {
+        const dir = launch.container_dir(self.io, self.root, name) orelse return true;
+        defer dir.close(self.io);
+        return files.mark_relay_stop(self.io, dir);
     }
 
     fn wait_gone(self: *ZigboxRuntime, ref: *const lifecycle.Ref, limit_ms: u32) bool {
@@ -812,8 +826,12 @@ fn sim_container(sim: *HostSim, name: []const u8, replica: ?[]const u8) !void {
         .command = &.{ "/bin/sh", "-c", "sleep 1000" },
         .labels = labels,
     };
-    try zigbox.start(sim.interface(), &spec, .{ .detached = true }, &sim_handle, &diagnostic);
+    const options: zigbox.StartOptions = .{ .detached = true };
+    try zigbox.start(sim.interface(), &spec, options, &sim_handle, &sim_gate, &diagnostic);
 }
+
+/// The trust gate's memory for `sim_container`'s starts (about 17 MiB, so static).
+var sim_gate: zigbox.GateWorkspace = undefined;
 
 test {
     _ = process_session; // Its tests, which no other root reaches.
@@ -959,6 +977,40 @@ test "a signal reaches the container and never waits" {
         error.NotFound,
         rt.signal(runtime.Handle.init("nope"), runtime.signal_term, &diag),
     );
+}
+
+test "a stop tells the container's relay before it signals (MUST B)" {
+    // Goal: a cancelled run relays nothing during its grace (0.5.2 review, MUST B): the
+    // supervisor stops the relay only after the reap, so the runtime tells the relay itself.
+    // Method: a launched container that does not die; `signal` TERM leaves `relay.stop` in its
+    // launch directory and the signal still lands; with the file removed, `stop` does the same.
+    // (The simulated kernel turns TERM to a PID 1 with no handler into KILL, so which signal
+    // lands is not checked here.)
+    var rig: Rig = undefined;
+    try rig.up(24);
+    defer rig.down();
+    rig.sim.world.immortal = true;
+    try sim_container(&rig.sim, "web-1", "web-1");
+    // The record names this launch's supervisor, so the launch owns it.
+    const own: u32 = rig.sim.interface().own_pid();
+    const container = try rewrite_record(&rig, "web-1", 0, own);
+    _ = try rewrite_record(&rig, "web-1", container, own);
+    try rig.launch_spec("web-1", 0);
+    try write_supervisor_pid(&rig, "web-1", @intCast(own));
+    const dir = launch.container_dir(rig.rt.io, rig.rt.root, "web-1").?;
+    defer dir.close(rig.rt.io);
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = rig.rt.interface();
+    const handle = runtime.Handle.init("web-1");
+    try testing.expect(!files.exists(rig.rt.io, dir, agent_records.file_relay_stop));
+    try rt.signal(handle, runtime.signal_term, &diag);
+    try testing.expect(files.exists(rig.rt.io, dir, agent_records.file_relay_stop));
+    try testing.expectEqual(@as(u32, 1), rig.sim.world.received_count);
+    try dir.deleteFile(rig.rt.io, agent_records.file_relay_stop);
+    try rt.stop(handle, 1000, &diag);
+    try testing.expect(files.exists(rig.rt.io, dir, agent_records.file_relay_stop));
+    try testing.expectEqual(@as(u32, 2), rig.sim.world.received_count);
 }
 
 test "a signal to a stopped container, or one still starting with no supervisor, does nothing" {

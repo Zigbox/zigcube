@@ -165,6 +165,37 @@ test "a restarted agent fences on a kept lease it cannot trust" {
     }
 }
 
+test "a lease kept by an agent before labels is not resumed under labels (0.5.2 review)" {
+    // Goal: an upgrade that adds labels never resumes the unlabelled registration, so an
+    // `exclusive` node is exclusive at once. Method: the kept file rewritten as an agent before
+    // B6 wrote it (no `labels`), the agent restarted with and without labels: with them it fences
+    // and registers a new tenure; without them it resumes the lease.
+    for ([_]bool{ false, true }) |labelled| {
+        const world = try start(if (labelled) 41 else 42);
+        defer world.destroy();
+        const tenure = world.agent.tenure;
+        const lease = world.agent.lease;
+        const ttl = world.agent.lease_ttl_ms;
+        const sent = world.agent.sent_ms;
+        world.restart_agent();
+        const labels = [_][]const u8{ "tenant=a", "exclusive=tenant" };
+        if (labelled) world.agent.config.labels = &labels;
+        var buffer: [200]u8 = undefined;
+        try world.files.interface().put_atomic(agent_mod.lease_file, try std.fmt.bufPrint(
+            &buffer,
+            "{{\"lease\":{d},\"ttl_ms\":{d},\"sent_ms\":{d},\"tenure\":{d},\"boot_id\":\"{s}\"}}",
+            .{ lease, ttl, sent, tenure, world.boot_id },
+        ));
+        world.advance(fence_steps_ms + 1_000);
+        try testing.expectEqual(@as(u32, @intFromBool(labelled)), world.agent.fences);
+        if (labelled) {
+            try testing.expect(world.agent.tenure != tenure);
+        } else {
+            try testing.expectEqual(tenure, world.agent.tenure);
+        }
+    }
+}
+
 test "an agent that restarts mid-fence finishes the fence by the first deadline" {
     // Goal: the fencing flag. Method: the tenure is replaced while the lease is still fresh, so
     // only the kept flag says to fence; one container ignores the polite stop; restart the agent,

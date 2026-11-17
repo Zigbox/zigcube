@@ -127,8 +127,9 @@ pub const Credential = struct {
     certificate: x509.Der = .{},
     chain: [1][]const u8 = undefined,
 
-    pub fn init(key: Ed25519.KeyPair) Credential {
-        return .{ .key = key };
+    /// `key` by pointer: the one copy is the credential's own (`Relay.stop` zeroes it).
+    pub fn init(key: *const Ed25519.KeyPair) Credential {
+        return .{ .key = key.* };
     }
 
     pub fn identity(credential: *const Credential) tls_client.Identity {
@@ -173,7 +174,8 @@ pub const Credential = struct {
     }
 };
 
-fn exists(dir_fd: fd_t, name: [*:0]const u8) bool {
+/// True if `name` can be opened in `dir_fd`.
+pub fn exists(dir_fd: fd_t, name: [*:0]const u8) bool {
     const opened = linux.openat(dir_fd, name, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(opened) != .SUCCESS) return false;
     _ = linux.close(@intCast(opened));

@@ -75,6 +75,9 @@ Both commands follow the same rules:
   revokes the node NAME only and `client/NAME` the client NAME only; a bare `NAME` revokes both
   kinds, as before (decisions/2026-11-14-revoked-names-by-kind.md, which supersedes
   2026-11-13-revoked-names-shared.md). A revoked name stops being issued at once.
+  Revocation is by name only: a certificate replaced with `--replace` stays valid until it
+  expires (at most 7 days) unless its name is revoked, so a leaked key is cut off by revoking the
+  name, not by re-issuing.
 
 A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`). The server
 rereads `revoked` without a restart (B7 slice 5): on each HTTP watchdog tick (500 ms) it looks
@@ -160,13 +163,16 @@ reply closes the connection.
 |---|---|
 | `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only (its `fetchers/<digest>` answers node names only, B7 slice 7); and `GET /v1/list` with `prefix` exactly `/node-store/` and no parameter but `limit`, `at` and `continue` (the swarm fetch's discovery, B7 slice 7) |
 | `client`, scope `jobs` | `/v1/jobs` and below, and `GET /v1/why/job/<name>` |
-| `client`, scope `admin` | everything but the credential endpoint |
+| `client`, scope `admin` | everything but the two issuing endpoints, `credential` and a run's `certificate` |
 | `local` (`--insecure-listen`) | everything |
 
 `POST /v1/agent/nodes/<name>/credential` signs a node's peer key and returns its `node.crt`, so
 over TLS only node `<name>`'s own certificate may call it: every client certificate, `admin`
 included, gets 403 `ZC-E0822` there (an admin cannot mint a node's identity through the API;
-`ca issue-node` on the server host is the only bootstrap). A node renews and registers only on
+`ca issue-node` on the server host is the only bootstrap). `POST
+/v1/agent/nodes/<name>/runs/<job>/certificate`, which signs a job's identity for the key it is
+given, is node `<name>`'s own the same way: an admin client must not mint a job's identity for a
+key of its own (0.5.2 review). A node renews and registers only on
 the lease of its own registration: a keepalive of another node's lease is `ZC-E0205`, and a
 registration on a lease another node is registered on is `ZC-E0104` (`agent_api.zig`).
 
@@ -551,6 +557,13 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   The client is not authenticated, so that close keeps its connection slot at most
   `tls_alert_flush_ms` (1 s) after the refusal, not the idle timeout
   (decisions/2026-11-14-b7-linger-bound.md).
+  Its workload-certificate row (B4 slice 4) puts the real relay
+  between the harness (the job) and each server, with a job certificate the cluster CA issued
+  through the server's issuance code: both servers read the job's SPIFFE id and extension; the
+  JDK server pins the job's id and refuses another job's certificate, while `openssl s_server`,
+  which has no SPIFFE allow-list, is shown to see the other job's id; both refuse an expired
+  certificate and one from another CA (ZC-E0814 in `relay.log`, the job's connection closed);
+  without a certificate the relay never dials (ZC-E0705) and neither server sees a connection.
 
 ## Issuance (B4 slice 2)
 
