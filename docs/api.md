@@ -252,7 +252,7 @@ so a checker can test authority.md's invariants on a snapshot instead of joining
 - **One revision.** Every key in the answer was read at `revision` (the first read's, when `at`
   is absent): a key's `mod_revision` is never above it.
 - **Not paged.** Each prefix is read in pages of 500 at that revision, at most
-  `api_view_pages_max` (16) pages per prefix, 8,000 keys, well above `replicas_max` (512) and
+  `cli_list_pages_max` (16) pages per prefix, the bound `zcube` already reads lists with, 8,000 keys, well above `replicas_max` (512) and
   `nodes_max` (64). A prefix with more is cut there and the answer says `"truncated": true`; a
   checker must not judge a truncated view. An answer over the request arena (16 MiB) is
   `ZC-E0207`, as for any read, never a partial body.

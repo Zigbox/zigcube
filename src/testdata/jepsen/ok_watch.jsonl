@@ -1,0 +1,1 @@
+{"type":"ok","f":"watch","process":3,"time":30,"service":"r1","value":[{"type":"put","mod_revision":4,"replicas":2},{"type":"delete","mod_revision":8,"replicas":null}],"from":2,"revision":9,"status":200}

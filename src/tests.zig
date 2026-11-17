@@ -130,4 +130,6 @@ test {
     _ = @import("zigbox_limits_test.zig");
     _ = @import("api_tls_test.zig");
     _ = @import("trust_file.zig");
+    _ = @import("jepsen_history.zig");
+    _ = @import("jepsen_client_test.zig");
 }
