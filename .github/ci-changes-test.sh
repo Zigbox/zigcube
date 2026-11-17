@@ -85,6 +85,7 @@ check $PR x "" "src/fencing.zig" TTTTTTTTTTTTT
 check $PR x "" "src/sim_cluster.zig src/sim_c1_teeth_oldrule_main.zig" TFFFFFFFFFFFF
 # B5 slice 3: the trust world and its tooth are simulator files.
 check $PR x "" "src/sim_trust.zig src/sim_c1_teeth_job_untrusted_main.zig" TFFFFFFFFFFFF
+# The Jepsen client runs only the code job, which builds it (`zig build jepsen-client`).
 check $PR x "" "src/jepsen_client.zig src/jepsen_history.zig src/zcube_jepsen_client.zig" TFFFFFFFFFFFF
 check $PR x "" "src/testing/fault_proxy.zig" TTTTTTTTTTTTT
 check $PR x "" "src/brand_new_file.zig" TTTTTTTTTTTTT

@@ -65,6 +65,8 @@ pub const usage =
     \\
 ;
 
+const image_problem = "--image is empty or holds a quote, a backslash or a control character";
+
 /// Reads the arguments (without the program name). A bad one is a sentence in `problem`.
 pub fn parse(arguments: []const []const u8, problem: *[]const u8) error{Usage}!Args {
     var op: ?Op = null;
@@ -76,6 +78,7 @@ pub fn parse(arguments: []const []const u8, problem: *[]const u8) error{Usage}!A
     while (index < arguments.len) : (index += 2) {
         const flag = arguments[index];
         if (index + 1 == arguments.len) return refuse(problem, "a flag has no value");
+        if (repeated(arguments, index)) return refuse(problem, "a flag is given twice");
         const text = arguments[index + 1];
         if (eql(flag, "--op")) {
             op = std.meta.stringToEnum(Op, text) orelse return refuse(problem, "unknown --op");
@@ -96,6 +99,7 @@ pub fn parse(arguments: []const []const u8, problem: *[]const u8) error{Usage}!A
             args.hold_ms = number(u32, text) orelse return refuse(problem, "bad --hold-ms");
             if (args.hold_ms > hold_ms_max) return refuse(problem, "--hold-ms is over 20000");
         } else if (eql(flag, "--image")) {
+            if (!plain(text)) return refuse(problem, image_problem);
             args.image = text;
         } else if (eql(flag, "--server")) {
             args.server = text;
@@ -129,6 +133,25 @@ fn check_op_flags(args: Args, problem: *[]const u8) error{Usage}!void {
     if (args.from) |from| {
         if (from == 0) return refuse(problem, "--from starts at 1");
     }
+}
+
+/// The flag at `index` was given before it (the last would win, unseen).
+fn repeated(arguments: []const []const u8, index: usize) bool {
+    assert(index % 2 == 0);
+    var earlier: usize = 0;
+    while (earlier < index) : (earlier += 2) {
+        if (eql(arguments[earlier], arguments[index])) return true;
+    }
+    return false;
+}
+
+/// Text that goes into the apply body's JSON string as it is: nothing to escape.
+fn plain(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| {
+        if (byte == '"' or byte == '\\' or byte < 0x20 or byte == 0x7f) return false;
+    }
+    return true;
 }
 
 fn refuse(problem: *[]const u8, sentence: []const u8) error{Usage} {
@@ -229,14 +252,17 @@ fn local(line: Line, why: []const u8) Line {
 }
 
 /// No reply: a request that never reached a connection did not happen; one that did is unknown
-/// when it writes, and a failed read either way.
+/// when it writes, and a failed read either way. The verdict rests on `sent` alone, never on
+/// which diagnostic (if any) the transport raised. The line keeps the id the request was sent
+/// with, so the server's log can be searched for a write left open.
 fn no_reply(arena: Allocator, client: *const Client, report: *const Report, line: Line) Line {
     var failed = line;
-    const code = report.diag.code orelse return local(line, "no reply");
-    failed.code = codes.full_name(code);
-    const cause = report.diag.last_cause() orelse "";
-    failed.@"error" = arena.dupe(u8, cause) catch "out of memory";
     failed.type = if (client.sent and writes(line.f)) .info else .fail;
+    const id = report.request_id.slice();
+    if (id.len > 0) failed.request_id = arena.dupe(u8, id) catch null;
+    if (report.diag.code) |code| failed.code = codes.full_name(code);
+    const cause = report.diag.last_cause() orelse "no reply";
+    failed.@"error" = arena.dupe(u8, cause) catch "out of memory";
     return failed;
 }
 

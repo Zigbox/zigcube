@@ -20,14 +20,23 @@ const Revision = store.Revision;
 
 pub const Error = controller.Error;
 
-/// Pages of `page_limit` keys a view reads of one prefix at most (8,000 keys).
+/// Pages a view reads of one prefix at most. A page holds at most `page_limit` keys (8,000 keys
+/// in all), and fewer when its values reach `store_page_bytes_max`: a prefix of large values is
+/// cut sooner, and the view says `truncated`.
 pub const pages_max: u32 = constants.cli_list_pages_max;
 const page_limit: u32 = constants.store_list_limit_max;
 
 comptime {
     assert(pages_max * page_limit >= constants.replicas_max);
     assert(pages_max * page_limit >= constants.nodes_max);
+    assert(pages_max * page_limit >= constants.assigned_max);
 }
+
+/// How a view pages: the defaults, except in a test of truncation.
+pub const Paging = struct {
+    pages: u32 = pages_max,
+    limit: u32 = page_limit,
+};
 
 pub const ReplicaRow = struct {
     id: []const u8,
@@ -60,6 +69,7 @@ const Reader = struct {
     ctx: *const Context,
     /// Null until the first page answers; every later page reads at it.
     revision: ?Revision,
+    paging: Paging,
     truncated: bool = false,
 
     fn prefix(reader: *Reader, wanted: []const u8) Error![]const KeyValue {
@@ -69,11 +79,13 @@ const Reader = struct {
         var found: std.ArrayList(KeyValue) = .empty;
         var after: ?[]const u8 = null;
         var page: u32 = 0;
-        while (page < pages_max) : (page += 1) {
+        assert(reader.paging.pages > 0);
+        assert(reader.paging.limit > 0);
+        while (page < reader.paging.pages) : (page += 1) {
             const got = try ctx.store.list(ctx.arena, .{
                 .prefix = wanted,
                 .at_revision = reader.revision,
-                .limit = page_limit,
+                .limit = reader.paging.limit,
                 .continue_after = after,
             }, ctx.diag);
             if (reader.revision) |fixed| assert(got.revision == fixed);
@@ -126,7 +138,11 @@ fn file(ctx: *const Context, entries: *std.ArrayList(Entry), entry: Entry) Error
 
 /// The replicas view at `at` (null: the current revision).
 pub fn replicas(ctx: *const Context, at: ?Revision) Error!View(ReplicaRow) {
-    var reader: Reader = .{ .ctx = ctx, .revision = at };
+    return replicas_paged(ctx, at, .{});
+}
+
+pub fn replicas_paged(ctx: *const Context, at: ?Revision, paging: Paging) Error!View(ReplicaRow) {
+    var reader: Reader = .{ .ctx = ctx, .revision = at, .paging = paging };
     var entries: std.ArrayList(Entry) = .empty;
     for (try reader.prefix(records.prefix_replicas)) |kv| {
         try file(ctx, &entries, .{ .row = last_part(kv.key), .kind = .replica, .kv = kv });
@@ -178,7 +194,7 @@ fn replica_row(ctx: *const Context, id: []const u8, group: []const Entry) Error!
 
 /// The nodes view at `at` (null: the current revision).
 pub fn nodes(ctx: *const Context, at: ?Revision) Error!View(NodeRow) {
-    var reader: Reader = .{ .ctx = ctx, .revision = at };
+    var reader: Reader = .{ .ctx = ctx, .revision = at, .paging = .{} };
     var entries: std.ArrayList(Entry) = .empty;
     const singles = [_]struct { []const u8, Kind }{
         .{ records.prefix_nodes, .node },
@@ -233,4 +249,51 @@ test "last and middle parts of keys" {
     try std.testing.expectEqualStrings("hello-1", last_part("/replicas/hello/hello-1"));
     try std.testing.expectEqualStrings("node1", middle_part("/assigned/node1/x-1", "/assigned/"));
     try std.testing.expectEqualStrings("x", middle_part("/assigned/x", "/assigned/"));
+}
+
+test "a prefix longer than the pages a view reads is cut and says truncated" {
+    // Goal: `truncated` is set when, and only when, a prefix has keys past the last page read
+    // (review of PR 276: nothing failed when it was never set). Method: two pages of three keys;
+    // five replicas fit, seven do not, and the six read are the first six by key.
+    const testing = std.testing;
+    const ManualClock = @import("clock.zig").ManualClock;
+    const MemoryStore = @import("store_memory.zig").MemoryStore;
+    const Diag = @import("diag.zig").Diag;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    const paging: Paging = .{ .pages = 2, .limit = 3 };
+    const keys = [_][]const u8{
+        "/replicas/s/s-1", "/replicas/s/s-2", "/replicas/s/s-3", "/replicas/s/s-4",
+        "/replicas/s/s-5", "/replicas/s/s-6", "/replicas/s/s-7",
+    };
+    for (keys, 0..) |key, index| {
+        const op: store.Op = .{ .put = .{ .key = key, .value = "{}" } };
+        _ = try ctx.store.txn(.{ .on_success = &.{op} }, &diag);
+        if (index == 4) {
+            const whole = try replicas_paged(&ctx, null, paging);
+            try testing.expect(!whole.truncated);
+            try testing.expectEqual(@as(usize, 5), whole.rows.len);
+        }
+    }
+    const cut = try replicas_paged(&ctx, null, paging);
+    try testing.expect(cut.truncated);
+    try testing.expectEqual(@as(usize, 6), cut.rows.len);
+    for (cut.rows, keys[0..6]) |row, key| {
+        try testing.expectEqualStrings(last_part(key), row.id);
+        try testing.expectEqualStrings(key, row.replica.?.key);
+    }
+    try testing.expect(!(try replicas(&ctx, null)).truncated);
 }
