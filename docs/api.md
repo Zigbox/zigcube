@@ -237,6 +237,75 @@ tolerant: a record that is malformed, newer than the server's reader, or with a 
 not a node name counts in `skipped` and is left out. Reads
 need no auth beyond the server's own.
 
+### `GET /v1/replicas?at=` and `GET /v1/nodes?at=`: state at one revision (PR J, proposed)
+
+**Status: proposed (PR `J`, 2026-11-17).** Read-only views for an outside checker (the Jepsen
+battery, `docs/jepsen.md`): what the store held at one revision, grouped by replica and by node,
+so a checker can test authority.md's invariants on a snapshot instead of joining three
+`GET /v1/list` reads that could each see another revision. They change nothing and add no code.
+
+- **`at=N`** reads at revision N; without it, at the current revision. It is the same parameter,
+  with the same refusals, as on `/v1/list` and `GET /v1/jobs` (which already takes it, so
+  `/v1/jobs?at=N` is the third view): below the compaction point `410` with `ZC-E0203`, above the
+  current revision `400` with `ZC-E0204`. The brief named it `?revision=N`; `at` is kept so that
+  one meaning has one name across the API. No other parameter is taken.
+- **One revision.** Every key in the answer was read at `revision` (the first read's, when `at`
+  is absent): a key's `mod_revision` is never above it.
+- **Not paged.** Each prefix is read in pages of 500 at that revision, at most
+  `api_view_pages_max` (16) pages per prefix, 8,000 keys, well above `replicas_max` (512) and
+  `nodes_max` (64). A prefix with more is cut there and the answer says `"truncated": true`; a
+  checker must not judge a truncated view. An answer over the request arena (16 MiB) is
+  `ZC-E0207`, as for any read, never a partial body.
+- **Records unchanged.** Each `kv` is `/v1/list`'s `{key, value, create_revision, mod_revision,
+  lease}`, the value the record of [keys.md](keys.md) as stored, `env` values hidden from a
+  read-only caller as everywhere. A record that does not decode is served as stored: these views
+  judge nothing.
+- **Order.** Rows ascend by id (replicas) or name (nodes), bytewise; the `kv`s inside a row ascend
+  by key.
+- **Scope.** Over `--listen` both need a client of scope `admin` (mtls.md, "Scopes").
+
+`GET /v1/replicas` has one row per replica id found under `/replicas/`, `/assigned/` (a replica's
+assignment, never a job run's `<name>-job`) or `/observed/`:
+
+```json
+{ "revision": 431, "truncated": false,
+  "replicas": [
+    { "id": "hello-1",
+      "replica": { "key": "/replicas/hello/hello-1", "value": {"v": 3, "…": "…"},
+                   "create_revision": 12, "mod_revision": 12, "lease": 0 },
+      "assigned": [ { "key": "/assigned/node1/hello-1", "value": {"v": 1, "…": "…"},
+                      "create_revision": 14, "mod_revision": 14, "lease": 0 } ],
+      "observed": [ { "key": "/observed/node1/hello-1", "value": {"v": 1, "…": "…"},
+                      "create_revision": 20, "mod_revision": 398, "lease": 0 } ] } ] }
+```
+
+`replica` is null when the id has no `/replicas/` record (deleted, its assignment or observation
+not yet removed). `assigned` and `observed` are lists because the store does not forbid more than
+one; more than one assignment of an id is what I1a forbids, and a checker sees it here. The
+assignment's `mod_revision` is the placement epoch; its node is the key's middle part.
+
+`GET /v1/nodes` has one row per node name found under `/nodes/`, `/node-status/`,
+`/allocations/` or `/assigned/`:
+
+```json
+{ "revision": 431, "truncated": false,
+  "nodes": [
+    { "name": "node1",
+      "node":       { "key": "/nodes/node1", "value": {"v": 1, "…": "…"},
+                      "create_revision": 3, "mod_revision": 3, "lease": 7587892 },
+      "status":     { "key": "/node-status/node1", "value": {"v": 1, "state": "ready", "…": "…"},
+                      "create_revision": 4, "mod_revision": 4, "lease": 0 },
+      "allocation": { "key": "/allocations/node1", "value": {"v": 1, "…": "…"},
+                      "create_revision": 5, "mod_revision": 14, "lease": 0 },
+      "assigned":   [ { "key": "/assigned/node1/hello-1", "…": "…" },
+                      { "key": "/assigned/node1/backup-job", "…": "…" } ] } ] }
+```
+
+`node`, `status` and `allocation` are null when absent: `node` is absent once the lease ended (the
+node's tenure is `node.mod_revision` while it is present). `assigned` is every key under
+`/assigned/<node>/`, job runs included, so I6 (the sum of their `requests` equals
+`allocation.value.allocated`) is checked from one row.
+
 ### `GET /v1/codes` and `GET /v1/explain/{code}`
 
 The registry, for the console's code reader. `codes` is `[{code, severity, blame, summary}]`;
