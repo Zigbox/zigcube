@@ -53,6 +53,10 @@ pub const Client = struct {
     /// Requests past `traces_max`, not recorded.
     trace_dropped: u32,
     counter: u32,
+    /// The last `attempt` reached a connection (a connect that succeeded, or the test transport
+    /// answering): a failure after this point may have left a request the server acted on. Read
+    /// by zcube-jepsen-client, which records such a write as unknown (docs/jepsen.md).
+    sent: bool,
 
     /// Initialises in place. The address comes from `--server`, then `ZCUBE_SERVER`, then the
     /// default; one that is not `HOST:PORT` is ZC-E0112.
@@ -78,6 +82,7 @@ pub const Client = struct {
             .trace_count = 0,
             .trace_dropped = 0,
             .counter = 0,
+            .sent = false,
         };
         assert(client.address.getPort() != 0);
         try client.init_tls(tls, report);
@@ -141,6 +146,7 @@ pub const Client = struct {
         var id: cli_report.RequestId = .{};
         client.next_id(&id);
         report.request_id = id;
+        client.sent = false;
         const reply = try client.exchange(method, path, body, id.slice(), report);
         client.record(reply.request_id, method, path, reply.status);
         return reply;
@@ -208,6 +214,7 @@ pub const Client = struct {
         if (client.env.transport) |transport| {
             const raw = transport.exchange(transport.context, method, path, body);
             const text = raw orelse return unreachable_server(client, report, refused);
+            client.sent = true;
             return parse_reply(text, report, id);
         }
         const io = client.env.io;
@@ -217,6 +224,7 @@ pub const Client = struct {
             return unreachable_server(client, report, connect_reason(err));
         };
         defer stream.close(io);
+        client.sent = true;
         // A service file is cut at `service_file_bytes_max`, so its JSON is far under the limit;
         // a job with an input is the one body that may be larger (`job_request_bytes_max`).
         assert(body.len <= constants.job_request_bytes_max);

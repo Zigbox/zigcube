@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
     });
     add_agent_smoke_step(b, built, shared_options);
+    add_jepsen_client_step(b, shared_options);
     add_swarm_smoke_steps(b, shared_options, built);
     add_relay_teeth_step(b, shared_options);
     add_mtls_interop_step(b, shared_options, built);
@@ -283,6 +284,24 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
         if (std.mem.eql(u8, executable.name, "zcube")) built.cli = exe;
     }
     return built;
+}
+
+/// `zig build jepsen-client`: zcube-jepsen-client, the Jepsen battery's test-only client
+/// (src/zcube_jepsen_client.zig, docs/jepsen.md), installed in the mode `-Doptimize` names. It is
+/// not part of `zig build`: the shipped executables do not grow for it.
+fn add_jepsen_client_step(b: *std.Build, options: ExecutablesOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "zcube-jepsen-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zcube_jepsen_client.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = options.zigbox }},
+        }),
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    const help = "Build and install zcube-jepsen-client, the Jepsen battery's test-only client";
+    b.step("jepsen-client", help).dependOn(&install.step);
 }
 
 /// `zig build agent-smoke`: the server and the agent as real processes, with real containers
@@ -2672,10 +2691,10 @@ fn add_check_step(b: *std.Build) void {
     run.addArgs(&.{ b.graph.zig_exe, user });
     run.has_side_effects = true;
     const gates = [_][]const u8{
-        "install",            "test",       "tidy",          "errors-site-check",
-        "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
-        "check-store-sqlite", "mtls-teeth", "demo-b3-build", "demo-b5-build",
-        "demos-build",
+        "install",            "test",          "tidy",          "errors-site-check",
+        "wasm-check",         "wasm-test",     "console-wasm",  "check-store-memory",
+        "check-store-sqlite", "mtls-teeth",    "demo-b3-build", "demo-b5-build",
+        "demos-build",        "jepsen-client",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);

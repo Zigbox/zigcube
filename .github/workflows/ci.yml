@@ -122,6 +122,9 @@ jobs:
           packages: libsqlite3-dev libpq-dev
       - name: Build the three executables
         run: zig build
+      # The Jepsen battery's client is test-only and outside the default build (docs/jepsen.md).
+      - name: Build the Jepsen client
+        run: zig build jepsen-client
       - name: Unit and snapshot tests
         run: zig build test --summary all
       # The golden files of every ZC- code are checked by the tests above (and embedded at compile

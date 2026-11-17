@@ -1814,3 +1814,69 @@ test "teeth: without the digest filter fetchers names nodes that fetch another i
     defer agent_api.set_test_fault(.fetchers_digest, false);
     try testing.expectEqual(@as(usize, 1), (try fetchers_of(&rig, "b3:99999999")).len);
 }
+
+test "replicas and nodes answer the state at one revision, grouped, with env values hidden" {
+    // Goal: docs/api.md "state at one revision". Method: read both views before and after a
+    // service is placed, check each row against the raw keys, then the refusals.
+    var rig = try Rig.start(7);
+    defer rig.stop();
+    rig.world.advance(2000);
+    const before = rig.world.revision().?;
+    _ = try rig.world.apply(hello);
+    rig.world.advance(4000);
+
+    const now = try rig.ok("/v1/replicas", "");
+    const revision = field(now, "revision").integer;
+    try testing.expect(revision > before);
+    try testing.expect(field(now, "truncated") == .bool and !field(now, "truncated").bool);
+    const rows = field(now, "replicas").array.items;
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("hello-1", field(rows[0], "id").string);
+    try testing.expectEqualStrings("hello-2", field(rows[1], "id").string);
+    for (rows) |row| {
+        const replica = field(row, "replica");
+        const key = field(replica, "key").string;
+        try testing.expect(std.mem.endsWith(u8, key, field(row, "id").string));
+        try testing.expect(field(replica, "mod_revision").integer <= revision);
+        const assigned = field(row, "assigned").array.items;
+        try testing.expectEqual(@as(usize, 1), assigned.len);
+        try testing.expect(std.mem.startsWith(u8, field(assigned[0], "key").string, "/assigned/"));
+        try testing.expect(field(assigned[0], "mod_revision").integer <= revision);
+        for (field(row, "observed").array.items) |seen| {
+            try testing.expect(field(seen, "mod_revision").integer <= revision);
+        }
+    }
+    try testing.expect(std.mem.indexOf(u8, rig.get("/v1/replicas", "").body, "s3cr3t") == null);
+
+    var query_buffer: [64]u8 = undefined;
+    const old = try std.fmt.bufPrint(&query_buffer, "at={d}", .{before});
+    const then = try rig.ok("/v1/replicas", old);
+    try testing.expectEqual(@as(i64, @intCast(before)), field(then, "revision").integer);
+    try testing.expectEqual(@as(usize, 0), field(then, "replicas").array.items.len);
+
+    const nodes = try rig.ok("/v1/nodes", "");
+    const node_rows = field(nodes, "nodes").array.items;
+    try testing.expectEqual(@as(usize, 1), node_rows.len);
+    const node = node_rows[0];
+    try testing.expectEqualStrings("/nodes/node1", field(field(node, "node"), "key").string);
+    const status_value = field(field(node, "status"), "value");
+    try testing.expectEqualStrings("ready", field(status_value, "state").string);
+    // I6 from one row: the allocation is the sum of the assignments' requests.
+    const allocated = field(field(field(node, "allocation"), "value"), "allocated");
+    var cpu: i64 = 0;
+    for (field(node, "assigned").array.items) |kv| {
+        cpu += field(field(field(kv, "value"), "requests"), "cpu_millis").integer;
+    }
+    try testing.expectEqual(field(allocated, "cpu_millis").integer, cpu);
+    try testing.expectEqual(@as(usize, 2), field(node, "assigned").array.items.len);
+
+    const empty = try rig.ok("/v1/nodes", "at=1");
+    try testing.expectEqual(@as(i64, 1), field(empty, "revision").integer);
+
+    try rig.refused(rig.get("/v1/replicas", "at=9999999"), 400, "ZC-E0204");
+    try rig.refused(rig.get("/v1/nodes", "limit=1"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/nodes/node1", ""), 404, "ZC-E0101");
+    try rig.compact(revision);
+    try rig.refused(rig.get("/v1/nodes", "at=1"), 410, "ZC-E0203");
+    try rig.refused(rig.get("/v1/replicas", old), 410, "ZC-E0203");
+}
