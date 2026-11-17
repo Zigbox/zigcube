@@ -2814,10 +2814,10 @@ fn add_check_step(b: *std.Build) void {
     run.addArgs(&.{ b.graph.zig_exe, user });
     run.has_side_effects = true;
     const gates = [_][]const u8{
-        "install",            "test",       "tidy",          "errors-site-check",
-        "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
-        "check-store-sqlite", "mtls-teeth", "demo-b3-build", "demo-b5-build",
-        "demos-build",
+        "install",            "test",          "tidy",          "errors-site-check",
+        "wasm-check",         "wasm-test",     "console-wasm",  "check-store-memory",
+        "check-store-sqlite", "mtls-teeth",    "demo-b3-build", "demo-b5-build",
+        "demos-build",        "jepsen-client",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);

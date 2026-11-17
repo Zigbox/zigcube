@@ -122,6 +122,9 @@ jobs:
           packages: libsqlite3-dev libpq-dev
       - name: Build the three executables
         run: zig build
+      # The Jepsen battery's client is test-only and outside the default build (docs/jepsen.md).
+      - name: Build the Jepsen client
+        run: zig build jepsen-client
       - name: Unit and snapshot tests
         run: zig build test --summary all
       # The golden files of every ZC- code are checked by the tests above (and embedded at compile
@@ -149,10 +152,10 @@ jobs:
 
       # The Jepsen recipe's scripts run as root only, so `zig build test` skips this test as the
       # runner's user; here it runs under sudo (a runner, never a developer's host) on the
-      # executables built above, in a scratch directory with a fake systemctl.
+      # executables built above (the client by "Build the Jepsen client"), in a scratch directory
+      # with a fake systemctl.
       - name: Jepsen recipe (zigcube.sh and fault.sh as root)
         run: |
-          zig build jepsen-client
           sudo bash ops/jepsen/test-recipe.sh zig-out/bin/zcube zig-out/bin/zcube-server \
             zig-out/bin/zcube-agent zig-out/bin/zcube-jepsen-client
 

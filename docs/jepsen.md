@@ -32,6 +32,8 @@ One run is one operation on one service, `NAME` (a service name, keys.md):
 
 `--server` and the TLS flags mean what they mean for `zcube` (cli.md); the battery runs the
 server with `--listen` and gives the client a certificate of scope `admin` (an apply needs it).
+A flag given twice is refused, as is an `--image` that is empty or holds a quote, a backslash or
+a control character (exit 64, nothing written).
 
 **The history file** is opened with `O_APPEND`. The client appends the invocation line before the
 request leaves and the completion line after, each with one `write(2)`, so the lines of clients
@@ -47,6 +49,15 @@ takes none), so under a partition that drops packets a client waits until the ke
 `cli_reply_timeout_ms` (30 s). The harness bounds each client with its own timeout and kills it
 past that. A killed client leaves its `invoke` line with no completion, which the harness reads
 as `info` (Jepsen's crashed process): the request may have been sent.
+
+**A process id is used once per outstanding operation.** After a completion of `info`, or a
+client killed with no completion, the harness gives that worker a new `--process` (Jepsen's rule
+for a crashed process): the old operation may still take effect, so the old process is never
+idle, and a checker must not see a second operation of a process whose first has not ended.
+
+**One clock per history.** `time` is the client host's boot clock, which means nothing on another
+host. Every client that writes one history runs on one host (the control host, which the nemesis
+never clock-skews), or the harness drops `time` and orders the lines by its own clock.
 
 ## The history
 
@@ -66,8 +77,8 @@ out; `value` is always present.
 | `mod_revision` | `get`: the service key's `mod_revision`, when it exists |
 | `action` | `apply` and `delete`: the server's `action` (`create`, `update`, `none`, `delete`) |
 | `status` | the HTTP status, when a reply came |
-| `code` | the diagnostic code: the server's first, or the client's own (`ZC-E0102`, `ZC-E0103`) |
-| `request_id` | the server's `X-Request-Id`, to find the request in its log |
+| `code` | the diagnostic code: the server's first, or the client's own (`ZC-E0102`, `ZC-E0103`, a TLS code such as `ZC-E0814`); a checker reads only `type` |
+| `request_id` | the server's echo of `X-Request-Id` when a reply came, else the id the client sent; present whenever a request was attempted |
 | `error` | the newest cause, in words |
 
 A watch event is `{"type": "put"|"delete", "mod_revision": N, "replicas": N|null}`. The golden
@@ -89,13 +100,15 @@ so a read that did not answer is `fail`. As `test-store-faults` treats `ZC-E0213
 | a 2xx the client reads | `ok` | `ok` |
 | a 2xx the client cannot read (`ZC-E0103`) | `info` | `fail` |
 | no connection (`ZC-E0102`, nothing sent) | `fail` | `fail` |
-| sent, then no reply (`ZC-E0102`) | `info` | `fail` |
+| sent, then no reply in time (`ZC-E0102`) or the connection cut (`ZC-E0103`) | `info` | `fail` |
 | 4xx (refused before any write: `ZC-E0101`, `ZC-E0105`, a scope refusal) | `fail` | `fail` |
 | 503 with `ZC-E0201` (the store was never reached) | `fail` | `fail` |
 | any other non-2xx (`ZC-E0213`, 500, 502, …) | `info` | `fail` |
 
 "Sent" means the connection was made (cli_http.zig's `Client.sent`): before that, no byte of the
-request can have reached the server.
+request can have reached the server. The rule rests on `sent`, not on the code: a sent write
+whose failure has no code is still `info`. `jepsen_client_test.zig`'s `socket:` tests run it over a
+real socket (a listener that never accepts, one that reads and closes, a refused port).
 
 ## The views: the state at one revision
 
@@ -113,8 +126,9 @@ before the server compacts past them (`410`, `ZC-E0203`).
 
 Each property names the source it is judged from: the **history** (the client's lines), a
 **view** at a revision, or **host** observation (processes on the nodes, which the harness reads
-over SSH; "Observing the hosts over SSH" below says how). The sim's checks of the same name (authority.md §4 and §7, core.md
-"sim-c1") are the definitions; these are what an outside observer can see of them.
+over SSH; "Observing the hosts over SSH" below says how). The sim's checks of the same name
+(authority.md §4 and §7, core.md "sim-c1") are the definitions; these are what an outside observer
+can see of them.
 
 ### Services (the history)
 
@@ -150,10 +164,16 @@ over SSH; "Observing the hosts over SSH" below says how). The sim's checks of th
 - **I4.** Not visible from outside (the writer of a transaction is not recorded); the sim checks
   it.
 - **I5.** Every `zcube why` answer the harness asks for is `complete` or names its truncation.
-- **I6.** In each `/v1/nodes` row, `allocation.value.allocated` equals the sum of the `requests` of
-  the row's `assigned` records, and is within the node's declared capacity.
-- **I7.** For every assignment created at revision P (its `create_revision`), the node's `status`
-  at P−1 is `ready` (read `/v1/nodes?at=P-1`).
+- **I6.** In each `/v1/nodes` row whose `node` record exists at that revision,
+  `allocation.value.allocated` equals the sum of the `requests` of the row's `assigned` records,
+  and is within the node's declared capacity. A row with no `node` (a node gone, its records not
+  yet removed) is not judged.
+- **I7.** For every assignment written at revision P (its `mod_revision`, the placement epoch),
+  in `/v1/nodes?at=P-1` (the placement's transaction writes neither record, so P−1 and P agree)
+  the node's row has a `node` record, its `status.value.tenure` equals that record's
+  `mod_revision` (the status was written under the current tenure), and `status.value.state` is
+  `ready`. This is authority.md's I7 as `sim-c1` checks it (`sim_checks.zig`, `ready_at`); a
+  status with no `tenure` (a C0 record) fails it.
 
 ### Jobs (views and hosts)
 

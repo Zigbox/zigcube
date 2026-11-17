@@ -87,8 +87,9 @@ classify() {
     # Not part of any job but the build, test, tidy and wasm ones: the web console and its
     # checks, the tools, the simulations and their runners, tests of the code, the gate's own
     # runner, the generated error pages' tool, the smokes' own drivers, the cloud container's
-    # hook, the fleet's host side, the site's generated pages, the Jepsen battery's client, its
-    # deployment recipe and the tool that packs it (`zig build dist`).
+    # hook, the fleet's host side, the site's generated pages, the Jepsen battery's client (the
+    # code job builds it: `zig build jepsen-client`), its deployment recipe (the code job's test
+    # runs `ops/jepsen/test-recipe.sh`) and the tool that packs it (`zig build dist`).
     web/* | tools/* | .claude/* | ops/sim-fleet/* | ops/demo-c2-images/* | site/errors/* | \
       ops/jepsen/* | src/dist.zig | \
       src/console_*.zig | src/web_embed.zig | src/sim_*.zig | src/tests.zig | src/tidy.zig | \

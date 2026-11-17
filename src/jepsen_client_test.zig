@@ -12,6 +12,8 @@ const jepsen = @import("jepsen_client.zig");
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
+const linux = std.os.linux;
+const net = std.Io.net;
 
 /// Plays the server: answers every request with `raw` (null: the connection could not be made)
 /// and keeps the last request it saw.
@@ -207,7 +209,8 @@ test "an apply with no connection is fail: nothing was sent" {
         .raw = null,
         .expected =
         \\{"type":"fail","f":"apply","process":1,"time":200,"service":"r1","value":4,
-        \\"code":"ZC-E0102","error":"connection refused: nothing is listening there"}
+        \\"code":"ZC-E0102","request_id":"zc-test-0001",
+        \\"error":"connection refused: nothing is listening there"}
         ,
         .method = "POST",
         .path = "/v1/apply",
@@ -473,5 +476,139 @@ test "parse refuses bad arguments" {
         var problem: []const u8 = "";
         try testing.expectError(error.Usage, jepsen.parse(case.args, &problem));
         try testing.expectEqualStrings(case.problem, problem);
+    }
+}
+
+test "parse refuses a repeated flag and an image a JSON string cannot hold as given" {
+    const cases = [_]struct { args: []const []const u8, problem: []const u8 }{
+        .{
+            .args = &.{
+                "--op",      "apply", "--history", "h",      "--process", "1",
+                "--service", "r1",    "--op",      "delete",
+            },
+            .problem = "a flag is given twice",
+        },
+        .{
+            .args = &.{
+                "--op",      "apply", "--history", "h", "--process", "1",
+                "--service", "r1",    "--value",   "3", "--image",   "a\"b",
+            },
+            .problem = "--image is empty or holds a quote, a backslash or a control character",
+        },
+    };
+    for (cases) |case| {
+        var problem: []const u8 = "";
+        try testing.expectError(error.Usage, jepsen.parse(case.args, &problem));
+        try testing.expectEqualStrings(case.problem, problem);
+    }
+}
+
+// ---- Over a real socket ----------------------------------------------------------------------
+// The script cannot say "sent, then cut": these cases run `perform` over `cli_http`'s own socket
+// path, so `Client.sent` is the real one (review of PR 276: dropping it went unseen).
+
+/// Performs `arguments` against `address` over a real socket and returns the completion.
+fn over_socket(arena: Allocator, arguments: []const []const u8, address: []const u8) !history.Line {
+    var all: std.ArrayList([]const u8) = .empty;
+    try all.appendSlice(arena, arguments);
+    try all.appendSlice(arena, &.{ "--history", "unused.jsonl" });
+    var problem: []const u8 = "";
+    const args = try jepsen.parse(all.items, &problem);
+    const environ = try arena.create(std.process.Environ.Map);
+    environ.* = .init(arena);
+    const stdout = try arena.create(Writer.Allocating);
+    stdout.* = .init(arena);
+    const stderr = try arena.create(Writer.Allocating);
+    stderr.* = .init(arena);
+    const env = try arena.create(cli_env.Env);
+    env.* = .{
+        .io = testing.io,
+        .arena = arena,
+        .environ = environ,
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .stdin = null,
+        .stdin_is_terminal = false,
+        .stderr_is_terminal = false,
+        .version = "0.0.0-test",
+        .deterministic_ids = true,
+        .reply_timeout_ms = 200,
+    };
+    var report: cli_report.Report = undefined;
+    report.reset();
+    const client = try arena.create(cli_http.Client);
+    try client.init(env, address, .{}, &report);
+    return jepsen.perform(env, client, args, jepsen.invocation(args, 100));
+}
+
+fn expect_line(line: history.Line, kind: history.Type, code: []const u8) !void {
+    try testing.expectEqual(kind, line.type);
+    try testing.expectEqualStrings(code, line.code.?);
+    try testing.expectEqualStrings("zc-test-0001", line.request_id.?);
+    try testing.expect(line.status == null);
+}
+
+const apply_args: []const []const u8 = &.{
+    "--op", "apply", "--process", "1", "--service", "r1", "--value", "3",
+};
+const delete_args: []const []const u8 = &.{ "--op", "delete", "--process", "1", "--service", "r1" };
+const get_args: []const []const u8 = &.{ "--op", "get", "--process", "1", "--service", "r1" };
+const watch_args: []const []const u8 = &.{
+    "--op", "watch", "--process", "1", "--service", "r1", "--from", "1", "--hold-ms", "100",
+};
+
+test "socket: sent, then no reply within the timeout, is info for a write and fail for a read" {
+    // A listener that never accepts: the connect completes in its backlog and the request is
+    // written, then no byte comes back (ZC-E0102, "no reply within 200 ms").
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
+    defer listener.deinit(testing.io);
+    const address = try std.fmt.allocPrint(arena, "{f}", .{listener.socket.address});
+    try expect_line(try over_socket(arena, apply_args, address), .info, "ZC-E0102");
+    try expect_line(try over_socket(arena, delete_args, address), .info, "ZC-E0102");
+    try expect_line(try over_socket(arena, get_args, address), .fail, "ZC-E0102");
+    try expect_line(try over_socket(arena, watch_args, address), .fail, "ZC-E0102");
+}
+
+/// Accepts one connection, reads what the client sent, and closes it without a reply.
+fn accept_read_close(listener: *net.Server) void {
+    var stream = listener.accept(testing.io) catch return;
+    defer stream.close(testing.io);
+    var buffer: [4096]u8 = undefined;
+    _ = linux.read(stream.socket.handle, &buffer, buffer.len);
+}
+
+test "socket: a server that reads the request and closes is info for a write, fail for a read" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
+    defer listener.deinit(testing.io);
+    const address = try std.fmt.allocPrint(arena, "{f}", .{listener.socket.address});
+    const cases = [_]struct { args: []const []const u8, kind: history.Type }{
+        .{ .args = apply_args, .kind = .info },
+        .{ .args = delete_args, .kind = .info },
+        .{ .args = get_args, .kind = .fail },
+        .{ .args = watch_args, .kind = .fail },
+    };
+    for (cases) |case| {
+        const server = try std.Thread.spawn(.{}, accept_read_close, .{&listener});
+        const line = over_socket(arena, case.args, address);
+        server.join();
+        try expect_line(try line, case.kind, "ZC-E0103");
+    }
+}
+
+test "socket: a refused connection is fail for every operation: nothing was sent" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
+    const address = try std.fmt.allocPrint(arena, "{f}", .{listener.socket.address});
+    listener.deinit(testing.io);
+    for ([_][]const []const u8{ apply_args, delete_args, get_args, watch_args }) |args| {
+        try expect_line(try over_socket(arena, args, address), .fail, "ZC-E0102");
     }
 }
