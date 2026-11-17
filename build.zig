@@ -1932,7 +1932,11 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_c1_comparison(b, sim, exe, step, nodes_text, true);
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
     const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 34 fault-on sim-c1 runners");
-    for (c1_teeth_roots) |entry| {
+    const shard = teeth_shard(b, teeth);
+    for (c1_teeth_roots, 0..) |entry, index| {
+        // CI's shards (`-Dteeth-shard=K -Dteeth-shards=N`) take every Nth tooth from K, so their
+        // union is the whole table, a tooth added later included. A bad shard takes none.
+        const in_shard = if (shard) |s| index % s.count == s.index else false;
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
             .root_module = b.createModule(.{
@@ -1951,11 +1955,15 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
             "--expect-fail",            symptom,
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
-        teeth.dependOn(&teeth_run.step);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
-        add_also_seeds(b, &.{ teeth, own }, teeth_exe, entry);
-        add_plain_tooth(b, teeth, teeth_exe, entry);
+        if (in_shard) {
+            teeth.dependOn(&teeth_run.step);
+            add_also_seeds(b, &.{ teeth, own }, teeth_exe, entry);
+            add_plain_tooth(b, teeth, teeth_exe, entry);
+        } else {
+            add_also_seeds(b, &.{own}, teeth_exe, entry);
+        }
         const own_install = b.addInstallArtifact(teeth_exe, .{});
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
@@ -1969,6 +1977,25 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// Which share of the sim-c1 negative tests `sim-c1-teeth` runs: the teeth whose index in
+/// `c1_teeth_roots` is `index` modulo `count`. The default, 0 of 1, is every tooth; a shard out of
+/// range is null, takes no tooth, and fails the step at once. Each tooth is
+/// a ReleaseSafe executable of its own (about a minute to compile), so the step is
+/// compile-bound and CI runs it as a matrix (docs/decisions/2026-11-17-ci-speed-shards.md).
+const TeethShard = struct { index: u32, count: u32 };
+
+fn teeth_shard(b: *std.Build, teeth: *std.Build.Step) ?TeethShard {
+    const index_help = "sim-c1-teeth runs only the teeth whose index modulo -Dteeth-shards is this";
+    const count_help = "Number of shards sim-c1-teeth is split into (default 1: every tooth)";
+    const index = b.option(u32, "teeth-shard", index_help) orelse 0;
+    const count = b.option(u32, "teeth-shards", count_help) orelse 1;
+    if (count == 0 or index >= count) {
+        teeth.dependOn(&b.addFail("-Dteeth-shard must be below -Dteeth-shards").step);
+        return null;
+    }
+    return .{ .index = index, .count = count };
 }
 
 /// One sim-c1 seed run natively and under both V8 compilers as WASM, the reports compared byte
@@ -2229,7 +2256,34 @@ const offline_seeds_max = 30;
 /// deadline wake (#202); seed 21 caught the first form of that fix. A seed takes about 165 s
 /// alone (measured), so 1..20 (about 55 CPU minutes) does not fit CI's budget: the seeds that
 /// once failed run, one process each. Seeds 1..60 were swept by hand for #202 (0 of 60 failed).
-const burst_seed_ranges = [_][]const u8{ "1..2", "14..14", "17..17", "21..21" };
+const burst_seed_ranges = [_][]const u8{ "1..1", "2..2", "14..14", "17..17", "21..21" };
+
+/// Seeds `first..last` of a world step, `per_run` to a process.
+const SeedRanges = struct { first: u32, last: u32, per_run: u32 };
+
+/// Runs `exe --seeds A..B <tail>` over `seeds`, one process per `per_run` seeds, so the build
+/// runner spreads a world over the cores (one range of all the seeds ran on one core). A range
+/// passes only if none of its seeds fails, so the ranges together judge exactly what the one
+/// range did (docs/decisions/2026-11-17-ci-speed-shards.md).
+fn add_seed_ranges(
+    b: *std.Build,
+    step: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    seeds: SeedRanges,
+    tail: []const []const u8,
+) void {
+    std.debug.assert(seeds.per_run > 0);
+    std.debug.assert(seeds.first <= seeds.last);
+    var from = seeds.first;
+    while (from <= seeds.last) : (from += seeds.per_run) {
+        const to = @min(from + seeds.per_run - 1, seeds.last);
+        const run = b.addRunArtifact(exe);
+        run.addArgs(&.{ "--seeds", b.fmt("{d}..{d}", .{ from, to }) });
+        run.addArgs(tail);
+        run.expectExitCode(0);
+        step.dependOn(&run.step);
+    }
+}
 
 /// `zig build sim-c1-burst`: the burst world (one node, bursts of 12 short jobs; #198) with the
 /// agent right: no seed may fail. With `Node.started_true` back at 8 entries seed 2 fails J8.
@@ -2273,10 +2327,8 @@ fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
             }),
         });
         only.dependOn(&b.addInstallArtifact(exe, .{}).step);
-        const run = b.addRunArtifact(exe);
-        run.addArgs(&.{ "--seeds", "1..5", "300", "--c1" });
-        run.expectExitCode(0);
-        step.dependOn(&run.step);
+        const seeds: SeedRanges = .{ .first = 1, .last = 5, .per_run = 1 };
+        add_seed_ranges(b, step, exe, seeds, &.{ "300", "--c1" });
         // #248: seed 225 broke J6 on fb385b2 (a server failure ended the job pass before an
         // orphan's committed stop); the replay must pass.
         const replay = b.addRunArtifact(exe);
@@ -2304,11 +2356,10 @@ fn add_reuse_step(b: *std.Build, sim: SimStepOptions) void {
     });
     b.step("sim-c1-reuse-exe", "Install the reuse world's runner")
         .dependOn(&b.addInstallArtifact(exe, .{}).step);
-    const run = b.addRunArtifact(exe);
-    run.addArgs(&.{ "--seeds", b.fmt("1..{d}", .{reuse_seeds_max}), "300", "--c1" });
-    run.expectExitCode(0);
-    b.step("sim-c1-reuse", "Run sim-c1 in the job_reuse world with the agent right (J11 holds)")
-        .dependOn(&run.step);
+    const reuse_help = "Run sim-c1 in the job_reuse world with the agent right (J11 holds)";
+    const step = b.step("sim-c1-reuse", reuse_help);
+    const seeds: SeedRanges = .{ .first = 1, .last = reuse_seeds_max, .per_run = 10 };
+    add_seed_ranges(b, step, exe, seeds, &.{ "300", "--c1" });
 }
 
 /// The seeds of `sim-c1-signed` (B5 slice 3).
@@ -2326,12 +2377,10 @@ fn add_signed_step(b: *std.Build, sim: SimStepOptions) void {
             .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
         }),
     });
-    const run = b.addRunArtifact(exe);
-    run.addArgs(&.{ "--seeds", b.fmt("1..{d}", .{signed_seeds_max}), "auto", "--c1" });
-    run.addArgs(&.{ "--signed", "--profile=auto" });
-    run.expectExitCode(0);
-    b.step("sim-c1-signed", "Run sim-c1 in the signed-jobs world, 20 seeds (J12 holds)")
-        .dependOn(&run.step);
+    const signed_help = "Run sim-c1 in the signed-jobs world, 20 seeds (J12 holds)";
+    const step = b.step("sim-c1-signed", signed_help);
+    const seeds: SeedRanges = .{ .first = 1, .last = signed_seeds_max, .per_run = 5 };
+    add_seed_ranges(b, step, exe, seeds, &.{ "auto", "--c1", "--signed", "--profile=auto" });
 }
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long
@@ -2346,13 +2395,10 @@ fn add_offline_step(b: *std.Build, sim: SimStepOptions) void {
             .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
         }),
     });
-    const run = b.addRunArtifact(exe);
-    run.addArgs(&.{
-        "--seeds",                            b.fmt("1..{d}", .{offline_seeds_max}),
-        b.fmt("{d}", .{c1_teeth_operations}), "--c1",
-    });
-    b.step("sim-c1-offline", "Run sim-c1 in the offline-deadline world with the fix on (J8 holds)")
-        .dependOn(&run.step);
+    const offline_help = "Run sim-c1 in the offline-deadline world with the fix on (J8 holds)";
+    const step = b.step("sim-c1-offline", offline_help);
+    const seeds: SeedRanges = .{ .first = 1, .last = offline_seeds_max, .per_run = 10 };
+    add_seed_ranges(b, step, exe, seeds, &.{ b.fmt("{d}", .{c1_teeth_operations}), "--c1" });
 }
 
 /// Seeds of `sim-c1-runs-unread`: each failed J6 in this world before the job fence (2026-11-15,

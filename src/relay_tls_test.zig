@@ -427,7 +427,12 @@ fn tls_copy_once(seed: u64) !void {
     var got: [fuzz_bytes_max]u8 = undefined;
     var written: usize = 0;
     var read: usize = 0;
-    const end = end_in(testing.io);
+    // The deadline bounds the time without progress, not the whole stream: every byte that moves
+    // either way pushes it out. A stream of up to three relay buffers through a one-byte receive
+    // buffer, with pauses on both sides, can take longer than `deadline_ms` on a loaded machine;
+    // a byte lost or stuck still stops progress and fails as Timeout, and a byte repeated or out
+    // of order still fails as WrongBytes (docs/decisions/2026-11-17-ci-speed-shards.md).
+    var end = end_in(testing.io);
     while (read < length) {
         if (peer_stream.boot_ms(testing.io) > end) return error.Timeout;
         if (written < length) {
@@ -435,7 +440,10 @@ fn tls_copy_once(seed: u64) !void {
             const flags = linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT;
             const moved = linux.sendto(fd, sent[written..].ptr, chunk, flags, null, 0);
             switch (linux.errno(moved)) {
-                .SUCCESS => written += moved,
+                .SUCCESS => {
+                    written += moved;
+                    end = end_in(testing.io);
+                },
                 .AGAIN => {},
                 else => return error.WriteFailed,
             }
@@ -448,6 +456,7 @@ fn tls_copy_once(seed: u64) !void {
         const count = receive(fd, got[read..][0..@min(want, got.len - read)], 20) orelse continue;
         if (count == 0) return error.EndedEarly;
         read += count;
+        end = end_in(testing.io);
     }
     if (!std.mem.eql(u8, sent[0..length], got[0..length])) return error.WrongBytes;
 }
