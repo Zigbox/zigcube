@@ -52,7 +52,7 @@ const identity_python =
 /// regular file under every mount it sees but /proc, /sys and /dev, and reports the count through
 /// the relay.
 const keys_python =
-    \\import os,time,urllib.request as u
+    \\import os,time,hashlib,base64 as B,urllib.request as u
     \\o=os.path
     \\g=lambda p:u.urlopen(os.environ["ZCUBE_RELAY"]+p,timeout=15).read()
     \\g("/whoami")
@@ -61,9 +61,8 @@ const keys_python =
 ++ keys_parse_python ++ keys_search_python ++
     \\s("environ",open("/proc/self/environ","rb").read())
     \\n=0
-    \\X=("/proc","/sys","/dev")
     \\for d,D,F in os.walk("/"):
-    \\ D[:]=[x for x in D if not o.join(d,x).startswith(X)]
+    \\ D[:]=[x for x in D if not o.join(d,x).startswith(("/proc","/sys","/dev"))]
     \\ for f in F:
     \\  p=o.join(d,f)
     \\  try:
@@ -76,11 +75,12 @@ const keys_python =
 /// the seeds' hex separated by spaces (`guest.sh key-candidates`). `bytes.fromhex` takes only
 /// `str` before Python 3.14, so the body is decoded first.
 const keys_parse_python =
-    \\K=[bytes.fromhex(x)for x in c.decode().split()]
+    \\K=[*map(bytes.fromhex,c.decode().split())]
     \\
 ;
 
-/// The search of `keys`, given the candidate seeds `K`: `s(name, data)` adds `name` to `H` once
+/// The search of `keys`, given the candidate seeds `K` (and `base64` as `B` and `hashlib`
+/// imported): `s(name, data)` adds `name` to `H` once
 /// per pattern found in `data`. For each seed and its expanded scalar (SHA-512's first half,
 /// clamped): the raw bytes; hex in lower or upper case, bare or with `:`, `-` or ` ` between
 /// bytes; and
@@ -90,7 +90,6 @@ const keys_parse_python =
 /// URL-safe alphabet mapped to the standard one. Terse: `keys` must fit one
 /// command-line argument (`cli_arg_bytes_max`).
 const keys_search_python =
-    \\import base64 as B,hashlib
     \\P=[];H=[]
     \\for k in K:
     \\ a=bytearray(hashlib.sha512(k).digest()[:32]);a[0]&=248;a[31]=a[31]&63|64
@@ -463,10 +462,10 @@ test "each job's script fits one command-line argument" {
 }
 
 /// Drives `keys_parse_python` over a `/candidates` body as bytes (the job's TypeError before
-/// Python 3.14, demo-b4 step 2), then `keys_search_python` over encodings of a test seed; exits 0 only if the
-/// body parses, each encoding is found and a file without the key is not.
+/// Python 3.14, demo-b4 step 2), then `keys_search_python` over encodings of a test seed; exits 0
+/// only if the body parses, each encoding is found and a file without the key is not.
 const keys_search_check_python =
-    \\import base64
+    \\import base64, base64 as B, hashlib
     \\k = bytes(range(1, 33))
     \\c = (bytes(32).hex() + " " + k.hex()).encode()
     \\
