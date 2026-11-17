@@ -61,6 +61,7 @@ jobs:
       demo_b5: ${{ steps.pick.outputs.demo_b5 || 'true' }}
       demo_b6: ${{ steps.pick.outputs.demo_b6 || 'true' }}
       demo_b4: ${{ steps.pick.outputs.demo_b4 || 'true' }}
+      jepsen: ${{ steps.pick.outputs.jepsen || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -149,6 +150,15 @@ jobs:
       # directory, with real containers. It cleans up what it starts.
       - name: Local smoke (zcube local up and down)
         run: zig build local-smoke --summary all
+
+      # The Jepsen recipe's scripts run as root only, so `zig build test` skips this test as the
+      # runner's user; here it runs under sudo (a runner, never a developer's host) on the
+      # executables built above (the client by "Build the Jepsen client"), in a scratch directory
+      # with a fake systemctl.
+      - name: Jepsen recipe (zigcube.sh and fault.sh as root)
+        run: |
+          sudo bash ops/jepsen/test-recipe.sh zig-out/bin/zcube zig-out/bin/zcube-server \
+            zig-out/bin/zcube-agent zig-out/bin/zcube-jepsen-client
 
   # The same conformance suite against a real Postgres 16, the server a deployment would run.
   # The image is pinned by digest (postgres:16.15, resolved from Docker Hub on 2026-10-26), so a
@@ -746,3 +756,54 @@ jobs:
           name: mtls-interop-output
           path: mtls-interop.txt
           if-no-files-found: warn
+
+  # The Jepsen battery's tarball and its Postgres recipe (docs/jepsen.md,
+  # docs/decisions/2026-11-17-jepsen-j2-dist-and-recipe.md). `zig build dist` builds the tarball
+  # the battery deploys; it is checked against its .sha256 and unpacked, its recipe compared with
+  # ops/jepsen/, and ops/jepsen/test-postgres.sh runs postgres.sh (a primary and a synchronous
+  # standby on two ports, a crash, a promotion, a rejoin) and fault.sh's Postgres pause as root,
+  # then test-recipe.sh against that pair with the tarball's executables. A few minutes, most of
+  # it the ReleaseSafe build.
+  jepsen:
+    name: jepsen recipe (dist, postgres.sh)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.jepsen == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: jepsen
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: Postgres 16 programs
+        id: pg16
+        run: |
+          if [ -x /usr/lib/postgresql/16/bin/pg_ctl ]; then echo need=false >> "${GITHUB_OUTPUT}"; else echo need=true >> "${GITHUB_OUTPUT}"; fi
+      - name: Install postgresql-16
+        if: ${{ steps.pg16.outputs.need == 'true' }}
+        uses: ./.github/actions/install-apt
+        with:
+          packages: postgresql-16
+      - name: Drop the package's own cluster
+        if: ${{ steps.pg16.outputs.need == 'true' }}
+        run: sudo pg_dropcluster --stop 16 main || true
+      - name: Build the tarball
+        run: zig build dist --summary all
+      - name: Check and unpack the tarball
+        shell: bash
+        run: |
+          (cd zig-out/dist && sha256sum -c ./*.sha256)
+          mkdir -p "${RUNNER_TEMP}/dist"
+          tar -xzf zig-out/dist/*.tar.gz -C "${RUNNER_TEMP}/dist"
+          top=$(echo "${RUNNER_TEMP}"/dist/zigcube-*)
+          for f in "${top}"/share/jepsen/*; do cmp "${f}" "ops/jepsen/$(basename "${f}")"; done
+          echo "TOP=${top}" >> "${GITHUB_ENV}"
+      - name: postgres.sh and the recipe on a Postgres pair (as root)
+        run: |
+          sudo bash ops/jepsen/test-postgres.sh "${TOP}/bin/zcube" "${TOP}/bin/zcube-server" \
+            "${TOP}/bin/zcube-agent" "${TOP}/bin/zcube-jepsen-client"

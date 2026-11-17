@@ -92,6 +92,16 @@ const shell_allowlist = [_][]const u8{
     // fixture, never in a build or test, and nothing but a list of `openssl` calls; the point is
     // certificates another tool made, so the build cannot make them itself.
     "src/testdata/x509/gen.sh",
+    // The Jepsen battery's deployment recipe (ops/jepsen/README.md, docs/briefs/c5.md item 2):
+    // the harness runs them over SSH as root on bare hosts that get the tarball and no Zig, and
+    // they are lists of `apt-get`, `systemctl`, `pg_ctl`, `iptables`, `kill` and `date` calls.
+    // `test-recipe.sh` runs two of them in `zig build test` against the built executables;
+    // `test-postgres.sh` runs postgres.sh and fault.sh's Postgres pause in CI's jepsen job.
+    "ops/jepsen/zigcube.sh",
+    "ops/jepsen/postgres.sh",
+    "ops/jepsen/fault.sh",
+    "ops/jepsen/test-recipe.sh",
+    "ops/jepsen/test-postgres.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).
