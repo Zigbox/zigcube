@@ -8,7 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const demo_host = @import("demo_host.zig");
-const server_ca = @import("server_ca.zig");
+const harness_tls = @import("harness_tls.zig");
 const steps = @import("demo_c2_steps.zig");
 const x509 = @import("x509.zig");
 
@@ -106,7 +106,7 @@ fn put(demo: *steps.Demo, file: []const u8, data: []const u8) !void {
 }
 
 /// The cluster CA's certificate, as the server wrote it into its state directory
-/// (`ca-<key hash>.crt`, `server_ca.zig`).
+/// (`ca.crt` or `ca-<key hash>.crt`, `server_ca.zig`).
 fn cluster_ca_pem(host: *Host) ![]const u8 {
     const dir_path = try host.path_in_work("server-state");
     var dir = try std.Io.Dir.cwd().openDir(host.io, dir_path, .{ .iterate = true });
@@ -115,8 +115,8 @@ fn cluster_ca_pem(host: *Host) ![]const u8 {
     var found: ?[]const u8 = null;
     while (try iterator.next(host.io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.startsWith(u8, entry.name, "ca")) continue;
-        if (!std.mem.endsWith(u8, entry.name, server_ca.cert_extension)) continue;
+        // `ca.crt` or `ca-<16 hex>.crt` only: `ca-browser.crt` is the browser CA, not this one.
+        if (!harness_tls.Pki.is_ca_cert_name(entry.name)) continue;
         if (found != null) return host.fail("two CA certificates in {s}", .{dir_path});
         found = try host.arena().dupe(u8, entry.name);
     }

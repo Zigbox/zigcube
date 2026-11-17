@@ -255,6 +255,8 @@ test "harness_tls: find_ca waits for a missing state directory and finds the ser
         "state/ca-0123456789abcdef.key", "state/ca-0123456789abcde.crt",
         "state/ca-0123456789ABCDEF.crt", "state/ca-0123456789abcdeg.crt",
         "state/ca.crt.tmp",              "state/xca.crt",
+        // The P-256 browser CA (`server_browser_ca.cert_name_for`) is not the cluster CA.
+        "state/ca-browser.crt",
     }) |path| try t.put(path);
     try testing.expectEqual(null, try t.pki.find_ca());
     try t.put("state/ca-0123456789abcdef.crt");
