@@ -335,10 +335,12 @@ const jepsen_recipe_files = [_][]const u8{
 
 /// `zig build dist`: the release tarball the Jepsen battery deploys (docs/jepsen.md, "The
 /// tarball"): zcube, zcube-server, zcube-agent and zcube-jepsen-client for x86_64 Linux (baseline
-/// CPU, glibc 2.36 or later), ReleaseSafe whatever `-Doptimize` says, and `ops/jepsen/`, written by
+/// CPU, glibc 2.39 or later), ReleaseSafe whatever `-Doptimize` says, and `ops/jepsen/`, written by
 /// src/dist.zig into `zig-out/dist/` with its SHA-256. The server links the host's libsqlite3 and
 /// libpq (`-Ddist-lib-dir`, default Debian's and Ubuntu's directory); the hosts that run it need
-/// libsqlite3-0 and libpq5, which `ops/jepsen/zigcube.sh install` installs.
+/// libsqlite3-0 and libpq5, which `ops/jepsen/zigcube.sh install` installs. glibc 2.39 is
+/// Ubuntu 24.04's, the build host's and CI's: its libsqlite3 needs symbols of glibc 2.38
+/// (`fmod@GLIBC_2.38`), so an older floor does not link there.
 fn add_dist_step(
     b: *std.Build,
     version: []const u8,
@@ -352,7 +354,7 @@ fn add_dist_step(
         .os_tag = .linux,
         .abi = .gnu,
         .cpu_model = .baseline,
-        .glibc_version = .{ .major = 2, .minor = 36, .patch = 0 },
+        .glibc_version = .{ .major = 2, .minor = 39, .patch = 0 },
     });
     const optimize: std.builtin.OptimizeMode = .ReleaseSafe;
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });

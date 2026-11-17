@@ -141,7 +141,8 @@ fn write_tarball(
     const file_buffer = try arena.alloc(u8, 64 * 1024);
     var file_writer = file.writer(io, file_buffer);
     const hashed_buffer = try arena.alloc(u8, 64 * 1024);
-    var hashed: std.Io.Writer.Hashed(Sha256) = .init(&file_writer.interface, hashed_buffer);
+    var hashed: std.Io.Writer.Hashed(Sha256) =
+        .initHasher(&file_writer.interface, .init(.{}), hashed_buffer);
     const window = try arena.alloc(u8, std.compress.flate.max_window_len);
     const compress = try arena.create(std.compress.flate.Compress);
     compress.* = try .init(&hashed.writer, window, .gzip, .default);
@@ -176,4 +177,3 @@ fn write_entry(init: std.process.Init, tar: *std.tar.Writer, entry: Entry) !void
         .mtime = 0,
     });
 }
-

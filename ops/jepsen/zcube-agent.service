@@ -1,0 +1,18 @@
+# zcube-agent for the Jepsen battery; zigcube.sh writes /etc/zcube/agent.zon and starts it.
+# KillMode=process: stopping the agent stops the agent only. Each container runs under a
+# supervisor of its own, which outlives the agent and is adopted when it starts again
+# (docs/agent.md); the default (control-group) would kill every container with it.
+# Restart=no, as for the server: a kill stays visible.
+[Unit]
+Description=Zigcube node agent (Jepsen)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/zigcube/current/bin/zcube-agent --config /etc/zcube/agent.zon
+KillMode=process
+Restart=no
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

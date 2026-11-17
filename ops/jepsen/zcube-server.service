@@ -1,0 +1,15 @@
+# zcube-server for the Jepsen battery; zigcube.sh writes /etc/zcube/server.zon and starts it.
+# Restart=no: a server the battery kills stays down until the harness starts it, so a kill is
+# never hidden by a restart the history cannot see.
+[Unit]
+Description=Zigcube server (Jepsen)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/zigcube/current/bin/zcube-server --config /etc/zcube/server.zon
+Restart=no
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

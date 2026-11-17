@@ -1,0 +1,11 @@
+// The image digests the fake runtime treats as present on a Jepsen node (fixtures/images.zon
+// says why such a list exists): `jepsen:1`, the default image of zcube-jepsen-client's apply,
+// and fixtures/images.zon's own, for jobs posted with the digests the demos use.
+.{
+    .images = .{
+        "jepsen:1",
+        "b3:51aa9c03",
+        "b3:9d20c4f1",
+        "b3:51aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c03",
+    },
+}
