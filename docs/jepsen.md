@@ -41,6 +41,13 @@ running at once never interleave. The completion is also printed on stdout.
 file cannot be opened or written (the operation, if it ran, is not recorded: the harness must
 treat the run as broken).
 
+**A client the harness kills.** The connect has no timeout of its own (cli_http.zig: std's connect
+takes none), so under a partition that drops packets a client waits until the kernel gives up
+(about two minutes with Linux's default `tcp_syn_retries`); a reply waits at most
+`cli_reply_timeout_ms` (30 s). The harness bounds each client with its own timeout and kills it
+past that. A killed client leaves its `invoke` line with no completion, which the harness reads
+as `info` (Jepsen's crashed process): the request may have been sent.
+
 ## The history
 
 One JSON object per line. Members are always in this order, and one that does not apply is left
