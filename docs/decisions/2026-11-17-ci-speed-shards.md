@@ -69,7 +69,23 @@ A branch protection rule that names the old checks must be updated.
 
 ## After
 
-Filled in from the `full-ci` run of this pull request.
+The `full-ci` run of this pull request, 44198072571 (head fdff7ee), every job green. Each new
+shard's cache entry did not exist yet, so all of them ran cold, which compares with the cold runs
+above:
+
+| Job | Before (cold) | After (cold) |
+|---|---|---|
+| sim-c1 negative tests | 24.2 to 27.9 | shards 8.6, 9.1, 10.2, 6.0 |
+| sim-c1 worlds | 21.5 to 25.4 | burst 10.4, evict 7.8 |
+| format, build, test | 7.5 to 12.2 | 12.7 |
+| demo-c2 | 7.5 to 10.3 | 9.9 |
+| simulations (sim-c0, sim-c1) | 9.5 to 11.5 | 7.5 |
+
+The longest job fell from 24 to 28 minutes to 12.7, and it is now `format, build, test`, which
+this change does not touch. The longest shard (worlds, burst: sim-c1-burst's five seeds of about
+165 s each, side by side with offline and runs-unread on four cores) is 10.4. The run's wall clock
+was 22 minutes from the first job queued to the last finished, including waiting for runners: 21
+jobs compete for the account's concurrent runners.
 
 ## The relay copy fuzz timed out under load
 
