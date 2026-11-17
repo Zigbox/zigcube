@@ -114,7 +114,9 @@ cmd_server() {
     converge zcube-server "$changed"
     local tries=0 ca
     while true; do
-        ca=$(find "$server_state" -maxdepth 1 -name 'ca-*.crt' ! -name 'ca-browser*' | head -n 1)
+        # The cluster CA: `ca-` and 16 hex digits (server_ca.zig), not `ca-<hash>-browser.crt`.
+        ca=$(find "$server_state" -maxdepth 1 -regextype posix-extended \
+            -regex '.*/ca-[0-9a-f]{16}\.crt' | head -n 1)
         [ -z "$ca" ] || break
         tries=$((tries + 1))
         [ $tries -le $ca_wait_tenths ] || die "no CA certificate in $server_state after 30 s"

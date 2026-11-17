@@ -147,7 +147,9 @@ fn write_tarball(
     const compress = try arena.create(std.compress.flate.Compress);
     compress.* = try .init(&hashed.writer, window, .gzip, .default);
     var tar: std.tar.Writer = .{ .underlying_writer = &compress.writer };
-    try tar.setRoot(top);
+    // `setRoot`, with the directory's mode given: its default is 0775.
+    try tar.writeDir(top, .{ .mode = 0o755, .mtime = 0 });
+    tar.prefix = top;
     const commit_line = try std.fmt.allocPrint(arena, "{s}\n", .{commit});
     try tar.writeFileBytes("COMMIT", commit_line, .{ .mode = 0o644, .mtime = 0 });
     for (entries) |entry| try write_entry(init, &tar, entry);

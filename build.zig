@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
     });
     add_agent_smoke_step(b, built, shared_options);
-    add_jepsen_client_step(b, shared_options);
+    add_jepsen_client_step(b, shared_options, built);
     add_dist_step(b, manifest.version, pq_include, web_files);
     add_swarm_smoke_steps(b, shared_options, built);
     add_relay_teeth_step(b, shared_options);
@@ -303,10 +303,23 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
 /// `zig build jepsen-client`: zcube-jepsen-client, the Jepsen battery's test-only client
 /// (src/zcube_jepsen_client.zig, docs/jepsen.md), installed in the mode `-Doptimize` names. It is
 /// not part of `zig build`: the shipped executables do not grow for it.
-fn add_jepsen_client_step(b: *std.Build, options: ExecutablesOptions) void {
-    const install = b.addInstallArtifact(jepsen_client_exe(b, options), .{});
+fn add_jepsen_client_step(b: *std.Build, options: ExecutablesOptions, built: Built) void {
+    const client = jepsen_client_exe(b, options);
+    const install = b.addInstallArtifact(client, .{});
     const help = "Build and install zcube-jepsen-client, the Jepsen battery's test-only client";
     b.step("jepsen-client", help).dependOn(&install.step);
+    // `zig build test` also runs the battery's deployment recipe (`ops/jepsen/`) against these
+    // executables through a fake systemctl; as a user other than root it skips (the recipe is
+    // root's).
+    const recipe = b.addSystemCommand(&.{"bash"});
+    recipe.addFileArg(b.path("ops/jepsen/test-recipe.sh"));
+    recipe.addArtifactArg(built.cli);
+    recipe.addArtifactArg(built.server);
+    recipe.addArtifactArg(built.agent);
+    recipe.addArtifactArg(client);
+    for (jepsen_recipe_files) |name| recipe.addFileInput(b.path(b.fmt("ops/jepsen/{s}", .{name})));
+    recipe.expectExitCode(0);
+    b.top_level_steps.get("test").?.step.dependOn(&recipe.step);
 }
 
 fn jepsen_client_exe(b: *std.Build, options: ExecutablesOptions) *std.Build.Step.Compile {
@@ -347,7 +360,8 @@ fn add_dist_step(
     pq_include: []const u8,
     web_files: *std.Build.Module,
 ) void {
-    const lib_dir = b.option([]const u8, "dist-lib-dir", "Where dist links libsqlite3 and libpq") orelse
+    const lib_dir_help = "Where dist links libsqlite3 and libpq";
+    const lib_dir = b.option([]const u8, "dist-lib-dir", lib_dir_help) orelse
         "/usr/lib/x86_64-linux-gnu";
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
