@@ -241,10 +241,12 @@ pub fn put_tls(demo: *Demo, index: u32) !void {
     assert(flags.len == 6);
     const session = &demo.guests.sessions[index];
     const timeout_s: u32 = 60;
-    const made = try session.run("mkdir -p -m 700 " ++ guest_tls_dir, timeout_s);
+    // `chmod` too: demo-b3's guest made the directory already (`guest.sh put`), and `mkdir -p`
+    // leaves an existing directory's mode as it is.
+    const dir_private = "mkdir -p -m 700 " ++ guest_tls_dir ++ " && chmod 700 " ++ guest_tls_dir;
+    const made = try session.run(dir_private, timeout_s);
     if (made.status != 0) return host.fail("can't make {s} in the guest", .{guest_tls_dir});
-    const names = [_][]const u8{ "ca.crt", "node.crt", "node.key" };
-    for (names, 0..) |name, slot| {
+    for (tls_names, 0..) |name, slot| {
         const text = try std.Io.Dir.cwd().readFileAlloc(
             host.io,
             flags[2 * slot + 1],
@@ -257,23 +259,53 @@ pub fn put_tls(demo: *Demo, index: u32) !void {
     // Zigbox's `Session.put_file` takes no mode: it writes under the shell's umask, through
     // /tmp/put.b64, and makes the file 755. The directory is 700, so nothing else can open the
     // files meanwhile; the copy in /tmp goes, and each mode is read back before it is claimed.
-    const chmod = "chmod 600 " ++ guest_tls_dir ++ "/* && rm -f /tmp/put.b64";
-    const kept = try session.run(chmod, timeout_s);
+    // The three files by name, not `*`: demo-b3's and demo-b4's guest keeps the TLS upstream's
+    // own files in the same directory (ops/demo-b3/guest.sh, `put` and `upstream`).
+    const kept = try session.run("chmod 600" ++ tls_paths ++ " && rm -f /tmp/put.b64", timeout_s);
     if (kept.status != 0) return host.fail("can't chmod {s} in the guest", .{guest_tls_dir});
-    const modes = try session.run("stat -c %a " ++ guest_tls_dir ++ "/*", timeout_s);
-    var private: u32 = 0;
-    var words = std.mem.tokenizeAny(u8, modes.output, " \r\n");
-    while (words.next()) |word| {
-        if (std.mem.eql(u8, word, "600")) private += 1 else private = names.len + 1;
-    }
-    if (modes.status != 0 or private != names.len) {
-        return host.fail("{s} in the guest has modes {s}, expected 600 each", .{
-            guest_tls_dir, modes.output,
+    const modes = try session.run("stat -c %a" ++ tls_paths, timeout_s);
+    if (modes.status != 0 or !all_private(modes.output)) {
+        return host.fail("{s} in the guest have modes {s}, expected 600 each", .{
+            tls_paths[1..], modes.output,
         });
     }
     host.say("  {s}: the CA, node.crt and node.key are in {s} (0600)", .{
         vms.names[index], guest_tls_dir,
     });
+}
+
+/// The files `put_tls` writes into `guest_tls_dir`, in the order of `agent_tls`'s flags.
+const tls_names = [_][]const u8{ "ca.crt", "node.crt", "node.key" };
+/// ` /root/tls/ca.crt /root/tls/node.crt /root/tls/node.key`, for `chmod` and `stat`.
+const tls_paths = paths: {
+    var text: []const u8 = "";
+    for (tls_names) |name| text = text ++ " " ++ guest_tls_dir ++ "/" ++ name;
+    break :paths text;
+};
+
+/// Whether `stat -c %a` of `tls_paths` printed `600` once per file and nothing else.
+fn all_private(output: []const u8) bool {
+    var private: u32 = 0;
+    var words = std.mem.tokenizeAny(u8, output, " \r\n");
+    while (words.next()) |word| {
+        if (!std.mem.eql(u8, word, "600")) return false;
+        private += 1;
+    }
+    return private == tls_names.len;
+}
+
+test "put_tls: the modes read back are the three files', each 600" {
+    try std.testing.expectEqualStrings(
+        " /root/tls/ca.crt /root/tls/node.crt /root/tls/node.key",
+        tls_paths,
+    );
+    try std.testing.expect(all_private("600\n600\n600"));
+    try std.testing.expect(all_private("600\r\n600\r\n600\n"));
+    try std.testing.expect(!all_private("600\n600"));
+    try std.testing.expect(!all_private("600\n644\n600"));
+    try std.testing.expect(!all_private("600\n600\n600\n600"));
+    try std.testing.expect(!all_private(""));
+    try std.testing.expect(!all_private("stat: cannot statx '/root/tls/node.key'"));
 }
 
 /// A PEM certificate or key: what `put_file` takes at most.

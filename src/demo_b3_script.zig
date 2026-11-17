@@ -230,3 +230,8 @@ comptime {
 test "the hostile script fits one command-line argument" {
     try std.testing.expect(hostile_python.len <= constants.cli_arg_bytes_max);
 }
+
+// The shared steps' own tests (`put_tls`'s mode check, which demo-b3 runs too).
+test {
+    _ = steps;
+}
