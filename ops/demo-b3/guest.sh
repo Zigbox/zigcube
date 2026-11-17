@@ -8,7 +8,7 @@
 # Commands:  guest.sh setup-root | learn <reference> | images <tree> <reference>
 #            guest.sh agent <node> <server host:port> | restart | node-addr
 #            guest.sh put <file> <base64 chunk> | upstream <cluster> <job,job,...>
-#            guest.sh upstream-log | listeners | relay-logs [<job>] | logs
+#            guest.sh upstream-log | listeners | relay-logs [<run>] | logs
 #            guest.sh key-candidates <marker> | stop-relay <marker>
 #
 # Every command prints `ok: ...` for what it did, or `FAIL: ...` and exits 1.
@@ -366,19 +366,20 @@ cmd_node_addr() {
 # What listens in the guest's own network namespace: a job's relay must not.
 cmd_listeners() { ss -ltnH; }
 
-# Every job's relay.log, under the layout `--runtime zigbox` uses (<state>/zigbox/<name>/; the
-# fake runtime's `containers/` does not exist there), or with a name only that job's. With none at
-# all it fails, so a wrong path cannot read as "nothing logged".
+# Every job's relay.log, under the layout `--runtime zigbox` uses (<state>/zigbox/<run id>/, the
+# run id being `<job>-job`; the fake runtime's `containers/` does not exist there), or with a run
+# id only that run's. With none at all it fails, so a wrong path cannot read as "nothing
+# logged".
 cmd_relay_logs() {
     if [ $# -eq 1 ]; then
         log="$STATE/zigbox/$1/relay.log"
-        [ -f "$log" ] || fail "no $log: job $1's relay left none"
+        [ -f "$log" ] || fail "no $log: run $1's relay left none"
         echo "---- $log ----"
         cat "$log"
-        echo "ok: job $1's relay.log"
+        echo "ok: run $1's relay.log"
         return
     fi
-    [ $# -eq 0 ] || fail "usage: guest.sh relay-logs [<job>]"
+    [ $# -eq 0 ] || fail "usage: guest.sh relay-logs [<run>]"
     found=0
     for log in "$STATE"/zigbox/*/relay.log; do
         [ -f "$log" ] || continue

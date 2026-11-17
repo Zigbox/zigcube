@@ -1,7 +1,7 @@
 #!/bin/sh
-# Tests guest.sh's `relay-logs [<job>]` against fake state directories (run by `zig build test`):
-# it must read the layout `--runtime zigbox` writes (<state>/zigbox/<name>/relay.log), print
-# what the logs say (one job's alone when named), and fail when there is no relay.log at all, so
+# Tests guest.sh's `relay-logs [<run>]` against fake state directories (run by `zig build test`):
+# it must read the layout `--runtime zigbox` writes (<state>/zigbox/<run id>/relay.log, the run
+# id being `<job>-job`), print what the logs say (one run's alone when named), and fail when there is no relay.log at all, so
 # the demo's "no ZC-E07xx line" check cannot pass for lack of a log.
 set -u
 here=$(dirname "$0")
@@ -21,9 +21,9 @@ STATE="$tmp/fake" sh "$here/guest.sh" relay-logs >"$tmp/out" 2>&1
 check "relay.log under containers/ is not where the zigbox runtime writes: fails" $((! $? ))
 
 # The real layout: found, and its content is printed, so the demo's grep can see a failure.
-mkdir -p "$tmp/real/zigbox/job" "$tmp/real/zigbox/bystander"
-echo "ZC-E0701 upstream refused" >"$tmp/real/zigbox/job/relay.log"
-: >"$tmp/real/zigbox/bystander/relay.log"
+mkdir -p "$tmp/real/zigbox/job-job" "$tmp/real/zigbox/bystander-job"
+echo "ZC-E0701 upstream refused" >"$tmp/real/zigbox/job-job/relay.log"
+: >"$tmp/real/zigbox/bystander-job/relay.log"
 STATE="$tmp/real" sh "$here/guest.sh" relay-logs >"$tmp/out" 2>&1
 check "the real layout passes" $?
 grep -q "ZC-E0701 upstream refused" "$tmp/out"
@@ -32,15 +32,17 @@ grep -q "ok: 2 relay.log files" "$tmp/out"
 check "both logs are counted" $?
 
 # One job's log: only its own lines, never another job's, and a job with none fails.
-STATE="$tmp/real" sh "$here/guest.sh" relay-logs bystander >"$tmp/out" 2>&1
+STATE="$tmp/real" sh "$here/guest.sh" relay-logs bystander-job >"$tmp/out" 2>&1
 check "one job's log passes" $?
 grep -q "ZC-E0701" "$tmp/out"
 check "another job's lines are not printed" $((! $? ))
-STATE="$tmp/real" sh "$here/guest.sh" relay-logs job >"$tmp/out" 2>&1
+STATE="$tmp/real" sh "$here/guest.sh" relay-logs job-job >"$tmp/out" 2>&1
 grep -q "ZC-E0701 upstream refused" "$tmp/out"
 check "the named job's lines are printed" $?
 STATE="$tmp/real" sh "$here/guest.sh" relay-logs nobody >"$tmp/out" 2>&1
 check "a job with no relay.log fails" $((! $? ))
+STATE="$tmp/real" sh "$here/guest.sh" relay-logs job >"$tmp/out" 2>&1
+check "the job's name is not its run id: fails" $((! $? ))
 
 [ "$failures" -eq 0 ] && echo "test-guest: ok"
 exit "$failures"

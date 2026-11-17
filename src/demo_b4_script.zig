@@ -15,6 +15,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const b3 = @import("demo_b3_script.zig");
 const constants = @import("constants.zig");
+const records = @import("records.zig");
 const relay_tls = @import("demo_relay_tls.zig");
 const state = @import("demo_b1_state.zig");
 const steps = @import("demo_c2_steps.zig");
@@ -28,6 +29,9 @@ const job_keys = "keys";
 const job_fence = "fence";
 const job_cancel = "cancelme";
 const job_orphan = "orphan";
+/// The orphan's run id: the agent names the run's container directory, and so its relay.log's
+/// directory, by it, not by the job.
+const run_orphan = job_orphan ++ records.job_run_suffix;
 const job_net = "net";
 const jobs = job_identity ++ "," ++ job_keys ++ "," ++ job_fence ++ "," ++ job_net ++ "," ++
     job_cancel ++ "," ++ job_orphan;
@@ -430,7 +434,7 @@ fn orphan_row(demo: *Demo) !void {
     demo.expect(view.end_kind != null and std.mem.eql(u8, view.end_kind.?, "exited") and
         view.code == null, "the job was killed by a signal, not left to sleep (end {s}, code " ++
         "{?d})", .{ view.end_kind orelse "?", view.code });
-    const logs = try demo.guest(0, "relay-logs {s}", .{job_orphan});
+    const logs = try demo.guest(0, "relay-logs {s}", .{run_orphan});
     demo.expect(std.mem.indexOf(u8, logs, "ZC-E0702") != null and
         std.mem.indexOf(u8, logs, "the job's command was killed") != null, "the orphan's own " ++
         "relay.log says why: ZC-E0702, the listener stopped and the command was killed", .{});
@@ -500,4 +504,9 @@ test "the key search finds a seed in a PKCS#8 PEM and its other encodings" {
     if (!result.term.success()) std.debug.print("{s}\n", .{result.stderr});
     try std.testing.expect(result.term.success());
     try std.testing.expectEqualStrings("ok\n", result.stdout);
+}
+
+test "demo-b4: relay-logs is given the orphan's run id, as the agent names it" {
+    var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    try std.testing.expectEqualStrings(records.job_run_id(&buffer, job_orphan), run_orphan);
 }
