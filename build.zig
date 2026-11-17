@@ -29,7 +29,11 @@ pub fn build(b: *std.Build) void {
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
     const zigbox_module = zigbox.module("zigbox");
 
-    const c_modules = add_c_modules(b, target, optimize);
+    // libpq's C header lives under /usr/include/postgresql on Debian and Ubuntu (libpq-dev);
+    // `-Dpq-include=` names another directory.
+    const pq_include = b.option([]const u8, "pq-include", "Directory of libpq-fe.h") orelse
+        "/usr/include/postgresql";
+    const c_modules = add_c_modules(b, target, optimize, .{ .pq_include = pq_include });
     const sqlite = c_modules.sqlite;
     const libpq_module = c_modules.libpq;
     const console = add_console_steps(b);
@@ -59,6 +63,7 @@ pub fn build(b: *std.Build) void {
     });
     add_agent_smoke_step(b, built, shared_options);
     add_jepsen_client_step(b, shared_options);
+    add_dist_step(b, manifest.version, pq_include, web_files);
     add_swarm_smoke_steps(b, shared_options, built);
     add_relay_teeth_step(b, shared_options);
     add_mtls_interop_step(b, shared_options, built);
@@ -189,10 +194,18 @@ fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
 
 const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
 
+const CPaths = struct {
+    pq_include: []const u8,
+    /// Where the linker finds libsqlite3 and libpq when the target is not the host's own (the
+    /// dist target): Zig searches the system's library directories for a native target only.
+    lib_dir: ?[]const u8 = null,
+};
+
 fn add_c_modules(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    paths: CPaths,
 ) CModules {
     // SQLite's C header, translated (`@cImport` is gone). Backends import it as `sqlite_c`.
     const sqlite = b.addTranslateC(.{
@@ -202,18 +215,19 @@ fn add_c_modules(
     }).createModule();
     sqlite.linkSystemLibrary("sqlite3", .{});
 
-    // libpq's C header, translated the same way. The header lives under /usr/include/postgresql on
-    // Debian and Ubuntu (libpq-dev); `-Dpq-include=` names another directory.
-    const pq_include = b.option([]const u8, "pq-include", "Directory of libpq-fe.h") orelse
-        "/usr/include/postgresql";
+    // libpq's C header, translated the same way.
     const libpq = b.addTranslateC(.{
         .root_source_file = b.path("src/libpq_c.h"),
         .target = target,
         .optimize = optimize,
     });
-    libpq.addIncludePath(.{ .cwd_relative = pq_include });
+    libpq.addIncludePath(.{ .cwd_relative = paths.pq_include });
     const libpq_module = libpq.createModule();
     libpq_module.linkSystemLibrary("pq", .{});
+    if (paths.lib_dir) |dir| {
+        sqlite.addLibraryPath(.{ .cwd_relative = dir });
+        libpq_module.addLibraryPath(.{ .cwd_relative = dir });
+    }
     return .{ .sqlite = sqlite, .libpq = libpq_module };
 }
 
@@ -290,7 +304,13 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
 /// (src/zcube_jepsen_client.zig, docs/jepsen.md), installed in the mode `-Doptimize` names. It is
 /// not part of `zig build`: the shipped executables do not grow for it.
 fn add_jepsen_client_step(b: *std.Build, options: ExecutablesOptions) void {
-    const exe = b.addExecutable(.{
+    const install = b.addInstallArtifact(jepsen_client_exe(b, options), .{});
+    const help = "Build and install zcube-jepsen-client, the Jepsen battery's test-only client";
+    b.step("jepsen-client", help).dependOn(&install.step);
+}
+
+fn jepsen_client_exe(b: *std.Build, options: ExecutablesOptions) *std.Build.Step.Compile {
+    return b.addExecutable(.{
         .name = "zcube-jepsen-client",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/zcube_jepsen_client.zig"),
@@ -299,9 +319,92 @@ fn add_jepsen_client_step(b: *std.Build, options: ExecutablesOptions) void {
             .imports = &.{.{ .name = "zigbox", .module = options.zigbox }},
         }),
     });
-    const install = b.addInstallArtifact(exe, .{});
-    const help = "Build and install zcube-jepsen-client, the Jepsen battery's test-only client";
-    b.step("jepsen-client", help).dependOn(&install.step);
+}
+
+/// The files of `ops/jepsen/` that `zig build dist` puts in the tarball, under `share/jepsen/`.
+/// A list, not a directory walk, so that a stray file in a checkout never ships.
+const jepsen_recipe_files = [_][]const u8{
+    "README.md",
+    "zigcube.sh",
+    "postgres.sh",
+    "fault.sh",
+    "images.zon",
+    "zcube-server.service",
+    "zcube-agent.service",
+};
+
+/// `zig build dist`: the release tarball the Jepsen battery deploys (docs/jepsen.md, "The
+/// tarball"): zcube, zcube-server, zcube-agent and zcube-jepsen-client for x86_64 Linux (baseline
+/// CPU, glibc 2.36 or later), ReleaseSafe whatever `-Doptimize` says, and `ops/jepsen/`, written by
+/// src/dist.zig into `zig-out/dist/` with its SHA-256. The server links the host's libsqlite3 and
+/// libpq (`-Ddist-lib-dir`, default Debian's and Ubuntu's directory); the hosts that run it need
+/// libsqlite3-0 and libpq5, which `ops/jepsen/zigcube.sh install` installs.
+fn add_dist_step(
+    b: *std.Build,
+    version: []const u8,
+    pq_include: []const u8,
+    web_files: *std.Build.Module,
+) void {
+    const lib_dir = b.option([]const u8, "dist-lib-dir", "Where dist links libsqlite3 and libpq") orelse
+        "/usr/lib/x86_64-linux-gnu";
+    const target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .linux,
+        .abi = .gnu,
+        .cpu_model = .baseline,
+        .glibc_version = .{ .major = 2, .minor = 36, .patch = 0 },
+    });
+    const optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
+    const c_modules = add_c_modules(b, target, optimize, .{
+        .pq_include = pq_include,
+        .lib_dir = lib_dir,
+    });
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
+    options.addOption([]const u8, "product", "zigcube");
+    const dist_options: ExecutablesOptions = .{
+        .target = target,
+        .optimize = optimize,
+        .options = options,
+        .zigbox = zigbox.module("zigbox"),
+        .sqlite = c_modules.sqlite,
+        .libpq = c_modules.libpq,
+        .web_files = web_files,
+        .install = false,
+    };
+    const built = add_executables(b, dist_options);
+    const tool = b.addExecutable(.{
+        .name = "dist",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dist.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    // The tool reads the commit from git, which the build's cache cannot see, and replaces the
+    // tarball of an earlier commit in zig-out/dist, which an install step would leave beside it.
+    run.has_side_effects = true;
+    // Run in the build root, so `.` is the checkout git reads, and the tarball lands in its
+    // `zig-out/dist` whatever `--prefix` says (as relay-teeth's `zig-out/teeth`).
+    run.setCwd(b.path("."));
+    run.addArg("zig-out/dist");
+    run.addArg(".");
+    run.addArg(version);
+    const binaries = [_]*std.Build.Step.Compile{
+        built.cli, built.server, built.agent, jepsen_client_exe(b, dist_options),
+    };
+    for (binaries) |exe| {
+        run.addPrefixedFileArg(b.fmt("bin/{s}=", .{exe.name}), exe.getEmittedBin());
+    }
+    for (jepsen_recipe_files) |name| {
+        const prefix = b.fmt("share/jepsen/{s}=", .{name});
+        run.addPrefixedFileArg(prefix, b.path(b.fmt("ops/jepsen/{s}", .{name})));
+    }
+    const help = "Build the release tarball for the Jepsen battery into zig-out/dist " ++
+        "(x86_64 Linux, ReleaseSafe, with its SHA-256)";
+    b.step("dist", help).dependOn(&run.step);
 }
 
 /// `zig build agent-smoke`: the server and the agent as real processes, with real containers
