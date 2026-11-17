@@ -1,7 +1,7 @@
 # Jepsen J2: the dist tarball and the deployment recipe
 
-Date: 2026-11-17. Status: proposed by the J2 implementer; each choice below is the supervisor's
-to confirm (the brief asks before any new default).
+Date: 2026-11-17. Status: accepted (supervisor, 2026-11-17). These are the test recipe's
+defaults, not the product's.
 
 J2 (docs/briefs/c5.md, "Jepsen on Google Cloud", items 1, 2 and 4) adds `zig build dist`,
 `ops/jepsen/` and docs/jepsen.md's "Faults". The choices it made:
@@ -36,4 +36,5 @@ J2 (docs/briefs/c5.md, "Jepsen on Google Cloud", items 1, 2 and 4) adds `zig bui
 11. **Test hooks**: `ZCUBE_SYSTEMCTL`, `ZCUBE_ETC`, `ZCUBE_OPT`, `ZCUBE_VAR`, `ZCUBE_UNIT_DIR`
     (and `ZCUBE_PG_DIR`, `ZCUBE_PG_PORT`, `ZCUBE_PG_BIN`) let `ops/jepsen/test-recipe.sh` run the
     scripts in a scratch directory. The scripts refuse to run as anyone but root, so the test
-    skips as `tester` and runs only in a root `zig build test`.
+    skips as `tester` and runs only in a root `zig build test`. CI's `check` job runs it under
+    `sudo` (allowed on a runner, never on a developer's host).

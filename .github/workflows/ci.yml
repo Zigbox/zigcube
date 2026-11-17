@@ -147,6 +147,15 @@ jobs:
       - name: Local smoke (zcube local up and down)
         run: zig build local-smoke --summary all
 
+      # The Jepsen recipe's scripts run as root only, so `zig build test` skips this test as the
+      # runner's user; here it runs under sudo (a runner, never a developer's host) on the
+      # executables built above, in a scratch directory with a fake systemctl.
+      - name: Jepsen recipe (zigcube.sh and fault.sh as root)
+        run: |
+          zig build jepsen-client
+          sudo bash ops/jepsen/test-recipe.sh zig-out/bin/zcube zig-out/bin/zcube-server \
+            zig-out/bin/zcube-agent zig-out/bin/zcube-jepsen-client
+
   # The same conformance suite against a real Postgres 16, the server a deployment would run.
   # The image is pinned by digest (postgres:16.15, resolved from Docker Hub on 2026-10-26), so a
   # moving tag cannot change what CI tests. The suite makes its own schema per test in the
