@@ -232,17 +232,18 @@ pub fn raise_refused(diag: *Diag, refusal: Refusal) void {
     diag.raise(.E0824);
     // Without --verbose only the last cause is shown: it names what the operator acts on, the
     // key id the records expect and the key file; the ones before say which record and why.
+    // The directory comes last: a cause is a fixed-size text, and a long path is what is cut.
     diag.cause("{d} sealed record(s) checked; the rest were not read", .{refusal.records});
     diag.cause("{s} does not open: {s}", .{ refusal.record, refusal.why });
     const expected: []const u8 = if (refusal.expected) |*id| id else "(unreadable)";
     const where = refusal.state_dir orelse "memory";
     if (refusal.found) |*id| {
-        diag.cause("the records expect key id {s}; {s}/{s} holds key id {s}", .{
-            expected, where, refusal.key_name, id,
+        diag.cause("the records expect key id {s}; {s} holds key id {s}, in {s}", .{
+            expected, refusal.key_name, id, where,
         });
     } else {
-        diag.cause("the records expect key id {s}; the key file {s}/{s} is missing", .{
-            expected, where, refusal.key_name,
+        diag.cause("the records expect key id {s}; {s} is missing from {s}", .{
+            expected, refusal.key_name, where,
         });
     }
     diag.fix(.{ .sentence = "restore the key file from a backup, mode 0600, and start again" });
