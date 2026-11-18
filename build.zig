@@ -1931,7 +1931,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_c1_comparison(b, sim, exe, step, nodes_text, false);
     add_c1_comparison(b, sim, exe, step, nodes_text, true);
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 34 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 33 fault-on sim-c1 runners");
     const shard = teeth_shard(b, teeth);
     for (c1_teeth_roots, 0..) |entry, index| {
         // CI's shards (`-Dteeth-shard=K -Dteeth-shards=N`) take every Nth tooth from K, so their

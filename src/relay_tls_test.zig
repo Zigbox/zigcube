@@ -26,6 +26,9 @@ const cluster = "prod.example";
 const job = "train-1";
 const job_uri = "spiffe://prod.example/job/train-1";
 const deadline_ms: u64 = 5000;
+/// The most a whole fuzz stream may take, however steadily it progresses: twelve times the
+/// time without progress that fails it, about a hundred times an idle machine's second.
+const whole_ms: u64 = 12 * deadline_ms;
 
 /// The relay's run certificate, as the server would issue it, and what may be wrong with it.
 const Bad = enum { none, other_job, expired, other_ca };
@@ -431,10 +434,14 @@ fn tls_copy_once(seed: u64) !void {
     // either way pushes it out. A stream of up to three relay buffers through a one-byte receive
     // buffer, with pauses on both sides, can take longer than `deadline_ms` on a loaded machine;
     // a byte lost or stuck still stops progress and fails as Timeout, and a byte repeated or out
-    // of order still fails as WrongBytes (docs/decisions/2026-11-17-ci-speed-shards.md).
+    // of order still fails as WrongBytes (docs/decisions/2026-11-17-ci-speed-shards.md). A second
+    // bound, `whole_ms`, does not move: a relay that trickles one byte per poll timeout would
+    // reset the first forever and still fails as Timeout.
+    const whole = peer_stream.boot_ms(testing.io) + whole_ms;
     var end = end_in(testing.io);
     while (read < length) {
-        if (peer_stream.boot_ms(testing.io) > end) return error.Timeout;
+        const now = peer_stream.boot_ms(testing.io);
+        if (now > end or now > whole) return error.Timeout;
         if (written < length) {
             const chunk = random.intRangeAtMost(usize, 1, @min(length - written, 3000));
             const flags = linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT;

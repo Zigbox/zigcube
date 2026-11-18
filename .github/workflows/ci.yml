@@ -397,8 +397,9 @@ jobs:
         run: zig build console-wasm --summary all
 
   # Simulations, not demo-c0 (docs/core.md). This job, `sim-c1-teeth` and `sim-worlds` (each a
-  # matrix of shards) are one set, split to run side by side. The same seed runs natively and in WASM and the reports must agree
-  # byte for byte. Seed 1 always, and one seed per CI run, printed here.
+  # matrix of shards) are one set, split to run side by side. The same seed runs natively and in
+  # WASM and the reports must agree byte for byte. Seed 1 always, and one seed per CI run,
+  # printed here.
   sim:
     name: simulations (sim-c0, sim-c1)
     needs: changes
@@ -447,14 +448,17 @@ jobs:
   # index in build.zig's `c1_teeth_roots` is the shard modulo 4, together every tooth
   # (docs/decisions/2026-11-17-ci-speed-shards.md). One cache entry per shard.
   sim-c1-teeth:
-    name: simulations (sim-c1 negative tests, shard ${{ matrix.shard }} of 4)
+    name: simulations (sim-c1 negative tests, shard ${{ matrix.shard }} of ${{ strategy.job-total }})
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Cold, a shard took 6 to 10 minutes (the decision file); twice the slowest is the margin.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
+        # The one place the shard count is written: the step below passes the number of entries
+        # (`strategy.job-total`) as -Dteeth-shards, so a shard cannot drop out unnoticed.
         shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -462,8 +466,11 @@ jobs:
       - uses: ./.github/actions/zig-cache
         with:
           name: sim-c1-teeth-${{ matrix.shard }}
-      - name: sim-c1 negative tests, shard ${{ matrix.shard }} of 4
-        run: zig build sim-c1-teeth -Dteeth-shard=${{ matrix.shard }} -Dteeth-shards=4 --summary all
+          limit-mb: 1000
+      - name: sim-c1 negative tests, shard ${{ matrix.shard }} of ${{ strategy.job-total }}
+        run: |
+          zig build sim-c1-teeth -Dteeth-shard=${{ matrix.shard }} \
+            -Dteeth-shards=${{ strategy.job-total }} --summary all
 
   # The worlds of the sim-c1 teeth with the fix on, in two shards of about the same CPU time.
   # Each step splits its seeds over processes (build.zig, `add_seed_ranges`) and a shard's steps
@@ -474,7 +481,8 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Cold, a part took 8 to 10 minutes (the decision file).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -495,8 +503,29 @@ jobs:
       - uses: ./.github/actions/zig-cache
         with:
           name: sim-worlds-${{ matrix.part }}
+          limit-mb: 1000
       - name: sim-c1 worlds (${{ matrix.steps }})
         run: zig build ${{ matrix.steps }} --summary all
+
+  # One check for the sharded simulation jobs. A matrix job whose `if` is false (a docs-only
+  # change) reports a single skipped check under its unexpanded name, so a required check cannot
+  # name a shard: branch protection requires this job instead. It succeeds when every sharded job
+  # succeeded or was skipped, and fails when any failed or was cancelled
+  # (docs/decisions/2026-11-17-ci-speed-shards.md).
+  sim-shards:
+    name: simulations (sharded jobs)
+    needs: [sim-c1-teeth, sim-worlds]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every sharded job succeeded or was skipped
+        run: |
+          echo "sim-c1-teeth: ${{ needs.sim-c1-teeth.result }}"
+          echo "sim-worlds: ${{ needs.sim-worlds.result }}"
+          case "${{ needs.sim-c1-teeth.result }} ${{ needs.sim-worlds.result }}" in
+            *failure*|*cancelled*) exit 1 ;;
+          esac
 
   # The Zigbox runtime on a real host (C2 slice 1, docs/demos/c2.md): zcube-server, zcube-agent
   # --runtime zigbox and real containers from a pulled Alpine image, in the Ubuntu 24.04 guest of

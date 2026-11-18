@@ -22,10 +22,10 @@ test`, takes 7.5 to 12.
 
 Why each is long:
 
-- **The negative tests are compile-bound.** Each of the 34 teeth is a ReleaseSafe executable of
+- **The negative tests are compile-bound.** Each of the 33 teeth is a ReleaseSafe executable of
   its own (its root sets one comptime switch), about 56 s to compile in CI at about 1 GB. Locally
   one took 88 s with the build runner's setup, four at once 166 s: about 1.7 compiles at a time
-  on four cores, so 34 take about 25 minutes. Running them takes little; on an exact cache hit the
+  on four cores, so 33 take about 25 minutes. Running them takes little; on an exact cache hit the
   whole job is 1.8 minutes. A change to `src/` misses the exact key, and every tooth imports most
   of the core, so every tooth recompiles.
 - **The worlds are run-bound and serial.** The six steps ran one after the other, and inside each
@@ -41,7 +41,7 @@ Why each is long:
    falls into one of them with no edit here. A shard out of range fails the step at once and
    compiles nothing. Each `sim-c1-teeth-<name>` step and `sim-c1-teeth-exe` are unchanged.
 2. **CI runs the negative tests as a matrix of four** (`simulations (sim-c1 negative tests, shard
-   I of 4)`), 9, 9, 8 and 8 teeth, each shard with its own cache entry
+   I of 4)`), 9, 8, 8 and 8 teeth, each shard with its own cache entry
    (`sim-c1-teeth-<I>`). Expected cold: about a quarter of 25 minutes plus setup, 8 to 9 minutes.
 3. **The world steps split their seeds over processes** (`add_seed_ranges` in `build.zig`):
    burst one seed per process (it was 1..2, 14, 17, 21), worlds one per process (the 225 replay
@@ -65,7 +65,18 @@ gains a row for `.github/actions/zig-cache/action.yml`).
 
 Job names change: `simulations (sim-c1 negative tests)` becomes four names with `shard I of 4`,
 and `simulations (sim-c1 worlds)` becomes `(sim-c1 worlds, burst)` and `(sim-c1 worlds, evict)`.
-A branch protection rule that names the old checks must be updated.
+A branch protection rule that names the old checks must be updated, and it must not name the
+matrix jobs: when a matrix job's `if` is false (a documentation-only change) GitHub reports one
+skipped check under the unexpanded name (`... shard ${{ matrix.shard }} of ...`), so a required
+check on `shard 0 of 4` would wait forever on such a change. The `simulations (sharded jobs)` job
+(`sim-shards`) `needs` both matrices, runs always, and succeeds when each result is `success` or
+`skipped`, so a required check names that one job. `main` is not protected today, so nothing
+breaks now; whoever adds a rule requires `simulations (sharded jobs)`, not the shard names.
+
+The shard count is written once, as the matrix's entries: the step passes `strategy.job-total` as
+`-Dteeth-shards`. Timeouts of the sharded jobs are 20 minutes (the slowest cold run was 10.4).
+Each sharded job's cache entry is limited to 1000 MB (the action's `limit-mb`; the other four
+keep 2000), which keeps the ten entries' ceiling at 14 GB rather than 20.
 
 ## After
 
