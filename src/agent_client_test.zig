@@ -556,6 +556,32 @@ test "a job report under an ended tenure is ZC-E0510, which is not a refused rep
     try testing.expectEqual(.E0510, rig.diag.code.?);
 }
 
+test "a registration refused with ZC-E0205 is a failed step, not a failed compare (#237)" {
+    // Goal: the server refuses a registration on a lease older than the key's (#237) with
+    // ZC-E0205, and the agent (this client, unchanged by #237) reads it as a refusal of the
+    // server: BackendFailed with ZC-E0504, never a result, so `Agent.heartbeat` neither asserts
+    // nor fences, and its next step registers on a new lease. Method: a scripted refusal.
+    const bodies = [_][]const u8{
+        "{\"diagnostics\":[{\"code\":\"ZC-E0205\",\"summary\":\"the lease has expired " ++
+            "or was revoked\"}]}",
+    };
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    defer rig.deinit();
+    rig.script.status = 503;
+    const node: records.Node = .{
+        .name = "node1",
+        .capacity = .{ .cpu_millis = 1000, .memory_bytes = 1 << 30 },
+    };
+    const value = try records.encode(rig.arena.allocator(), node, &rig.diag);
+    const put: store.Op = .{ .put = .{ .key = "/nodes/node1", .value = value, .lease = 9 } };
+    const request: store.TxnRequest = .{ .on_success = &.{put} };
+    const remote = rig.remote.interface();
+    try testing.expectError(error.BackendFailed, remote.txn(request, &rig.diag));
+    try testing.expectEqual(.E0504, rig.diag.code.?);
+    try testing.expectEqualStrings("/v1/agent/nodes/node1", rig.script.targets[0]);
+}
+
 test "a listing with a record at revision 0 is refused, not handed to the agent" {
     // Goal: network input is checked: an assignment epoch of 0 would crash the agent.
     const bodies = [_][]const u8{

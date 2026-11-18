@@ -71,6 +71,7 @@ const SeenExtensions = struct {
 };
 
 const ext_server_name: u16 = 0;
+const ext_alpn: u16 = 16;
 const ext_supported_groups: u16 = 10;
 const ext_signature_algorithms: u16 = 13;
 const ext_supported_versions: u16 = 43;
@@ -556,6 +557,24 @@ const ClientExtensions = struct {
     early_data: bool = false,
     /// supported_groups was sent; a key_share needs it (section 9.2).
     supported_groups: bool = false,
+    /// The public mode's hello (`parse_client_hello_public`): server_name, ALPN and the groups
+    /// are read, strictly; the mTLS path skips them as before.
+    public: bool = false,
+    /// server_name's one host_name, as sent (not yet canonical).
+    server_name: ?[]const u8 = null,
+    alpn: Alpn = .absent,
+    /// supported_groups lists x25519 (public mode only).
+    x25519_listed: bool = false,
+};
+
+/// What the client's ALPN offers (RFC 7301): nothing, a list with `http/1.1`, or a list without.
+pub const Alpn = enum { absent, http11, other };
+
+/// A ClientHello read by the public mode: the hello, the server name it asks for, and its ALPN.
+pub const PublicHello = struct {
+    hello: ClientHello,
+    server_name: ?[]const u8,
+    alpn: Alpn,
 };
 
 /// Reads a ClientHello body (after the four-byte handshake header) for a server that speaks only
@@ -565,6 +584,29 @@ const ClientExtensions = struct {
 /// Extensions this server does not use (server_name, pre_shared_key, psk_key_exchange_modes,
 /// ...) are skipped; each type may appear once (RFC 8446 section 4.2).
 pub fn parse_client_hello(body: []const u8) Error!ClientHello {
+    var parsed: ClientExtensions = .{};
+    return read_client_hello(body, &parsed);
+}
+
+/// The public mode's ClientHello (docs/briefs/c5.md, "Public TLS"): as `parse_client_hello`, and
+/// server_name (one host_name), ALPN and supported_groups are read strictly. A client that lists
+/// x25519 but sent no share for it would need a HelloRetryRequest, which this server never sends:
+/// `error.HelloRetryRequest`, so the server can count it apart from a client without x25519. An
+/// x25519 share whose group supported_groups does not list is `error.IllegalParameter`.
+pub fn parse_client_hello_public(body: []const u8) Error!PublicHello {
+    var parsed: ClientExtensions = .{ .public = true };
+    const hello = read_client_hello(body, &parsed) catch |err| {
+        if (err == error.Group and parsed.x25519_listed) return error.HelloRetryRequest;
+        return err;
+    };
+    assert(parsed.public);
+    assert(parsed.supported_groups); // `read_client_hello` refuses a key_share without it.
+    // A share must be for a group the client lists (section 4.2.8): the strict read aborts.
+    if (!parsed.x25519_listed) return error.IllegalParameter;
+    return .{ .hello = hello, .server_name = parsed.server_name, .alpn = parsed.alpn };
+}
+
+fn read_client_hello(body: []const u8, parsed: *ClientExtensions) Error!ClientHello {
     var reader = Reader.init(body);
     _ = try reader.read_u16(); // legacy_version: supported_versions decides (section 4.1.2).
     _ = try reader.take(32); // random
@@ -574,11 +616,10 @@ pub fn parse_client_hello(body: []const u8) Error!ClientHello {
     if (suites.len == 0) return error.Malformed;
     if (suites.len % 2 != 0) return error.Malformed;
     const compression = try reader.vector8();
-    var parsed: ClientExtensions = .{};
     // A ClientHello with no extensions at all is a TLS 1.2 (or older) one.
     if (reader.remaining() > 0) {
         var extensions = Reader.init(try reader.vector16());
-        try read_client_extensions(&extensions, &parsed);
+        try read_client_extensions(&extensions, parsed);
     }
     try reader.finish();
     if (!(parsed.tls13 orelse false)) return error.ProtocolVersion;
@@ -615,7 +656,16 @@ fn read_client_extensions(reader: *Reader, parsed: *ClientExtensions) Error!void
         switch (kind) {
             ext_supported_versions => parsed.tls13 = try lists_version(data),
             ext_key_share => try read_client_key_share(data, parsed),
-            ext_supported_groups => parsed.supported_groups = true,
+            ext_supported_groups => {
+                parsed.supported_groups = true;
+                if (parsed.public) parsed.x25519_listed = try lists_group(data, group_x25519);
+            },
+            ext_server_name => if (parsed.public) {
+                parsed.server_name = try read_server_name(data);
+            },
+            ext_alpn => if (parsed.public) {
+                parsed.alpn = try read_alpn(data);
+            },
             ext_signature_algorithms => {
                 parsed.ed25519 = try lists_ed25519(data);
                 parsed.ecdsa_p256 = try lists_scheme(data, scheme_ecdsa_p256);
@@ -638,6 +688,50 @@ fn lists_version(data: []const u8) Error!bool {
     if (list.len == 0) return error.Malformed;
     if (list.len % 2 != 0) return error.Malformed;
     return lists_u16(list, version_tls13);
+}
+
+/// supported_groups (section 4.2.7): a two-byte length, then two-byte groups, at least one.
+fn lists_group(data: []const u8, wanted: u16) Error!bool {
+    var reader = Reader.init(data);
+    const list = try reader.vector16();
+    try reader.finish();
+    if (list.len == 0) return error.Malformed;
+    if (list.len % 2 != 0) return error.Malformed;
+    return lists_u16(list, wanted);
+}
+
+/// server_name (RFC 6066 section 3): a list holding exactly one name of type host_name (0), not
+/// empty and at most 255 bytes (its canonical form is checked by the caller).
+fn read_server_name(data: []const u8) Error![]const u8 {
+    var reader = Reader.init(data);
+    var list = Reader.init(try reader.vector16());
+    try reader.finish();
+    const name_type = try list.read_u8();
+    if (name_type != 0) return error.IllegalParameter;
+    const name = try list.vector16();
+    try list.finish();
+    if (name.len == 0) return error.Malformed;
+    if (name.len > 255) return error.IllegalParameter;
+    return name;
+}
+
+/// application_layer_protocol_negotiation (RFC 7301 section 3.1): a non-empty list of non-empty
+/// protocol names.
+fn read_alpn(data: []const u8) Error!Alpn {
+    var reader = Reader.init(data);
+    var list = Reader.init(try reader.vector16());
+    try reader.finish();
+    if (list.remaining() == 0) return error.Malformed;
+    var found = false;
+    var count: u32 = 0;
+    while (list.remaining() > 0) {
+        const protocol = try list.vector8();
+        if (protocol.len == 0) return error.Malformed;
+        if (std.mem.eql(u8, protocol, "http/1.1")) found = true;
+        count += 1;
+        assert(count <= data.len);
+    }
+    return if (found) .http11 else .other;
 }
 
 /// key_share in a ClientHello: a list of (group, key) entries, each group at most once
@@ -707,6 +801,22 @@ pub fn write_server_hello(
 /// server_name, so it sends no empty one back).
 pub const encrypted_extensions_message = [_]u8{ handshake_encrypted_extensions, 0, 0, 2, 0, 0 };
 
+/// The public mode's EncryptedExtensions: an empty server_name, acknowledging the one the
+/// server used (RFC 6066 section 3).
+pub const encrypted_extensions_public = [_]u8{
+    handshake_encrypted_extensions, 0, 0, 6, // type, length
+    0, 4, // extensions
+    0, @intCast(ext_server_name), 0, 0, // server_name, empty
+};
+
+/// The same with ALPN selecting `http/1.1` (RFC 7301 section 3.1), for a client that offered it.
+pub const encrypted_extensions_public_alpn = [_]u8{
+    handshake_encrypted_extensions, 0, 0, 21, // type, length
+    0, 19, // extensions
+    0, @intCast(ext_server_name), 0, 0, // server_name, empty
+    0, @intCast(ext_alpn), 0, 11, 0, 9, 8, // ALPN: a list of one name of 8 bytes
+} ++ "http/1.1".*;
+
 /// CertificateRequest: an empty context (section 4.3.2: empty in the handshake) and
 /// signature_algorithms listing Ed25519 only.
 pub const certificate_request_message = [_]u8{
@@ -756,6 +866,40 @@ pub fn write_certificate(out: []u8, certificates: []const []const u8) []const u8
     out[0] = handshake_certificate;
     std.mem.writeInt(u24, out[1..4], @intCast(length - 4), .big);
     assert(length <= certificate_bytes_max);
+    return out[0..length];
+}
+
+/// Bytes of the public mode's Certificate message: an empty context and up to
+/// `edge_chain_certificates_max` certificates of `edge_chain_bytes_max` together.
+pub const certificate_public_bytes_max: u32 = 4 + 1 + 3 +
+    constants.edge_chain_certificates_max * (3 + 2) + constants.edge_chain_bytes_max;
+
+/// The public mode's Certificate message: as `write_certificate`, with the public chain's bounds
+/// (a public CA's leaf and intermediates, opaque DER).
+pub fn write_certificate_public(out: []u8, certificates: []const []const u8) []const u8 {
+    assert(certificates.len >= 1);
+    assert(certificates.len <= constants.edge_chain_certificates_max);
+    assert(out.len >= certificate_public_bytes_max);
+    var length: u32 = 4;
+    out[length] = 0; // certificate_request_context
+    length += 1;
+    const list_at = length;
+    length += 3;
+    var chain_bytes: u32 = 0;
+    for (certificates) |certificate| {
+        assert(certificate.len > 0);
+        assert(certificate.len <= constants.edge_certificate_bytes_max);
+        chain_bytes += @intCast(certificate.len);
+        std.mem.writeInt(u24, out[length..][0..3], @intCast(certificate.len), .big);
+        @memcpy(out[length + 3 ..][0..certificate.len], certificate);
+        std.mem.writeInt(u16, out[length + 3 + certificate.len ..][0..2], 0, .big);
+        length += @intCast(3 + certificate.len + 2);
+    }
+    assert(chain_bytes <= constants.edge_chain_bytes_max);
+    std.mem.writeInt(u24, out[list_at..][0..3], @intCast(length - list_at - 3), .big);
+    out[0] = handshake_certificate;
+    std.mem.writeInt(u24, out[1..4], @intCast(length - 4), .big);
+    assert(length <= certificate_public_bytes_max);
     return out[0..length];
 }
 

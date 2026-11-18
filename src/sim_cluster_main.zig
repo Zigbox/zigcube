@@ -53,11 +53,12 @@ const symptom_spec = @import("symptom.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--trace-steps]\n" ++
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] " ++
+    "[--late-registration] [--trace-steps]\n" ++
     "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--expect-fail] " ++
-    "[--trace-steps]\n";
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] " ++
+    "[--late-registration] [--expect-fail] [--trace-steps]\n";
 
 /// What the command line asked for.
 const Args = struct {
@@ -160,6 +161,8 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.options.signed = true;
     } else if (std.mem.eql(u8, arg, "--tenants")) {
         parsed.options.tenants = true;
+    } else if (std.mem.eql(u8, arg, "--late-registration")) {
+        parsed.options.late_registration = true;
     } else if (std.mem.eql(u8, arg, "--c1")) {
         parsed.options.c1 = true;
     } else if (std.mem.eql(u8, arg, "--expect-symptom-any")) {
@@ -307,6 +310,7 @@ fn print_replay(
     if (options.strong or c1_teeth.strong_world) try out.writeAll(" --strong");
     if (options.signed) try out.writeAll(" --signed");
     if (options.tenants) try out.writeAll(" --tenants");
+    if (options.late_registration) try out.writeAll(" --late-registration");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
     if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});
     if (options.lease_ttl_ms) |ttl| try out.print(" --lease-ttl-ms={d}", .{ttl});

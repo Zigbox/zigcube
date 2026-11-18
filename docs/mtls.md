@@ -508,6 +508,52 @@ names the client's offence. ZC-E0820 is the server's own signer failing: the cli
     the same range with the check on must produce none.
 - Tidy allows only test files and the server's fuzzer to import `tls_testclient.zig`.
 
+## The public path (C5 slice 1)
+
+`Server.init_public` (docs/briefs/c5.md, "Public TLS"; docs/decisions/2026-11-15-c5-public-tls-mode.md)
+is the third way to start the server, next to the cluster (mTLS) path and the browser path. It is
+for the edge, which faces the internet; nothing serves it yet (slice 4b does). B7's two paths are
+unchanged: their tests and teeth run as before.
+
+- **No client certificate.** No CertificateRequest is sent; the handshake ends at the client's
+  Finished. `peer()` has nothing to return.
+- **The chain by server name.** `PublicTable` holds up to `edge_hosts_max` rows of (canonical
+  host, P-256 leaf key, chain DER), sorted by host, each chain the leaf and up to two
+  intermediates, sent as given: the server never parses them. The client's `server_name` is
+  canonicalized by `edge_host.canonicalize` (the function `Host` will be compared with) and looked
+  up; no name, a name `edge_host` refuses (IP literal, wildcard, `localhost`, one label) or one the
+  table lacks ends with `unrecognized_name`. `server_name()` returns the host once the chain is
+  picked. `PublicTable.init` refuses a table that breaks a bound or is out of order.
+- **ALPN.** A client that offers ALPN must offer `http/1.1`, which the server selects; otherwise
+  `no_application_protocol`. No ALPN is fine.
+- **Groups and signatures.** x25519 only, as on the other paths; a client that offers x25519
+  without a share would need a HelloRetryRequest and is refused (`handshake_failure`). The
+  client's `signature_algorithms` must list `ecdsa_secp256r1_sha256`; CertificateVerify is
+  ECDSA P-256 with the chain's key, low S (`x509_p256.sign`).
+- **The rest** is the cluster path's: the ClientHello rules, early data refused, the
+  change_cipher_spec window, the key-change boundary, KeyUpdates, one alert on failure.
+- **Codes.** None new: a refused public ClientHello is ZC-E0818 with its alert and a cause naming
+  the offence (docs/decisions/2026-11-18-c5-slice1-public-tls-bounds.md).
+
+**Tests.**
+
+- `tls_server_public_test.zig`: the scripted client's public path at chunk sizes 1, 7, 100 and
+  4096, with and without a change_cipher_spec, data both ways; the chain picked by a
+  canonicalized name and its opaque intermediate sent as given; the refusal table (no name, an
+  unknown one, an IP, `localhost`, a wildcard, `h2` alone, x25519 without a share, no ECDSA, early
+  data, TLS 1.2), each with its alert and code; Chromium 157's recorded ClientHello
+  (`src/testdata/tls/`) read whole and in one-byte pieces; the `PublicTable` bounds; and three
+  teeth, `skip_sni_check`, `skip_alpn_check` and `cert_request_sent`.
+- `tls_server_public_fuzz.zig`: the cluster fuzzer's method on the public path (the scripted
+  client correct or wrong in one of eighteen knobs, the server name spelled in upper case or
+  with a trailing dot, its hello or flight damaged and fed in pieces). Its two teeth, in
+  `tls_server_fuzz_teeth.zig`, switch off the name and ALPN checks.
+- `zig build public-tls-check` (`tools/public_tls_check.mjs`, `src/public_tls_listener.zig`;
+  test-only, not in `check`; CI's `mtls-interop` job runs it): a test listener on the public path with a test CA, and Playwright's
+  Chromium with a scratch NSS store. Without the CA the page fails with
+  `ERR_CERT_AUTHORITY_INVALID`; with it the page loads over TLS 1.3 with `http/1.1`. Needs Node,
+  Playwright's Chromium and `certutil`.
+
 ## The constants
 
 All are in `src/constants.zig` with their reasons; changing one is a change to that file.
@@ -523,6 +569,10 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
 | `tls_records_per_key_max` | 2^24 | records before a KeyUpdate is due |
 | `tls_key_updates_per_connection_max` | 2^16 | KeyUpdates in one connection |
 | `tls_handshake_timeout_ms` / `tls_alert_flush_ms` | 10000 / 1000 | handshake deadline / alert send |
+| `edge_host_bytes_max` / `edge_host_label_bytes_max` | 253 / 63 | a public host name and label |
+| `edge_chain_certificates_max` | 3 | a public chain: the leaf and two intermediates |
+| `edge_certificate_bytes_max` / `edge_chain_bytes_max` | 4096 / 8192 | one public certificate / the chain |
+| `edge_hosts_max` | 1024 | rows of a `PublicTable` |
 
 ## Checks that run where
 
@@ -595,7 +645,7 @@ Threats this does not answer yet:
 | ZC-E0820 | the signer holding the client certificate's key did not sign |
 | ZC-E0815 | a TLS record could not be read: it does not authenticate, is too long, has the wrong type or came after a key limit |
 | ZC-E0816 | the connection ended or stalled without close_notify, or the handshake or a KeyUpdate answer did not finish in time, or a call came after an earlier failure had ended the connection |
-| ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |
+| ZC-E0818 | the peer needs something zcube does not offer: another version, suite, group or scheme, early data, or a HelloRetryRequest; on the public path also a server name not served here, ALPN without `http/1.1`, or x25519 listed without a share |
 | ZC-E0819 | issued for another role, such as a client certificate where a server's is needed |
 | ZC-E0821 | the operating system's secure random source failed, so no key, nonce or seed was made (the weaker `random` is never used instead) |
 

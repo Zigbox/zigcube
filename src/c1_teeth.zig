@@ -29,6 +29,11 @@ pub const wedge = declared("c1_teeth_wedge");
 /// if the controller did not compare the report's tenure (must break I3).
 pub const stale_observation = declared("c1_teeth_stale_observation");
 
+/// The server registers a node on a lease older than the one its key is on (the lease order is
+/// not checked; must break I1b: a registration overtaken by a newer one lands late and puts the
+/// key on a lease nobody renews, #237).
+pub const register_unchecked = declared("c1_teeth_register_unchecked");
+
 /// The scheduler ranks locality ahead of spread (C2 slice 5; must break the placement-order
 /// invariant of `sim-cluster`).
 pub const locality_before_spread = declared("c1_teeth_locality_before_spread");
@@ -205,7 +210,7 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
     job_untrusted or placement_exclusive or relabel_kept or job_pass_break or
-    job_runs_unread;
+    job_runs_unread or register_unchecked;
 
 /// The runner a replay line names: the runner a root names itself (`sim_runner`), else the
 /// fault-on runner whose root switched a tooth on (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe`
@@ -259,4 +264,5 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_relabel_kept", "sim_c1_teeth_relabel_kept" },
     .{ "c1_teeth_job_pass_break", "sim_c1_teeth_job_pass_break" },
     .{ "c1_teeth_job_runs_unread", "sim_c1_runs_unread" },
+    .{ "c1_teeth_register_unchecked", "sim_c1_teeth_register_unchecked" },
 };

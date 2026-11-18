@@ -38,12 +38,17 @@ const Diag = diag_mod.Diag;
 /// (a cancel is not a failure to name), nothing is left open, and the caller stops quietly.
 pub const Error = error{ StartFailed, OutOfMemory, Canceled };
 
+pub const Hook = http.Hook;
+
 pub const Options = struct {
     version: []const u8,
     /// Print the controller's failures to stderr; tests that break the store turn it off.
     report_failures: bool = true,
     /// Log requests to stderr; tests turn it off.
     log_requests: bool = true,
+    /// Test-only (#237): runs around every write before it takes the API's lock
+    /// (`server_http.Hook`, the registration barrier). Null in every shipped server.
+    hook: ?http.Hook = null,
 };
 
 pub const Server = struct {
@@ -160,6 +165,7 @@ pub const Server = struct {
                     .quiet = config.quiet,
                     .silent = !options.log_requests,
                 },
+                .hook = options.hook,
             },
             .driver = .{
                 .gpa = gpa,
