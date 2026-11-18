@@ -184,6 +184,9 @@ pub const PublicRefusal = enum {
     /// x25519 listed without a key share: it would take a HelloRetryRequest, which this server
     /// does not send (docs/briefs/c5.md, "Public TLS").
     x25519_without_share,
+    /// The client ended the handshake itself, with a fatal alert or an early close_notify (a
+    /// browser that does not trust the chain, say): not a hello this server refused.
+    client_alert,
     other,
 };
 
@@ -723,6 +726,9 @@ pub const Server = struct {
         // The level (content[0]) is ignored on purpose: in TLS 1.3 every alert but close_notify
         // (and user_canceled) ends the connection whatever its level (RFC 8446 section 6).
         const code = content[1];
+        if (self.mode == .public and self.state != .connected and self.refusal == null) {
+            self.refusal = .client_alert;
+        }
         if (code == @backingInt(wire.Alert.close_notify)) {
             if (self.state != .connected) {
                 diag.raise(.E0816);
@@ -833,15 +839,6 @@ pub const Server = struct {
             .cluster => try self.read_hello(diag, message),
             .public => try self.read_public_hello(diag, message),
         };
-        if (hello.early_data and !fault_on(.early_data)) {
-            return self.fail(
-                diag,
-                .E0818,
-                .illegal_parameter,
-                "the client offers early data; this server takes none",
-                .{},
-            );
-        }
         self.transcript.add(message);
         var shared = X25519.scalarmult(self.secret, hello.public_key) catch {
             return self.fail(
@@ -898,6 +895,8 @@ pub const Server = struct {
         assert(self.mode == .cluster);
         const hello = wire.parse_client_hello(message[4..]) catch |err|
             return self.wire_failure(diag, err, "ClientHello");
+        // Early data is refused before the scheme is judged, as before the public path.
+        try self.refuse_early_data(diag, hello);
         if (!hello.ed25519) {
             // The ClientHello lists the browser's scheme only; without a browser identity this
             // server has no certificate the client would take.
@@ -947,7 +946,21 @@ pub const Server = struct {
                 );
             },
         }
+        try self.refuse_early_data(diag, parsed.hello);
         return parsed.hello;
+    }
+
+    /// 0-RTT is never taken (docs/mtls.md): a ClientHello that offers it is refused.
+    fn refuse_early_data(self: *Server, diag: *Diag, hello: wire.ClientHello) Error!void {
+        if (!hello.early_data) return;
+        if (fault_on(.early_data)) return;
+        return self.fail(
+            diag,
+            .E0818,
+            .illegal_parameter,
+            "the client offers early data; this server takes none",
+            .{},
+        );
     }
 
     /// The chain for the client's server name, canonicalized as `Host` is.

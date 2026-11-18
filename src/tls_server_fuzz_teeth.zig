@@ -56,3 +56,8 @@ test "teeth: the public fuzzer catches a skipped server name check" {
 test "teeth: the public fuzzer catches a skipped ALPN check" {
     try expect_false_connect_in(.alpn_check, public_fuzz.run_once);
 }
+
+test "teeth: the public fuzzer catches a skipped Finished check" {
+    // The public path's only proof that the client holds the handshake keys.
+    try expect_false_connect_in(.finished, public_fuzz.run_once);
+}

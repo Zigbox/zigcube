@@ -10,7 +10,7 @@
 #   demo_b1       demo-b1 on SQLite and on Postgres
 #   zigbox_smoke  the Zigbox runtime on a real host (QEMU/KVM)
 #   demo_c2       demo-c2 (four VMs, KVM, GHCR images)
-#   mtls_interop  mtls-interop (stock openssl and JDK servers)
+#   mtls_interop  mtls-interop (stock openssl and JDK servers) and public-tls-check (Chromium)
 #   demo_b3       demo-b3 (one VM, KVM, a GHCR image)
 #   demo_b7       demo-b7 (the API over mTLS, FakeRuntime, SQLite)
 #   demo_b5       demo-b5 (one VM, KVM, a GHCR image, signed jobs)
@@ -91,6 +91,8 @@ classify() {
       want_one mtls_interop; return ;;
     # The mTLS interop harness and its Java server.
     src/mtls_interop*.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
+    # C5 slice 1's browser check runs in the mtls-interop job (Chromium against the public path).
+    tools/public_tls_check.mjs) want_one mtls_interop; return ;;
     # The smoke's own files.
     ops/zigbox-smoke/*) want_one zigbox_smoke; return ;;
     # The Jepsen battery: its deployment recipe, the tool that packs the tarball, and its client

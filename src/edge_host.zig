@@ -51,7 +51,7 @@ pub fn canonicalize(out: *Name, name: []const u8) Error![]const u8 {
     const labels = try check_labels(lower);
     assert(labels >= 1);
     if (labels == 1) return error.OneLabel;
-    if (all_digits(last_label(lower))) return error.IpLiteral;
+    if (is_number_label(last_label(lower))) return error.IpLiteral;
     assert(lower.len <= host_bytes_max);
     return lower;
 }
@@ -121,6 +121,18 @@ fn is_localhost(name: []const u8) bool {
 fn last_label(name: []const u8) []const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
     return name[dot + 1 ..];
+}
+
+/// Whether a browser's URL parser (WHATWG URL, "ends in a number") reads the last label as a
+/// number, and so the whole host as IPv4: all decimal digits, or `0x` and hex digits (none
+/// included). `label` is lowercase.
+fn is_number_label(label: []const u8) bool {
+    if (all_digits(label)) return true;
+    if (!std.mem.startsWith(u8, label, "0x")) return false;
+    for (label[2..]) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
 }
 
 fn all_digits(label: []const u8) bool {
@@ -279,6 +291,9 @@ test "edge_host: canonical names" {
         .{ .name = "XN--BCHER-KVA.example", .want = "xn--bcher-kva.example" },
         .{ .name = "123.example.com", .want = "123.example.com" },
         .{ .name = "a.b", .want = "a.b" },
+        // Only a last label of `0x` and hex digits is a number to a browser.
+        .{ .name = "example.0xg", .want = "example.0xg" },
+        .{ .name = "0x1.example", .want = "0x1.example" },
     };
     for (cases) |case| {
         var out: Name = undefined;
@@ -298,6 +313,10 @@ test "edge_host: each rule refuses" {
         .{ .name = &comptime repeat("a", 2000), .want = error.TooLong },
         .{ .name = "b\xc3\xbccher.example", .want = error.NotAscii },
         .{ .name = "192.0.2.1", .want = error.IpLiteral },
+        .{ .name = "1.2.3.0x4", .want = error.IpLiteral },
+        .{ .name = "example.0x1", .want = error.IpLiteral },
+        .{ .name = "example.0X1F", .want = error.IpLiteral },
+        .{ .name = "example.0x", .want = error.IpLiteral },
         .{ .name = "2001:db8::1", .want = error.IpLiteral },
         .{ .name = "[2001:db8::1]", .want = error.IpLiteral },
         .{ .name = "*.example.com", .want = error.Wildcard },

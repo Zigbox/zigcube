@@ -1965,12 +1965,22 @@ pub const registry = [_]Entry{
         .summary = "a TLS peer needs something zcube does not offer",
         .explanation =
         \\zcube speaks TLS 1.3 only, with x25519, TLS_AES_128_GCM_SHA256 and Ed25519
-        \\signatures, and offers no resumption and no retry. The peer answered with
-        \\an older protocol version, another suite, group or signature scheme, or a
-        \\HelloRetryRequest. The cause names which.
+        \\signatures, and offers no resumption, no early data and no retry. The peer
+        \\answered or asked with an older protocol version, another suite, group or
+        \\signature scheme, early data, or a HelloRetryRequest. The cause names which.
         \\
         \\Peers of a zcube cluster are zcube servers. If this is not one, connect to
         \\the right address; there is no setting that widens what zcube offers.
+        \\
+        \\On a public listener, which browsers reach, the server takes ECDSA P-256
+        \\signatures (ecdsa_secp256r1_sha256) instead of Ed25519 and asks for no
+        \\client certificate. It also refuses, with this code, a ClientHello with no
+        \\server name (SNI), one whose name is not a host name or not a service public
+        \\here (alert unrecognized_name), one whose ALPN list lacks http/1.1 (alert
+        \\no_application_protocol), and one that lists x25519 without a key share for
+        \\it. Check that the name the client asked for is the service's public host,
+        \\that its DNS points at this listener, and that the client speaks HTTP/1.1;
+        \\the cause names the name and the rule.
         ,
     },
     .{

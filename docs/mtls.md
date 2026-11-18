@@ -549,7 +549,7 @@ unchanged: their tests and teeth run as before.
   with a trailing dot, its hello or flight damaged and fed in pieces). Its two teeth, in
   `tls_server_fuzz_teeth.zig`, switch off the name and ALPN checks.
 - `zig build public-tls-check` (`tools/public_tls_check.mjs`, `src/public_tls_listener.zig`;
-  test-only, not in `check`): a test listener on the public path with a test CA, and Playwright's
+  test-only, not in `check`; CI's `mtls-interop` job runs it): a test listener on the public path with a test CA, and Playwright's
   Chromium with a scratch NSS store. Without the CA the page fails with
   `ERR_CERT_AUTHORITY_INVALID`; with it the page loads over TLS 1.3 with `http/1.1`. Needs Node,
   Playwright's Chromium and `certutil`.
@@ -645,7 +645,7 @@ Threats this does not answer yet:
 | ZC-E0820 | the signer holding the client certificate's key did not sign |
 | ZC-E0815 | a TLS record could not be read: it does not authenticate, is too long, has the wrong type or came after a key limit |
 | ZC-E0816 | the connection ended or stalled without close_notify, or the handshake or a KeyUpdate answer did not finish in time, or a call came after an earlier failure had ended the connection |
-| ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |
+| ZC-E0818 | the peer needs something zcube does not offer: another version, suite, group or scheme, early data, or a HelloRetryRequest; on the public path also a server name not served here, ALPN without `http/1.1`, or x25519 listed without a share |
 | ZC-E0819 | issued for another role, such as a client certificate where a server's is needed |
 | ZC-E0821 | the operating system's secure random source failed, so no key, nonce or seed was made (the weaker `random` is never used instead) |
 

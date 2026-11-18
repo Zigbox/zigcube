@@ -751,7 +751,7 @@ fn add_bench_watch_step(b: *std.Build, options: ExecutablesOptions) void {
 /// a test-only listener on the server's public path (src/public_tls_listener.zig) and real
 /// Chromium, with the listener's test CA in its trust store, completing a handshake to it
 /// (tools/public_tls_check.mjs). Needs Node and Playwright's Chromium and `certutil`; never
-/// cached, not in `check`.
+/// cached, not in `check` (CI's mtls-interop job runs it).
 fn add_public_tls_check_step(b: *std.Build, options: ExecutablesOptions) void {
     const exe = b.addExecutable(.{
         .name = "public_tls_listener",

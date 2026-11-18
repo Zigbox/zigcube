@@ -591,7 +591,8 @@ pub fn parse_client_hello(body: []const u8) Error!ClientHello {
 /// The public mode's ClientHello (docs/briefs/c5.md, "Public TLS"): as `parse_client_hello`, and
 /// server_name (one host_name), ALPN and supported_groups are read strictly. A client that lists
 /// x25519 but sent no share for it would need a HelloRetryRequest, which this server never sends:
-/// `error.HelloRetryRequest`, so the server can count it apart from a client without x25519.
+/// `error.HelloRetryRequest`, so the server can count it apart from a client without x25519. An
+/// x25519 share whose group supported_groups does not list is `error.IllegalParameter`.
 pub fn parse_client_hello_public(body: []const u8) Error!PublicHello {
     var parsed: ClientExtensions = .{ .public = true };
     const hello = read_client_hello(body, &parsed) catch |err| {
@@ -599,6 +600,9 @@ pub fn parse_client_hello_public(body: []const u8) Error!PublicHello {
         return err;
     };
     assert(parsed.public);
+    assert(parsed.supported_groups); // `read_client_hello` refuses a key_share without it.
+    // A share must be for a group the client lists (section 4.2.8): the strict read aborts.
+    if (!parsed.x25519_listed) return error.IllegalParameter;
     return .{ .hello = hello, .server_name = parsed.server_name, .alpn = parsed.alpn };
 }
 

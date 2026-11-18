@@ -67,9 +67,11 @@ check $PR x "" "src/demo_c0.zig src/demo_c1.zig" TFTTFFFFFFFFFFF
 # The TLS server sits behind zcube-server's listener since B7 slice 3: it runs everything.
 check $PR x "" "src/tls_server.zig src/tls_server_test.zig src/tls_testclient.zig" TTTTTTTTTTTTTTT
 # C5 slice 1: the public path shares the TLS server with B7's listeners, so its files run
-# everything; its browser check and fixture recorder (tools/) and fixtures run the code job only.
+# everything; its browser check runs in the mtls-interop job, and its fixture recorder runs the
+# code job only.
 check $PR x "" "src/edge_host.zig src/tls_server_public_test.zig src/public_tls_listener.zig" TTTTTTTTTTTTTTT
-check $PR x "" "tools/public_tls_check.mjs tools/record_client_hello.mjs" TFFFFFFFFFFFFFF
+check $PR x "" "tools/public_tls_check.mjs" TFFFFFFTFFFFFFF
+check $PR x "" "tools/record_client_hello.mjs" TFFFFFFFFFFFFFF
 # Everything: the build, CI itself, the shared demo driver, the server, the agent, the store
 # backends, the core, and any path no rule names (also a new directory).
 check $PR x "" "build.zig" TTTTTTTTTTTTTTT

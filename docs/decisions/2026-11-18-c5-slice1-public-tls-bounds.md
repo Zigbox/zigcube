@@ -33,11 +33,19 @@ the host, so an operator sees which host a refused browser asked for.
 cluster fuzzer's twenty-one knobs and seed ranges, which its teeth depend on, stay as they were.
 Tidy's `testclient_importer` allows it. The scripted client gained `.rsa_pss` (a signature list
 with no ECDSA) for the refusal row, since its `.ed25519` and `.other` lists both carry
-`ecdsa_secp256r1_sha256`. `mtls-teeth` now selects 56 tests (51 + 3 + 2).
+`ecdsa_secp256r1_sha256`. `mtls-teeth` now selects 57 tests (51 + 3 + 3: the public fuzzer has
+teeth for the name, ALPN and Finished checks).
 
-**The browser check** (`zig build public-tls-check`) is test-only and not in `check` or CI: it
-needs Playwright's Chromium and `certutil`. Its first visit, with an empty NSS store, must fail
+**The browser check** (`zig build public-tls-check`) is test-only and not in `check`: it needs
+Playwright's Chromium and `certutil`. CI runs it in the `mtls-interop` job (review of #282),
+which installs both; `tools/public_tls_check.mjs` selects that job. Its first visit, with an empty NSS store, must fail
 with `ERR_CERT_AUTHORITY_INVALID`, so that the second visit's pass is due to the test CA.
+
+**Server size.** The public flight is larger than the cluster one: the flight buffer and
+`send_flight`'s stack copy grow from about 2,072 bytes (EncryptedExtensions 6 and a cluster
+Certificate 2,066) to about 8,240 bytes (EncryptedExtensions with ALPN 25 and the public
+Certificate 8,215), about 6,168 bytes more per `Server` and about 0.6 MiB over 96 connections.
+The total `@sizeOf(Server)` was not measured in this slice.
 
 Where: `src/constants.zig`, `src/tls_server.zig`, `src/tls_server_public_test.zig`,
 `src/tls_server_public_fuzz.zig`, `tools/public_tls_check.mjs`, docs/mtls.md "The public path".
