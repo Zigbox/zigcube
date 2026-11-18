@@ -1975,15 +1975,18 @@ const c1_teeth_roots = [_]struct {
         // by about one seed in a hundred: seed 32 until B2.1 slice 6 (#205: a failing step no
         // longer aborts the pass) shifted the world, then seed 186 (1..2000 searched up to the
         // first hit; docs/decisions/2026-11-11-job-evicted-tooth-sparse.md), then seed 241 after
-        // #225's fix (docs/decisions/2026-11-13-job-evicted-tooth-seed-241.md). CI's run ends
-        // there, and the fleet canary runs seed 241 alone at 300 operations (fresh seeds at
-        // drawn operations would take hours for a one-in-a-hundred hit). A sparse tooth:
-        // widening its world so more seeds hit is B3 work. Seed 241 passes with the fault off.
+        // #225's fix (docs/decisions/2026-11-13-job-evicted-tooth-seed-241.md), then seed 284
+        // after #237's registration order
+        // (docs/decisions/2026-11-18-job-evicted-tooth-seed-284.md).
+        // CI's run ends there, and the fleet canary runs seed 284 alone at 300 operations (fresh
+        // seeds at drawn operations would take hours for a one-in-a-hundred hit). A sparse
+        // tooth: widening its world so more seeds hit is B3 work. Seed 284 passes with the fault
+        // off.
         .symptom = "J8: a run that no node started",
         .canary_seeds = 1,
-        .canary_first = 241,
-        .first_seed = 241,
-        .seeds = 241,
+        .canary_first = 284,
+        .first_seed = 284,
+        .seeds = 284,
         .ops = 300,
     },
     .{
