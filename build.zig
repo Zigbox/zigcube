@@ -32,8 +32,6 @@ pub fn build(b: *std.Build) void {
 
     const pq_include = pq_include_option(b);
     const c_modules = add_c_modules(b, target, optimize, .{ .pq_include = pq_include });
-    const sqlite = c_modules.sqlite;
-    const libpq_module = c_modules.libpq;
     const console = add_console_steps(b);
     const web_files = add_web_files(b, console);
 
@@ -42,8 +40,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .options = options,
         .zigbox = zigbox_module,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
+        .sqlite = c_modules.sqlite,
+        .libpq = c_modules.libpq,
         .web_files = web_files,
     };
     const built = add_executables(b, shared_options);
@@ -56,8 +54,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .zigbox = zigbox_module,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
+        .sqlite = c_modules.sqlite,
+        .libpq = c_modules.libpq,
     });
     add_agent_smoke_step(b, built, shared_options);
     add_jepsen_client_step(b, shared_options, built);
