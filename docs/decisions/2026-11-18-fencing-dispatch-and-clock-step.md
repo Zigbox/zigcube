@@ -59,6 +59,13 @@ The grace's lower bound, `grace_min_ms(ttl) = cover_needed(ttl) − fence_margin
 So `--lost-grace-ms` under 580–600 ms (by ttl) is now refused; the default, 1,000, is admitted
 at every admitted ttl.
 
+## Upgrading
+
+Only the server changes. A server started with `--lost-grace-ms` (or `.lost_grace_ms`) below the
+shortest grace for its ttl, 580 to 600 ms, no longer starts (ZC-E0121, naming the grace): lengthen
+it before upgrading, or drop the flag for the default. Agents are unchanged and check grants as
+before, so servers and agents upgrade in either order.
+
 ## Why the grace and not the floor
 
 The alternative (PR #242) raised `fence_margin_ms` to 4,000 and with it the shortest ttl to
