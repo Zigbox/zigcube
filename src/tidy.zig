@@ -688,9 +688,10 @@ fn testpeer_importer(path: []const u8) bool {
     return std.mem.eql(u8, path, "src/tls_fuzz.zig");
 }
 
-/// The files that may import `tls_testclient.zig`: test files and the server's fuzzer.
+/// The files that may import `tls_testclient.zig`: test files and the server's fuzzers.
 fn testclient_importer(path: []const u8) bool {
     if (std.mem.endsWith(u8, path, "_test.zig")) return true;
+    if (std.mem.eql(u8, path, "src/tls_server_public_fuzz.zig")) return true;
     return std.mem.eql(u8, path, "src/tls_server_fuzz.zig");
 }
 
@@ -995,6 +996,7 @@ test "imports: the scripted TLS server and client are imported only from test ro
     const client_cases = [_]struct { path: []const u8, allowed: bool }{
         .{ .path = "src/tls_server_test.zig", .allowed = true },
         .{ .path = "src/tls_server_fuzz.zig", .allowed = true },
+        .{ .path = "src/tls_server_public_fuzz.zig", .allowed = true },
         .{ .path = "src/tls_server.zig", .allowed = false },
         .{ .path = "src/zcube_server.zig", .allowed = false },
     };

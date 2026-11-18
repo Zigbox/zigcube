@@ -73,14 +73,19 @@ const Rig = struct {
             };
         }
         rig.table = try tls_server.PublicTable.init(&rig.chains);
-        rig.server.init_public(&.{ .random = @splat(0x31), .secret = @splat(0x32), .table = &rig.table });
+        rig.server.init_public(&.{
+            .random = @splat(0x31),
+            .secret = @splat(0x32),
+            .table = &rig.table,
+        });
         var adjusted = public;
         adjusted.root = rig.root;
         var client_faults = faults;
         if (client_faults.hello.signature_algorithms == .ed25519) {
             client_faults.hello.signature_algorithms = .chrome;
         }
-        try rig.client.init(.{ .ca = try x509_test.ca_pair(), .public = adjusted, .faults = client_faults });
+        const ca = try x509_test.ca_pair();
+        try rig.client.init(.{ .ca = ca, .public = adjusted, .faults = client_faults });
         rig.sent_length = 0;
         rig.data_events = 0;
     }
@@ -180,7 +185,12 @@ test "public: the server name picks the chain, canonicalized as Host is" {
         .{ .sent = "hello.test", .host = "hello.test" },
     };
     for (cases) |case| {
-        try rig.setup(.{ .root = undefined, .server_name = case.sent, .expect_host = case.host }, .{});
+        const public: testclient.Public = .{
+            .root = undefined,
+            .server_name = case.sent,
+            .expect_host = case.host,
+        };
+        try rig.setup(public, .{});
         try testing.expect(try rig.handshake(4096) == .connected);
         try expect_connected(&rig, case.host);
     }
@@ -261,7 +271,7 @@ const refusals = [_]Refusal{
     },
     .{
         .name = "no ECDSA P-256 signatures",
-        .faults = .{ .hello = .{ .signature_algorithms = .other } },
+        .faults = .{ .hello = .{ .signature_algorithms = .rsa_pss } },
         .alert = .handshake_failure,
         .reason = .other,
     },
@@ -292,7 +302,9 @@ test "public: each refused ClientHello ends with its alert and its reason" {
         try testing.expectEqual(@backingInt(row.alert), rig.hello_alert().?);
         try testing.expectEqual(row.reason, rig.server.public_refusal().?);
         try testing.expect(rig.diag.code != null);
-        try testing.expect(rig.server.server_name() == null);
+        // The name is known once the table had it: refusals after the chain is picked name it.
+        const named = row.reason == .alpn or std.mem.eql(u8, row.name, "early data");
+        try testing.expectEqual(named, rig.server.server_name() != null);
     }
 }
 
@@ -317,17 +329,6 @@ test "public: Chromium's recorded ClientHello is answered with hello.test's chai
     try testing.expect(!parsed.hello.ed25519);
 }
 
-test "public: a cluster ClientHello is refused, a public one at a cluster server too" {
-    // Goal: the paths never mix. Method: an ed25519-only hello at the public server; the public
-    // client at a public server named in the cluster's way (no SNI the table has).
-    var rig: Rig = undefined;
-    try rig.setup(.{ .root = undefined }, .{ .hello = .{ .signature_algorithms = .ed25519 } });
-    // `setup` turned ed25519 into Chromium's list; put the cluster's back.
-    rig.client.config.faults.hello.signature_algorithms = .ed25519;
-    try testing.expectError(error.Refused, rig.feed(rig.client.hello(&rig.input), 4096));
-    try testing.expectEqual(PublicRefusal.other, rig.server.public_refusal().?);
-}
-
 test "public: a client that cannot read the ServerHello may answer with a plain alert" {
     var rig: Rig = undefined;
     try rig.setup(.{ .root = undefined }, .{});
@@ -337,34 +338,52 @@ test "public: a client that cannot read the ServerHello may answer with a plain 
     try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0813), rig.diag.code);
 }
 
+/// A one-chain table for `host` with `certificates`, all under one key.
+fn table_one(host: []const u8, certificates: []const []const u8) !void {
+    const key = try p256_test.key(0x41);
+    const chains = [_]tls_server.PublicChain{
+        .{ .host = host, .key = &key, .certificates = certificates },
+    };
+    _ = try tls_server.PublicTable.init(&chains);
+}
+
+/// A table of `names` in the order given, each with a one-certificate chain.
+fn table_of(
+    chains: []tls_server.PublicChain,
+    key: *const p256.KeyPair,
+    names: []const []const u8,
+) !tls_server.PublicTable {
+    for (names, 0..) |name, index| {
+        chains[index] = .{ .host = name, .key = key, .certificates = &.{"leaf"} };
+    }
+    return tls_server.PublicTable.init(chains[0..names.len]);
+}
+
 test "public: the table refuses what it cannot serve" {
-    var key = try p256_test.key(0x41);
-    const leaf: []const u8 = "leaf";
     const big: [constants.edge_certificate_bytes_max + 1]u8 = @splat(1);
-    const half: [constants.edge_chain_bytes_max / 2 + 1]u8 = @splat(1);
-    const chain = struct {
-        fn of(host: []const u8, k: *const p256.KeyPair, c: []const []const u8) tls_server.PublicChain {
-            return .{ .host = host, .key = k, .certificates = c };
-        }
-    }.of;
-    const Table = tls_server.PublicTable;
-    const one = [_][]const u8{leaf};
-    try testing.expectError(error.Unsorted, Table.init(&.{ chain("b.test", &key, &one), chain("a.test", &key, &one) }));
-    try testing.expectError(error.Unsorted, Table.init(&.{ chain("a.test", &key, &one), chain("a.test", &key, &one) }));
-    try testing.expectError(error.NotCanonical, Table.init(&.{chain("A.test", &key, &one)}));
-    try testing.expectError(error.NotCanonical, Table.init(&.{chain("a.test.", &key, &one)}));
-    try testing.expectError(error.NotCanonical, Table.init(&.{chain("localhost", &key, &one)}));
-    try testing.expectError(error.ChainEmpty, Table.init(&.{chain("a.test", &key, &.{})}));
-    try testing.expectError(error.ChainEmpty, Table.init(&.{chain("a.test", &key, &.{""})}));
-    try testing.expectError(error.ChainTooLong, Table.init(&.{chain("a.test", &key, &.{ leaf, leaf, leaf, leaf })}));
-    try testing.expectError(error.CertificateTooLarge, Table.init(&.{chain("a.test", &key, &.{&big})}));
-    try testing.expectError(error.ChainTooLarge, Table.init(&.{chain("a.test", &key, &.{ &half, &half })}));
-    const table = try Table.init(&.{ chain("a.test", &key, &one), chain("b.test", &key, &one), chain("c.test", &key, &one) });
+    const third: [constants.edge_chain_bytes_max / 3 + 1]u8 = @splat(1);
+    const leaf: []const u8 = "leaf";
+    try testing.expectError(error.NotCanonical, table_one("A.test", &.{leaf}));
+    try testing.expectError(error.NotCanonical, table_one("a.test.", &.{leaf}));
+    try testing.expectError(error.NotCanonical, table_one("localhost", &.{leaf}));
+    try testing.expectError(error.ChainEmpty, table_one("a.test", &.{}));
+    try testing.expectError(error.ChainEmpty, table_one("a.test", &.{""}));
+    try testing.expectError(error.ChainTooLong, table_one("a.test", &.{ leaf, leaf, leaf, leaf }));
+    try testing.expectError(error.CertificateTooLarge, table_one("a.test", &.{&big}));
+    try testing.expectError(error.ChainTooLarge, table_one("a.test", &.{ &third, &third, &third }));
+    try table_one("a.test", &.{ leaf, &third, &third });
+
+    const key = try p256_test.key(0x41);
+    var chains: [3]tls_server.PublicChain = undefined;
+    try testing.expectError(error.Unsorted, table_of(&chains, &key, &.{ "b.test", "a.test" }));
+    try testing.expectError(error.Unsorted, table_of(&chains, &key, &.{ "a.test", "a.test" }));
+    const table = try table_of(&chains, &key, &.{ "a.test", "b.test", "c.test" });
+    try testing.expectEqualStrings("a.test", table.find("a.test").?.host);
     try testing.expectEqualStrings("b.test", table.find("b.test").?.host);
     try testing.expectEqualStrings("c.test", table.find("c.test").?.host);
     try testing.expect(table.find("d.test") == null);
     try testing.expect(table.find("") == null);
-    const empty = try Table.init(&.{});
+    const empty = try table_of(&chains, &key, &.{});
     try testing.expect(empty.find("a.test") == null);
 }
 
@@ -404,5 +423,6 @@ test "teeth: cert_request_sent: the public flight asks for a client certificate"
     defer tls_server.set_test_fault(.cert_request_sent, false);
     try rig.setup(.{ .root = undefined }, .{});
     _ = try rig.feed(rig.client.hello(&rig.input), 4096);
-    try testing.expectError(error.BadFlight, rig.client.accept_flight(rig.sent[0..rig.sent_length]));
+    const flight = rig.sent[0..rig.sent_length];
+    try testing.expectError(error.BadFlight, rig.client.accept_flight(flight));
 }

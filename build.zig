@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
     add_local_smoke_step(b, built);
     add_x509_format_step(b, zigbox_module);
     add_bench_watch_step(b, shared_options);
+    add_public_tls_check_step(b, shared_options);
     add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
     add_errors_site_steps(b);
@@ -743,6 +744,32 @@ fn add_bench_watch_step(b: *std.Build, options: ExecutablesOptions) void {
     run.has_side_effects = true;
     run.setCwd(b.path("."));
     b.step("bench-watch", "Run the watch fan-out benchmark (50 agents, 2,000 assignments)")
+        .dependOn(&run.step);
+}
+
+/// `zig build public-tls-check`: C5 slice 1's browser check (docs/mtls.md, "The public path"):
+/// a test-only listener on the server's public path (src/public_tls_listener.zig) and real
+/// Chromium, with the listener's test CA in its trust store, completing a handshake to it
+/// (tools/public_tls_check.mjs). Needs Node and Playwright's Chromium and `certutil`; never
+/// cached, not in `check`.
+fn add_public_tls_check_step(b: *std.Build, options: ExecutablesOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "public_tls_listener",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/public_tls_listener.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.options.createModule() },
+                .{ .name = "zigbox", .module = options.zigbox },
+            },
+        }),
+    });
+    const run = b.addSystemCommand(&.{ "node", "--no-warnings", "tools/public_tls_check.mjs" });
+    run.addArtifactArg(exe);
+    run.has_side_effects = true;
+    run.setCwd(b.path("."));
+    b.step("public-tls-check", "Check that Chromium completes a handshake on the public path")
         .dependOn(&run.step);
 }
 

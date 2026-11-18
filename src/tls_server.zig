@@ -20,14 +20,14 @@
 //! ever sees it; a failed `open` wipes the record buffer and the keys; bytes behind a key change
 //! in one record are refused; after a fatal error nothing more is produced but the one alert.
 //!
-//! The public path (docs/briefs/c5.md, "Public TLS"; docs/decisions/2026-11-15-c5-public-tls-mode.md):
-//! a server set up with `init_public` faces the internet. It sends no CertificateRequest and
-//! takes no client certificate; the handshake ends at the client's Finished. It picks the
-//! certificate chain by the canonical server name (SNI) from a `PublicTable` of P-256 keys,
-//! leaves and opaque intermediates, refuses a ClientHello with no server name or an unknown one
-//! (`unrecognized_name`), and one whose ALPN list lacks http/1.1 (`no_application_protocol`).
-//! Its CertificateVerify is ECDSA P-256 with the chain's key. Neither cluster path is reachable
-//! from it.
+//! The public path (docs/briefs/c5.md, "Public TLS";
+//! docs/decisions/2026-11-15-c5-public-tls-mode.md): a server set up with `init_public` faces the
+//! internet. It sends no CertificateRequest and takes no client certificate; the handshake ends at
+//! the client's Finished. It picks the certificate chain by the canonical server name (SNI) from a
+//! `PublicTable` of P-256 keys, leaves and opaque intermediates, refuses a ClientHello with no
+//! server name or an unknown one (`unrecognized_name`), and one whose ALPN list lacks http/1.1
+//! (`no_application_protocol`). Its CertificateVerify is ECDSA P-256 with the chain's key. Neither
+//! cluster path is reachable from it.
 //!
 //! Core code: no allocation, no clock, no randomness, no I/O.
 

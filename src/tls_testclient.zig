@@ -36,7 +36,7 @@ pub const Hello = struct {
     /// The x25519 key is all zero: a low-order point.
     low_order: bool = false,
     /// `chrome` is Chromium's list, which has ecdsa_secp256r1_sha256 and no ed25519.
-    signature_algorithms: enum { ed25519, other, absent, chrome } = .ed25519,
+    signature_algorithms: enum { ed25519, other, absent, chrome, rsa_pss } = .ed25519,
     /// The one compression method offered.
     compression: u8 = 0,
     session_id: bool = true,
@@ -309,6 +309,7 @@ pub const Client = struct {
         switch (knobs.signature_algorithms) {
             .ed25519 => w.bytes(&.{ 0, 13, 0, 6, 0, 4, 0x04, 0x03, 0x08, 0x07 }),
             .other => w.bytes(&.{ 0, 13, 0, 4, 0, 2, 0x04, 0x03 }),
+            .rsa_pss => w.bytes(&.{ 0, 13, 0, 4, 0, 2, 0x08, 0x04 }),
             .chrome => w.bytes(&.{
                 0,    13,   0,    18,   0,    16,
                 0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
@@ -361,7 +362,7 @@ pub const Client = struct {
         w.u16_(51);
         const extension = w.open16();
         const list = w.open16();
-        const without_share = if (self.config.public) |public| public.x25519_without_share else false;
+        const without_share = if (self.config.public) |path| path.x25519_without_share else false;
         if (!knobs.x25519 or without_share) {
             w.bytes(&.{ 0, 23, 0, 1, 4 }); // secp256r1, a stub key
         } else {
@@ -441,28 +442,7 @@ pub const Client = struct {
                 self.transcript.add(message);
                 return wire.handshake_certificate;
             },
-            wire.handshake_certificate => {
-                if (self.config.public) |public| return self.read_public_certificate(public, message);
-                const chain = wire.parse_certificate(body) catch return error.BadFlight;
-                if (self.config.browser) |browser| {
-                    const anchor = p256.point_of(browser);
-                    const parsed = p256.verify(chain.leaf, anchor, self.config.now_ms, .{
-                        .kind = .server,
-                        .name = null,
-                    }) catch return error.BadFlight;
-                    self.server_point = parsed.point(chain.leaf);
-                    self.transcript.add(message);
-                    return wire.handshake_certificate_verify;
-                }
-                const anchor = self.config.ca.public_key.toBytes();
-                const parsed = x509.verify(chain.leaf, anchor, self.config.now_ms, .{
-                    .kind = .server,
-                    .name = null,
-                }) catch return error.BadFlight;
-                self.server_key = parsed.public_key.of(chain.leaf)[0..32].*;
-                self.transcript.add(message);
-                return wire.handshake_certificate_verify;
-            },
+            wire.handshake_certificate => return self.read_certificate(message),
             wire.handshake_certificate_verify => {
                 if (self.config.browser != null) return self.read_browser_verify(message);
                 if (self.config.public != null) return self.read_browser_verify(message);
@@ -490,6 +470,33 @@ pub const Client = struct {
             },
             else => return error.BadFlight,
         }
+    }
+
+    /// The server's Certificate: the public path, the browser path or the cluster's.
+    fn read_certificate(self: *Client, message: []const u8) Error!u8 {
+        const body = message[4..];
+        if (self.config.public) |public| {
+            return self.read_public_certificate(public, message);
+        }
+        const chain = wire.parse_certificate(body) catch return error.BadFlight;
+        if (self.config.browser) |browser| {
+            const anchor = p256.point_of(browser);
+            const parsed = p256.verify(chain.leaf, anchor, self.config.now_ms, .{
+                .kind = .server,
+                .name = null,
+            }) catch return error.BadFlight;
+            self.server_point = parsed.point(chain.leaf);
+            self.transcript.add(message);
+            return wire.handshake_certificate_verify;
+        }
+        const anchor = self.config.ca.public_key.toBytes();
+        const parsed = x509.verify(chain.leaf, anchor, self.config.now_ms, .{
+            .kind = .server,
+            .name = null,
+        }) catch return error.BadFlight;
+        self.server_key = parsed.public_key.of(chain.leaf)[0..32].*;
+        self.transcript.add(message);
+        return wire.handshake_certificate_verify;
     }
 
     /// The public path's EncryptedExtensions, parsed here: an empty server_name at most, and ALPN
