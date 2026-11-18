@@ -691,6 +691,22 @@ comptime {
     assert(x509_cert_bytes_max < 65536);
 }
 
+// ---- Sealed records (C5 slice 2, `seal.zig`) --------------------------------------------------
+
+/// The most plaintext one sealed record holds: a P-256 private key in SEC 1 or PKCS #8 DER is
+/// under 140 bytes, so this leaves room without letting a record grow. Internal; not a limit an
+/// operator meets.
+pub const seal_plaintext_bytes_max: u32 = 512;
+/// The most store pages the start-up check of sealed records reads under one prefix: far more
+/// records than a cluster has public hosts. Reaching it is a refusal to start, never a skip.
+pub const seal_scan_pages_max: u32 = 4096;
+
+comptime {
+    assert(seal_plaintext_bytes_max >= 140);
+    assert(seal_plaintext_bytes_max < store_value_bytes_max);
+    assert(seal_scan_pages_max > 0);
+}
+
 // ---- TLS 1.3 record layer for the mTLS client (docs/briefs/mtls-client.md, slice 3) -----------
 
 /// RFC 8446 section 5.1: the most content bytes one record carries.

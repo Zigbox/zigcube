@@ -135,6 +135,8 @@ pub const Code = enum(u8) {
     E0820,
     E0821,
     E0822,
+    E0824,
+    W0808,
     B0001,
     B0002,
     B0003,
@@ -2050,6 +2052,41 @@ pub const registry = [_]Entry{
         \\
         \\Use a certificate with the scope the request needs: an operator issues one
         \\with `zcube-server ca issue-client NAME --scope admin`.
+        ,
+    },
+    .{
+        .code = .E0824,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "sealed records do not open with this server's sealing key",
+        .explanation =
+        \\The store holds sealed records (certificate keys under /edge-certs/ and
+        \\ACME account keys under /acme-account/), and the server's sealing key
+        \\does not open one of them: the key file is missing, or it is another key.
+        \\The server refuses to start, so that it never orders new certificates
+        \\over records it cannot read. The diagnostic names the key file, the
+        \\record and the key id the records expect; it never prints a key.
+        \\
+        \\Restore the key file (seal-<hash>.key, mode 0600, beside the CA key in
+        \\the state directory) from a backup and start again. If there is no
+        \\backup, start once with `zcube-server --discard-sealed`: every sealed
+        \\record is deleted, a new key is made, and every public host is ordered
+        \\again (ZC-W0808).
+        ,
+    },
+    .{
+        .code = .W0808,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "sealed records were discarded; every public host is ordered again",
+        .explanation =
+        \\The server started with --discard-sealed. It deleted every sealed record
+        \\(certificates and ACME accounts) and every ACME order, and made a new
+        \\sealing key. Every public host is ordered again, which counts against
+        \\Let's Encrypt's limits: 50 certificates per registered domain per week,
+        \\and 5 duplicate certificates per week.
+        \\
+        \\Back up the new key file and start without --discard-sealed from now on.
         ,
     },
     .{
