@@ -767,9 +767,10 @@ jobs:
           if-no-files-found: warn
 
   # Stock servers (openssl s_server, a JDK 21 SSLServerSocket) against the mTLS client. Test-only
-  # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md.
+  # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md. Then C5 slice 1's browser
+  # check (public-tls-check: real Chromium against the server's public path, docs/mtls.md).
   mtls-interop:
-    name: mtls-interop (openssl, JDK 21)
+    name: mtls-interop (openssl, JDK 21) and public-tls-check (Chromium)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.mtls_interop == 'true' }}
     runs-on: ubuntu-24.04
@@ -791,12 +792,30 @@ jobs:
           openssl version
           "$ZCUBE_JAVA_HOME/bin/java" -version
           zig build mtls-interop --summary all 2>&1 | tee mtls-interop.txt
+      # Playwright and its Chromium (the cloud container has both preinstalled; a runner does
+      # not), and NSS's certutil for the check's scratch certificate store.
+      - name: Playwright, Chromium and certutil
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm install --no-save --no-audit --no-fund playwright@1.63.0
+          sudo npx playwright install-deps chromium
+          npx playwright install chromium
+          sudo apt-get install -y libnss3-tools
+          echo "NODE_PATH=$RUNNER_TEMP/pw/node_modules" >> "$GITHUB_ENV"
+      - name: public-tls-check
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: zig build public-tls-check --summary all 2>&1 | tee public-tls-check.txt
       - name: Keep the output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mtls-interop-output
-          path: mtls-interop.txt
+          path: |
+            mtls-interop.txt
+            public-tls-check.txt
           if-no-files-found: warn
 
   # The Jepsen battery's tarball and its Postgres recipe (docs/jepsen.md,

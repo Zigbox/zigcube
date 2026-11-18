@@ -85,6 +85,7 @@ pub const modules = .{
     @import("store_verified.zig"),
     @import("test_util.zig"),
     @import("testing/history.zig"),
+    @import("edge_host.zig"),
     @import("text.zig"),
     @import("tls_client.zig"),
     @import("tls_server.zig"),
@@ -180,6 +181,7 @@ test {
     // server they use is a fixture and is imported only here.
     _ = @import("tls_client_test.zig");
     _ = @import("tls_server_test.zig");
+    _ = @import("tls_server_public_test.zig");
     _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
     _ = @import("scheduler_test.zig");

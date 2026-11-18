@@ -477,6 +477,13 @@ const hello_misses = [_]NearMiss{
         .faults = .{ .hello = .{ .early_data = true } },
     },
     .{
+        // Early data is judged before the scheme: illegal_parameter, not handshake_failure.
+        .name = "early data without Ed25519",
+        .code = .E0818,
+        .alert = .illegal_parameter,
+        .faults = .{ .hello = .{ .early_data = true, .signature_algorithms = .other } },
+    },
+    .{
         .name = "psk not last",
         .code = .E0813,
         .alert = .illegal_parameter,
