@@ -24,3 +24,6 @@ one `key<TAB>value` per line, unedited. Never regenerate it: it is the proof tha
 
 `sim_cluster_drawn.txt` is real output of `sim_teeth --seeds 1..3 auto --profile=auto` (ReleaseSafe, the C3 fleet
 slice-1 build): three failing seeds in the drawn form that `sim_fleet`'s parser test reads. Unedited.
+
+`tls/client_hello_chromium.bin` is a ClientHello Chromium sent, recorded for the public TLS mode's
+tests; `tls/README.md` says how. Never edit it by hand.

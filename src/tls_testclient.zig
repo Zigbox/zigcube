@@ -36,7 +36,7 @@ pub const Hello = struct {
     /// The x25519 key is all zero: a low-order point.
     low_order: bool = false,
     /// `chrome` is Chromium's list, which has ecdsa_secp256r1_sha256 and no ed25519.
-    signature_algorithms: enum { ed25519, other, absent, chrome } = .ed25519,
+    signature_algorithms: enum { ed25519, other, absent, chrome, rsa_pss } = .ed25519,
     /// The one compression method offered.
     compression: u8 = 0,
     session_id: bool = true,
@@ -99,8 +99,28 @@ pub const Faults = struct {
     unbound_auth: bool = false,
 };
 
+/// The public path (docs/briefs/c5.md, "Public TLS"): the client sends a server name and ALPN,
+/// takes no CertificateRequest, checks the server's P-256 leaf against `root` and the host, and
+/// sends only its Finished, as a browser does.
+pub const Public = struct {
+    /// The key of the CA that signed the server's leaf.
+    root: p256.KeyPair,
+    /// The server name sent; null sends no server_name extension.
+    server_name: ?[]const u8 = "hello.test",
+    /// The DNS name the server's leaf must carry.
+    expect_host: []const u8 = "hello.test",
+    alpn: Alpn = .h2_and_http11,
+    /// supported_groups lists x25519 and the key share has only secp256r1: a HelloRetryRequest
+    /// would be needed.
+    x25519_without_share: bool = false,
+
+    pub const Alpn = enum { absent, h2_and_http11, h2_only };
+};
+
 pub const Config = struct {
     ca: Ed25519.KeyPair,
+    /// When set, the client takes the public path; `browser` and the client chain are unused.
+    public: ?Public = null,
     /// The browser CA: when set, the client takes the browser path with a P-256 certificate.
     /// `client_kind` and `node_kind` then present the cluster CA's Ed25519 certificates (the
     /// cross path), `server_kind` a browser server certificate.
@@ -122,7 +142,10 @@ pub const Client = struct {
     write: schedule.Direction,
     client_application: schedule.Secret,
     server_key: [32]u8,
-    received: [constants.tls_handshake_flight_bytes_max]u8,
+    /// Big enough for the public path's flight, whose chain is up to `edge_chain_bytes_max`.
+    received: [constants.tls_record_plaintext_bytes_max]u8,
+    /// The public path's EncryptedExtensions selected http/1.1.
+    alpn_selected: bool,
     received_length: u32,
     finished_seen: bool,
     leaf: x509.Der,
@@ -136,9 +159,11 @@ pub const Client = struct {
         self.transcript = schedule.Transcript.init();
         self.secrets = schedule.Schedule.init();
         self.received_length = 0;
+        self.alpn_selected = false;
         self.finished_seen = false;
         self.p256_key = try p256_test.key(0x67);
         self.server_point = @splat(0);
+        if (config.public != null) return; // The public path presents no certificate.
         if (config.browser) |browser| return self.issue_browser(browser);
         try self.issue();
     }
@@ -274,12 +299,17 @@ pub const Client = struct {
 
     fn hello_extensions(self: *Client, w: *Writer) void {
         const knobs = self.config.faults.hello;
-        // server_name, supported_groups: read past by the server.
-        w.bytes(&.{ 0, 0, 0, 9, 0, 7, 0, 0, 4, 'z', 'c', '.', 'x' });
+        if (self.config.public) |public| {
+            hello_public_extensions(w, public);
+        } else {
+            // server_name: read past by the cluster paths.
+            w.bytes(&.{ 0, 0, 0, 9, 0, 7, 0, 0, 4, 'z', 'c', '.', 'x' });
+        }
         if (knobs.supported_groups) w.bytes(&.{ 0, 10, 0, 4, 0, 2, 0, 0x1d });
         switch (knobs.signature_algorithms) {
             .ed25519 => w.bytes(&.{ 0, 13, 0, 6, 0, 4, 0x04, 0x03, 0x08, 0x07 }),
             .other => w.bytes(&.{ 0, 13, 0, 4, 0, 2, 0x04, 0x03 }),
+            .rsa_pss => w.bytes(&.{ 0, 13, 0, 4, 0, 2, 0x08, 0x04 }),
             .chrome => w.bytes(&.{
                 0,    13,   0,    18,   0,    16,
                 0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
@@ -297,6 +327,34 @@ pub const Client = struct {
         if (knobs.psk_not_last) w.bytes(&.{ 0, 45, 0, 2, 1, 1 });
     }
 
+    /// server_name and ALPN, written here, not with the server's code.
+    fn hello_public_extensions(w: *Writer, public: Public) void {
+        if (public.server_name) |name| {
+            w.u16_(0); // server_name
+            const extension = w.open16();
+            const list = w.open16();
+            w.u8_(0); // host_name
+            w.u16_(@intCast(name.len));
+            w.bytes(name);
+            w.close16(list);
+            w.close16(extension);
+        }
+        const names: []const []const u8 = switch (public.alpn) {
+            .absent => return,
+            .h2_and_http11 => &.{ "h2", "http/1.1" },
+            .h2_only => &.{"h2"},
+        };
+        w.u16_(16); // application_layer_protocol_negotiation
+        const extension = w.open16();
+        const list = w.open16();
+        for (names) |name| {
+            w.u8_(@intCast(name.len));
+            w.bytes(name);
+        }
+        w.close16(list);
+        w.close16(extension);
+    }
+
     fn key_share(self: *Client, w: *Writer) void {
         const knobs = self.config.faults.hello;
         var public = X25519.recoverPublicKey(self.config.secret);
@@ -304,7 +362,8 @@ pub const Client = struct {
         w.u16_(51);
         const extension = w.open16();
         const list = w.open16();
-        if (!knobs.x25519) {
+        const without_share = if (self.config.public) |path| path.x25519_without_share else false;
+        if (!knobs.x25519 or without_share) {
             w.bytes(&.{ 0, 23, 0, 1, 4 }); // secp256r1, a stub key
         } else {
             const copies: u32 = if (knobs.duplicate_group) 2 else 1;
@@ -368,6 +427,11 @@ pub const Client = struct {
         const body = message[4..];
         switch (message[0]) {
             wire.handshake_encrypted_extensions => {
+                if (self.config.public != null) {
+                    try self.read_public_extensions(body);
+                    self.transcript.add(message);
+                    return wire.handshake_certificate; // A CertificateRequest is refused.
+                }
                 wire.parse_encrypted_extensions(body) catch return error.BadFlight;
                 self.transcript.add(message);
                 return wire.handshake_certificate_request;
@@ -378,29 +442,10 @@ pub const Client = struct {
                 self.transcript.add(message);
                 return wire.handshake_certificate;
             },
-            wire.handshake_certificate => {
-                const chain = wire.parse_certificate(body) catch return error.BadFlight;
-                if (self.config.browser) |browser| {
-                    const anchor = p256.point_of(browser);
-                    const parsed = p256.verify(chain.leaf, anchor, self.config.now_ms, .{
-                        .kind = .server,
-                        .name = null,
-                    }) catch return error.BadFlight;
-                    self.server_point = parsed.point(chain.leaf);
-                    self.transcript.add(message);
-                    return wire.handshake_certificate_verify;
-                }
-                const anchor = self.config.ca.public_key.toBytes();
-                const parsed = x509.verify(chain.leaf, anchor, self.config.now_ms, .{
-                    .kind = .server,
-                    .name = null,
-                }) catch return error.BadFlight;
-                self.server_key = parsed.public_key.of(chain.leaf)[0..32].*;
-                self.transcript.add(message);
-                return wire.handshake_certificate_verify;
-            },
+            wire.handshake_certificate => return self.read_certificate(message),
             wire.handshake_certificate_verify => {
                 if (self.config.browser != null) return self.read_browser_verify(message);
+                if (self.config.public != null) return self.read_browser_verify(message);
                 const signature = wire.parse_certificate_verify(body) catch return error.BadFlight;
                 const hash = self.transcript.hash();
                 const content = schedule.certificate_verify_content(.server, &hash);
@@ -427,6 +472,79 @@ pub const Client = struct {
         }
     }
 
+    /// The server's Certificate: the public path, the browser path or the cluster's.
+    fn read_certificate(self: *Client, message: []const u8) Error!u8 {
+        const body = message[4..];
+        if (self.config.public) |public| {
+            return self.read_public_certificate(public, message);
+        }
+        const chain = wire.parse_certificate(body) catch return error.BadFlight;
+        if (self.config.browser) |browser| {
+            const anchor = p256.point_of(browser);
+            const parsed = p256.verify(chain.leaf, anchor, self.config.now_ms, .{
+                .kind = .server,
+                .name = null,
+            }) catch return error.BadFlight;
+            self.server_point = parsed.point(chain.leaf);
+            self.transcript.add(message);
+            return wire.handshake_certificate_verify;
+        }
+        const anchor = self.config.ca.public_key.toBytes();
+        const parsed = x509.verify(chain.leaf, anchor, self.config.now_ms, .{
+            .kind = .server,
+            .name = null,
+        }) catch return error.BadFlight;
+        self.server_key = parsed.public_key.of(chain.leaf)[0..32].*;
+        self.transcript.add(message);
+        return wire.handshake_certificate_verify;
+    }
+
+    /// The public path's EncryptedExtensions, parsed here: an empty server_name at most, and ALPN
+    /// only if offered, selecting exactly http/1.1.
+    fn read_public_extensions(self: *Client, body: []const u8) Error!void {
+        const public = self.config.public.?;
+        if (body.len < 2) return error.BadFlight;
+        if (std.mem.readInt(u16, body[0..2], .big) != body.len - 2) return error.BadFlight;
+        var at: usize = 2;
+        while (at < body.len) {
+            if (body.len - at < 4) return error.BadFlight;
+            const kind = std.mem.readInt(u16, body[at..][0..2], .big);
+            const length = std.mem.readInt(u16, body[at + 2 ..][0..2], .big);
+            if (body.len - at - 4 < length) return error.BadFlight;
+            const data = body[at + 4 ..][0..length];
+            switch (kind) {
+                0 => if (length != 0) return error.BadFlight,
+                16 => {
+                    if (public.alpn == .absent) return error.BadFlight;
+                    if (self.alpn_selected) return error.BadFlight;
+                    const selected = [_]u8{ 0, 9, 8 } ++ "http/1.1".*;
+                    if (!std.mem.eql(u8, data, &selected)) return error.BadFlight;
+                    self.alpn_selected = true;
+                },
+                else => return error.BadFlight,
+            }
+            at += 4 + length;
+        }
+    }
+
+    /// The public path's Certificate: the leaf checked against `root` and the host; whatever
+    /// follows it is passed over, as a browser builds its own path.
+    fn read_public_certificate(self: *Client, public: Public, message: []const u8) Error!u8 {
+        const body = message[4..];
+        if (body.len < 4 + 3 or body[0] != 0) return error.BadFlight;
+        const leaf_length = std.mem.readInt(u24, body[4..7], .big);
+        if (body.len < 7 + leaf_length) return error.BadFlight;
+        const leaf = body[7..][0..leaf_length];
+        const anchor = p256.point_of(public.root);
+        const parsed = p256.verify(leaf, anchor, self.config.now_ms, .{
+            .kind = .server,
+            .name = public.expect_host,
+        }) catch return error.BadFlight;
+        self.server_point = parsed.point(leaf);
+        self.transcript.add(message);
+        return wire.handshake_certificate_verify;
+    }
+
     /// The browser path's server CertificateVerify: ECDSA P-256, strict DER, and a low S (this
     /// server normalises it, so a high one is a server bug).
     fn read_browser_verify(self: *Client, message: []const u8) Error!u8 {
@@ -446,6 +564,7 @@ pub const Client = struct {
     /// application keys.
     pub fn flight(self: *Client, out: []u8) []u8 {
         assert(self.finished_seen);
+        if (self.config.public != null) return self.public_flight(out);
         const faults = self.config.faults;
         var length: usize = 0;
         for (0..faults.ccs) |_| {
@@ -474,6 +593,22 @@ pub const Client = struct {
         const finished = self.finished_message(&buffers[2]);
         if (finished) |message| append(&messages, &count, message);
         length += self.seal_messages(out[length..], messages[0..count]);
+        self.write = schedule.Direction.init(&self.client_application);
+        return out[0..length];
+    }
+
+    /// The public path's last flight: a change_cipher_spec, then the Finished alone.
+    fn public_flight(self: *Client, out: []u8) []u8 {
+        const faults = self.config.faults;
+        var length: usize = 0;
+        for (0..faults.ccs) |_| {
+            const ccs = [1]u8{faults.ccs_byte};
+            length += schedule.write_plain(out[length..], .change_cipher_spec, 0x0303, &ccs).len;
+        }
+        var buffer: [4 + schedule.hash_bytes]u8 = undefined;
+        if (self.finished_message(&buffer)) |finished| {
+            length += self.seal(out[length..], .handshake, finished).len;
+        }
         self.write = schedule.Direction.init(&self.client_application);
         return out[0..length];
     }

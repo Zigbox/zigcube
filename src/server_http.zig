@@ -76,6 +76,20 @@ pub const Tick = struct {
     run: *const fn (context: *anyopaque) void,
 };
 
+/// Test-only (#237): runs around a write, before it takes `api_mutex`
+/// (server_register_barrier.zig). `before` may block; `after` runs only when `before` answered
+/// true. No shipped server sets one: `zcube_server.zig` makes it only in a build with
+/// `-Dregister-barrier=true`.
+pub const Hook = struct {
+    context: *anyopaque,
+    before: *const fn (context: *anyopaque, request: api_mod.Request) bool,
+    after: *const fn (
+        context: *anyopaque,
+        request: api_mod.Request,
+        response: api_mod.Response,
+    ) void,
+};
+
 /// Everything the connections share.
 pub const Shared = struct {
     gpa: Allocator,
@@ -94,6 +108,8 @@ pub const Shared = struct {
     tls_slots: u32 = constants.http_connections_max,
     /// More work for each watchdog tick: the server's watch of its `revoked` file.
     tick: ?Tick = null,
+    /// Test-only (#237): see `Hook`.
+    hook: ?Hook = null,
 
     // ---- The connection table ----
 
@@ -195,6 +211,18 @@ pub const Shared = struct {
         request: api_mod.Request,
     ) api_mod.Response {
         if (is_read(request.method)) return shared.api.handle(ctx, request);
+        const hook = shared.hook orelse return shared.write(ctx, request);
+        if (!hook.before(hook.context, request)) return shared.write(ctx, request);
+        const response = shared.write(ctx, request);
+        hook.after(hook.context, request, response);
+        return response;
+    }
+
+    fn write(
+        shared: *Shared,
+        ctx: *const controller.Context,
+        request: api_mod.Request,
+    ) api_mod.Response {
         shared.api_mutex.lockUncancelable(shared.io);
         defer shared.api_mutex.unlock(shared.io);
         return shared.api.handle(ctx, request);

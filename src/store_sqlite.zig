@@ -1733,6 +1733,35 @@ test "a store survives a restart: data, revision, compaction point and leases" {
     try testing.expect((try s.get(arena_state.allocator(), "/n", null, &diag)).kv == null);
 }
 
+test "lease ids grow across a restart, when every lease was deleted first (#237)" {
+    // Goal: the registration compare (docs/authority.md) needs ids that never go back, also
+    // after a restart. A plain rowid would reuse the largest id once its row is gone; the
+    // counter must live in the file. Method: grant two, revoke the larger, reap the other, close;
+    // reopen and grant: the new id is larger than both.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const first = try fixture.open_new(.{ .create = true, .sync = .normal });
+    var diag: Diag = undefined;
+    diag.reset();
+    var s = first.interface();
+    const older = try s.lease_grant(1000, &diag);
+    const newer = try s.lease_grant(60_000, &diag);
+    _ = try s.lease_revoke(newer.id, &diag);
+    fixture.manual.advance(1500);
+    try testing.expectEqual(@as(u32, 1), try s.expire_leases(&diag));
+    try testing.expectEqual(@as(usize, 0), (try s.lease_list(arena_state.allocator(), &diag)).len);
+    release(first);
+
+    const second = try fixture.open_new(.{ .create = false, .sync = .normal });
+    defer release(second);
+    s = second.interface();
+    const after = try s.lease_grant(1000, &diag);
+    try testing.expect(newer.id > older.id);
+    try testing.expect(after.id > newer.id);
+}
+
 test "compaction deletes the history it no longer needs from the file" {
     // Goal: compaction frees space, not just the right answers (the suite checks those).
     // Method: five versions of a key and a deleted key; count the log's rows before and after.

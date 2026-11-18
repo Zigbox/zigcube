@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     // Zigbox's package has a `build_options` module of its own; if the two files were byte for
     // byte the same, the compiler would see one file in two modules. This line keeps them apart.
     options.addOption([]const u8, "product", "zigcube");
+    options.addOption(bool, "register_barrier", register_barrier_option(b));
 
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
     const zigbox_module = zigbox.module("zigbox");
@@ -69,6 +70,7 @@ pub fn build(b: *std.Build) void {
     add_local_smoke_step(b, built);
     add_x509_format_step(b, zigbox_module);
     add_bench_watch_step(b, shared_options);
+    add_public_tls_check_step(b, shared_options);
     add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
     add_errors_site_steps(b);
@@ -305,6 +307,31 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
     return built;
 }
 
+/// `zig build register-barrier-build`: compiles (installs nothing) a zcube-server with the
+/// test-only registration barrier on, the build the zigcube-jepsen test runs, so the gated code
+/// in `zcube_server.zig` cannot rot unseen. `check` and CI's check job run it.
+fn add_register_barrier_step(b: *std.Build, shared: ExecutablesOptions) void {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    options.addOption([]const u8, "product", "zigcube");
+    options.addOption(bool, "register_barrier", true);
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/zcube_server.zig"),
+        .target = shared.target,
+        .optimize = shared.optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = options.createModule() },
+            .{ .name = "zigbox", .module = shared.zigbox },
+            .{ .name = "sqlite_c", .module = shared.sqlite },
+            .{ .name = "libpq_c", .module = shared.libpq },
+            .{ .name = "web_files", .module = shared.web_files },
+        },
+    });
+    const exe = b.addExecutable(.{ .name = "zcube-server-barrier", .root_module = module });
+    const help = "Compile zcube-server with the test-only registration barrier (#237)";
+    b.step("register-barrier-build", help).dependOn(&exe.step);
+}
+
 /// `zig build jepsen-client`: zcube-jepsen-client, the Jepsen battery's test-only client
 /// (src/zcube_jepsen_client.zig, docs/jepsen.md), installed in the mode `-Doptimize` names. It is
 /// not part of `zig build`: the shipped executables do not grow for it.
@@ -313,6 +340,7 @@ fn add_jepsen_client_step(b: *std.Build, options: ExecutablesOptions, built: Bui
     const install = b.addInstallArtifact(client, .{});
     const help = "Build and install zcube-jepsen-client, the Jepsen battery's test-only client";
     b.step("jepsen-client", help).dependOn(&install.step);
+    add_register_barrier_step(b, options); // The other test-only executable.
     // `zig build test` also runs the battery's deployment recipe (`ops/jepsen/`) against these
     // executables through a fake systemctl; as a user other than root it skips (the recipe is
     // root's).
@@ -427,6 +455,17 @@ fn add_release_step(
     b.step("release", help).dependOn(&run.step);
 }
 
+/// Test-only (#237): a zcube-server that holds a node's registration before its transaction when
+/// ZCUBE_TEST_REGISTER_BARRIER names a directory (server_register_barrier.zig), for the
+/// zigcube-jepsen stale-registration test. `dist` and `release` never set it.
+fn register_barrier_option(b: *std.Build) bool {
+    return b.option(
+        bool,
+        "register-barrier",
+        "Build zcube-server with the test-only registration barrier (default false)",
+    ) orelse false;
+}
+
 /// The options of the executables a tarball ships: Linux with glibc 2.39 for `arch`, baseline
 /// CPU, ReleaseSafe, the C libraries linked from `lib_dir`, nothing installed.
 fn shipped_options(
@@ -453,6 +492,7 @@ fn shipped_options(
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "product", "zigcube");
+    options.addOption(bool, "register_barrier", false); // Never in a shipped binary.
     return .{
         .target = target,
         .optimize = optimize,
@@ -743,6 +783,32 @@ fn add_bench_watch_step(b: *std.Build, options: ExecutablesOptions) void {
     run.has_side_effects = true;
     run.setCwd(b.path("."));
     b.step("bench-watch", "Run the watch fan-out benchmark (50 agents, 2,000 assignments)")
+        .dependOn(&run.step);
+}
+
+/// `zig build public-tls-check`: C5 slice 1's browser check (docs/mtls.md, "The public path"):
+/// a test-only listener on the server's public path (src/public_tls_listener.zig) and real
+/// Chromium, with the listener's test CA in its trust store, completing a handshake to it
+/// (tools/public_tls_check.mjs). Needs Node and Playwright's Chromium and `certutil`; never
+/// cached, not in `check` (CI's mtls-interop job runs it).
+fn add_public_tls_check_step(b: *std.Build, options: ExecutablesOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "public_tls_listener",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/public_tls_listener.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.options.createModule() },
+                .{ .name = "zigbox", .module = options.zigbox },
+            },
+        }),
+    });
+    const run = b.addSystemCommand(&.{ "node", "--no-warnings", "tools/public_tls_check.mjs" });
+    run.addArtifactArg(exe);
+    run.has_side_effects = true;
+    run.setCwd(b.path("."));
+    b.step("public-tls-check", "Check that Chromium completes a handshake on the public path")
         .dependOn(&run.step);
 }
 
@@ -1899,6 +1965,16 @@ const c1_teeth_roots = [_]struct {
         .canary_seeds = 50,
     },
     .{
+        .name = "register_unchecked",
+        .root = "src/sim_c1_teeth_register_unchecked_main.zig",
+        // I1b: the stale registration's lease expires with the agent quiet or cut off, the node
+        // is marked lost and its replicas are replaced while the agent still runs them (23 of
+        // 40 seeds). The other seeds end in a liveness failure; the canary needs I1b itself.
+        .symptom = "I1b",
+        .canary_seeds = 40,
+        .any_symptom = true,
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         // J11 (a run that exited without a node starting it); the reuse world
@@ -1942,15 +2018,18 @@ const c1_teeth_roots = [_]struct {
         // by about one seed in a hundred: seed 32 until B2.1 slice 6 (#205: a failing step no
         // longer aborts the pass) shifted the world, then seed 186 (1..2000 searched up to the
         // first hit; docs/decisions/2026-11-11-job-evicted-tooth-sparse.md), then seed 241 after
-        // #225's fix (docs/decisions/2026-11-13-job-evicted-tooth-seed-241.md). CI's run ends
-        // there, and the fleet canary runs seed 241 alone at 300 operations (fresh seeds at
-        // drawn operations would take hours for a one-in-a-hundred hit). A sparse tooth:
-        // widening its world so more seeds hit is B3 work. Seed 241 passes with the fault off.
+        // #225's fix (docs/decisions/2026-11-13-job-evicted-tooth-seed-241.md), then seed 284
+        // after #237's registration order
+        // (docs/decisions/2026-11-18-job-evicted-tooth-seed-284.md).
+        // CI's run ends there, and the fleet canary runs seed 284 alone at 300 operations (fresh
+        // seeds at drawn operations would take hours for a one-in-a-hundred hit). A sparse
+        // tooth: widening its world so more seeds hit is B3 work. Seed 284 passes with the fault
+        // off.
         .symptom = "J8: a run that no node started",
         .canary_seeds = 1,
-        .canary_first = 241,
-        .first_seed = 241,
-        .seeds = 241,
+        .canary_first = 284,
+        .first_seed = 284,
+        .seeds = 284,
         .ops = 300,
     },
     .{
@@ -2009,7 +2088,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_c1_comparison(b, sim, exe, step, nodes_text, false);
     add_c1_comparison(b, sim, exe, step, nodes_text, true);
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 33 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 34 fault-on sim-c1 runners");
     const shard = teeth_shard(b, teeth);
     for (c1_teeth_roots, 0..) |entry, index| {
         // CI's shards (`-Dteeth-shard=K -Dteeth-shards=N`) take every Nth tooth from K, so their
@@ -2052,6 +2131,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_worlds_step(b, sim);
     add_reuse_step(b, sim);
     add_signed_step(b, sim);
+    add_late_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
@@ -2459,6 +2539,26 @@ fn add_signed_step(b: *std.Build, sim: SimStepOptions) void {
     const step = b.step("sim-c1-signed", signed_help);
     const seeds: SeedRanges = .{ .first = 1, .last = signed_seeds_max, .per_run = 5 };
     add_seed_ranges(b, step, exe, seeds, &.{ "auto", "--c1", "--signed", "--profile=auto" });
+}
+
+/// `zig build sim-c1-late` (#237): the cluster simulation with the late registration of the
+/// `register_unchecked` tooth's world on and the fix in (the lease order): every check holds on
+/// seeds 1 to 40, and the report shows the stale registrations landing (refused).
+fn add_late_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_late",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "--seeds", "1..40", "100", "--c1", "--late-registration" });
+    run.expectExitCode(0);
+    b.step("sim-c1-late", "Run sim-c1 with late registrations (#237) and the fix in")
+        .dependOn(&run.step);
 }
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long
@@ -2942,10 +3042,10 @@ fn add_check_step(b: *std.Build) void {
     run.addArgs(&.{ b.graph.zig_exe, user });
     run.has_side_effects = true;
     const gates = [_][]const u8{
-        "install",            "test",          "tidy",          "errors-site-check",
-        "wasm-check",         "wasm-test",     "console-wasm",  "check-store-memory",
-        "check-store-sqlite", "mtls-teeth",    "demo-b3-build", "demo-b5-build",
-        "demos-build",        "jepsen-client",
+        "install",            "test",          "tidy",                   "errors-site-check",
+        "wasm-check",         "wasm-test",     "console-wasm",           "check-store-memory",
+        "check-store-sqlite", "mtls-teeth",    "demo-b3-build",          "demo-b5-build",
+        "demos-build",        "jepsen-client", "register-barrier-build",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);

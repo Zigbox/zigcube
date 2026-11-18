@@ -38,7 +38,7 @@ const header_bytes = constants.tls_record_header_bytes;
 const records_max = 32;
 const content_ccs: u8 = @backingInt(schedule.ContentType.change_cipher_spec);
 
-const Mutation = enum {
+pub const Mutation = enum {
     none,
     flip_bit,
     truncate,
@@ -114,7 +114,7 @@ fn copy_records(out: []u8, bytes: []const u8, starts: []const u32, order: []cons
 }
 
 /// Writes `bytes` damaged by `kind` into `out` and returns its length.
-fn mutate(random: std.Random, kind: Mutation, bytes: []const u8, out: []u8) usize {
+pub fn mutate(random: std.Random, kind: Mutation, bytes: []const u8, out: []u8) usize {
     var starts: [records_max + 1]u32 = undefined;
     const count = record_starts(bytes, &starts);
     var order: [records_max + 1]u32 = undefined;
@@ -234,7 +234,7 @@ fn is_good_ccs(record: []const u8) bool {
 /// The hello the server read is the client's: the same records, the same order, then at most
 /// one well-formed change_cipher_spec (which a client may send before its flight) and nothing
 /// else. Returns how many change_cipher_spec records followed, or null when the hello is not whole.
-fn hello_whole(original: []const u8, damaged: []const u8) ?u32 {
+pub fn hello_whole(original: []const u8, damaged: []const u8) ?u32 {
     var original_starts: [records_max + 1]u32 = undefined;
     var damaged_starts: [records_max + 1]u32 = undefined;
     const count = record_starts(original, &original_starts);
@@ -257,7 +257,7 @@ fn hello_whole(original: []const u8, damaged: []const u8) ?u32 {
 /// The records of `damaged` begin with the protected records of `original`, in order, with at
 /// most one well-formed change_cipher_spec among them and the `ccs_before` the hello carried,
 /// and nothing else.
-fn flight_whole(original: []const u8, damaged: []const u8, ccs_before: u32) bool {
+pub fn flight_whole(original: []const u8, damaged: []const u8, ccs_before: u32) bool {
     var original_starts: [records_max + 1]u32 = undefined;
     var damaged_starts: [records_max + 1]u32 = undefined;
     const original_count = record_starts(original, &original_starts);
@@ -418,7 +418,7 @@ fn random_faults(
 }
 
 /// One wrong knob of the ClientHello, `knob` in 0..11 (`random_faults`).
-fn wrong_hello(
+pub fn wrong_hello(
     random: std.Random,
     browser: bool,
     knob: u32,

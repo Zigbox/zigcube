@@ -128,6 +128,9 @@ jobs:
       # The Jepsen battery's client is test-only and outside the default build (docs/jepsen.md).
       - name: Build the Jepsen client
         run: zig build jepsen-client
+      # zcube-server with the test-only registration barrier (#237), compiled, never shipped.
+      - name: Build the registration barrier
+        run: zig build register-barrier-build
       - name: Unit and snapshot tests
         run: zig build test --summary all
       # The golden files of every ZC- code are checked by the tests above (and embedded at compile
@@ -492,8 +495,9 @@ jobs:
           # One node, bursts of short jobs (#198): J8 must hold on a correct agent. The
           # deadline-offline tooth's world (long cuts, short deadlines). The runs-unread world
           # (runs read cut while a stop is asked, keepalives answered): the job fence holds J6.
+          # #237's world (stale registrations delivered late): every one is refused.
           - part: burst
-            steps: sim-c1-burst sim-c1-offline sim-c1-runs-unread
+            steps: sim-c1-burst sim-c1-offline sim-c1-runs-unread sim-c1-late
           # The job_evicted tooth's world (burst, strong, more than 512 runs). The job_reuse
           # tooth's world (retention jumps, names reused over stopped containers). B5's trust
           # world (signed jobs, node policies), 20 seeds at drawn shapes: J12 holds.
@@ -763,9 +767,10 @@ jobs:
           if-no-files-found: warn
 
   # Stock servers (openssl s_server, a JDK 21 SSLServerSocket) against the mTLS client. Test-only
-  # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md.
+  # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md. Then C5 slice 1's browser
+  # check (public-tls-check: real Chromium against the server's public path, docs/mtls.md).
   mtls-interop:
-    name: mtls-interop (openssl, JDK 21)
+    name: mtls-interop (openssl, JDK 21) and public-tls-check (Chromium)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.mtls_interop == 'true' }}
     runs-on: ubuntu-24.04
@@ -787,12 +792,30 @@ jobs:
           openssl version
           "$ZCUBE_JAVA_HOME/bin/java" -version
           zig build mtls-interop --summary all 2>&1 | tee mtls-interop.txt
+      # Playwright and its Chromium (the cloud container has both preinstalled; a runner does
+      # not), and NSS's certutil for the check's scratch certificate store.
+      - name: Playwright, Chromium and certutil
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm install --no-save --no-audit --no-fund playwright@1.63.0
+          sudo npx playwright install-deps chromium
+          npx playwright install chromium
+          sudo apt-get install -y libnss3-tools
+          echo "NODE_PATH=$RUNNER_TEMP/pw/node_modules" >> "$GITHUB_ENV"
+      - name: public-tls-check
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: zig build public-tls-check --summary all 2>&1 | tee public-tls-check.txt
       - name: Keep the output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mtls-interop-output
-          path: mtls-interop.txt
+          path: |
+            mtls-interop.txt
+            public-tls-check.txt
           if-no-files-found: warn
 
   # The Jepsen battery's tarball and its Postgres recipe (docs/jepsen.md,
