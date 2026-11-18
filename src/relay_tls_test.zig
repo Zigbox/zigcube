@@ -430,18 +430,13 @@ fn tls_copy_once(seed: u64) !void {
     var got: [fuzz_bytes_max]u8 = undefined;
     var written: usize = 0;
     var read: usize = 0;
-    // The deadline bounds the time without progress, not the whole stream: every byte that moves
-    // either way pushes it out. A stream of up to three relay buffers through a one-byte receive
-    // buffer, with pauses on both sides, can take longer than `deadline_ms` on a loaded machine;
-    // a byte lost or stuck still stops progress and fails as Timeout, and a byte repeated or out
-    // of order still fails as WrongBytes (docs/decisions/2026-11-17-ci-speed-shards.md). A second
-    // bound, `whole_ms`, does not move: a relay that trickles one byte per poll timeout would
-    // reset the first forever and still fails as Timeout.
+    // `end` bounds the time without progress (every byte moved pushes it out); `whole` does not
+    // move (docs/decisions/2026-11-17-ci-speed-shards.md).
     const whole = peer_stream.boot_ms(testing.io) + whole_ms;
     var end = end_in(testing.io);
     while (read < length) {
-        const now = peer_stream.boot_ms(testing.io);
-        if (now > end or now > whole) return error.Timeout;
+        const tick = peer_stream.boot_ms(testing.io);
+        if (tick > end or tick > whole) return error.Timeout;
         if (written < length) {
             const chunk = random.intRangeAtMost(usize, 1, @min(length - written, 3000));
             const flags = linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT;
