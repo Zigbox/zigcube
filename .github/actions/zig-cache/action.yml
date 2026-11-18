@@ -13,6 +13,13 @@ inputs:
   name:
     description: Which job's cache this is. One entry per job, so two jobs never race to save the same key.
     required: true
+  limit-mb:
+    description: >
+      Size past which a restored entry is dropped and the job starts cold. GitHub keeps 10 GB for
+      the repository (evicting the least recently used entries, and `main`'s with them), so the
+      limits of the jobs that use this action should add up to about that, or less; each pull
+      request also saves entries of its own.
+    default: "2000"
 runs:
   using: composite
   steps:
@@ -36,8 +43,13 @@ runs:
           zig-v2-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('.github/actions/setup-zig/action.yml') }}-
     # Zig never deletes from its cache, so a chain of restores that start from the previous entry
     # only grows. Past this size the restored entry is dropped and the job starts cold, which then
-    # saves a fresh, small entry. GitHub keeps 10 GB for the repository; five jobs use this
-    # action, so the entries stay under about 10 GB together.
+    # saves a fresh, small entry. GitHub keeps 10 GB for the repository and evicts the least
+    # recently used entries past it. Ten jobs use this action. The four jobs that are not
+    # sharded keep the 2000 MB limit (8 GB together); the six sharded ones (the sim-c1 teeth and
+    # the worlds, docs/decisions/2026-11-17-ci-speed-shards.md) pass 1000 MB, each holding only
+    # its share (the four teeth shards together were about 605 MB before the split). The limits
+    # are a ceiling on growth, not a measure: 14 GB if every entry reached it, which is why the
+    # sharded ones are lower than the rest.
     # No `if:` on the matched key: it is empty on a restore-key (prefix) hit, which is the normal
     # warm path after a source change. The step looks at the directories instead, and does
     # nothing when nothing was restored.
@@ -50,7 +62,7 @@ runs:
         # A cold start restored nothing; du exits non-zero on a missing path, which pipefail turns
         # into a failed step.
         mkdir -p ~/.cache/zig .zig-cache
-        limit_mb=2000
+        limit_mb=${{ inputs.limit-mb }}
         size_mb=$(du -smc ~/.cache/zig .zig-cache 2>/dev/null | tail -1 | cut -f1)
         echo "zig-cache: restored ${size_mb} MB (hit: ${{ steps.cache.outputs.cache-hit }}," \
           "key: ${{ steps.cache.outputs.cache-matched-key }})"

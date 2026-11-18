@@ -618,4 +618,5 @@ no registration is I7's. `sim-c1-teeth-placement_exclusive` (`c1_teeth.placement
 (`c1_teeth.relabel_kept`, which implies `--tenants`) turns off the controllers' relabel eviction and must
 fail P1.
 
-`zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.
+`zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`). It does not run `sim-c1-teeth`;
+CI's `sim-c1-teeth` shards do.
