@@ -786,6 +786,34 @@ comptime {
     assert(tls_output_bytes_max < tls_record_plaintext_bytes_max);
 }
 
+// ---- The edge's public TLS mode and host names (docs/briefs/c5.md, slice 1) -------------------
+
+/// A canonical host name: at most 253 bytes (RFC 1035, without the trailing dot).
+pub const edge_host_bytes_max: u32 = 253;
+/// A DNS label: 1 to 63 bytes.
+pub const edge_host_label_bytes_max: u32 = 63;
+/// The longest name `edge_host` reads before it refuses it as too long: room for a Unicode
+/// spelling (up to four bytes per character) of a name whose punycode fits, and a `:443`.
+pub const edge_host_input_bytes_max: u32 = 4 * edge_host_bytes_max + 8;
+/// A public chain: the leaf and up to two intermediates (a Let's Encrypt chain is the leaf and
+/// one intermediate; a cross-signed one adds a second).
+pub const edge_chain_certificates_max: u32 = 3;
+/// One certificate of a public chain, DER. A Let's Encrypt ECDSA leaf with 100 names is under
+/// 4 KiB; an intermediate is about 1.3 KiB.
+pub const edge_certificate_bytes_max: u32 = 4096;
+/// The whole chain's DER. With the rest of the server's flight it fits one 16 KiB record.
+pub const edge_chain_bytes_max: u32 = 8192;
+/// Host names one public listener serves (the SNI table's rows).
+pub const edge_hosts_max: u32 = 1024;
+
+comptime {
+    assert(edge_host_label_bytes_max < edge_host_bytes_max);
+    assert(edge_host_bytes_max <= 255); // SNI's HostName and a one-byte length hold it.
+    assert(edge_certificate_bytes_max <= edge_chain_bytes_max);
+    assert(edge_chain_certificates_max >= 2);
+    assert(edge_chain_bytes_max + 4096 < tls_record_plaintext_bytes_max);
+}
+
 comptime {
     assert(peer_handshakes_max > peer_connections_max);
     assert(peer_handshakes_pending_per_source_max > 1);
