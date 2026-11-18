@@ -32,7 +32,8 @@ key is on the lease it renews (ZC-E0205), so that agent now fences at its next r
    committed between its read and its write is then the agent's to retry on its next step.
 2. **Why the order is enough.** The #237 PUT is an earlier attempt, so its lease is older than
    the one the agent registered on next: lease ids only grow (SQLite `AUTOINCREMENT`, a Postgres
-   identity column, the memory store's counter; a conformance test), and an agent grants its
+   identity column, the memory store's counter; a conformance test, and a SQLite test that
+   deletes every lease, reopens the file and grants again), and an agent grants its
    lease before it sends. Every legitimate retry (a lost reply, a crash before the agent
    recorded the tenure, a server restart, a wiped state directory) carries a lease at least as
    new as the key's and is accepted at once.
@@ -106,7 +107,8 @@ held one, released, meets the key on the newer lease and comes back refused (ZC-
 every other build ignores `ZCUBE_TEST_REGISTER_BARRIER` and compiles none of it, and `dist` and
 `release` set the option false. `Server.Options.hook` is null in every shipped server. The unit
 test `server_register_barrier_test.zig` runs it in a real server (arm, hold, a newer registration
-landing during the hold, release, `done`), so a change that breaks it fails `zig build test`.
+landing during the hold, release, `done`), so a change that breaks it fails `zig build test`;
+`zig build register-barrier-build` compiles the gated server (in `check` and CI's check job).
 
 ## The tooth
 

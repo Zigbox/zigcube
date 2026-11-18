@@ -617,7 +617,7 @@ test "a report that is not this node's own, or not one transaction, is refused" 
     // Goal: an agent cannot write another node's keys, nor a key that is not its record's, nor a
     // transaction the store would assert on. Method: one bad report per rule; the revision
     // must not move.
-    var rig = try Rig.start(6);
+    var rig = try Rig.start(7);
     defer rig.stop();
     try rig.join("node2");
     const before = try rig.revision();
@@ -683,7 +683,7 @@ test "a report that is not this node's own, or not one transaction, is refused" 
 test "a report whose record does not name the request's tenure is refused" {
     // Goal: a record with no tenure would read as C0 and bypass the controller's admissibility
     // gate (authority.md section 3). Method: a record without one, and one with another tenure.
-    var rig = try Rig.start(6);
+    var rig = try Rig.start(7);
     defer rig.stop();
     try rig.join("node2");
     const before = try rig.revision();

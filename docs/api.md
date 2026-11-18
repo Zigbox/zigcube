@@ -826,10 +826,14 @@ Registers the node: the server writes `/nodes/<node>` on the lease, in the recor
 **A registration on a lease older than the one `/nodes/<node>` is on is `ZC-E0510`** and moves
 nothing (#237): it is an earlier attempt that was delayed on the wire and landed after a newer
 one, and accepting it would move the key onto a lease nobody renews. A key that is absent, or on
-the registration's own or an older lease, is written (the agent's own retry after a lost reply
-always carries a lease at least as new). The read and the write are one transaction, compared on
-the revision read, so a registration that races another is refused the same way. The rule needs
-nothing in the body, so an agent of any version is held to it and there is no upgrade order. A
+an older lease, is written. A registration on the key's own lease with the same body is a copy of
+the one already accepted (the agent grants a fresh lease for every attempt, so only a duplicated
+request repeats one): it is answered with the key's revision and writes nothing. The read and the
+write are one transaction, compared on the revision read: if the key changes in between (its
+lease ends, or, once a second server shares the store, another registration lands) the
+registration is `ZC-E0510` as well. The rule needs nothing in the body, so every agent is held to
+it. An agent built before the rule panics on that `ZC-E0510` (`ZC-B0001`, exit 70) and registers
+again on a new lease when its supervisor restarts it; the decision says when that can happen. A
 keepalive of a lease the node's key is not on is `ZC-E0205` (the lease is an orphan: the agent
 grants again and registers again). `docs/decisions/2026-11-18-registration-lease-order.md`.
 

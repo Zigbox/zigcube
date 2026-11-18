@@ -306,6 +306,31 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
     return built;
 }
 
+/// `zig build register-barrier-build`: compiles (installs nothing) a zcube-server with the
+/// test-only registration barrier on, the build the zigcube-jepsen test runs, so the gated code
+/// in `zcube_server.zig` cannot rot unseen. `check` and CI's check job run it.
+fn add_register_barrier_step(b: *std.Build, shared: ExecutablesOptions) void {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    options.addOption([]const u8, "product", "zigcube");
+    options.addOption(bool, "register_barrier", true);
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/zcube_server.zig"),
+        .target = shared.target,
+        .optimize = shared.optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = options.createModule() },
+            .{ .name = "zigbox", .module = shared.zigbox },
+            .{ .name = "sqlite_c", .module = shared.sqlite },
+            .{ .name = "libpq_c", .module = shared.libpq },
+            .{ .name = "web_files", .module = shared.web_files },
+        },
+    });
+    const exe = b.addExecutable(.{ .name = "zcube-server-barrier", .root_module = module });
+    const help = "Compile zcube-server with the test-only registration barrier (#237)";
+    b.step("register-barrier-build", help).dependOn(&exe.step);
+}
+
 /// `zig build jepsen-client`: zcube-jepsen-client, the Jepsen battery's test-only client
 /// (src/zcube_jepsen_client.zig, docs/jepsen.md), installed in the mode `-Doptimize` names. It is
 /// not part of `zig build`: the shipped executables do not grow for it.
@@ -314,6 +339,7 @@ fn add_jepsen_client_step(b: *std.Build, options: ExecutablesOptions, built: Bui
     const install = b.addInstallArtifact(client, .{});
     const help = "Build and install zcube-jepsen-client, the Jepsen battery's test-only client";
     b.step("jepsen-client", help).dependOn(&install.step);
+    add_register_barrier_step(b, options); // The other test-only executable.
     // `zig build test` also runs the battery's deployment recipe (`ops/jepsen/`) against these
     // executables through a fake systemctl; as a user other than root it skips (the recipe is
     // root's).
@@ -428,8 +454,6 @@ fn add_release_step(
     b.step("release", help).dependOn(&run.step);
 }
 
-/// The options of the executables a tarball ships: Linux with glibc 2.39 for `arch`, baseline
-/// CPU, ReleaseSafe, the C libraries linked from `lib_dir`, nothing installed.
 /// Test-only (#237): a zcube-server that holds a node's registration before its transaction when
 /// ZCUBE_TEST_REGISTER_BARRIER names a directory (server_register_barrier.zig), for the
 /// zigcube-jepsen stale-registration test. `dist` and `release` never set it.
@@ -441,6 +465,8 @@ fn register_barrier_option(b: *std.Build) bool {
     ) orelse false;
 }
 
+/// The options of the executables a tarball ships: Linux with glibc 2.39 for `arch`, baseline
+/// CPU, ReleaseSafe, the C libraries linked from `lib_dir`, nothing installed.
 fn shipped_options(
     b: *std.Build,
     arch: std.Target.Cpu.Arch,
@@ -2970,10 +2996,10 @@ fn add_check_step(b: *std.Build) void {
     run.addArgs(&.{ b.graph.zig_exe, user });
     run.has_side_effects = true;
     const gates = [_][]const u8{
-        "install",            "test",          "tidy",          "errors-site-check",
-        "wasm-check",         "wasm-test",     "console-wasm",  "check-store-memory",
-        "check-store-sqlite", "mtls-teeth",    "demo-b3-build", "demo-b5-build",
-        "demos-build",        "jepsen-client",
+        "install",            "test",          "tidy",                   "errors-site-check",
+        "wasm-check",         "wasm-test",     "console-wasm",           "check-store-memory",
+        "check-store-sqlite", "mtls-teeth",    "demo-b3-build",          "demo-b5-build",
+        "demos-build",        "jepsen-client", "register-barrier-build",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);

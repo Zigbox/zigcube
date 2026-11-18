@@ -224,17 +224,26 @@ than the registration's, and otherwise writes in one transaction that compares t
 read (or absent). A registration that was delayed on the wire and arrives after a newer one
 finds the key on a newer lease and is refused; without the rule it would move the key onto
 its own lease, which nobody renews, and the node would be lost while its agent still ran its
-replicas (I1b). A key on the registration's own or an older lease was written by the agent's own
-earlier attempt (a lost reply, a crash before it recorded the tenure), and the retry is accepted.
-The rule needs nothing from the agent, so agents of every version are held to it. **Lease ids only grow
+replicas (I1b). A key on an older lease is a tenure the agent left behind (its lease was fenced or
+lapsed while the key stood) and is replaced. The agent grants a fresh lease for every attempt, so a
+registration on the key's own lease is a duplicated copy of the accepted one: it is answered with
+the key's revision and writes nothing, so it cannot move the tenure the agent holds. If the key
+changes between the read and the write, the compare refuses the registration (ZC-E0510): within
+one server only a lease's end (`expire_leases`, which does not take the API's write lock) gets
+between them today; the compare also guards a second server on the store (C7). The rule needs
+nothing from the agent, so every agent is held to it; one built before it panics on the refusal
+and is restarted by its supervisor (the decision's "Old agents"). **Lease ids only grow
 within one store's history** (SQLite `AUTOINCREMENT`, a Postgres identity column, the memory
-counter; the conformance test checks one store process) and a registration's lease is granted
-before it is sent. That does not hold through an async failover that loses only lease grants
-(`VerifiedStore` sees no revision or chain-hash change, so ZC-E0215 does not halt it, and the
-promoted standby reissues those ids) nor after an operator accepts a rollback. It does not reach
-I1b: a registration in flight across such a failover is narrow, and if one lands on a reissued id
-it moves its node's key onto another node's lease, but the agent's next attempt grants a newer id
-and is accepted, which replaces the key. The bound is the agent's next step. The lease keepalive requires that the node's key is on the lease it
+counter; the conformance test checks one store process, and a SQLite test a reopened file) and a
+registration's lease is granted before it is sent. That does not hold through an async failover
+that loses only lease grants (`VerifiedStore` sees no revision or chain-hash change, so ZC-E0215
+does not halt it, and the promoted standby reissues those ids) nor after an operator accepts a
+rollback. It does not reach I1b: a registration in flight across such a failover is narrow. If it
+carries an id now reissued to another node that has registered on it, `lease_not_elsewhere`
+refuses it. If that node has not registered yet, the late registration lands on its lease, the
+other node's registration on that id is then refused by the same check, so neither node holds a
+tenure on the other's lease, and the late agent's next attempt grants a newer id and is accepted, which replaces the key. The bound is
+the agent's next step. The lease keepalive requires that the node's key is on the lease it
 renews, so an agent whose registration was overtaken stops renewing at once and fences (ZC-E0205).
 `docs/decisions/2026-11-18-registration-lease-order.md`.
 
