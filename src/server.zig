@@ -44,6 +44,9 @@ pub const Options = struct {
     report_failures: bool = true,
     /// Log requests to stderr; tests turn it off.
     log_requests: bool = true,
+    /// Test-only (#237): hold the next registration of a node before its transaction
+    /// (server_register_barrier.zig). Null in every shipped server.
+    register_barrier: ?[]const u8 = null,
 };
 
 pub const Server = struct {
@@ -101,6 +104,7 @@ pub const Server = struct {
             return error.StartFailed;
         };
         errdefer backend.close();
+        if (options.register_barrier) |dir| try backend.arm_register_barrier(io, dir);
         const server = try gpa.create(Server);
         errdefer gpa.destroy(server);
         server.* = try init_value(gpa, io, backend, config, options);

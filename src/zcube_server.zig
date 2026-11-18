@@ -120,6 +120,15 @@ fn issue(init: std.process.Init, request: *const config_mod.Issue) u8 {
     return say(init.io, line);
 }
 
+/// Test-only (#237): the directory of the registration barrier, in a server built with
+/// `-Dregister-barrier=true` (server_register_barrier.zig). A shipped server never reads it.
+fn register_barrier(init: std.process.Init) ?[]const u8 {
+    if (!build_options.register_barrier) return null;
+    const dir = init.environ_map.get("ZCUBE_TEST_REGISTER_BARRIER") orelse return null;
+    if (dir.len == 0) return null;
+    return dir;
+}
+
 fn run(init: std.process.Init, config: config_mod.Config) u8 {
     verbose_panics = config.verbose;
     const limit = constants.http_connections_max + constants.http_refusals_max +
@@ -131,6 +140,7 @@ fn run(init: std.process.Init, config: config_mod.Config) u8 {
     diag.reset();
     const server = server_mod.Server.start(init.gpa, io, config, .{
         .version = build_options.version,
+        .register_barrier = register_barrier(init),
     }, &diag) catch |err| switch (err) {
         error.OutOfMemory => return constants.exit_environment,
         error.Canceled => return constants.exit_ok, // Stopped on request: nothing to report.

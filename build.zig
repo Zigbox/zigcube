@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     // Zigbox's package has a `build_options` module of its own; if the two files were byte for
     // byte the same, the compiler would see one file in two modules. This line keeps them apart.
     options.addOption([]const u8, "product", "zigcube");
+    options.addOption(bool, "register_barrier", register_barrier_option(b));
 
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
     const zigbox_module = zigbox.module("zigbox");
@@ -429,6 +430,17 @@ fn add_release_step(
 
 /// The options of the executables a tarball ships: Linux with glibc 2.39 for `arch`, baseline
 /// CPU, ReleaseSafe, the C libraries linked from `lib_dir`, nothing installed.
+/// Test-only (#237): a zcube-server that holds a node's registration before its transaction when
+/// ZCUBE_TEST_REGISTER_BARRIER names a directory (server_register_barrier.zig), for the
+/// zigcube-jepsen stale-registration test. `dist` and `release` never set it.
+fn register_barrier_option(b: *std.Build) bool {
+    return b.option(
+        bool,
+        "register-barrier",
+        "Build zcube-server with the test-only registration barrier (default false)",
+    ) orelse false;
+}
+
 fn shipped_options(
     b: *std.Build,
     arch: std.Target.Cpu.Arch,
@@ -453,6 +465,7 @@ fn shipped_options(
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "product", "zigcube");
+    options.addOption(bool, "register_barrier", false); // Never in a shipped binary.
     return .{
         .target = target,
         .optimize = optimize,
@@ -1899,6 +1912,16 @@ const c1_teeth_roots = [_]struct {
         .canary_seeds = 50,
     },
     .{
+        .name = "register_unchecked",
+        .root = "src/sim_c1_teeth_register_unchecked_main.zig",
+        // I1b: the stale registration's lease expires with the agent quiet or cut off, the node
+        // is marked lost and its replicas are replaced while the agent still runs them (22 of
+        // 40 seeds). The other seeds end in a liveness failure; the canary needs I1b itself.
+        .symptom = "I1b",
+        .canary_seeds = 40,
+        .any_symptom = true,
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         // J11 (a run that exited without a node starting it); the reuse world
@@ -2036,6 +2059,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_worlds_step(b, sim);
     add_reuse_step(b, sim);
     add_signed_step(b, sim);
+    add_late_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
@@ -2443,6 +2467,26 @@ fn add_signed_step(b: *std.Build, sim: SimStepOptions) void {
     const step = b.step("sim-c1-signed", signed_help);
     const seeds: SeedRanges = .{ .first = 1, .last = signed_seeds_max, .per_run = 5 };
     add_seed_ranges(b, step, exe, seeds, &.{ "auto", "--c1", "--signed", "--profile=auto" });
+}
+
+/// `zig build sim-c1-late` (#237): the cluster simulation with the late registration of the
+/// `register_unchecked` tooth's world on and the fix in (the lease order): every check holds on
+/// seeds 1 to 40, and the report shows the stale registrations landing (refused).
+fn add_late_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_late",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "--seeds", "1..40", "100", "--c1", "--late-registration" });
+    run.expectExitCode(0);
+    b.step("sim-c1-late", "Run sim-c1 with late registrations (#237) and the fix in")
+        .dependOn(&run.step);
 }
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long

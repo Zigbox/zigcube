@@ -78,6 +78,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <h2>What it means</h2>
 <p>A lease holds keys alive for as long as its owner keeps renewing it. This one is gone: it ran out of time (the owner could not reach the store in time) or someone revoked it. The keys attached to it were deleted.</p>
 <p>A node agent that sees this has lost its place in the cluster. It stops its workloads, grants a new lease and registers again.</p>
+<p>The same code answers a keepalive for a lease the node's registration is not on, and a registration made on a lease that is gone. The first means a later registration took the node: the agent fences, as above.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0205</pre>

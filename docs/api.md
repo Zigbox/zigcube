@@ -823,6 +823,16 @@ Registers the node: the server writes `/nodes/<node>` on the lease, in the recor
 `lease` and `capacity` are required, and both capacity numbers must be above 0. Answer
 `{"revision": 431}`. A lease that is not the store's is `ZC-E0205`.
 
+**A registration on a lease older than the one `/nodes/<node>` is on is `ZC-E0510`** and moves
+nothing (#237): it is an earlier attempt that was delayed on the wire and landed after a newer
+one, and accepting it would move the key onto a lease nobody renews. A key that is absent, or on
+the registration's own or an older lease, is written (the agent's own retry after a lost reply
+always carries a lease at least as new). The read and the write are one transaction, compared on
+the revision read, so a registration that races another is refused the same way. The rule needs
+nothing in the body, so an agent of any version is held to it and there is no upgrade order. A
+keepalive of a lease the node's key is not on is `ZC-E0205` (the lease is an orphan: the agent
+grants again and registers again). `docs/decisions/2026-11-18-registration-lease-order.md`.
+
 ### `PUT /v1/agent/nodes/{node}/store` (C2 slice 5)
 
 Writes the node's image summary, `/node-store/<node>` of keys.md, bound to the node's lease. The body

@@ -15,6 +15,7 @@ const store = @import("store.zig");
 const MemoryStore = @import("store_memory.zig").MemoryStore;
 const PostgresStore = @import("store_postgres.zig").PostgresStore;
 const SqliteStore = @import("store_sqlite.zig").SqliteStore;
+const RegisterBarrier = @import("server_register_barrier.zig").Barrier;
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -41,6 +42,8 @@ pub const Backend = struct {
     gpa: Allocator,
     real: RealClock,
     kind: Kind,
+    /// Test-only (#237): the registration barrier in front of the store, when armed.
+    barrier: ?*RegisterBarrier = null,
 
     const Kind = union(enum) {
         memory: struct { memory: *MemoryStore, locked: *Locked },
@@ -60,6 +63,7 @@ pub const Backend = struct {
         errdefer gpa.destroy(backend);
         backend.gpa = gpa;
         backend.real = .{ .io = io };
+        backend.barrier = null;
         const time = backend.real.clock();
         switch (spec) {
             .memory => {
@@ -106,10 +110,31 @@ pub const Backend = struct {
                 gpa.destroy(postgres);
             },
         }
+        if (backend.barrier) |barrier| gpa.destroy(barrier);
         gpa.destroy(backend);
     }
 
+    /// Test-only (#237): puts the registration barrier in front of the store; every `handle`
+    /// after it goes through the barrier. Once per process, before the server serves.
+    pub fn arm_register_barrier(
+        backend: *Backend,
+        io: std.Io,
+        dir: []const u8,
+    ) error{OutOfMemory}!void {
+        assert(backend.barrier == null);
+        const barrier = try backend.gpa.create(RegisterBarrier);
+        _ = barrier.install(backend.raw(), io, dir);
+        backend.barrier = barrier;
+    }
+
     pub fn handle(backend: *Backend) Store {
+        if (backend.barrier) |barrier| {
+            return .{ .context = barrier.inner.context, .vtable = &barrier.vtable };
+        }
+        return backend.raw();
+    }
+
+    fn raw(backend: *Backend) Store {
         return switch (backend.kind) {
             .memory => |parts| parts.locked.interface(),
             .sqlite => |sqlite| sqlite.interface(),

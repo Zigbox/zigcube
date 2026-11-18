@@ -196,6 +196,71 @@ test "a node takes a lease, registers on it and renews it" {
     try testing.expectEqual(@as(i64, 10000), field(field(renewed, "lease"), "ttl_ms").integer);
 }
 
+test "a registration on a lease older than the key's is ZC-E0510 and moves nothing (#237)" {
+    // Goal: a registration PUT that lands after the agent's newer one cannot take the node key
+    // onto its own, abandoned lease, whatever the agent sends: the rule is the lease order, so an
+    // agent of any version is held to it. Method: register on L1, then on L2, then deliver L1's
+    // PUT again: refused, the store unchanged. Once L2 has ended and the key is gone, a
+    // registration on a newer lease fills it.
+    var rig = try Rig.start(4);
+    defer rig.stop();
+    var buffer: [512]u8 = undefined;
+    const first = try rig.grant("node2");
+    const second = try rig.grant("node2");
+    const early = try register_text(&buffer, first);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", early);
+    const newer = try register_text(&buffer, second);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", newer);
+    const before = try rig.revision();
+
+    const late = try register_text(&buffer, first);
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", late), 503, "ZC-E0510");
+    try testing.expectEqual(before, try rig.revision());
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
+    try testing.expectEqual(second, field(field(listed, "kvs").array.items[0], "lease").integer);
+
+    rig.world.advance(11_000);
+    const third = try rig.grant("node2");
+    const again = try register_text(&buffer, third);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", again);
+}
+
+test "a registration on the key's own lease or a newer one is accepted (#237)" {
+    // Goal: an agent whose registration landed but whose reply was lost retries, on the same
+    // lease or a newer one, and is not refused for a key its own attempt moved. Method: register
+    // on L2 twice (same lease), then on L3 (newer); a registration on L1 is then refused.
+    var rig = try Rig.start(6);
+    defer rig.stop();
+    var buffer: [512]u8 = undefined;
+    const first = try rig.grant("node2");
+    const second = try rig.grant("node2");
+    const body = try register_text(&buffer, second);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    const third = try rig.grant("node2");
+    const retry = try register_text(&buffer, third);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", retry);
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
+    try testing.expectEqual(third, field(field(listed, "kvs").array.items[0], "lease").integer);
+    const stale = try register_text(&buffer, first);
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", stale), 503, "ZC-E0510");
+}
+
+test "a keepalive of a lease the node's key is not on is ZC-E0205 (#237)" {
+    // Goal: an agent whose key moved to another lease must fence, not keep renewing. Method: two
+    // leases, the key on the second; renew the first.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    var buffer: [512]u8 = undefined;
+    const first = try rig.grant("node2");
+    const second = try rig.grant("node2");
+    const body = try register_text(&buffer, second);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    var path: [96]u8 = undefined;
+    try rig.refused(rig.call("POST", try keepalive_path(&path, first), "", ""), 503, "ZC-E0205");
+    _ = try rig.ok("POST", try keepalive_path(&path, second), "", "");
+}
+
 test "a lease that has ended is ZC-E0205, for a keepalive and for a registration" {
     // Goal: the agent learns its lease is gone from the diagnostic's code. Method: renew and
     // register on a lease the store never granted, and on one that has run out.
@@ -392,7 +457,7 @@ test "a report that is not this node's own, or not one transaction, is refused" 
     // Goal: an agent cannot write another node's keys, nor a key that is not its record's, nor a
     // transaction the store would assert on. Method: one bad report per rule; the revision
     // must not move.
-    var rig = try Rig.start(7);
+    var rig = try Rig.start(6);
     defer rig.stop();
     try rig.join("node2");
     const before = try rig.revision();
@@ -458,7 +523,7 @@ test "a report that is not this node's own, or not one transaction, is refused" 
 test "a report whose record does not name the request's tenure is refused" {
     // Goal: a record with no tenure would read as C0 and bypass the controller's admissibility
     // gate (authority.md section 3). Method: a record without one, and one with another tenure.
-    var rig = try Rig.start(7);
+    var rig = try Rig.start(6);
     defer rig.stop();
     try rig.join("node2");
     const before = try rig.revision();

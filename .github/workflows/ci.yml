@@ -492,8 +492,9 @@ jobs:
           # One node, bursts of short jobs (#198): J8 must hold on a correct agent. The
           # deadline-offline tooth's world (long cuts, short deadlines). The runs-unread world
           # (runs read cut while a stop is asked, keepalives answered): the job fence holds J6.
+          # #237's world (stale registrations delivered late): every one is refused.
           - part: burst
-            steps: sim-c1-burst sim-c1-offline sim-c1-runs-unread
+            steps: sim-c1-burst sim-c1-offline sim-c1-runs-unread sim-c1-late
           # The job_evicted tooth's world (burst, strong, more than 512 runs). The job_reuse
           # tooth's world (retention jumps, names reused over stopped containers). B5's trust
           # world (signed jobs, node policies), 20 seeds at drawn shapes: J12 holds.
