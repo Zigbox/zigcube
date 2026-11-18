@@ -207,10 +207,38 @@ fn job_state(ctx: *const Context, name: []const u8) Error!State {
         .health = health,
         .desired = if (ended) 0 else 1,
         .running = if (status.state == .running) 1 else 0,
-        .text = try controller.format(ctx, "job {s}: {s}{s}", .{
-            name, @tagName(status.state), try refused_phrase(ctx, &status),
+        .text = try controller.format(ctx, "job {s}: {s}{s}{s}", .{
+            name,
+            @tagName(status.state),
+            try refused_phrase(ctx, &status),
+            if (ended) try held_phrase(ctx, name, &status) else "",
         }),
     };
+}
+
+/// ", kept while its run is still assigned to node2 ..." when an ended job's run still has its
+/// assignment on the node that ran it: retention keeps the job, and its name stays taken, until
+/// the scheduler releases it (#243). A release that never comes is a node whose allocation the
+/// auditor cannot account for, so its open finding is named when there is one.
+fn held_phrase(
+    ctx: *const Context,
+    name: []const u8,
+    status: *const records.JobStatus,
+) Error![]const u8 {
+    const node = status.node orelse return "";
+    var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const id = records.job_run_id(&id_buffer, name);
+    const assigned_key = records.assigned_key(node, id);
+    const assigned = try ctx.store.get(ctx.arena, assigned_key.slice(), null, ctx.diag);
+    if (assigned.kv == null) return "";
+    const audit_key = records.audit_key(node);
+    const audit = try ctx.store.get(ctx.arena, audit_key.slice(), null, ctx.diag);
+    const finding: []const u8 = if (audit.kv == null)
+        ""
+    else
+        "; the allocation auditor has an open finding on that node (`zcube status`)";
+    return controller.format(ctx, ", kept while its run is still assigned to {s}: the " ++
+        "scheduler has not released it{s}", .{ node, finding });
 }
 
 /// ", refused by node2's trust policy" when the run ended refused (B5), else "": the cause and
@@ -1340,6 +1368,9 @@ const Scene = struct {
     diagnostic: ?[]const u8 = null,
     stop: ?records.RunStopCause = null,
     status: ?records.JobStatus = null,
+    /// The run's assignment still stands after the job ended (the scheduler has not released
+    /// it). A scene with no status, or one not ended, always has its assignment.
+    held: bool = false,
 };
 
 fn revision_of(world: *sim_world.World, key: []const u8) !u64 {
@@ -1366,7 +1397,11 @@ fn put_scene(world: *sim_world.World, scene: Scene) !void {
     }, "fits");
     try put_record(world, .api, records.job_key("train").slice(), train);
     try put_record(world, .job_controller, records.job_run_key("train").slice(), run);
-    try put_record(world, .scheduler, records.assigned_key("node1", "train-job").slice(), placed);
+    const ended = if (scene.status) |status| records.job_state_terminal(status.state) else false;
+    if (!ended or scene.held) {
+        const key = records.assigned_key("node1", "train-job");
+        try put_record(world, .scheduler, key.slice(), placed);
+    }
     if (scene.report) |status| {
         const report: records.JobObserved = .{
             .run = "train-job",
@@ -1582,6 +1617,45 @@ test "why job: a running job whose node is lost ends at the desired run" {
     );
     // The decision above it carries the answer to "why": the reason and the action.
     try testing.expectEqualStrings("the node was lost", result.steps[0].decision.?.reason);
+}
+
+test "why job: an ended job whose run is still assigned says why it is kept (#243)" {
+    // Retention keeps an ended job while its run's assignment stands, so its name stays taken;
+    // `why job` says so, and names the auditor's finding when the node's allocation has one (the
+    // case in which the scheduler cannot release it).
+    for ([_]bool{ false, true }, 0..) |finding, index| {
+        const world = try new_world(50 + index);
+        defer world.destroy();
+        if (finding) {
+            const none: records.Requests = .{ .cpu_millis = 0, .memory_bytes = 0 };
+            const tally: records.Tally = .{ .allocated = none, .count = 0 };
+            const audit: records.Audit = .{
+                .recorded = tally,
+                .reconstructed = tally,
+                .revision = 1,
+                .decision = "",
+            };
+            try put_record(world, .auditor, records.audit_key("node1").slice(), audit);
+        }
+        const result = try scene_chain(world, .{
+            .action = "end_job",
+            .reason = "the node was lost",
+            .cites = .run,
+            .held = true,
+            .status = .{
+                .state = .failed,
+                .node = "node1",
+                .end = .{ .kind = .failed, .cause = .@"unreachable" },
+                .ended_at_ms = 6,
+                .reported_at_ms = 6,
+            },
+        });
+        const kept = "job train: failed, kept while its run is still assigned to node1: the " ++
+            "scheduler has not released it";
+        const audited = kept ++ "; the allocation auditor has an open finding on that node " ++
+            "(`zcube status`)";
+        try testing.expectEqualStrings(if (finding) audited else kept, result.state.text);
+    }
 }
 
 test "why job: an ending with no agent report ends at the desired run" {

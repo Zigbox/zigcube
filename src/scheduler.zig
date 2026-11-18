@@ -764,7 +764,8 @@ pub const Scheduler = struct {
     holds: [hold_memory_max]Hold = @splat(.{ .replica = 0, .evidence = 0 }),
     holds_next: u32 = 0,
     /// The simulator's reuse world only (#243): while set, no run's assignment is released, as
-    /// when the scheduler is down. The server never sets it.
+    /// when the scheduler is down. It has no effect in a build without that world
+    /// (`c1_teeth.reuse_world` is comptime), so no server can hold its releases.
     runs_held: bool = false,
 
     pub fn init(instance: u16) Scheduler {
@@ -811,7 +812,7 @@ pub const Scheduler = struct {
         const assign = world.assigns.items[index];
         if (!assign.live) return;
         if (assign.job) {
-            if (sc.runs_held) return;
+            if (c1_teeth.reuse_world and sc.runs_held) return;
             return sc.release_run(ctx, world, pass, index);
         }
         if (world.desired.contains(assign.replica)) return;

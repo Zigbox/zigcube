@@ -600,7 +600,10 @@ const Call = struct {
         const assigned_key = records.assigned_key(call.node, id);
         const claim_key = records.job_observed_key(call.node, name);
         const input_key = records.job_input_key(name);
-        const keys = [_][]const u8{ assigned_key.slice(), claim_key.slice(), input_key.slice() };
+        const run_key = records.job_run_key(name);
+        const keys = [_][]const u8{
+            assigned_key.slice(), claim_key.slice(), input_key.slice(), run_key.slice(),
+        };
         // One revision for all three, so a claim and an input that were never there together
         // are not read together (RA-N3).
         const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
@@ -609,8 +612,10 @@ const Call = struct {
             slot.* = ctx.store.get(ctx.arena, key, head.revision, ctx.diag) catch
                 return propagate(ctx);
         }
-        // Only the node the run is assigned to, and only after it claimed the run.
-        if (found[0].kv == null) return no_input(ctx, name, .unassigned);
+        // Only the node the run is assigned to, and only after it claimed the run. An assignment
+        // an earlier job of the name left places none of this job's run (#243).
+        const assigned_kv = found[0].kv orelse return no_input(ctx, name, .unassigned);
+        if (Call.assignment_left(assigned_kv, found[3].kv)) return no_input(ctx, name, .left);
         if (found[1].kv == null) return no_input(ctx, name, .unclaimed);
         const input_kv = found[2].kv orelse return no_input(ctx, name, .missing);
         // A value that does not decode is a damaged input: the same ZC-E0523 as a mismatch.
@@ -694,8 +699,10 @@ const Call = struct {
         const status_key = records.job_status_key(name);
         const claim_key = records.job_observed_key(call.node, name);
         const assigned_key = records.assigned_key(call.node, id);
+        const run_key = records.job_run_key(name);
         const keys = [_][]const u8{
-            job_key.slice(), status_key.slice(), claim_key.slice(), assigned_key.slice(),
+            job_key.slice(),      status_key.slice(), claim_key.slice(),
+            assigned_key.slice(), run_key.slice(),
         };
         const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
         var found: [keys.len]store.GetResult = undefined;
@@ -715,12 +722,25 @@ const Call = struct {
                 return propagate(ctx)
         else
             null;
-        const assignment: ?job_cert.Assignment = if (found[3].kv) |kv|
-            .{ .node = call.node, .epoch = kv.mod_revision }
-        else
-            null;
+        // An assignment an earlier job of the name left is none of this run's (#243).
+        var assignment: ?job_cert.Assignment = null;
+        if (found[3].kv) |kv| {
+            if (!Call.assignment_left(kv, found[4].kv)) {
+                assignment = .{ .node = call.node, .epoch = kv.mod_revision };
+            }
+        }
         return job_cert.decide(job, status, claim, assignment, ask) catch |refusal|
             refused_certificate(ctx, name, refusal);
+    }
+
+    /// True if `placed` was left by an earlier job of the name: older than the run record read
+    /// at the same revision (`records.assignment_is_stale`, #243). With no run record the
+    /// assignment is judged by the callers' other reads, as before.
+    fn assignment_left(placed: store.KeyValue, run: ?store.KeyValue) bool {
+        // Test-only (`c1_teeth.job_reuse_assigned`): any incarnation's assignment serves.
+        if (c1_teeth.job_reuse_assigned) return false;
+        const run_kv = run orelse return false;
+        return records.assignment_is_stale(placed.mod_revision, run_kv.create_revision);
     }
 
     // ---- POST /v1/agent/nodes/{node}/job-observed ----
@@ -768,6 +788,7 @@ const Call = struct {
                 return bad_request(ctx, "run_revision", "is needed to claim a run");
             }
             if (input.observed_revision != 0) try call.replaced_is_stale(name, input);
+            if (try call.claim_is_stale(name, input)) return call.job_refused(input.tenure);
             set = .{};
             const assignment = rec.assignment;
             compare_sets.job_claim(
@@ -789,6 +810,23 @@ const Call = struct {
         if (!result.succeeded) return call.job_refused(input.tenure);
         const pair = try call.chain_written(result);
         return reply(ctx, .{ .revision = result.revision, .applied = true, .chain = pair });
+    }
+
+    /// True if the claim names an assignment older than the run it claims: one an earlier job of
+    /// the same name left (`records.assignment_is_stale`, #243). It is refused as a failed
+    /// compare (`applied: false`), which every agent version takes as "read again", so no agent
+    /// starts a reused name's run under the old assignment. The run is read at the head; the
+    /// claim's compare on `run_revision` then pins the record whose `create_revision` was judged.
+    fn claim_is_stale(call: Call, name: []const u8, input: JobObservedBody) Failure!bool {
+        // Test-only (`c1_teeth.job_reuse_assigned`): a stale assignment is claimed.
+        if (c1_teeth.job_reuse_assigned) return false;
+        const ctx = call.ctx;
+        const run_key = records.job_run_key(name);
+        const run = ctx.store.get(ctx.arena, run_key.slice(), null, ctx.diag) catch
+            return propagate(ctx);
+        const run_kv = run.kv orelse return false; // Gone: the claim's compare refuses it.
+        if (run_kv.mod_revision != input.run_revision) return false; // Moved: the same.
+        return records.assignment_is_stale(input.value.assignment, run_kv.create_revision);
     }
 
     /// A claim that replaces an observation (`observed_revision`) may replace only a leftover of
@@ -1416,12 +1454,13 @@ fn no_input(ctx: *const Context, name: []const u8, why: InputWhy) Failure {
     switch (why) {
         .missing => @import("agent_jobs.zig").raise_input(ctx.diag, name, .absent),
         .damaged => @import("agent_jobs.zig").raise_input(ctx.diag, name, .mismatch),
-        .unassigned, .unclaimed => {
+        .unassigned, .left, .unclaimed => {
             ctx.diag.raise(.E0133);
-            if (why == .unassigned) {
-                ctx.diag.cause("job {s} is not assigned to this node", .{name});
-            } else {
-                ctx.diag.cause("this node has not claimed the run of job {s}", .{name});
+            switch (why) {
+                .unassigned => ctx.diag.cause("job {s} is not assigned to this node", .{name}),
+                .left => ctx.diag.cause("this node's assignment of run {s}-job is older than " ++
+                    "the run: an earlier job of that name left it", .{name}),
+                else => ctx.diag.cause("this node has not claimed the run of job {s}", .{name}),
             }
             const sentence = "the agent claims the run first, then asks for its input";
             ctx.diag.fix(.{ .sentence = sentence });
@@ -1430,7 +1469,7 @@ fn no_input(ctx: *const Context, name: []const u8, why: InputWhy) Failure {
     return error.Failed;
 }
 
-const InputWhy = enum { unassigned, unclaimed, missing, damaged };
+const InputWhy = enum { unassigned, left, unclaimed, missing, damaged };
 
 fn too_many_runs(ctx: *const Context) Failure {
     assert(ctx.diag.code == null);

@@ -249,10 +249,12 @@ const World = struct {
         return &world.statuses[at];
     }
 
-    /// The run's assignment, if it places this incarnation of the run: an assignment that names
-    /// another run record's `create_revision` (one a reused job name left, #243) is none of this
-    /// run's, so nothing it carries (a placement, a claim, an ending) moves this run. An
-    /// assignment an older server wrote names none and is taken as before.
+    /// The run's assignment, if it places this incarnation of the run, else none (#243): nothing
+    /// an assignment a reused job name left carries (a placement, a claim, an ending) moves this
+    /// run. A run is placed after it is created and never moved, so an assignment of this
+    /// incarnation was written after the run record (`records.assignment_is_stale`, the rule the
+    /// agent API and the agent apply too); one an older server wrote is judged by that alone.
+    /// `run_created`, where the scheduler wrote it, must also name this run record.
     fn placement(
         world: *const World,
         entry: *const Entry(records.JobRun),
@@ -261,6 +263,9 @@ const World = struct {
         const placed = &world.assigned[at];
         // Test-only (`c1_teeth.job_reuse_assigned`): any incarnation's assignment is taken.
         if (c1_teeth.job_reuse_assigned) return placed;
+        if (records.assignment_is_stale(placed.kv.mod_revision, entry.kv.create_revision)) {
+            return null;
+        }
         const created = placed.rec.run_created orelse return placed;
         if (created != entry.kv.create_revision) return null;
         return placed;

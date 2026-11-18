@@ -848,6 +848,12 @@ const Work = struct {
         const ctx = work.ctx;
         const run = &entry.rec;
         if (run.stop != null) return; // Never claimed: the run moved.
+        // An assignment an earlier job of this name left places none of this run (#243): the
+        // server refuses the claim, and the scheduler releases it once this run ends.
+        // Test-only (`c1_teeth.job_reuse_assigned`): it is claimed.
+        if (!c1_teeth.job_reuse_assigned and work.is_stale_epoch(subject.id, subject.epoch)) {
+            return;
+        }
         const record: StartRecord = .{
             .run = subject.id,
             .epoch = subject.epoch,
