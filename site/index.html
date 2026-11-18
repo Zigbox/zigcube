@@ -164,9 +164,9 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 
 <script>// ===== Site data: update the milestone entries as work lands. =====
 const SITE = {
-  updated: "2026-11-12",
+  updated: "2026-11-18",
   sisterUrl: "../zigbox/", // Zigbox site
-  stage: "Pre-alpha · B2 shipped, B3 demonstrated",
+  stage: "Pre-alpha · 0.5.2 shipped, C3 to C5 in progress for 0.6.0",
 };
 // status: "done" | "wip" | "plan"
 // When a milestone ships: status "done", slices {green, total, note}, recorded {url, date} linking the
@@ -204,7 +204,7 @@ const MILESTONES = [
    demo:[["$","zcube apply hello-v3-broken.zon"],["","rolling 1/6 … health check /ready failed (503)"],["","rolled back to b3:51aa…9c03   0 requests failed"]]},
   {id:"C4", name:"Mesh", status:"wip", slices:{green:0, total:12, note:"slices 1 to 5 built on stacked branches (#263), none merged; ships in 0.6.0. The demo lines are the script, not recorded"}, goal:"Services find each other by name and talk only along declared grants.",
    demo:[["$","zcube exec batch -- nc -z db 5432"],["","refused: no grant batch → db:5432"],["$","zcube grant batch db:5432 && zcube exec batch -- nc -z db 5432"],["","db:5432 open"]]},
-  {id:"C5", name:"Edge", status:"plan", goal:"A service gets a public HTTPS address from one line of config.",
+  {id:"C5", name:"Edge", status:"wip", slices:{green:1, total:8, note:"slice 1 of 8 (public TLS mode) merged; slice 2 in review (#284); ships in 0.6.0. The demo lines are the script, not recorded"}, goal:"A service gets a public HTTPS address from one line of config.",
    demo:[["$","curl -sI https://hello.demo.example | head -1"],["","HTTP/2 200"]]},
   {id:"C6", name:"Trust", status:"plan", goal:"Only signed, policy-compliant images run, even with a compromised control plane.",
    demo:[["$","zcube why service hello"],["","refused by node policy on vm1, vm2, vm3 (no trusted signature)"],["","still serving b3:51aa…9c03"]]},
