@@ -152,7 +152,15 @@ pub const job_reuse = declared("c1_teeth_job_reuse");
 /// names are reused: a store-side retention jump (`Cluster.retention_jump`, which ticks no agent)
 /// deletes ended jobs, and some creates then name a deleted job, so that a node's stopped
 /// container of the earlier job meets the new one. Not in `any`.
-pub const reuse_world = declared("c1_reuse_world") or job_reuse;
+pub const reuse_world = declared("c1_reuse_world") or job_reuse or job_reuse_assigned;
+
+/// Retention deletes an ended job whose run is still assigned, and the job controller takes a
+/// run's assignment whatever incarnation it names: both of #243's fixes off
+/// (`job_retention.mark_assigned`, `job_controller.World.placement`). In the reuse world a job
+/// created again under the name then meets the old assignment, and the agent's claim or its
+/// re-reported ending moves the new run (must break J11 or J2;
+/// docs/decisions/2026-11-18-job-incarnation.md).
+pub const job_reuse_assigned = declared("c1_teeth_job_reuse_assigned");
 
 /// The scheduler's placement filter skips the `exclusive` rule, so a replica or a job of another
 /// tenant can land on an exclusive node (must break P1: no assignment breaks a node's `exclusive`
@@ -201,7 +209,7 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
     job_untrusted or placement_exclusive or relabel_kept or job_pass_break or
-    job_runs_unread;
+    job_runs_unread or job_reuse_assigned;
 
 /// The runner a replay line names: the runner a root names itself (`sim_runner`), else the
 /// fault-on runner whose root switched a tooth on (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe`
@@ -242,6 +250,7 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_job_evicted", "sim_c1_teeth_job_evicted" },
     .{ "c1_teeth_job_ledger_small", "sim_c1_teeth_job_ledger_small" },
     .{ "c1_teeth_job_reuse", "sim_c1_teeth_job_reuse" },
+    .{ "c1_teeth_job_reuse_assigned", "sim_c1_teeth_job_reuse_assigned" },
     .{ "c1_teeth_relay_leak", "sim_c1_teeth_relay_leak" },
     .{ "c1_teeth_relay_dropped", "sim_c1_teeth_relay_dropped" },
     .{ "c1_teeth_job_cert_stale", "sim_c1_teeth_job_cert_stale" },

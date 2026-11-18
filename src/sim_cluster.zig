@@ -946,6 +946,9 @@ pub const Cluster = struct {
     /// creates of a name made before, and those that found a container of that name on a node.
     reuse_cursor: job_retention.Cursor,
     reuse_ops: u32,
+    /// Set from the `job_create` before a jump until the reuse after it: the scheduler releases
+    /// no run (#243's outage), so the jump meets ended runs that are still assigned.
+    reuse_runs_held: bool,
     reuse_jumps: u32,
     reuse_made: u32,
     reuse_met: u32,
@@ -1063,6 +1066,7 @@ pub const Cluster = struct {
     fn init_reuse(c: *Cluster) void {
         c.reuse_cursor = .{ .age_ms = constants.job_finished_age_ms_min };
         c.reuse_ops = 0;
+        c.reuse_runs_held = false;
         c.reuse_jumps = 0;
         c.reuse_made = 0;
         c.reuse_met = 0;
@@ -1267,6 +1271,7 @@ pub const Cluster = struct {
     fn server_step(c: *Cluster) u32 {
         const ctx = c.controller_context();
         c.stats.server_steps += 1;
+        c.server.scheduler.runs_held = c.reuse_runs_held;
         const wake = c.server.reconcile(&ctx) catch {
             c.diag.reset();
             c.stats.server_failures += 1;
@@ -2438,6 +2443,8 @@ fn operation(c: *Cluster) void {
                         if (made == 4) break;
                     }
                 }
+                // The scheduler is down from the create before a jump to the reuse after it.
+                c.reuse_runs_held = c.reuse_ops % 3 == 2;
             }
         },
         .job_cancel => c.cancel_job(),
@@ -3815,9 +3822,13 @@ fn print_jobs(c: *Cluster) void {
         w.truth_count, w.handled_count, w.watches, w.relists, w.restarts,
     });
     if (c1_teeth.reuse_world) {
-        c.report.print("jobs: reuse jumps={d} dropped={d} reused creates={d} met a " ++
-            "container={d}\n", .{
-            c.reuse_jumps, c.reuse_cursor.dropped, c.reuse_made, c.reuse_met,
+        c.report.print("jobs: reuse jumps={d} dropped={d} held assigned={d} reused creates={d} " ++
+            "met a container={d}\n", .{
+            c.reuse_jumps,
+            c.reuse_cursor.dropped,
+            c.reuse_cursor.held_assigned,
+            c.reuse_made,
+            c.reuse_met,
         });
     }
     if (c.trust) |world| world.print(c.report);

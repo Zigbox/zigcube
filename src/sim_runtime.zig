@@ -485,8 +485,10 @@ pub const SimRuntime = struct {
         if (self.on_start) |hook| hook(self.on_start_context, spec);
         if (self.find(spec.name)) |existing| {
             // Names are unique among containers that have not stopped; a stopped one with the
-            // same name is replaced, the way a runtime reuses a name.
-            assert(existing.phase == .stopped);
+            // same name is replaced, the way a runtime reuses a name. The `job_reuse_assigned`
+            // tooth breaks the agent's rule on purpose (a run started again while it runs, which
+            // J2 has judged in `on_start`): the running one is replaced, so the run ends.
+            if (!c1_teeth.job_reuse_assigned) assert(existing.phase == .stopped);
             self.remove(existing);
         }
         try self.make_room(diag);

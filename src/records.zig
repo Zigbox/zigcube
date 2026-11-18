@@ -866,6 +866,11 @@ pub const Assigned = struct {
     /// The job a run belongs to (version 2): set for `<name>-job` ids, absent for replicas. Every
     /// reader of `service` takes this branch for a run (`assigned_group`).
     job: ?[]const u8 = null,
+    /// The run's incarnation (#243): the `create_revision` of the `/job-runs/<name>` record the
+    /// scheduler placed. A job name created again gets a new run record, so an assignment left
+    /// from the old one names another value and is none of the new run's. Set for a run by this
+    /// release and later; absent in a replica's and in a run's an older server wrote.
+    run_created: ?u64 = null,
 };
 
 /// Assignments are written at the oldest version that holds their members: version 2 only for a

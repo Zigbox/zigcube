@@ -1909,6 +1909,22 @@ const c1_teeth_roots = [_]struct {
         .ops = 300,
     },
     .{
+        .name = "job_reuse_assigned",
+        .root = "src/sim_c1_teeth_job_reuse_assigned_main.zig",
+        // #243: retention deletes a job whose run is still assigned and the job controller
+        // takes any incarnation's assignment; a job created again under the name meets it.
+        // The reuse world holds the scheduler's releases around a jump (`reuse_runs_held`).
+        // Sparse: 7 of seeds 1..60 fail at 300 operations, `--c1` (2026-11-18), J2 at 33 36 39
+        // 44 57 59 and J4 at 40; CI runs 30..60 and stops at 33. The fleet's 180 fresh seeds at
+        // a rate of 0.117 miss a working check with probability 0.883^180 = 2e-10.
+        .symptom = "J2|J4",
+        .canary_seeds = 180,
+        .also_seeds = &.{40},
+        .first_seed = 30,
+        .seeds = 60,
+        .ops = 300,
+    },
+    .{
         .name = "job_untrusted",
         .root = "src/sim_c1_teeth_job_untrusted_main.zig",
         // J12 (a run started that its node's trust policy refuses); signed jobs and node

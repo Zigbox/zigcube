@@ -168,7 +168,11 @@ const Fixture = struct {
         var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
         const id = records.job_run_id(&buffer, name);
         const need: records.Requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 };
-        const value = records.assigned_run(id, name, need, "test");
+        var value = records.assigned_run(id, name, need, "test");
+        // As the scheduler writes it: the incarnation of the run it places (#243).
+        const ctx = self.context();
+        const run = try ctx.store.get(ctx.arena, records.job_run_key(name).slice(), null, ctx.diag);
+        if (run.kv) |kv| value.run_created = kv.create_revision;
         const key = records.assigned_key(node_name, id);
         try self.put(.scheduler, key.slice(), value);
     }
@@ -1247,4 +1251,51 @@ test "an ending is not written when the node's judgement changed by the commit (
     const gone = [_]store.Op{.{ .delete = records.node_status_key("n1").slice() }};
     try testing.expectEqual(@as(u32, 0), try racing(&f, &gone));
     try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+}
+
+test "a reused job name never takes the old run's assignment or reports (#243)" {
+    // Goal: the TLA+ jobs model's traces `finding-job-reuse-assigned` (J2) and
+    // `finding-job-reuse-report` (J11) as one deterministic run. Method: run `j` on n1 and end
+    // it; delete its records but leave its assignment (retention before the fix in
+    // `job_retention.zig`); create `j` again. The agent then claims the run under the old
+    // assignment, and re-reports the old ending: neither moves the new run, which is never
+    // placed on the old assignment, and ends `not_started` at its start bound, which frees the
+    // name's old assignment for the scheduler's release.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.running("j");
+    try fixture.report("n1", "j", .stopped, .{ .kind = .exited, .code = 0 }, null);
+    _ = try fixture.pass();
+    try testing.expectEqual(records.JobState.exited, (try fixture.read_status("j")).?.state);
+    const keys = [_]records.Key{
+        records.job_key("j"),
+        records.job_input_key("j"),
+        records.job_run_key("j"),
+        records.job_status_key("j"),
+        records.job_observed_key("n1", "j"),
+    };
+    var gone: [keys.len]store.Op = undefined;
+    for (&gone, &keys) |*op, *key| op.* = .{ .delete = key.slice() };
+    const ctx = fixture.context();
+    const done = try writers.txn(ctx.store, .retention, .{ .on_success = &gone }, ctx.diag);
+    try testing.expect(done.succeeded);
+    try fixture.job("j", 60 * 1000, false);
+    _ = try fixture.pass();
+    try testing.expectEqual(records.JobState.pending, (try fixture.read_status("j")).?.state);
+    // `finding-job-reuse-assigned`: a claim under the old assignment.
+    try fixture.report("n1", "j", .claimed, null, null);
+    _ = try fixture.pass();
+    try testing.expectEqual(records.JobState.pending, (try fixture.read_status("j")).?.state);
+    // `finding-job-reuse-report`: the old run's ending, re-reported.
+    try fixture.report("n1", "j", .stopped, .{ .kind = .exited, .code = 0 }, null);
+    _ = try fixture.pass();
+    try testing.expectEqual(records.JobState.pending, (try fixture.read_status("j")).?.state);
+    const run = (try fixture.read_run("j")).?;
+    fixture.manual.ms = run.start_by_ms + 1;
+    _ = try fixture.pass();
+    _ = try fixture.pass();
+    const status = (try fixture.read_status("j")).?;
+    try testing.expectEqual(records.JobState.failed, status.state);
+    try testing.expect(status.node == null);
 }
