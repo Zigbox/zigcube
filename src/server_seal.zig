@@ -328,7 +328,8 @@ pub fn render_warning(diag: *Diag, deleted: u64, id: seal.KeyId) void {
     diag.cause("--discard-sealed deleted {d} sealed record(s) and ACME order(s)", .{deleted});
     diag.cause("a new sealing key was made, with id {s}", .{&id});
     diag.cause("every public host is ordered again, which counts against Let's Encrypt's " ++
-        "limits: 50 certificates per registered domain and 5 duplicates per week", .{});
+        "limits: 50 certificates per registered domain per week and 5 duplicates per " ++
+        "week", .{});
     diag.fix(.{
         .sentence = "back up the new key file; start without --discard-sealed from now on",
     });

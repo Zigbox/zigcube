@@ -3,7 +3,7 @@ warning[ZC-W0808]: sealed records were discarded; every public host is ordered a
   cause  --discard-sealed deleted 21 sealed record(s) and ACME order(s)
   cause  a new sealing key was made, with id 9e3c71b05d4a2f86
   cause  every public host is ordered again, which counts against Let's
-         Encrypt's limits: 50 certificates per registered domain and 5
+         Encrypt's limits: 50 certificates per registered domain per week and 5
          duplicates per week
   reqid  r-0000001
   fix    back up the new key file; start without --discard-sealed from now on
