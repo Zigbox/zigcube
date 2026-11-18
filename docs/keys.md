@@ -47,8 +47,9 @@ Sealed records (C5 slice 2, `src/seal.zig`): the secret member of an `/edge-cert
 the envelope header and the record's store key as associated data, so a record cannot be moved
 to another key. The sealing key is `seal-<hash>.key` (or `seal.key`), 0600, beside the CA key in
 the state directory, never in the store; the key id is the first 8 bytes of SHA-256 of
-"zcube seal key id", a zero byte and the key, in hex. `zcube-server --discard-sealed` deletes
-every record under `/edge-certs/`, `/acme-account/` and `/acme-orders/` before it makes a new key.
+"zcube seal key id", a zero byte and the key, in hex. `zcube-server --discard-sealed`, when the
+key does not open the sealed records, deletes every record under `/edge-certs/`, `/acme-account/`
+and `/acme-orders/` before it makes a new key (`docs/sealing.md`).
 
 An agent writes only `/nodes/<its node>`, `/node-store/<its node>`, `/pulls/<its node>/…`, `/observed/<its node>/…` and `/job-observed/<its node>/…`.
 The `zcube-agent fetch` process reads `/node-store/<node>` (`peer`, `filter`) to find peers, and

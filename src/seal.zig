@@ -172,20 +172,67 @@ pub fn key_id_of(envelope: []const u8) ?KeyId {
     return id.*;
 }
 
-/// The envelope inside a record's value (a JSON string member, in later slices), or null if the
-/// value holds none. It ends at the first byte that cannot be part of one. A value that holds
-/// the magic but is cut short gives what follows it, which `open` refuses as `Malformed`: a
-/// damaged envelope is never mistaken for a record with nothing sealed.
-pub fn find(value: []const u8) ?[]const u8 {
-    const start = std.mem.indexOf(u8, value, magic) orelse return null;
-    var end = start + header_bytes;
-    if (end > value.len) return value[start..];
-    while (end < value.len) : (end += 1) {
-        if (!is_base64url(value[end])) break;
+/// The envelopes inside a record's value (JSON string members, in later slices), in order.
+///
+/// A candidate is any text of the header's shape, `zcseal<digits>.<16 hex>.`, whatever the
+/// version, running on to the first byte that cannot be part of an envelope. So every sealed
+/// member is checked, not only the first; a clear member that merely contains the magic (a host
+/// named `zcseal1.example.com`, a URL) is not of the header's shape and is skipped, neither
+/// hiding a later envelope nor refusing the record; and a header of another version, written by
+/// a later build, is returned too, which `open` refuses as `Malformed`, never skipped as
+/// nothing sealed. A header whose key id is itself damaged is no longer of the shape and is
+/// skipped (accepted: `docs/decisions/2026-11-18-c5-seal-fix-discard-and-find.md`).
+pub fn envelopes(value: []const u8) Envelopes {
+    assert(value.len <= std.math.maxInt(u32));
+    return .{ .value = value };
+}
+
+pub const Envelopes = struct {
+    value: []const u8,
+    at: u32 = 0,
+
+    pub fn next(it: *Envelopes) ?[]const u8 {
+        assert(it.at <= it.value.len);
+        while (std.mem.indexOfPos(u8, it.value, it.at, magic_stem)) |start| {
+            const header_end = header_shape(it.value[start..]) orelse {
+                it.at = @intCast(start + 1);
+                continue;
+            };
+            var end = start + header_end;
+            while (end < it.value.len and is_base64url(it.value[end])) end += 1;
+            it.at = @intCast(end);
+            const envelope = it.value[start..end];
+            assert(std.mem.startsWith(u8, envelope, magic_stem));
+            return envelope;
+        }
+        it.at = @intCast(it.value.len);
+        return null;
     }
-    const envelope = value[start..end];
-    assert(std.mem.startsWith(u8, envelope, magic));
-    return envelope;
+};
+
+/// The magic without its version: `zcseal<digits>.` is how every format starts.
+const magic_stem = "zcseal";
+const version_digits_max = 9;
+
+comptime {
+    assert(std.mem.startsWith(u8, magic, magic_stem));
+}
+
+/// The length of the header at the start of `text`, `zcseal<digits>.<16 hex>.`, or null.
+fn header_shape(text: []const u8) ?usize {
+    assert(std.mem.startsWith(u8, text, magic_stem));
+    var at: usize = magic_stem.len;
+    while (at < text.len and at - magic_stem.len < version_digits_max and
+        std.ascii.isDigit(text[at])) : (at += 1)
+    {}
+    if (at == magic_stem.len) return null;
+    if (at >= text.len or text[at] != '.') return null;
+    at += 1;
+    if (text.len < at + key_id_bytes + 1) return null;
+    if (!is_key_id(text[at..][0..key_id_bytes])) return null;
+    at += key_id_bytes;
+    if (text[at] != '.') return null;
+    return at + 1;
 }
 
 pub fn is_key_id(text: []const u8) bool {
@@ -238,7 +285,9 @@ test "a sealed record opens at its own path with its own key, and round-trips ev
         const envelope = seal(&key, "/edge-certs/a.example", plain[0..length], nonce, &out);
         try testing.expectEqual(envelope_bytes(length), @as(u32, @intCast(envelope.len)));
         try testing.expectEqualSlices(u8, &key.id(), &key_id_of(envelope).?);
-        try testing.expectEqualStrings(envelope, find(envelope).?);
+        var found = envelopes(envelope);
+        try testing.expectEqualStrings(envelope, found.next().?);
+        try testing.expect(found.next() == null);
         const back = try open(&key, "/edge-certs/a.example", envelope, &opened);
         try testing.expectEqualSlices(u8, plain[0..length], back);
     }
@@ -276,16 +325,20 @@ test "a moved record, a tampered byte, a relabelled key id and another key are r
 
 test "envelopes are found inside a record's value, and junk is not one" {
     // Goal: the start-up check's parser. Method: an envelope inside JSON is found whole; values
-    // without one, or with a damaged header, are refused by `find` or `key_id_of`.
+    // without one give none; a cut-short or damaged body is still returned and refused by
+    // `key_id_of` or `open`.
     const key = test_key(0x44);
     var out: [envelope_bytes_max]u8 = undefined;
     const envelope = seal(&key, "/acme-account/0123", "account", @splat(9), &out);
     var value_buffer: [envelope_bytes_max + 64]u8 = undefined;
     const value = try std.fmt.bufPrint(&value_buffer, "{{\"key\":\"{s}\",\"x\":1}}", .{envelope});
-    try testing.expectEqualStrings(envelope, find(value).?);
-    try testing.expect(find("{\"key\":\"plain\"}") == null);
-    try testing.expectEqualStrings("zcseal1.0123", find("zcseal1.0123").?);
-    try testing.expect(key_id_of(find("zcseal1.0123").?) == null);
+    var found = envelopes(value);
+    try testing.expectEqualStrings(envelope, found.next().?);
+    try testing.expect(found.next() == null);
+    found = envelopes("{\"key\":\"plain\"}");
+    try testing.expect(found.next() == null);
+    found = envelopes("zcseal1.0123456789abcdef.");
+    try testing.expect(key_id_of(found.next().?) == null);
     try testing.expect(key_id_of("zcseal1.0123456789ABCDEF.AAAA") == null);
     try testing.expect(key_id_of("zcseal1.0123456789abcdef-AAAA") == null);
     try testing.expect(key_id_of("zcseal1.0123456789abcdef.") == null);
@@ -295,6 +348,108 @@ test "envelopes are found inside a record's value, and junk is not one" {
     var short_buffer: [header_bytes + 4]u8 = undefined;
     const short = try std.fmt.bufPrint(&short_buffer, "{s}{s}.AAAA", .{ magic, &key.id() });
     try testing.expectError(error.Malformed, open(&key, "/edge-certs/x", short, &opened));
+}
+
+test "a clear member holding the magic neither hides nor fakes an envelope" {
+    // Goal: review of #284 (seal.zig `find`): a host named `zcseal1.example.com` in clear before
+    // the sealed member. Method: such a value yields exactly the real envelope, which opens; a
+    // value with only the clear member yields nothing.
+    const key = test_key(0x45);
+    var out: [envelope_bytes_max]u8 = undefined;
+    const path = "/edge-certs/zcseal1.example.com";
+    const envelope = seal(&key, path, "leaf", @splat(3), &out);
+    var value_buffer: [envelope_bytes_max + 128]u8 = undefined;
+    const value = try std.fmt.bufPrint(
+        &value_buffer,
+        "{{\"host\":\"zcseal1.example.com\",\"url\":\"https://zcseal7.x/zcseal1.\"," ++
+            "\"key\":\"{s}\"}}",
+        .{envelope},
+    );
+    var found = envelopes(value);
+    const first = found.next().?;
+    try testing.expectEqualStrings(envelope, first);
+    try testing.expect(found.next() == null);
+    var opened: [constants.seal_plaintext_bytes_max]u8 = undefined;
+    try testing.expectEqualStrings("leaf", try open(&key, path, first, &opened));
+    found = envelopes("{\"host\":\"zcseal1.example.com\"}");
+    try testing.expect(found.next() == null);
+}
+
+test "every envelope in a value is returned, and another version is one this build refuses" {
+    // Goal: review of #284 (seal.zig `find`): a second sealed member, and a `zcseal2.` met after
+    // a downgrade. Method: two envelopes sealed with two keys are both returned, in order, so
+    // the second's key is checked too; a header of version 2 is returned and `open` refuses it
+    // as `Malformed`, never as "nothing sealed".
+    const a = test_key(0x46);
+    const b = test_key(0x47);
+    const path = "/acme-account/0123";
+    var out_a: [envelope_bytes_max]u8 = undefined;
+    var out_b: [envelope_bytes_max]u8 = undefined;
+    const first = seal(&a, path, "one", @splat(1), &out_a);
+    const second = seal(&b, path, "two", @splat(2), &out_b);
+    var value_buffer: [2 * envelope_bytes_max + 64]u8 = undefined;
+    const value = try std.fmt.bufPrint(&value_buffer, "{{\"k\":\"{s}\",\"j\":\"{s}\"}}", .{
+        first, second,
+    });
+    var found = envelopes(value);
+    var opened: [constants.seal_plaintext_bytes_max]u8 = undefined;
+    try testing.expectEqualStrings("one", try open(&a, path, found.next().?, &opened));
+    try testing.expectError(error.WrongKey, open(&a, path, found.next().?, &opened));
+    try testing.expect(found.next() == null);
+
+    var later_buffer: [envelope_bytes_max + 64]u8 = undefined;
+    const later = try std.fmt.bufPrint(&later_buffer, "{{\"key\":\"zcseal2.{s}\"}}", .{
+        first["zcseal1.".len..],
+    });
+    found = envelopes(later);
+    const unknown = found.next().?;
+    try testing.expect(std.mem.startsWith(u8, unknown, "zcseal2."));
+    try testing.expectError(error.Malformed, open(&a, path, unknown, &opened));
+    try testing.expect(found.next() == null);
+}
+
+test "known answer: the envelope's bytes and the key id are pinned" {
+    // Goal: review of #284: the on-disk format cannot change unnoticed (the AD order, the key-id
+    // label and truncation, nonce || ciphertext || tag, the base64 alphabet). Method: a fixed
+    // key, nonce, path and plaintext give exactly this envelope, and it opens to the plaintext.
+    var key: Key = .{ .bytes = undefined };
+    for (&key.bytes, 0..) |*byte, index| byte.* = @intCast(index);
+    var nonce: [nonce_bytes]u8 = undefined;
+    for (&nonce, 0..) |*byte, index| byte.* = @intCast(0xa0 + index);
+    const path = "/edge-certs/a.example";
+    const plain = "the leaf key";
+    try testing.expectEqualStrings("10d49fcffe05434d", &key.id());
+    var out: [envelope_bytes_max]u8 = undefined;
+    const envelope = seal(&key, path, plain, nonce, &out);
+    try testing.expectEqualStrings("zcseal1.10d49fcffe05434d." ++
+        "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3MYRvPds4xcpBBEjwa5brdFDtbyBgT8hcev1Yog", envelope);
+    var opened: [constants.seal_plaintext_bytes_max]u8 = undefined;
+    try testing.expectEqualStrings(plain, try open(&key, path, envelope, &opened));
+}
+
+test "known answer: draft-irtf-cfrg-xchacha-03, A.3.1, through Aead" {
+    // Goal: the primitive is pinned as well as the framing. Method: the draft's AEAD test vector.
+    const plain = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip " ++
+        "for the future, sunscreen would be it.";
+    const ad = [_]u8{ 0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
+    var key: [key_bytes]u8 = undefined;
+    for (&key, 0..) |*byte, index| byte.* = @intCast(0x80 + index);
+    var nonce: [nonce_bytes]u8 = undefined;
+    for (&nonce, 0..) |*byte, index| byte.* = @intCast(0x40 + index);
+    const expected_hex = "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb" ++
+        "731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452" ++
+        "2f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9" ++
+        "21f9664c97637da9768812f615c68b13b52e";
+    const tag_hex = "c0875924c1c7987947deafd8780acf49";
+    var ciphertext: [plain.len]u8 = undefined;
+    var tag: [tag_bytes]u8 = undefined;
+    Aead.encrypt(&ciphertext, &tag, plain, &ad, nonce, key);
+    var expected: [plain.len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, expected_hex);
+    var expected_tag: [tag_bytes]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_tag, tag_hex);
+    try testing.expectEqualSlices(u8, &expected, &ciphertext);
+    try testing.expectEqualSlices(u8, &expected_tag, &tag);
 }
 
 test "key ids differ between keys and do not contain the key" {

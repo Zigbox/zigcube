@@ -2071,20 +2071,33 @@ pub const registry = [_]Entry{
         \\the state directory) from a backup and start again. If there is no
         \\backup, start once with `zcube-server --discard-sealed`: every sealed
         \\record is deleted, a new key is made, and every public host is ordered
-        \\again (ZC-W0808).
+        \\again (ZC-W0808); the old key file is kept, renamed aside.
+        \\
+        \\The start-up check reads at most 2,048,000 records under each prefix
+        \\(4096 pages of 500). Past that the server refuses to start rather than
+        \\check part of them: delete the records no public host uses any more.
+        \\The same code ends a --discard-sealed start that could not empty a
+        \\prefix because another writer kept adding records: stop it, then start
+        \\again.
         ,
     },
     .{
         .code = .W0808,
         .severity = .warning,
         .blame = .user,
-        .summary = "sealed records were discarded; every public host is ordered again",
+        .summary = "the server started with --discard-sealed",
         .explanation =
-        \\The server started with --discard-sealed. It deleted every sealed record
-        \\(certificates and ACME accounts) and every ACME order, and made a new
-        \\sealing key. Every public host is ordered again, which counts against
-        \\Let's Encrypt's limits: 50 certificates per registered domain per week,
-        \\and 5 duplicate certificates per week.
+        \\The server started with --discard-sealed. If its sealing key opened every
+        \\sealed record, the flag did nothing: no record was deleted, the key was
+        \\kept, and the warning says to remove the flag.
+        \\
+        \\Otherwise it deleted every sealed record (certificates and ACME accounts)
+        \\and every ACME order, renamed the old key file aside
+        \\(seal-<hash>.key.discarded-<unix seconds>, still 0600; docs/sealing.md
+        \\says how to restore it) and made a new sealing key. Every public host is
+        \\ordered again, which counts against Let's Encrypt's limits: 50
+        \\certificates per registered domain per week, and 5 duplicate
+        \\certificates per week.
         \\
         \\Back up the new key file and start without --discard-sealed from now on.
         ,

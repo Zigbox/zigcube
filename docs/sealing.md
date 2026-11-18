@@ -29,6 +29,14 @@ store's key has no file: its records end with the process. Only the server reads
 (`src/server_seal.zig`, `open`). Back it up with the CA key: without it the sealed records are
 lost.
 
+The key is written without replacing a file: if two starts race to make it, the second reads the
+first one's key instead of writing its own (the CA key is not written this way; see
+`docs/decisions/2026-11-18-c5-seal-fix-discard-and-find.md`).
+
+Two Postgres stores served from one state directory share `seal.key`, as they share `ca.key`:
+neither file's name tells the stores apart. Give each Postgres store its own `--state-dir`; a
+start whose store was sealed with the other store's key is refused with ZC-E0824.
+
 ## At start
 
 After the store's first check and before the CA is loaded, the server reads every record under
@@ -43,22 +51,69 @@ After the store's first check and before the CA is loaded, the server reads ever
   and why. No key is written. Fixes: restore the key file from a backup, or start once with
   `--discard-sealed`.
 
-A value with no envelope is skipped: an entry not yet given a key holds nothing sealed.
+Every envelope in a value is opened, not only the first. An envelope is `zcseal`, a version in
+digits, a dot, a 16-hex key id and a dot, followed by base64url; text that is not of that shape
+(a host named `zcseal1.example.com`, say) is not one. An envelope of another version is refused
+as one this server cannot read. A value with no envelope is skipped: an entry not yet given a key
+holds nothing sealed.
+
+The check reads at most 2,048,000 records under each prefix (`seal_scan_pages_max`, 4096 pages of
+`store_list_limit_max`, 500). Past that the start is refused with ZC-E0824 ("more than 2048000
+records under ..."), whose fix is to delete the records no public host uses any more: the server
+does not start over records it has only partly checked, and `--discard-sealed` is not the remedy
+(it would delete every one of them).
 
 ## `zcube-server --discard-sealed`
 
-The way out when the key is lost. It deletes every record under `/edge-certs/`, `/acme-account/`
-and `/acme-orders/`, then makes and writes a new key, then prints **ZC-W0808** (with every cause:
-the count, the new key's id and Let's Encrypt's limits) and starts. Every public host is then
-ordered again, which counts against Let's Encrypt's limits: 50 certificates per registered domain
-per week and 5 duplicates per week. Leave the flag out of later starts: with it, every start
-discards again.
+The way out when the key is lost. The flag acts only when the start check fails (sealed records
+and no key, or a key that does not open one). With a key that opens every sealed record it does
+nothing: no record is deleted, the key is kept, and ZC-W0808 says "nothing to discard; remove
+--discard-sealed".
+
+When it acts, the discard is planned during the check and carried out only after every start step
+that can refuse (the CA, the listeners), so a refused start deletes nothing. Then, in order:
+
+1. Every record under `/edge-certs/`, `/acme-account/` and `/acme-orders/` is deleted.
+2. The old key file, if there is one, is renamed `<key file>.discarded-<unix seconds>` (for
+   example `seal-0123456789abcdef.key.discarded-1763424000`, or `seal.key.discarded-...` for
+   Postgres), still 0600, never over another file.
+3. A new key is made and written.
+4. **ZC-W0808** is printed (with every cause: the count, where the old key went, the new key's id
+   and Let's Encrypt's limits) and the server starts.
+
+Every public host is then ordered again, which counts against Let's Encrypt's limits: 50
+certificates per registered domain per week and 5 duplicates per week. Leave the flag out of
+later starts.
+
+If something else keeps writing under a prefix (another `zcube-server` on the same store), the
+deletes cannot finish: the start ends with ZC-E0824 ("--discard-sealed could not empty ..."), the
+old key file is left where it was, and the fix is to stop the other writer and start again.
+
+### Restoring a discarded key
+
+The sealed records are gone once the discard has run, so the old key opens nothing in this store.
+It still opens a backup of the store taken before the discard. To go back to that backup:
+
+1. Stop the server.
+2. Restore the store from the backup.
+3. In the state directory, move the new key aside and put the old one back, keeping mode 0600:
+
+       mv seal-<hash>.key seal-<hash>.key.new
+       mv seal-<hash>.key.discarded-<seconds> seal-<hash>.key
+       chmod 600 seal-<hash>.key
+
+4. Start the server without `--discard-sealed`. The start check confirms the key opens the
+   restored records, or refuses with ZC-E0824.
 
 ## Redaction
 
 `src/testing/redaction.zig` looks for a planted secret in raw bytes, hex in either case and base64
-(standard and URL-safe, at any alignment inside a longer string). Slice 2's test
+(standard and URL-safe, at any alignment inside a longer string), in the output as it is and with
+whitespace and the JSON escapes `\n`, `\r`, `\t` and `\/` taken out, so base64 wrapped at 64 or
+76 columns (PEM) or escaped in a JSON string is found too. Slice 2's test
 (`src/server_test.zig`, "sealed records: ...") plants a sealed record and checks `/v1/list` of
-every key, a watch from revision 1, `/v1/status` and ZC-E0824's text for the sealing key and the
-plaintext. `zcube bundle` fetches `/v1/list`, `/v1/status` and `/v1/why` (the first two are
+every key, a watch from revision 1, `/v1/status` and ZC-E0824's text (plain, `--verbose` and JSON,
+in `src/server_seal.zig`'s tests) for the sealing key and the plaintext; as a negative control it
+then writes the plaintext in base64 into a record of its own and the harness must find it in the
+same replies. `zcube bundle` fetches `/v1/list`, `/v1/status` and `/v1/why` (the first two are
 checked here) and never reads the state directory, so it never holds `seal-*.key` or `ca-*.key`.

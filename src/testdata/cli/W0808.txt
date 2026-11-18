@@ -1,4 +1,4 @@
-warning[ZC-W0808]: sealed records were discarded; every public host is ordered again
+warning[ZC-W0808]: the server started with --discard-sealed
   cause  every public host is ordered again, which counts against Let's
          Encrypt's limits: 50 certificates per registered domain per week and 5
          duplicates per week

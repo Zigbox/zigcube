@@ -1211,6 +1211,10 @@ test "sealed records: the key is made at start, no API reply holds it, E0824, --
     const third = try start_server(io, config_for(.{ .sqlite = path }, false));
     try testing.expectEqualSlices(u8, &fresh.bytes, &third.seal_key.bytes);
     third.stop();
+    // The flag again, with a key that opens every record: nothing to discard, the key is kept.
+    const fourth = try start_server(io, discard_config);
+    try testing.expectEqualSlices(u8, &fresh.bytes, &fourth.seal_key.bytes);
+    fourth.stop();
 }
 
 /// Every API reply that serves records or state holds neither the key nor the plaintext in any
@@ -1238,6 +1242,30 @@ fn expect_sealed_redacted(
     const listed = try get(io, server.address(), "/v1/list?prefix=%2Fedge-certs%2F");
     defer listed.free();
     try testing.expect(std.mem.indexOf(u8, listed.raw, header) != null);
+    // Last: the watch from revision 1 replays the canary's write from now on.
+    try expect_canary_found(io, server, plain);
+}
+
+/// The negative control: the plaintext, written as a careless path would (base64 in a record of
+/// its own), is found by the harness in the same replies; the record is deleted again.
+fn expect_canary_found(io: std.Io, server: *server_mod.Server, plain: []const u8) !void {
+    const redaction = @import("testing/redaction.zig");
+    const Op = @import("store.zig").Op;
+    var encoded: [256]u8 = undefined;
+    const text = std.base64.standard.Encoder.encode(&encoded, plain);
+    var value_buffer: [320]u8 = undefined;
+    const value = try std.fmt.bufPrint(&value_buffer, "{{\"v\":1,\"leak\":\"{s}\"}}", .{text});
+    var diag: Diag = undefined;
+    diag.reset();
+    const put = [_]Op{.{ .put = .{ .key = "/canary/leak", .value = value } }};
+    _ = try server.verified.interface().txn(.{ .on_success = &put }, &diag);
+    for ([_][]const u8{ "/v1/list?prefix=%2F", "/v1/watch?from=1&timeout=0" }) |api_path| {
+        const reply = try get(io, server.address(), api_path);
+        defer reply.free();
+        try testing.expect(redaction.find(reply.raw, plain) != null);
+    }
+    const delete = [_]Op{.{ .delete = "/canary/leak" }};
+    _ = try server.verified.interface().txn(.{ .on_success = &delete }, &diag);
 }
 
 /// A start over the sealed record without its key is ZC-E0824, names the key file, writes no

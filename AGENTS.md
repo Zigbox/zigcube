@@ -41,8 +41,9 @@ These arrive with the scaffold; keep this list current as they land.
   [--tls-san NAME_OR_IP]... [--store memory|sqlite:<path>|postgres:<settings>] [--create-store]
   [--discard-sealed]`; `--help` says the rest. At start it makes or loads the sealing key
   (`seal-<hash>.key` or `seal.key`, 0600, beside the CA key) and refuses to start over sealed
-  records the key does not open (ZC-E0824); `--discard-sealed` deletes them and makes a new key
-  (ZC-W0808). `docs/sealing.md`.
+  records the key does not open (ZC-E0824); `--discard-sealed` then deletes them, renames the old
+  key aside (`.discarded-<unix seconds>`) and makes a new key, after the CA and listeners have
+  opened (ZC-W0808), and does nothing when the key opens them. `docs/sealing.md`.
   `--listen` serves TLS 1.3 and every client presents a certificate of the store's CA;
   `--insecure-listen` serves plain HTTP on loopback only, as the caller `local`, which may call
   everything (B7 slice 3, docs/mtls.md "The API over TLS"). Only these use it: `zcube local` and

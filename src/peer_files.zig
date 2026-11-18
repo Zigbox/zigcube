@@ -233,6 +233,58 @@ pub fn sync_dir(io: std.Io, dir: Dir, where: []const u8, name: []const u8, diag:
     handle.sync(io) catch |err| return unusable(diag, where, name, "write", @errorName(err));
 }
 
+/// Writes a secret seed as `name` unless `name` exists: true if this call made it, false if a
+/// file of that name was there first (nothing is written; the caller reads that one). Two
+/// starts racing on one state directory so agree on one seed.
+pub fn write_seed_new(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    name: []const u8,
+    seed: [32]u8,
+    diag: *Diag,
+) Error!bool {
+    var line: [65]u8 = undefined;
+    defer std.crypto.secureZero(u8, &line);
+    const text = std.fmt.bufPrint(&line, "{x}\n", .{&seed}) catch
+        unreachable; // 64 digits and "\n".
+    var temp: [temp_bytes_max]u8 = undefined;
+    const temp_name = try stage(io, dir, where, name, text, 0o600, &temp, diag);
+    defer dir.deleteFile(io, temp_name) catch {}; // Gone already when renamed.
+    const made = try rename_new(io, dir, where, temp_name, name, diag);
+    if (made) try sync_dir(io, dir, where, name, diag);
+    return made;
+}
+
+/// Renames `from` to `to` in `dir` unless `to` exists: true if renamed, false if `to` was there
+/// (nothing changed). Where the file system has no such rename, a hard link and an unlink do
+/// the same, never replacing `to`.
+pub fn rename_new(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    from: []const u8,
+    to: []const u8,
+    diag: *Diag,
+) Error!bool {
+    assert(!std.mem.eql(u8, from, to));
+    dir.renamePreserve(from, dir, to, io) catch |err| switch (err) {
+        error.PathAlreadyExists => return false,
+        error.OperationUnsupported => {
+            dir.hardLink(from, dir, to, io, .{}) catch |link_err| switch (link_err) {
+                error.PathAlreadyExists => return false,
+                else => return unusable(diag, where, to, "write", @errorName(link_err)),
+            };
+            dir.deleteFile(io, from) catch |unlink_err| {
+                return unusable(diag, where, from, "remove", @errorName(unlink_err));
+            };
+            return true;
+        },
+        else => return unusable(diag, where, to, "write", @errorName(err)),
+    };
+    return true;
+}
+
 /// Writes a secret seed as `name`.
 pub fn write_seed(
     io: std.Io,

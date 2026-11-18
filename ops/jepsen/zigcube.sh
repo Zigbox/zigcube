@@ -146,7 +146,10 @@ cmd_server() {
     install -m 0644 "$ca" "$etc/ca.crt"
     # The CA file is written before the listener opens: a client run right after `server`
     # would be refused. Wait for the port as well.
+    # An IPv6 listen address is bracketed, `[::1]:9443`; /dev/tcp takes the address bare.
     local host=${2%:*} port=${2##*:}
+    host=${host#\[}
+    host=${host%\]}
     tries=0
     until (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
         tries=$((tries + 1))

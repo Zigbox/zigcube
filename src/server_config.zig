@@ -87,9 +87,10 @@ pub const usage =
     \\  --create-store    create the store's file or schema if it is not there
     \\  --new-ca          make a new peer CA key although the store has run before (every agent
     \\                    then joins again); the key file is in the state directory
-    \\  --discard-sealed  delete every sealed record (certificate and ACME account keys) and
-    \\                    make a new sealing key, when the old key is lost (ZC-E0824); every
-    \\                    public host is then ordered again (ZC-W0808)
+    \\  --discard-sealed  when the sealing key does not open the sealed records (ZC-E0824):
+    \\                    delete them (certificate and ACME account keys), rename the old key
+    \\                    file aside and make a new one; every public host is then ordered
+    \\                    again (ZC-W0808). With a key that opens them it does nothing
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
     \\

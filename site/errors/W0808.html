@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-W0808 · Zigcube</title>
-<meta name="description" content="sealed records were discarded; every public host is ordered again">
+<meta name="description" content="the server started with --discard-sealed">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/W0808.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,10 +73,11 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-W0808</h1>
-<p class="summary">sealed records were discarded; every public host is ordered again</p>
+<p class="summary">the server started with --discard-sealed</p>
 <dl class="facts"><div><dt>Kind</dt><dd>warning</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>The server started with --discard-sealed. It deleted every sealed record (certificates and ACME accounts) and every ACME order, and made a new sealing key. Every public host is ordered again, which counts against Let's Encrypt's limits: 50 certificates per registered domain per week, and 5 duplicate certificates per week.</p>
+<p>The server started with --discard-sealed. If its sealing key opened every sealed record, the flag did nothing: no record was deleted, the key was kept, and the warning says to remove the flag.</p>
+<p>Otherwise it deleted every sealed record (certificates and ACME accounts) and every ACME order, renamed the old key file aside (seal-&lt;hash&gt;.key.discarded-&lt;unix seconds&gt;, still 0600; docs/sealing.md says how to restore it) and made a new sealing key. Every public host is ordered again, which counts against Let's Encrypt's limits: 50 certificates per registered domain per week, and 5 duplicate certificates per week.</p>
 <p>Back up the new key file and start without --discard-sealed from now on.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

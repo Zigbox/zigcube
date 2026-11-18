@@ -680,7 +680,7 @@ fn sealed_refused(diag: *diag_mod.Diag) void { // server_seal.zig
 
 fn sealed_discarded(diag: *diag_mod.Diag) void { // server_seal.zig
     const id: seal.KeyId = "9e3c71b05d4a2f86".*;
-    server_seal.render_warning(diag, 21, id);
+    server_seal.render_warning(diag, 21, id, "seal-0123456789abcdef.key.discarded-1763424000");
 }
 
 fn scope_refused(diag: *diag_mod.Diag) void { // api.zig

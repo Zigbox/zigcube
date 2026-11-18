@@ -3,7 +3,9 @@
 //! whether the output holds the secret in any form a careless path would print it: the raw bytes,
 //! hex in either case, and base64 (standard and URL-safe, padded or not). A secret embedded in a
 //! longer base64 or hex string at any byte offset is found too: base64 is tried at all three
-//! alignments, and the forms are searched as substrings.
+//! alignments, and the forms are searched as substrings. Each form is also searched in the
+//! output with whitespace and the JSON escapes `\n`, `\r`, `\t` and `\/` taken out, so base64
+//! wrapped at 64 or 76 columns (PEM, MIME) or escaped inside a JSON string is found too.
 //!
 //! Test-only. It never prints the secret: a failure names the form and the offset.
 
@@ -20,13 +22,55 @@ pub const Form = enum {
     base64_url,
 };
 
-pub const Found = struct { form: Form, offset: usize };
+/// `offset` is in the output as searched: with `unwrapped`, the output with whitespace and JSON
+/// escapes taken out.
+pub const Found = struct { form: Form, offset: usize, unwrapped: bool = false };
 
 /// The first form of `secret` that `haystack` holds, or null. `secret` is at least 8 bytes, so
 /// that a short match by chance is not a finding.
 pub fn find(haystack: []const u8, secret: []const u8) ?Found {
     assert(secret.len >= 8);
     assert(secret.len <= secret_bytes_max);
+    if (find_plain(haystack, secret)) |found| return found;
+    const unwrapped = std.testing.allocator.alloc(u8, haystack.len) catch
+        @panic("redaction: out of memory"); // Test-only; a failed test, not a missed secret.
+    defer std.testing.allocator.free(unwrapped);
+    var found = find_plain(unwrap(haystack, unwrapped), secret) orelse return null;
+    found.unwrapped = true;
+    return found;
+}
+
+/// `haystack` without whitespace and with the JSON escapes `\n`, `\r`, `\t` removed and `\/`
+/// made `/`, in `out`.
+fn unwrap(haystack: []const u8, out: []u8) []const u8 {
+    assert(out.len >= haystack.len);
+    var length: usize = 0;
+    var index: usize = 0;
+    while (index < haystack.len) : (index += 1) {
+        const byte = haystack[index];
+        if (byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n') continue;
+        if (byte == '\\' and index + 1 < haystack.len) {
+            switch (haystack[index + 1]) {
+                'n', 'r', 't' => {
+                    index += 1;
+                    continue;
+                },
+                '/' => {
+                    index += 1;
+                    out[length] = '/';
+                    length += 1;
+                    continue;
+                },
+                else => {},
+            }
+        }
+        out[length] = byte;
+        length += 1;
+    }
+    return out[0..length];
+}
+
+fn find_plain(haystack: []const u8, secret: []const u8) ?Found {
     if (std.mem.indexOf(u8, haystack, secret)) |offset| return .{ .form = .raw, .offset = offset };
     var hex: [secret_bytes_max * 2]u8 = undefined;
     const lower = std.fmt.bufPrint(&hex, "{x}", .{secret}) catch unreachable; // Fits.
@@ -45,8 +89,9 @@ pub fn find(haystack: []const u8, secret: []const u8) ?Found {
 /// message, never the secret.
 pub fn expect_absent(haystack: []const u8, secret: []const u8, what: []const u8) !void {
     if (find(haystack, secret)) |found| {
-        std.debug.print("redaction: {s} holds the secret ({s}) at byte {d}\n", .{
-            what, @tagName(found.form), found.offset,
+        const where = if (found.unwrapped) " of the unwrapped text" else "";
+        std.debug.print("redaction: {s} holds the secret ({s}) at byte {d}{s}\n", .{
+            what, @tagName(found.form), found.offset, where,
         });
         return error.SecretFound;
     }
@@ -127,4 +172,52 @@ test "every form of a planted secret is found, and its absence is not a finding"
     // `expect_absent` on `raw` would fail through `find`, which the checks above cover; it is not
     // called here because its message on stderr counts as a failure of the test step.
     try testing.expectEqual(@as(usize, 5), find(raw, &secret).?.offset);
+}
+
+test "base64 wrapped at 64 and 76 columns, or escaped in JSON, is found" {
+    // Goal: a PEM block or a JSON-escaped PEM does not hide a secret (ruling 3). Method: a
+    // 200-byte secret inside a longer base64 string, wrapped at 64 columns with "\n", at 76 with
+    // "\r\n", and as a JSON string ("\\n" between lines, "\\/" for each '/'): each is found;
+    // the same text with one byte of the secret changed is not.
+    var secret: [200]u8 = undefined;
+    for (&secret, 0..) |*byte, index| byte.* = @intCast((index * 37 + 11) % 256);
+    var input: [208]u8 = @splat(0x5c);
+    @memcpy(input[5..][0..secret.len], &secret);
+    var encoded_buffer: [400]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buffer, &input);
+    try testing.expect(std.mem.indexOfScalar(u8, encoded, '/') != null);
+    var text: [1024]u8 = undefined;
+    for ([_]struct { width: usize, eol: []const u8 }{
+        .{ .width = 64, .eol = "\n" },
+        .{ .width = 76, .eol = "\r\n" },
+        .{ .width = 64, .eol = "\\n" },
+    }) |shape| {
+        const pem = wrap(&text, encoded, shape.width, shape.eol, shape.eol[0] == '\\');
+        try testing.expect(std.mem.indexOf(u8, pem, shape.eol) != null);
+        const found = find(pem, &secret).?;
+        try testing.expect(found.unwrapped);
+        try testing.expectEqual(Form.base64_standard, found.form);
+    }
+    var other = secret;
+    other[100] ^= 1;
+    const pem = wrap(&text, encoded, 64, "\n", false);
+    try testing.expect(find(pem, &other) == null);
+}
+
+/// `encoded` in lines of `width`, each ended by `eol`; with `json`, each '/' written "\\/".
+fn wrap(out: []u8, encoded: []const u8, width: usize, eol: []const u8, json: bool) []const u8 {
+    var length: usize = 0;
+    for (encoded, 0..) |byte, index| {
+        if (index > 0 and index % width == 0) {
+            @memcpy(out[length..][0..eol.len], eol);
+            length += eol.len;
+        }
+        if (json and byte == '/') {
+            out[length] = '\\';
+            length += 1;
+        }
+        out[length] = byte;
+        length += 1;
+    }
+    return out[0..length];
 }

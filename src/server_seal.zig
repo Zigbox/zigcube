@@ -4,13 +4,16 @@
 //! The key is `seal-<hash>.key` (or `seal.key`), 0600, beside the CA key, named the way the CA
 //! key is (`server_ca.key_name_for`). `open` is the one function that loads it:
 //!
-//! - No key and no sealed records (a new cluster, or a C3/C4 store upgraded): the key is made.
+//! - No key and no sealed records (a new cluster, or a C3/C4 store upgraded): the key is made,
+//!   never over a key another start wrote meanwhile (that one is read instead).
 //! - Sealed records and no key, or a key that does not open one of them: ZC-E0824, naming the
 //!   key file, the key id the records expect and the two fixes.
-//! - `--discard-sealed`: every sealed record (and every ACME order) is deleted first, then a new
-//!   key is made and written, then ZC-W0808 is printed. A crash between the two leaves no sealed
-//!   records and the old key, which the next start keeps: nothing is lost that the flag did not
-//!   already give up (docs/decisions/2026-11-18-c5-seal-discard-order.md).
+//! - `--discard-sealed` acts only then. With a key that opens every sealed record it deletes
+//!   nothing, keeps the key and says so (ZC-W0808, "nothing to discard"). Otherwise `open` only
+//!   plans the discard, and `discard` carries it out once every start step that can refuse has
+//!   passed: the sealed records (and every ACME order) are deleted, the old key file is renamed
+//!   aside (`<name>.discarded-<unix seconds>`, still 0600), a new key is written and ZC-W0808 is
+//!   printed (docs/decisions/2026-11-18-c5-seal-fix-discard-and-find.md).
 //!
 //! The start-up check reads through the raw store, so that a store halted by the verified pair
 //! (`first_check`) is still checked; the discard writes through the guarded store, so that its
@@ -33,6 +36,25 @@ const Diag = diag_mod.Diag;
 pub const Error = files.Error || error{ OutOfMemory, Canceled };
 
 pub const key_name_bytes_max = 64;
+/// A key name, ".discarded-" and a count of seconds.
+pub const aside_name_bytes_max = key_name_bytes_max + ".discarded-".len + 20;
+
+/// The most records the start-up check reads under one prefix, and so the most `--discard-sealed`
+/// is ever asked to delete under one: 4096 pages of 500, 2,048,000.
+pub const scan_records_max: u64 =
+    @as(u64, constants.seal_scan_pages_max) * constants.store_list_limit_max;
+
+/// The discard's rounds of `store_txn_ops_max` deletes under one prefix: enough for every record
+/// the scan admits, plus one failed compare (a record rewritten meanwhile) per page.
+const discard_rounds_max: u64 =
+    (scan_records_max + constants.store_txn_ops_max - 1) / constants.store_txn_ops_max +
+    constants.seal_scan_pages_max;
+
+comptime {
+    assert(scan_records_max == 2_048_000);
+    assert((discard_rounds_max - constants.seal_scan_pages_max) *
+        constants.store_txn_ops_max >= scan_records_max);
+}
 
 pub const Options = struct {
     /// The key file's name in the state directory (`key_name_for`).
@@ -41,6 +63,15 @@ pub const Options = struct {
     discard: bool = false,
     /// Say nothing on stderr (tests).
     quiet: bool = false,
+};
+
+/// What `open` decided.
+pub const Opened = union(enum) {
+    /// The start goes on with this key.
+    ready: seal.Key,
+    /// `--discard-sealed`, and the key does not open the sealed records: `discard` deletes them
+    /// and makes the key, after every start step that can refuse.
+    discard,
 };
 
 /// The sealing key's file for the CA key file `ca_name`: `ca.key` gives `seal.key`, and
@@ -72,25 +103,33 @@ const Scan = struct {
     };
 };
 
-/// Loads, makes or (with `discard`) replaces the sealing key. `scan` is the raw store, `write`
-/// the guarded one; `state_dir` null means a memory store, whose key lives in memory only.
+/// Loads or makes the sealing key, or (with `discard`, when the key does not open the sealed
+/// records) plans the discard. `scan` is the raw store; `state_dir` null means a memory store,
+/// whose key lives in memory only. Deletes nothing.
 pub fn open(
     gpa: Allocator,
     io: std.Io,
     scan: store.Store,
-    write: store.Store,
     state_dir: ?[]const u8,
     options: Options,
     diag: *Diag,
-) Error!seal.Key {
+) Error!Opened {
     assert(diag.code == null);
     assert(options.key_name.len > 0);
-    if (options.discard) return discard(gpa, io, write, state_dir, options, diag);
     var found = try load(io, state_dir, options.key_name, diag);
-    errdefer if (found) |*key| key.wipe();
+    defer if (found) |*key| key.wipe();
     var result: Scan = .{};
     try check(gpa, scan, if (found) |*key| key else null, &result, diag);
     if (result.refused) |*refused| {
+        if (options.discard) {
+            // Planned first, so that the discard can finish: every prefix it empties is within
+            // the bound its rounds are sized for.
+            for (seal.discarded_prefixes) |prefix| {
+                var counter: Counter = .{};
+                try walk(gpa, scan, prefix, &counter, diag);
+            }
+            return .discard;
+        }
         const found_id: ?seal.KeyId = if (found) |*key| key.id() else null;
         raise_refused(diag, .{
             .state_dir = state_dir,
@@ -103,9 +142,10 @@ pub fn open(
         });
         return error.Failed;
     }
-    if (found) |key| return key;
+    if (options.discard and !options.quiet) warn_nothing(io);
+    if (found) |key| return .{ .ready = key };
     assert(result.records == 0);
-    return make(io, state_dir, options.key_name, diag);
+    return .{ .ready = try make(io, state_dir, options.key_name, diag) };
 }
 
 /// The key in the state directory, or null if there is no file (or no directory: memory).
@@ -118,7 +158,8 @@ fn load(io: std.Io, state_dir: ?[]const u8, name: []const u8, diag: *Diag) Error
 }
 
 /// A new key from the kernel (ZC-E0821 if it fails), written to the state directory if there
-/// is one.
+/// is one. The file is never replaced: if another start wrote one first, that key is read and
+/// returned instead, so two racing starts agree on one key.
 fn make(io: std.Io, state_dir: ?[]const u8, name: []const u8, diag: *Diag) Error!seal.Key {
     var key: seal.Key = .{ .bytes = undefined };
     errdefer key.wipe();
@@ -129,8 +170,12 @@ fn make(io: std.Io, state_dir: ?[]const u8, name: []const u8, diag: *Diag) Error
     const path = state_dir orelse return key;
     var dir = try open_dir(io, path, name, diag);
     defer dir.close(io);
-    try files.write_seed(io, dir, path, name, key.bytes, diag);
-    return key;
+    if (try files.write_seed_new(io, dir, path, name, key.bytes, diag)) return key;
+    key.wipe();
+    const seed = try files.read_seed(io, dir, path, name, diag) orelse {
+        return files.unusable(diag, path, name, "read", "it was written and then removed");
+    };
+    return .{ .bytes = seed };
 }
 
 fn open_dir(io: std.Io, path: []const u8, name: []const u8, diag: *Diag) Error!std.Io.Dir {
@@ -154,61 +199,114 @@ fn check(
     result: *Scan,
     diag: *Diag,
 ) Error!void {
+    for (seal.sealed_prefixes) |prefix| {
+        var checker: Checker = .{ .key = key, .result = result };
+        try walk(gpa, scan, prefix, &checker, diag);
+        if (result.refused != null) return;
+    }
+}
+
+const Checker = struct {
+    key: ?*const seal.Key,
+    result: *Scan,
+
+    fn visit(checker: *Checker, kv: store.KeyValue) bool {
+        check_one(kv, checker.key, checker.result);
+        return checker.result.refused == null;
+    }
+};
+
+const Counter = struct {
+    records: u64 = 0,
+
+    fn visit(counter: *Counter, kv: store.KeyValue) bool {
+        _ = kv;
+        counter.records += 1;
+        return true;
+    }
+};
+
+/// Lists every record under `prefix` at one revision, page by page, handing each to
+/// `visitor.visit` until it returns false. More than `scan_records_max` records is ZC-E0824:
+/// the start is refused, never half-checked.
+fn walk(
+    gpa: Allocator,
+    scan: store.Store,
+    prefix: []const u8,
+    visitor: anytype,
+    diag: *Diag,
+) Error!void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    for (seal.sealed_prefixes) |prefix| {
-        var revision: ?store.Revision = null;
-        var after: ?[]const u8 = null;
-        var after_buffer: [constants.store_key_bytes_max]u8 = undefined;
-        var pages: u32 = 0;
-        while (pages < constants.seal_scan_pages_max) : (pages += 1) {
-            _ = arena_state.reset(.retain_capacity);
-            const page = scan.list(arena_state.allocator(), .{
-                .prefix = prefix,
-                .at_revision = revision,
-                .limit = constants.store_list_limit_max,
-                .continue_after = after,
-            }, diag) catch return error.Failed;
-            revision = page.revision;
-            for (page.kvs) |kv| {
-                check_one(kv, key, result);
-                if (result.refused != null) return;
-            }
-            const next = page.continue_after orelse break;
-            @memcpy(after_buffer[0..next.len], next);
-            after = after_buffer[0..next.len];
-        } else {
-            diag.raise(.E0824);
-            diag.cause("more than {d} pages of records under {s}: too many to check", .{
-                constants.seal_scan_pages_max, prefix,
-            });
-            diag.fix(.{ .sentence = "start once with --discard-sealed to remove them" });
-            return error.Failed;
+    var revision: ?store.Revision = null;
+    var after: ?[]const u8 = null;
+    var after_buffer: [constants.store_key_bytes_max]u8 = undefined;
+    var pages: u32 = 0;
+    while (pages < constants.seal_scan_pages_max) : (pages += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        const page = scan.list(arena_state.allocator(), .{
+            .prefix = prefix,
+            .at_revision = revision,
+            .limit = constants.store_list_limit_max,
+            .continue_after = after,
+        }, diag) catch return error.Failed;
+        revision = page.revision;
+        for (page.kvs) |kv| {
+            if (!visitor.visit(kv)) return;
         }
+        const next = page.continue_after orelse return;
+        @memcpy(after_buffer[0..next.len], next);
+        after = after_buffer[0..next.len];
     }
+    raise_too_many(diag, prefix);
+    return error.Failed;
+}
+
+/// ZC-E0824 for a prefix past the bound: one cause naming the bound and what was found, and a
+/// fix that is not `--discard-sealed` (which would delete every one of them). Public for the
+/// CLI golden test.
+pub fn raise_too_many(diag: *Diag, prefix: []const u8) void {
+    assert(diag.code == null);
+    diag.raise(.E0824);
+    diag.cause("more than {d} records under {s}; the start-up check reads at most {d} " ++
+        "({d} pages of {d}), so it refuses to start rather than check part of them", .{
+        scan_records_max,              prefix,                         scan_records_max,
+        constants.seal_scan_pages_max, constants.store_list_limit_max,
+    });
+    diag.fix(.{ .sentence = "delete the records under that prefix that no public host uses " ++
+        "any more, then start again" });
 }
 
 fn check_one(kv: store.KeyValue, key: ?*const seal.Key, result: *Scan) void {
     assert(result.refused == null);
-    // A record with no envelope holds nothing sealed (an entry not yet given a key).
-    const envelope = seal.find(kv.value) orelse return;
-    result.records += 1;
-    const expected = seal.key_id_of(envelope);
-    const why: []const u8 = if (key) |k| why: {
-        var plain: [constants.seal_plaintext_bytes_max]u8 = undefined;
-        defer std.crypto.secureZero(u8, &plain);
-        _ = seal.open(k, kv.key, envelope, &plain) catch |err| break :why switch (err) {
-            error.Malformed => "it is not a sealed envelope this server can read",
-            error.WrongKey => "it was sealed with another key",
-            error.Forged => "it does not open with this key (changed, or moved from another key)",
-        };
+    // Every envelope in the value is checked; a record with none holds nothing sealed (an
+    // entry not yet given a key).
+    var envelopes = seal.envelopes(kv.value);
+    var counted = false;
+    while (envelopes.next()) |envelope| {
+        if (!counted) result.records += 1;
+        counted = true;
+        const why = refusal_of(envelope, kv.key, key) orelse continue;
+        result.refused = .{ .expected = seal.key_id_of(envelope), .why = why };
+        const refused = &result.refused.?;
+        assert(kv.key.len <= refused.key_buffer.len);
+        @memcpy(refused.key_buffer[0..kv.key.len], kv.key);
+        refused.key_length = @intCast(kv.key.len);
         return;
-    } else "there is no key file";
-    result.refused = .{ .expected = expected, .why = why };
-    const refused = &result.refused.?;
-    assert(kv.key.len <= refused.key_buffer.len);
-    @memcpy(refused.key_buffer[0..kv.key.len], kv.key);
-    refused.key_length = @intCast(kv.key.len);
+    }
+}
+
+/// Why `envelope` at `path` does not open with `key`, or null if it opens.
+fn refusal_of(envelope: []const u8, path: []const u8, key: ?*const seal.Key) ?[]const u8 {
+    const k = key orelse return "there is no key file";
+    var plain: [constants.seal_plaintext_bytes_max]u8 = undefined;
+    defer std.crypto.secureZero(u8, &plain);
+    _ = seal.open(k, path, envelope, &plain) catch |err| return switch (err) {
+        error.Malformed => "it is not a sealed envelope this server can read",
+        error.WrongKey => "it was sealed with another key",
+        error.Forged => "it does not open with this key (changed, or moved from another key)",
+    };
+    return null;
 }
 
 /// What ZC-E0824 names.
@@ -254,9 +352,12 @@ pub fn raise_refused(diag: *Diag, refusal: Refusal) void {
     });
 }
 
-/// `--discard-sealed`: deletes the sealed records and the ACME orders, then makes and writes a
-/// new key, then warns (ZC-W0808).
-fn discard(
+/// Carries out the discard `open` planned: deletes the sealed records and the ACME orders, then
+/// renames the old key file aside, then makes and writes a new key, then warns (ZC-W0808). The
+/// server calls it after every start step that can refuse. A crash part way leaves either the
+/// old key and fewer records, or no key and no records: the next start, with the flag or
+/// without, is never worse off.
+pub fn discard(
     gpa: Allocator,
     io: std.Io,
     write: store.Store,
@@ -264,24 +365,52 @@ fn discard(
     options: Options,
     diag: *Diag,
 ) Error!seal.Key {
+    assert(diag.code == null);
+    assert(options.discard);
     var deleted: u64 = 0;
     for (seal.discarded_prefixes) |prefix| {
         deleted += try delete_all(gpa, write, prefix, diag);
     }
+    var aside_buffer: [aside_name_bytes_max]u8 = undefined;
+    const aside = try set_aside(io, state_dir, options.key_name, &aside_buffer, diag);
     const key = try make(io, state_dir, options.key_name, diag);
-    if (!options.quiet) warn_discarded(io, deleted, key.id());
+    if (!options.quiet) warn_discarded(io, deleted, key.id(), aside);
     return key;
+}
+
+/// Renames the key file to `<name>.discarded-<unix seconds>`, never over another file, and
+/// returns the new name; null if there is no key file (or no directory: memory).
+fn set_aside(
+    io: std.Io,
+    state_dir: ?[]const u8,
+    name: []const u8,
+    buffer: *[aside_name_bytes_max]u8,
+    diag: *Diag,
+) Error!?[]const u8 {
+    const path = state_dir orelse return null;
+    var dir = try open_dir(io, path, name, diag);
+    defer dir.close(io);
+    dir.access(io, name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return files.unusable(diag, path, name, "read", @errorName(err)),
+    };
+    const seconds = @divFloor(std.Io.Clock.real.now(io).toMilliseconds(), 1000);
+    const aside = std.fmt.bufPrint(buffer, "{s}.discarded-{d}", .{ name, seconds }) catch
+        unreachable; // A name of at most key_name_bytes_max and a 64-bit count.
+    if (!try files.rename_new(io, dir, path, name, aside, diag)) {
+        return files.unusable(diag, path, aside, "keep the old key as", "that file exists");
+    }
+    try files.sync_dir(io, dir, path, aside, diag);
+    return aside;
 }
 
 /// Deletes every record under `prefix`, `store_txn_ops_max` to a transaction. Returns how many.
 fn delete_all(gpa: Allocator, write: store.Store, prefix: []const u8, diag: *Diag) Error!u64 {
-    const rounds_max = constants.seal_scan_pages_max *
-        (constants.store_list_limit_max / constants.store_txn_ops_max);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var deleted: u64 = 0;
-    var round: u32 = 0;
-    while (round < rounds_max) : (round += 1) {
+    var round: u64 = 0;
+    while (round < discard_rounds_max) : (round += 1) {
         _ = arena_state.reset(.retain_capacity);
         const page = write.list(arena_state.allocator(), .{
             .prefix = prefix,
@@ -302,31 +431,56 @@ fn delete_all(gpa: Allocator, write: store.Store, prefix: []const u8, diag: *Dia
         }, diag) catch return error.Failed;
         if (result.succeeded) deleted += page.kvs.len;
     }
-    diag.raise(.E0824);
-    diag.cause("{s} still holds records after {d} rounds of deletes", .{ prefix, rounds_max });
-    diag.fix(.{ .sentence = "stop whatever writes there, and start with --discard-sealed again" });
+    raise_unfinished(diag, prefix);
     return error.Failed;
 }
 
-/// ZC-W0808 on stderr. The id of the new key is printed, never the key.
-fn warn_discarded(io: std.Io, deleted: u64, id: seal.KeyId) void {
-    var diag: Diag = undefined;
-    diag.reset();
-    render_warning(&diag, deleted, id);
+/// ZC-E0824 for a discard that could not finish: something kept writing under `prefix`. The fix
+/// is not the flag, which the operator is already using. Public for the CLI golden test.
+pub fn raise_unfinished(diag: *Diag, prefix: []const u8) void {
+    assert(diag.code == null);
+    diag.raise(.E0824);
+    diag.cause("--discard-sealed could not empty {s}: records kept appearing there after {d} " ++
+        "rounds of deletes, so another writer is at work; the old key file is unchanged", .{
+        prefix, discard_rounds_max,
+    });
+    diag.fix(.{ .sentence = "stop every other zcube-server on this store, then start again" });
+}
+
+/// ZC-W0808 on stderr, rendered verbose: every cause matters once (the count, the new key's id,
+/// where the old key went, the limits), and the text mode shows only the last.
+fn warn(io: std.Io, diag: *Diag) void {
     var diagnostic: diag_mod.Diagnostic = undefined;
-    diag_mod.to_diagnostic(&diagnostic, &diag);
+    diag_mod.to_diagnostic(&diagnostic, diag);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
-    // Verbose: every cause matters once (the count, the new key's id, the limits), and the text
-    // mode shows only the last.
     const text = diag_mod.render(&diagnostic, .verbose, false, &buffer);
     std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
 }
 
-/// The warning's diagnostic, apart so that tests can render it.
-pub fn render_warning(diag: *Diag, deleted: u64, id: seal.KeyId) void {
+fn warn_discarded(io: std.Io, deleted: u64, id: seal.KeyId, aside: ?[]const u8) void {
+    var diag: Diag = undefined;
+    diag.reset();
+    render_warning(&diag, deleted, id, aside);
+    warn(io, &diag);
+}
+
+fn warn_nothing(io: std.Io) void {
+    var diag: Diag = undefined;
+    diag.reset();
+    render_nothing(&diag);
+    warn(io, &diag);
+}
+
+/// The warning's diagnostic, apart so that tests can render it. The id of the new key is
+/// printed, never the key; `aside` is the old key file's new name, if there was one.
+pub fn render_warning(diag: *Diag, deleted: u64, id: seal.KeyId, aside: ?[]const u8) void {
     assert(diag.code == null);
     diag.raise(.W0808);
     diag.cause("--discard-sealed deleted {d} sealed record(s) and ACME order(s)", .{deleted});
+    if (aside) |name| {
+        diag.cause("the old key file was renamed {s}, beside the new one (docs/sealing.md " ++
+            "says how to restore it)", .{name});
+    }
     diag.cause("a new sealing key was made, with id {s}", .{&id});
     diag.cause("every public host is ordered again, which counts against Let's Encrypt's " ++
         "limits: 50 certificates per registered domain per week and 5 duplicates per " ++
@@ -334,6 +488,15 @@ pub fn render_warning(diag: *Diag, deleted: u64, id: seal.KeyId) void {
     diag.fix(.{
         .sentence = "back up the new key file; start without --discard-sealed from now on",
     });
+}
+
+/// ZC-W0808 when the key opens every sealed record: the flag did nothing.
+pub fn render_nothing(diag: *Diag) void {
+    assert(diag.code == null);
+    diag.raise(.W0808);
+    diag.cause("--discard-sealed: the sealing key opens every sealed record, so nothing was " ++
+        "deleted and the key was kept", .{});
+    diag.fix(.{ .sentence = "nothing to discard; remove --discard-sealed" });
 }
 
 // ---- Tests ---------------------------------------------------------------------------------
@@ -372,13 +535,39 @@ const TestRig = struct {
         return rig.path_buffer[0..rig.path_length];
     }
 
+    fn options(discard_sealed: bool) Options {
+        return .{ .key_name = "seal.key", .discard = discard_sealed, .quiet = true };
+    }
+
+    /// `open`, then the planned discard if there is one, as the server does.
     fn open_key(rig: *TestRig, discard_sealed: bool) Error!seal.Key {
         const s = rig.memory.interface();
-        return open(testing.allocator, testing.io, s, s, rig.path(), .{
-            .key_name = "seal.key",
-            .discard = discard_sealed,
-            .quiet = true,
-        }, &rig.diag);
+        const o = options(discard_sealed);
+        return switch (try open(testing.allocator, testing.io, s, rig.path(), o, &rig.diag)) {
+            .ready => |key| key,
+            .discard => discard(testing.allocator, testing.io, s, rig.path(), o, &rig.diag),
+        };
+    }
+
+    /// `open` alone.
+    fn plan(rig: *TestRig, discard_sealed: bool) Error!Opened {
+        const s = rig.memory.interface();
+        const o = options(discard_sealed);
+        return open(testing.allocator, testing.io, s, rig.path(), o, &rig.diag);
+    }
+
+    /// The names in the state directory that start with "seal.key.discarded-".
+    fn asides(rig: *TestRig, first: *[aside_name_bytes_max]u8) !usize {
+        var dir = try rig.tmp.dir.openDir(testing.io, ".", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        var found: usize = 0;
+        while (try iterator.next(testing.io)) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "seal.key.discarded-")) continue;
+            if (found == 0) @memcpy(first[0..entry.name.len], entry.name);
+            found += 1;
+        }
+        return found;
     }
 
     fn put(rig: *TestRig, key: []const u8, value: []const u8) !void {
@@ -469,8 +658,7 @@ test "sealed records with the key removed, or another key, are ZC-E0824 naming t
     try testing.expect(std.mem.indexOf(u8, text, &id) != null);
     try testing.expect(std.mem.indexOf(u8, text, "seal.key is missing") != null);
     try testing.expect(std.mem.indexOf(u8, text, "--discard-sealed") != null);
-    try redaction.expect_absent(text, &key.bytes, "E0824, no key");
-    try redaction.expect_absent(text, plain_key, "E0824, no key");
+    try expect_redacted_all(&rig.diag, &key.bytes, plain_key);
     // Nothing was made in its place: a refused start writes no key.
     try testing.expect((try rig.key_file()) == null);
 
@@ -482,8 +670,8 @@ test "sealed records with the key removed, or another key, are ZC-E0824 naming t
     text = rig.rendered(&buffer);
     try testing.expect(std.mem.indexOf(u8, text, &id) != null);
     try testing.expect(std.mem.indexOf(u8, text, &files_id(other)) != null);
-    try redaction.expect_absent(text, &key.bytes, "E0824, other key");
-    try redaction.expect_absent(text, &other, "E0824, other key");
+    try expect_redacted_all(&rig.diag, &key.bytes, plain_key);
+    try expect_redacted_all(&rig.diag, &other, plain_key);
     rig.diag.reset();
     try testing.expectEqual(@as(usize, 1), try rig.count("/edge-certs/"));
 }
@@ -568,7 +756,7 @@ test "--discard-sealed deletes the sealed records and orders, makes a new key an
 
     var warning: Diag = undefined;
     warning.reset();
-    render_warning(&warning, 21, fresh.id());
+    render_warning(&warning, 21, fresh.id(), "seal.key.discarded-1700000000");
     try testing.expectEqual(codes.Code.W0808, warning.code.?);
     var diagnostic: diag_mod.Diagnostic = undefined;
     diag_mod.to_diagnostic(&diagnostic, &warning);
@@ -576,7 +764,138 @@ test "--discard-sealed deletes the sealed records and orders, makes a new key an
     const text = diag_mod.render(&diagnostic, .verbose, false, &buffer);
     try testing.expect(std.mem.indexOf(u8, text, &fresh.id()) != null);
     try testing.expect(std.mem.indexOf(u8, text, "50 certificates") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "seal.key.discarded-1700000000") != null);
     try redaction.expect_absent(text, &fresh.bytes, "W0808");
+}
+
+test "--discard-sealed with a key that opens every record deletes nothing and keeps the key" {
+    // Goal: the flag acts only when the start check fails (ruling 1). Method: seal records with
+    // the key in place and start with the flag: every record and the key file are as they were,
+    // no file is set aside, and W0808's other text says to remove the flag.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    var key = try rig.open_key(false);
+    defer key.wipe();
+    try rig.put_sealed(&key, "/edge-certs/a.example", plain_key);
+    try rig.put("/acme-orders/a.example", "{\"v\":1}");
+    var again = try rig.open_key(true);
+    defer again.wipe();
+    try testing.expectEqualSlices(u8, &key.bytes, &again.bytes);
+    try testing.expectEqualSlices(u8, &key.bytes, &(try rig.key_file()).?);
+    try testing.expectEqual(@as(usize, 1), try rig.count("/edge-certs/"));
+    try testing.expectEqual(@as(usize, 1), try rig.count("/acme-orders/"));
+    var name: [aside_name_bytes_max]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try rig.asides(&name));
+
+    var warning: Diag = undefined;
+    warning.reset();
+    render_nothing(&warning);
+    try testing.expectEqual(codes.Code.W0808, warning.code.?);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &warning);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "nothing to discard; remove --discard-sealed") !=
+        null);
+}
+
+test "--discard-sealed renames the old key aside, 0600, and a planned discard deletes nothing" {
+    // Goal: the old key is never overwritten, and a start refused after `open` (CA, listeners)
+    // deletes nothing (ruling 1). Method: another key in place of the sealing key; `open` with
+    // the flag plans the discard and the records are all still there; then the discard runs and
+    // the old key is found, unchanged and 0600, under its aside name.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    var key = try rig.open_key(false);
+    defer key.wipe();
+    try rig.put_sealed(&key, "/edge-certs/a.example", plain_key);
+    try rig.put("/acme-orders/a.example", "{\"v\":1}");
+    rig.diag.reset();
+    const other: [32]u8 = @splat(0x42);
+    try rig.tmp.dir.deleteFile(testing.io, "seal.key");
+    try files.write_seed(testing.io, rig.tmp.dir, "tmp", "seal.key", other, &rig.diag);
+
+    try testing.expect(try rig.plan(true) == .discard);
+    try testing.expectEqual(@as(usize, 1), try rig.count("/edge-certs/"));
+    try testing.expectEqual(@as(usize, 1), try rig.count("/acme-orders/"));
+    try testing.expectEqualSlices(u8, &other, &(try rig.key_file()).?);
+
+    var fresh = try rig.open_key(true);
+    defer fresh.wipe();
+    try testing.expectEqual(@as(usize, 0), try rig.count("/edge-certs/"));
+    try testing.expectEqual(@as(usize, 0), try rig.count("/acme-orders/"));
+    var name: [aside_name_bytes_max]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try rig.asides(&name));
+    const aside = name[0 .. "seal.key.discarded-".len + 10];
+    const kept = (try files.read_seed(testing.io, rig.tmp.dir, "tmp", aside, &rig.diag)).?;
+    try testing.expectEqualSlices(u8, &other, &kept);
+    try testing.expect(!std.mem.eql(u8, &other, &fresh.bytes));
+}
+
+test "a key written by another start meanwhile is read, never replaced" {
+    // Goal: no-replace creation (ruling 4). Method: write the key file between the check and
+    // `make`, as a racing start would: `make` returns that key and leaves the file as it was.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    const racer: [32]u8 = @splat(0x17);
+    try files.write_seed(testing.io, rig.tmp.dir, "tmp", "seal.key", racer, &rig.diag);
+    var key = try make(testing.io, rig.path(), "seal.key", &rig.diag);
+    defer key.wipe();
+    try testing.expectEqualSlices(u8, &racer, &key.bytes);
+    try testing.expectEqualSlices(u8, &racer, &(try rig.key_file()).?);
+}
+
+test "a record is checked envelope by envelope, and a clear member naming the magic is none" {
+    // Goal: the start check reads every envelope (ruling 3). Method: a record whose first
+    // envelope opens and whose second was sealed with another key is refused; a record whose
+    // clear member is a host named "zcseal1.example.com" next to a good envelope starts.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    var key = try rig.open_key(false);
+    defer key.wipe();
+    const other: seal.Key = .{ .bytes = @splat(0x42) };
+    var first: [seal.envelope_bytes_max]u8 = undefined;
+    var second: [seal.envelope_bytes_max]u8 = undefined;
+    const nonce: [seal.nonce_bytes]u8 = @splat(7);
+    const path_ = "/acme-account/0123abcd";
+    const a = seal.seal(&key, path_, "one", nonce, &first);
+    var value: [2 * seal.envelope_bytes_max + 64]u8 = undefined;
+    try rig.put(path_, try std.fmt.bufPrint(&value, "{{\"a\":\"{s}\",\"b\":\"{s}\"}}", .{
+        a, seal.seal(&other, path_, "two", nonce, &second),
+    }));
+    try testing.expectError(error.Failed, rig.open_key(false));
+    try testing.expectEqual(codes.Code.E0824, rig.diag.code.?);
+    try testing.expect(cause_holds(&rig.diag, "sealed with another key"));
+
+    rig.diag.reset();
+    try rig.put(path_, try std.fmt.bufPrint(&value, "{{\"host\":\"zcseal1.example.com\"," ++
+        "\"key\":\"{s}\"}}", .{a}));
+    var ok = try rig.open_key(false);
+    ok.wipe();
+}
+
+test "the scan's bound is one cause naming the bound, the count and a remedy without the flag" {
+    var diag: Diag = undefined;
+    diag.reset();
+    raise_too_many(&diag, "/edge-certs/");
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "more than 2048000 records under /edge-certs/") !=
+        null);
+    try testing.expect(std.mem.indexOf(u8, text, "--discard-sealed") == null);
+    diag.reset();
+    raise_unfinished(&diag, "/edge-certs/");
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    const unfinished = diag_mod.render(&diagnostic, .text, false, &buffer);
+    try testing.expectEqual(codes.Code.E0824, diag.code.?);
+    try testing.expect(std.mem.indexOf(u8, unfinished, "start once with") == null);
+    try testing.expect(std.mem.indexOf(u8, unfinished, "another writer") != null);
 }
 
 test "the sealing key is named after the CA key" {
@@ -591,6 +910,18 @@ test "the sealing key is named after the CA key" {
 fn files_id(bytes: [32]u8) seal.KeyId {
     const key: seal.Key = .{ .bytes = bytes };
     return key.id();
+}
+
+/// The diagnostic in each mode (text, --verbose, JSON) holds neither the key nor the plaintext.
+fn expect_redacted_all(diag: *Diag, key: []const u8, plain: []const u8) !void {
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, diag);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    inline for (.{ .text, .verbose, .json }) |mode| {
+        const text = diag_mod.render(&diagnostic, mode, false, &buffer);
+        try redaction.expect_absent(text, key, @tagName(mode));
+        try redaction.expect_absent(text, plain, @tagName(mode));
+    }
 }
 
 fn cause_holds(diag: *Diag, needle: []const u8) bool {
