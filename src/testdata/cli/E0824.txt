@@ -1,0 +1,7 @@
+error[ZC-E0824]: sealed records do not open with this server's sealing key
+  cause  the records expect key id 5a1d0c4e9b2f7a68; seal-0123456789abcdef.key
+         is missing from /var/lib/zcube-server
+  fix    restore the key file from a backup, mode 0600, and start again
+         or start once with --discard-sealed: every sealed record is deleted and every public host is ordered again   zcube-server --discard-sealed
+  more   zcube explain E0824 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0824.html

@@ -1,0 +1,7 @@
+warning[ZC-W0808]: the server started with --discard-sealed
+  cause  every public host is ordered again, which counts against Let's
+         Encrypt's limits: 50 certificates per registered domain per week and 5
+         duplicates per week
+  fix    back up the new key file; start without --discard-sealed from now on
+  more   zcube explain W0808 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0808.html

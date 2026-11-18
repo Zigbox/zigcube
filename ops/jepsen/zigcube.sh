@@ -11,9 +11,10 @@
 #                                            when the executables changed
 #   zigcube.sh server STORE LISTEN           write server.zon (--listen LISTEN, store STORE)
 #                                            and (re)start zcube-server if it changed or is not
-#                                            running; then ca.crt and the admin client `jepsen`
-#                                            (issued again when server.zon changed: another
-#                                            store may have another CA)
+#                                            running; then ca.crt, wait until it listens, and
+#                                            the admin client `jepsen` (issued again when
+#                                            server.zon changed: another store may have
+#                                            another CA)
 #   zigcube.sh client-cert NAME [--replace]  an admin client certificate in $etc/client
 #   zigcube.sh node-cert NAME [--replace]    a node certificate in $etc/nodes, to copy to NAME
 #   zigcube.sh agent NAME SERVER CPU_MILLIS MEMORY_BYTES
@@ -143,6 +144,18 @@ cmd_server() {
         sleep 0.1
     done
     install -m 0644 "$ca" "$etc/ca.crt"
+    # The CA file is written before the listener opens: a client run right after `server`
+    # would be refused. Wait for the port as well.
+    # An IPv6 listen address is bracketed, `[::1]:9443`; /dev/tcp takes the address bare.
+    local host=${2%:*} port=${2##*:}
+    host=${host#\[}
+    host=${host%\]}
+    tries=0
+    until (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
+        tries=$((tries + 1))
+        [ $tries -le $ca_wait_tenths ] || die "the server is not listening on $2 after 30 s"
+        sleep 0.1
+    done
     # A changed server.zon may name another store, whose CA did not sign the old certificate.
     if [ "$changed" = changed ]; then issue client jepsen --replace; else issue client jepsen; fi
 }

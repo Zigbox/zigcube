@@ -32,7 +32,9 @@ const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
+const seal = @import("seal.zig");
 const secure_random = @import("secure_random.zig");
+const server_seal = @import("server_seal.zig");
 const testpeer = @import("tls_testpeer.zig");
 const tls_client = @import("tls_client.zig");
 const x509 = @import("x509.zig");
@@ -664,6 +666,23 @@ fn entropy_failed(diag: *diag_mod.Diag) void { // secure_random.zig
     secure_random.raise(diag, "the TLS key share");
 }
 
+fn sealed_refused(diag: *diag_mod.Diag) void { // server_seal.zig
+    server_seal.raise_refused(diag, .{
+        .state_dir = "/var/lib/zcube-server",
+        .key_name = "seal-0123456789abcdef.key",
+        .records = 1,
+        .record = "/edge-certs/shop.example.com",
+        .why = "there is no key file",
+        .expected = "5a1d0c4e9b2f7a68".*,
+        .found = null,
+    });
+}
+
+fn sealed_discarded(diag: *diag_mod.Diag) void { // server_seal.zig
+    const id: seal.KeyId = "9e3c71b05d4a2f86".*;
+    server_seal.render_warning(diag, 21, id, "seal-0123456789abcdef.key.discarded-1763424000");
+}
+
 fn scope_refused(diag: *diag_mod.Diag) void { // api.zig
     const caller: api.Caller = .{ .client = .{ .name = "app", .scope = .jobs } };
     const path = "/v1/list";
@@ -962,6 +981,8 @@ const cases = [_]Case{
     relayed(.E0820, tls_signer_failed),
     relayed(.E0821, entropy_failed),
     relayed(.E0822, scope_refused),
+    relayed(.E0824, sealed_refused),
+    relayed(.W0808, sealed_discarded),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),

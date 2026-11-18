@@ -110,6 +110,9 @@ comptime {
     _ = @import("peer_server.zig");
     _ = @import("fetch_cli.zig");
     _ = @import("fetch_worker.zig");
+    _ = @import("seal.zig");
+    _ = @import("server_seal.zig");
+    _ = @import("testing/redaction.zig");
     _ = @import("server_ca.zig");
     _ = @import("server_revoked.zig");
     _ = @import("server_tls.zig");

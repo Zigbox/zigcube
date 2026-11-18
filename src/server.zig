@@ -24,6 +24,8 @@ const server_listen = @import("server_listen.zig");
 const Remembered = @import("server_remember.zig").Remembered;
 const peer_ca = @import("peer_ca.zig");
 const server_ca = @import("server_ca.zig");
+const server_seal = @import("server_seal.zig");
+const seal = @import("seal.zig");
 const server_browser_ca = @import("server_browser_ca.zig");
 const server_tls = @import("server_tls.zig");
 const server_revoked = @import("server_revoked.zig");
@@ -68,6 +70,11 @@ pub const Server = struct {
     /// The CA key's file for this store and whether the store has run here before (`guard`).
     ca_name_buffer: [server_ca.key_name_bytes_max]u8 = undefined,
     ca_name_length: u8 = 0,
+    /// The sealing key (C5 slice 2, `server_seal.zig`): `seal-<hash>.key` beside the CA key.
+    seal_key: seal.Key = undefined,
+    /// `--discard-sealed` and the key does not open the sealed records: `finish_seal` discards
+    /// them once every step that can refuse the start has passed.
+    seal_discard: bool = false,
     /// The trust policy `POST /v1/jobs` checks (B5), when the configuration names one; its
     /// scratch (about 4 MiB) is allocated only then.
     trust: ?job_trust.Trust = null,
@@ -117,10 +124,16 @@ pub const Server = struct {
         errdefer if (server.trust) |trust| gpa.destroy(trust.scratch);
         try server.guard(config, diag);
         errdefer server.unguard();
-        try server.open_ca(config, diag);
         server.first_check(diag);
+        // Before the CA: a start refused over sealed records makes nothing, and the CA file a
+        // deployment waits for is written as late as it was before sealing. A discard is only
+        // planned here and carried out after the listeners, so a refused start deletes nothing.
+        try server.open_seal(config, diag);
+        errdefer server.seal_key.wipe();
+        try server.open_ca(config, diag);
         try server.open_listeners(config, diag);
         errdefer server.close_listeners();
+        try server.finish_seal(config, diag);
         try server.spawn(diag);
         return server;
     }
@@ -295,6 +308,82 @@ pub const Server = struct {
             },
         };
         server.shared.api.ca = &server.ca;
+    }
+
+    /// Loads or makes the sealing key, refusing to start over sealed records it does not open
+    /// (ZC-E0824), or plans their discard (`--discard-sealed`; `finish_seal`). Runs after
+    /// `first_check`: the check reads the raw store, so a halted store is still checked.
+    fn open_seal(server: *Server, config: config_mod.Config, diag: *Diag) Error!void {
+        var name_buffer: [server_seal.key_name_bytes_max]u8 = undefined;
+        const place = try server.seal_place(config, &name_buffer, diag);
+        const opened = server_seal.open(
+            server.gpa,
+            server.io,
+            server.backend.handle(),
+            place.directory,
+            place.options,
+            diag,
+        ) catch |err| return seal_failed(err, diag);
+        switch (opened) {
+            .ready => |key| server.seal_key = key,
+            .discard => {
+                server.seal_key = .{ .bytes = @splat(0) };
+                server.seal_discard = true;
+            },
+        }
+    }
+
+    /// Carries out the discard `open_seal` planned (ZC-W0808), writing through the guarded
+    /// store. Runs after every start step that can refuse.
+    fn finish_seal(server: *Server, config: config_mod.Config, diag: *Diag) Error!void {
+        if (!server.seal_discard) return;
+        var name_buffer: [server_seal.key_name_bytes_max]u8 = undefined;
+        const place = try server.seal_place(config, &name_buffer, diag);
+        server.seal_key = server_seal.discard(
+            server.gpa,
+            server.io,
+            server.verified.interface(),
+            place.directory,
+            place.options,
+            diag,
+        ) catch |err| return seal_failed(err, diag);
+        server.seal_discard = false;
+    }
+
+    const SealPlace = struct { directory: ?[]const u8, options: server_seal.Options };
+
+    fn seal_place(
+        server: *Server,
+        config: config_mod.Config,
+        name_buffer: *[server_seal.key_name_bytes_max]u8,
+        diag: *Diag,
+    ) Error!SealPlace {
+        const state = state_path(config, diag);
+        if (diag.code != null) return error.StartFailed;
+        // A memory store's records end with the process, so its sealing key does too: no file,
+        // even with a state directory.
+        const directory = if (config.store == .memory) null else state;
+        const ca_name = if (server.ca_name_length == 0)
+            server_ca.key_file
+        else
+            server.ca_name_buffer[0..server.ca_name_length];
+        const name = server_seal.key_name_for(ca_name, name_buffer);
+        return .{ .directory = directory, .options = .{
+            .key_name = name,
+            .discard = config.discard_sealed,
+            .quiet = config.quiet,
+        } };
+    }
+
+    fn seal_failed(err: server_seal.Error, diag: *Diag) Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Canceled => error.Canceled, // No diagnostic: see `Error`.
+            error.Failed => {
+                assert(diag.code != null);
+                return error.StartFailed;
+            },
+        };
     }
 
     /// `file` as an absolute path (working directory plus name, lexically), for keying the
@@ -485,6 +574,7 @@ pub const Server = struct {
         server.group.cancel(server.io);
         server.cancel_tasks();
         server.close_listeners();
+        server.seal_key.wipe();
         const gpa = server.gpa;
         if (!server.verified.flush()) {
             const line = "zcube-server: could not save the remembered revision (ZC-E0216); " ++

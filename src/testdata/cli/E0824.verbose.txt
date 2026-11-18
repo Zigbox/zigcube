@@ -1,0 +1,11 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0824]: sealed records do not open with this server's sealing key
+  cause  1 sealed record(s) checked; the rest were not read
+  cause  /edge-certs/shop.example.com does not open: there is no key file
+  cause  the records expect key id 5a1d0c4e9b2f7a68; seal-0123456789abcdef.key
+         is missing from /var/lib/zcube-server
+  reqid  r-0000001
+  fix    restore the key file from a backup, mode 0600, and start again
+         or start once with --discard-sealed: every sealed record is deleted and every public host is ordered again   zcube-server --discard-sealed
+  more   zcube explain E0824
+  docs   https://zigbox.github.io/zigcube/errors/E0824.html

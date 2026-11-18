@@ -47,7 +47,7 @@ pub const tls_name_default = "zcube-server";
 pub const usage =
     \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--insecure-listen HOST:PORT]
     \\                    [--tls-name NAME] [--tls-san NAME_OR_IP]... [--store SPEC]
-    \\                    [--create-store] [--new-ca]
+    \\                    [--create-store] [--new-ca] [--discard-sealed]
     \\                    [--verbose] [--quiet]
     \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]
     \\       zcube-server ca issue-client NAME --scope jobs|admin --p12 FILE [--password-file F]
@@ -87,6 +87,10 @@ pub const usage =
     \\  --create-store    create the store's file or schema if it is not there
     \\  --new-ca          make a new peer CA key although the store has run before (every agent
     \\                    then joins again); the key file is in the state directory
+    \\  --discard-sealed  when the sealing key does not open the sealed records (ZC-E0824):
+    \\                    delete them (certificate and ACME account keys), rename the old key
+    \\                    file aside and make a new one; every public host is then ordered
+    \\                    again (ZC-W0808). With a key that opens them it does nothing
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
     \\
@@ -140,6 +144,8 @@ pub const Config = struct {
     quiet: bool,
     /// Make a new CA key although the store has run here before (`--new-ca`).
     new_ca: bool = false,
+    /// Delete the sealed records and make a new sealing key (`--discard-sealed`, ZC-W0808).
+    discard_sealed: bool = false,
     /// The ttl of the leases the server grants to agents.
     lease_ttl_ms: u32 = constants.lease_ttl_ms,
     /// How long after a node is marked lost its replicas are moved (docs/authority.md §3).
@@ -241,6 +247,8 @@ const Flags = struct {
     verbose: bool = false,
     quiet: bool = false,
     new_ca: bool = false,
+    /// Delete the sealed records and make a new sealing key (`--discard-sealed`, ZC-W0808).
+    discard_sealed: bool = false,
     version: bool = false,
     help: bool = false,
 };
@@ -394,9 +402,9 @@ fn issue_config(arena: Allocator, io: std.Io, rest: []const []const u8, diag: *D
         return bad(diag, "--version is not a setting of ca", .{}, "run zcube-server --version");
     }
     assert(!flags.help); // `load_ca` answered it.
-    if (flags.new_ca or flags.create_store) {
+    if (flags.new_ca or flags.create_store or flags.discard_sealed) {
         const problem = "ca signs with the CA a server already made";
-        return bad(diag, problem, .{}, "leave out --new-ca and --create-store");
+        return bad(diag, problem, .{}, "leave out --new-ca, --create-store and --discard-sealed");
     }
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
@@ -422,6 +430,7 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .verbose = flags.verbose,
         .quiet = flags.quiet,
         .new_ca = flags.new_ca,
+        .discard_sealed = flags.discard_sealed,
         .lease_ttl_ms = try lease_ttl_of(flags.lease_ttl_ms orelse file.lease_ttl_ms, diag),
         .lost_grace_ms = try lost_grace_of(flags.lost_grace_ms orelse file.lost_grace_ms, diag),
         .relays = try relays_valid(file.relays, diag),
@@ -486,6 +495,8 @@ pub fn parse_flags(arena: Allocator, args: []const []const u8, diag: *Diag) Erro
             flags.create_store = true;
         } else if (std.mem.eql(u8, arg, "--new-ca")) {
             flags.new_ca = true;
+        } else if (std.mem.eql(u8, arg, "--discard-sealed")) {
+            flags.discard_sealed = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             flags.verbose = true;
         } else if (std.mem.eql(u8, arg, "-v")) {
