@@ -60,8 +60,10 @@ pub fn main(init: std.process.Init) u8 {
     if (args.len - 5 > entries_max) return fail(init.io, "dist: too many entries");
     var entries: [entries_max]Entry = undefined;
     var packages: [platforms_max]Package = undefined;
-    const count = parse(init, mode, args[5..], &entries, &packages) catch
-        return constants.exit_user;
+    const count = parse(mode, args[5..], &entries, &packages) catch |err| {
+        const text = std.fmt.allocPrint(arena, "dist: {s}", .{parse_message(err)}) catch "dist";
+        return fail(init.io, text);
+    };
     const plan: Plan = .{
         .out_path = args[2],
         .root = args[3],
@@ -81,16 +83,40 @@ pub fn main(init: std.process.Init) u8 {
     return constants.exit_ok;
 }
 
+/// Why `parse` refused the arguments; `parse_message` says it in words.
+const ParseError = error{
+    JepsenPlatform,
+    PlatformMissing,
+    PlatformEmpty,
+    PlatformBad,
+    PlatformTwice,
+    PlatformsTooMany,
+    EntryBad,
+};
+
+fn parse_message(err: ParseError) []const u8 {
+    return switch (err) {
+        error.JepsenPlatform => "jepsen mode takes no --platform",
+        error.PlatformMissing => "release mode needs --platform= first",
+        error.PlatformEmpty => "a platform is empty",
+        error.PlatformBad => "a platform is not lowercase letters, digits, '_' and '-'",
+        error.PlatformTwice => "a platform is named twice",
+        error.PlatformsTooMany => "too many platforms",
+        error.EntryBad => "an entry is not <archive-path>=<source-path>",
+    };
+}
+
 /// Splits the arguments into packages: in `jepsen` mode one, for x86_64 Linux, with no
 /// `--platform=`; in `release` mode one per `--platform=`, which must come first, each with at
-/// least one entry. Returns how many packages it filled.
+/// least one entry and none named twice (two tarballs of one name would overwrite each other,
+/// and SHA256SUMS would list it twice). Returns how many packages it filled. Pure: the caller
+/// reports the error.
 fn parse(
-    init: std.process.Init,
     mode: Mode,
     args: []const []const u8,
     entries: *[entries_max]Entry,
     packages: *[platforms_max]Package,
-) error{Reported}!u32 {
+) ParseError!u32 {
     assert(args.len > 0);
     assert(args.len <= entries_max);
     const marker = "--platform=";
@@ -101,24 +127,26 @@ fn parse(
     if (mode == .jepsen) count = 1;
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, marker)) {
-            if (mode == .jepsen) return report(init, "jepsen mode takes no --platform", .{});
+            if (mode == .jepsen) return error.JepsenPlatform;
             if (count > 0) packages[count - 1].entries = entries[first..entry_count];
-            if (count > 0 and first == entry_count) return report(init, "a platform is empty", .{});
-            if (count == platforms_max) return report(init, "too many platforms", .{});
+            if (count > 0 and first == entry_count) return error.PlatformEmpty;
+            if (count == platforms_max) return error.PlatformsTooMany;
             const platform = arg[marker.len..];
-            if (!platform_valid(platform)) return report(init, "bad platform '{s}'", .{platform});
+            if (!platform_valid(platform)) return error.PlatformBad;
+            for (packages[0..count]) |package| {
+                if (std.mem.eql(u8, package.platform, platform)) return error.PlatformTwice;
+            }
             packages[count] = .{ .platform = platform, .entries = &.{} };
             count += 1;
             first = entry_count;
             continue;
         }
-        if (count == 0) return report(init, "release mode needs --platform= first", .{});
-        const split = std.mem.indexOfScalar(u8, arg, '=') orelse
-            return report(init, "an entry is not <archive-path>=<source-path>", .{});
+        if (count == 0) return error.PlatformMissing;
+        const split = std.mem.indexOfScalar(u8, arg, '=') orelse return error.EntryBad;
         entries[entry_count] = .{ .archive_path = arg[0..split], .source_path = arg[split + 1 ..] };
         entry_count += 1;
     }
-    if (first == entry_count) return report(init, "a platform is empty", .{});
+    if (first == entry_count) return error.PlatformEmpty;
     packages[count - 1].entries = entries[first..entry_count];
     assert(count <= platforms_max);
     return count;
@@ -332,4 +360,77 @@ fn write_entry(init: std.process.Init, tar: *std.tar.Writer, entry: Entry) !void
         .mode = mode,
         .mtime = 0,
     });
+}
+
+const testing = std.testing;
+
+/// `parse` over `args`, split at spaces; the packages' platforms and entry counts on success.
+fn parse_text(mode: Mode, text: []const u8) ParseError!struct { count: u32, sizes: [4]usize } {
+    var args_buffer: [entries_max][]const u8 = undefined;
+    var args_count: u32 = 0;
+    var words = std.mem.tokenizeScalar(u8, text, ' ');
+    while (words.next()) |word| : (args_count += 1) args_buffer[args_count] = word;
+    var entries: [entries_max]Entry = undefined;
+    var packages: [platforms_max]Package = undefined;
+    const count = try parse(mode, args_buffer[0..args_count], &entries, &packages);
+    var sizes: [4]usize = .{ 0, 0, 0, 0 };
+    for (packages[0..count], 0..) |package, index| sizes[index] = package.entries.len;
+    return .{ .count = count, .sizes = sizes };
+}
+
+test "dist parse: valid release and jepsen arguments" {
+    const two = try parse_text(.release, "--platform=x86_64-linux a=b c=d " ++
+        "--platform=aarch64-linux e=f");
+    try testing.expectEqual(@as(u32, 2), two.count);
+    try testing.expectEqual([4]usize{ 2, 1, 0, 0 }, two.sizes);
+    const four = try parse_text(.release, "--platform=a x=y --platform=b x=y " ++
+        "--platform=c x=y --platform=d x=y");
+    try testing.expectEqual(@as(u32, platforms_max), four.count);
+    const jepsen = try parse_text(.jepsen, "bin/zcube=/x share/a=/y");
+    try testing.expectEqual(@as(u32, 1), jepsen.count);
+    try testing.expectEqual([4]usize{ 2, 0, 0, 0 }, jepsen.sizes);
+    // The source path may hold `=`: only the first one splits.
+    _ = try parse_text(.release, "--platform=x a=b=c");
+}
+
+test "dist parse: refusals" {
+    const cases = [_]struct { mode: Mode, text: []const u8, err: ParseError }{
+        .{ .mode = .release, .text = "--platform=x --platform=y a=b", .err = error.PlatformEmpty },
+        .{ .mode = .release, .text = "--platform=x a=b --platform=y", .err = error.PlatformEmpty },
+        .{ .mode = .release, .text = "--platform=x", .err = error.PlatformEmpty },
+        .{ .mode = .release, .text = "a=b --platform=x c=d", .err = error.PlatformMissing },
+        .{ .mode = .jepsen, .text = "a=b --platform=x c=d", .err = error.JepsenPlatform },
+        .{ .mode = .release, .text = "--platform=X a=b", .err = error.PlatformBad },
+        .{ .mode = .release, .text = "--platform=x/y a=b", .err = error.PlatformBad },
+        .{ .mode = .release, .text = "--platform= a=b", .err = error.PlatformBad },
+        .{ .mode = .release, .text = "--platform=x ab", .err = error.EntryBad },
+        .{ .mode = .jepsen, .text = "ab", .err = error.EntryBad },
+        .{
+            .mode = .release,
+            .text = "--platform=x a=b --platform=x c=d",
+            .err = error.PlatformTwice,
+        },
+        .{
+            .mode = .release,
+            .text = "--platform=a x=y --platform=b x=y --platform=c x=y --platform=d x=y " ++
+                "--platform=e x=y",
+            .err = error.PlatformsTooMany,
+        },
+    };
+    for (cases) |case| {
+        try testing.expectError(case.err, parse_text(case.mode, case.text));
+        try testing.expect(parse_message(case.err).len > 0);
+    }
+}
+
+test "dist platform_valid: the boundary" {
+    try testing.expect(platform_valid("x86_64-linux"));
+    try testing.expect(platform_valid("a"));
+    try testing.expect(platform_valid("0-_"));
+    try testing.expect(!platform_valid(""));
+    try testing.expect(!platform_valid("Linux"));
+    try testing.expect(!platform_valid("a.b"));
+    try testing.expect(!platform_valid("a/b"));
+    try testing.expect(!platform_valid("a b"));
+    try testing.expect(!platform_valid("a=b"));
 }

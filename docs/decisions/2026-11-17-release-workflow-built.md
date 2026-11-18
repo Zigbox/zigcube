@@ -35,13 +35,27 @@ Where it differs from Zigbox's `release.yml`, and why:
 - **The release scripts load from `.release-tools`** (the workflow's own commit), like the local
   actions, so a fix to them reaches an older release commit; ci.yml's `release` job fails if
   `release.yml` names a script or action outside it.
-- **An already-published release stops `plan` quietly**, so a re-run after success is a no-op.
+- **An already-published release stops `plan` quietly**, after checking that its tag is at the
+  release commit (else it fails), so a re-run after success is a no-op.
 - **`publish` accepts a tag that already names the release commit** (Zigbox refuses any existing
-  tag): a re-run after a publish that made the tag but failed its check then finishes. A tag at
-  another commit is still refused.
-- **No build cache in the release build.** Every release builds from nothing (about ten minutes).
+  tag), so a tag made by hand at the right commit does not block a release. A tag at another
+  commit is still refused. A run whose `publish` made the release public and then failed its tag
+  check is finished by "Re-run all jobs" or a dispatch: `plan` finds the published release and
+  checks its tag. "Re-run failed jobs" does not finish it: `publish`'s `find-draft` finds no
+  draft. (Corrected by PR #279's fix session; the first version said a re-run finishes it.)
+- **No build cache in the release build.** Every release builds from nothing (about ten minutes),
+  and `setup-zig` runs with `cache: 'false'`, so Zig's SHA-256 is checked on every run.
+- **The build holds no write token** (PR #279's review): `build` is `contents: read` with no
+  `GH_TOKEN`, and hands its checked assets to an `attach` job as a workflow artifact, with the
+  SHA-256 of `SHA256SUMS` as an output. Zigbox's `build` uploads itself.
+- **`plan` and `publish` fail closed on an unprotected `release` environment**
+  (`.github/release-env.sh`): a required reviewer, `can_admins_bypass: false`, branch `main`
+  alone. GitHub would otherwise create a missing environment unprotected and run `publish` at once.
+- **Both architectures link Ubuntu's libpq**, one version for both: `release-libs.sh` removes the
+  runner's apt.postgresql.org source and pins libpq5 to the newest version Ubuntu serves for both
+  (CI job 134461192114 failed on PGDG's amd64 libpq5 18.6 against the ports' arm64 16.15).
 
 Where: `.github/workflows/release.yml`, `.github/release-libs.sh`, `.github/release-check.sh`,
-`.github/release-tag.sh`, `.github/actions/setup-gh`, `.github/actions/find-draft`, `src/dist.zig`
+`.github/release-tag.sh`, `.github/release-env.sh`, `.github/actions/setup-gh`, `.github/actions/find-draft`, `src/dist.zig`
 (mode `release`), `build.zig` (`zig build release`), ci.yml's `release` job,
 `docs/releases/automation.md`.

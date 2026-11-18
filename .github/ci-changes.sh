@@ -44,6 +44,10 @@ want_one() { want[$1]=1; if [ "$1" = demo_b3 ]; then want[demo_b4]=1; fi; }
 is_docs() {
   case "$1" in
     web/* | src/* | site/errors/*) return 1 ;;
+    # A release's notes start the release workflow when they reach main (docs/releases/
+    # automation.md), so the pull request that adds them runs everything, as a release branch
+    # does, and "CI green" on it means something. The runbook beside them stays documentation.
+    docs/releases/[0-9]*) return 1 ;;
     *.zig | *.zon | *.sh) return 1 ;;
     site/*) return 0 ;;
     *.md) return 0 ;;

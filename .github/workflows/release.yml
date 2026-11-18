@@ -9,13 +9,21 @@
 #   plan      everything that can refuse, before anything is written
 #   draft     a DRAFT GitHub release at the release commit (no tag exists yet)
 #   build     zig build release (x86_64 and aarch64 Linux, ReleaseSafe) and SHA256SUMS, checked,
-#             attached to the draft
+#             handed on as a workflow artifact; read-only, no token that can write
+#   attach    the checked assets attached to the draft (stray assets deleted)
 #   publish   the owner's ONE approval (environment `release`); the draft's assets are checked
 #             again, and the draft becomes the release, which makes the tag
 #
 # A failure before `publish` leaves a draft and nothing else: no tag, no public release. Every job
-# is idempotent: re-running a failed run, or running this workflow by hand with the version, from
-# main, finishes a half-done release (the draft is reused and its assets replaced).
+# is idempotent: "Re-run all jobs" on a failed run, or running this workflow by hand with the
+# version, from main, finishes a half-done release (the draft is reused and its assets replaced).
+# A run that failed after `publish` made the release public is finished the same way: `plan` then
+# finds the release and checks that its tag is at the release commit. ("Re-run failed jobs" on
+# such a run fails in `find-draft`: there is no draft any more.)
+#
+# `plan` refuses to start unless the environment `release` exists with a required reviewer, no
+# admin bypass and the branch main alone (.github/release-env.sh): GitHub creates a missing
+# environment unprotected, and `publish` would then run without the owner's approval.
 #
 # No secret is used: GITHUB_TOKEN alone, and nothing is signed (SHA256SUMS is not signed; see the
 # runbook). ci.yml's `release` job runs the same build and checks on pull requests that touch
@@ -140,7 +148,11 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id > /dev/null 2> "$err" ||
             status=$?
           if [ "$status" = 0 ]; then
-            stop "$tag is already published; nothing to do"
+            # A run that failed after publishing is finished here: the tag must be at $sha.
+            at=$(.release-tools/.github/release-tag.sh "$tag")
+            [ "$at" = "$sha" ] ||
+              fail "$tag is published, but its tag is at $at, not at $sha"
+            stop "$tag is already published, its tag at $sha; nothing to do"
           fi
           grep -q 'HTTP 404' "$err" ||
             fail "could not look up the release $tag: $(head -c 200 "$err")"
@@ -149,6 +161,9 @@ jobs:
           if [ "$at" != absent ] && [ "$at" != "$sha" ]; then
             fail "the tag $tag exists at $at, not at $sha; nothing is released"
           fi
+          # Before anything is written: the owner's approval must be one GitHub enforces.
+          .release-tools/.github/release-env.sh release ||
+            fail "the environment release does not protect the release (see above)"
           prerelease=false
           if [[ "$version" == *-* ]]; then prerelease=true; fi
           {
@@ -198,9 +213,20 @@ jobs:
       - name: Create the draft, or refresh the notes of the one that exists
         env:
           ID: ${{ steps.found.outputs.id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          notes="docs/releases/$VERSION.md"
+          # The release page says what SHA256SUMS is worth and where the assets came from: it is
+          # not signed, so it detects a damaged download, not a replaced one.
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            cat "docs/releases/$VERSION.md"
+            printf '\n---\n\n'
+            printf '%s\n' "SHA256SUMS is not signed: it detects a damaged download, not a" \
+              "replaced one, since whoever could replace a tarball here could replace it too." \
+              "The assets were built from commit $SHA and attached by the workflow run" \
+              "$RUN_URL."
+          } > "$notes"
           if [ -n "$ID" ]; then
             # tag_name and target_commitish are passed again: a PATCH of a draft without them
             # turns its tag into an "untagged-..." placeholder, and every later find-draft,
@@ -217,28 +243,28 @@ jobs:
             --title "zigcube $VERSION" --notes-file "$notes" "${flags[@]}"
           echo "draft: created the draft $TAG at $SHA"
 
-  # Builds and checks the assets and attaches them to the draft, which only people with write
-  # access to the repository can see. The owner looks at the draft before approving `publish`.
+  # Builds and checks the assets, and hands them to `attach` as a workflow artifact. It runs the
+  # release commit's build.zig, the zigbox package's, apt's maintainer scripts as root and the
+  # new binaries, before the owner has approved anything, so it holds no token that can write:
+  # contents: read, no GH_TOKEN, no gh. A job token is readable from the runner's memory by a
+  # step with sudo, so scoping the variable alone would not be enough.
   build:
-    name: build and attach (x86_64 and aarch64 Linux)
-    needs: [plan, draft]
+    name: build and check (x86_64 and aarch64 Linux)
+    needs: [plan]
     if: ${{ needs.plan.outputs.go == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
-      contents: write
+      contents: read
     outputs:
       sums: ${{ steps.check.outputs.sums }}
     env:
-      GH_TOKEN: ${{ github.token }}
-      TAG: ${{ needs.plan.outputs.tag }}
       VERSION: ${{ needs.plan.outputs.version }}
       SHA: ${{ needs.plan.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.sha }}
-          # Nothing here pushes; the token must not sit in .git/config for the build to read.
           persist-credentials: false
       - name: Check out the release tools at the workflow's commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -250,10 +276,11 @@ jobs:
             /.github/actions/
             /.github/release-*.sh
           sparse-checkout-cone-mode: false
-      # No build cache (.github/actions/zig-cache): the release is built from nothing. The
-      # toolchain is checked against its SHA-256 before it is ever cached.
+      # No build cache (.github/actions/zig-cache) and no toolchain cache: the toolchain is
+      # downloaded and checked against its SHA-256 in this job, and the release built from nothing.
       - uses: ./.release-tools/.github/actions/setup-zig
-      - uses: ./.release-tools/.github/actions/setup-gh
+        with:
+          cache: 'false'
       - name: The aarch64 libraries and qemu-user
         run: |
           set -euo pipefail
@@ -267,30 +294,97 @@ jobs:
           set -euo pipefail
           .release-tools/.github/release-check.sh zig-out/release "$VERSION" "$SHA"
           echo "sums=$(sha256sum zig-out/release/SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets
+          path: zig-out/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Attaches what `build` checked to the draft, which only people with write access to the
+  # repository can see; the owner looks at the draft before approving `publish`. It runs no code
+  # of the release commit: the pinned gh and the tools of the workflow's own commit.
+  attach:
+    name: attach the assets to the draft
+    needs: [plan, draft, build]
+    if: ${{ needs.plan.outputs.go == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SUMS: ${{ needs.build.outputs.sums }}
+    steps:
+      - name: Check out the release tools at the workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/actions/
+            /.github/release-*.sh
+          sparse-checkout-cone-mode: false
+      - uses: ./.release-tools/.github/actions/setup-gh
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/assets
+      - name: The artifact holds what build checked
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/assets"
+          want=$(printf '%s\n' SHA256SUMS "zigcube-$VERSION-x86_64-linux.tar.gz" \
+            "zigcube-$VERSION-aarch64-linux.tar.gz" | sort)
+          got=$(find . -mindepth 1 -maxdepth 1 -printf '%P\n' | sort)
+          [ "$got" = "$want" ] || { echo "release: the artifact holds: $got" >&2; exit 1; }
+          [ "$(sha256sum SHA256SUMS | cut -d' ' -f1)" = "$SUMS" ] ||
+            { echo "release: the artifact's SHA256SUMS is not the one build checked" >&2; exit 1; }
+          sha256sum --strict -c SHA256SUMS
       - uses: ./.release-tools/.github/actions/find-draft
+        id: found
         with:
           tag: ${{ needs.plan.outputs.tag }}
           sha: ${{ needs.plan.outputs.sha }}
           require: 'true'
       - name: Attach the tarballs and SHA256SUMS to the draft
+        env:
+          ID: ${{ steps.found.outputs.id }}
         run: |
           set -euo pipefail
-          cd zig-out/release
+          cd "$RUNNER_TEMP/assets"
           files=(*)
+          # An asset of another name (a hand upload, or one a cancelled run left half written)
+          # would fail publish's exact-set check on every run: it is deleted first.
+          "$GH" api --paginate "repos/$GITHUB_REPOSITORY/releases/$ID/assets" \
+            --jq '.[] | [.id, .name] | @tsv' > "$RUNNER_TEMP/held"
+          while IFS=$'\t' read -r asset name; do
+            [ -n "$asset" ] || continue
+            if ! printf '%s\n' "${files[@]}" | grep -qxF "$name"; then
+              echo "attach: deleting the stray asset $name"
+              "$GH" api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset"
+            fi
+          done < "$RUNNER_TEMP/held"
           "$GH" release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
 
   # The one step that makes a release public, and so makes the tag (at the release commit, by
   # the draft's target), after the owner's one approval. GITHUB_TOKEN with contents: write is
-  # enough; the environment holds no secret.
+  # enough; the environment holds no secret. `plan` refused to start unless the environment
+  # exists with a required reviewer (a missing one would be created unprotected and not wait);
+  # this job checks it again before it writes, in case it changed while the run waited.
   publish:
     name: publish the release
-    needs: [plan, build]
+    needs: [plan, build, attach]
     if: ${{ needs.plan.outputs.go == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: release
     permissions:
       contents: write
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.plan.outputs.tag }}
@@ -310,6 +404,8 @@ jobs:
             /.github/release-*.sh
           sparse-checkout-cone-mode: false
       - uses: ./.release-tools/.github/actions/setup-gh
+      - name: The environment still protects the release
+        run: .release-tools/.github/release-env.sh release
       - uses: ./.release-tools/.github/actions/find-draft
         id: found
         with:
@@ -335,8 +431,28 @@ jobs:
           ID: ${{ steps.found.outputs.id }}
         run: |
           set -euo pipefail
+          # Latest only when no published release has a higher version: a fix to an older line
+          # (0.5.3 after 0.6.0) must not take `releases/latest` from the newer one.
           latest=true
-          if [ "$PRERELEASE" = true ]; then latest=false; fi
+          if [ "$PRERELEASE" = true ]; then
+            latest=false
+          else
+            err="$RUNNER_TEMP/latestcheck"
+            current=$("$GH" api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name \
+              2> "$err") || {
+              grep -q 'HTTP 404' "$err" ||
+                { echo "release: could not read the latest release: $(head -c 200 "$err")" >&2
+                  exit 1; }
+              current=""
+            }
+            current=${current#v}
+            if [ -n "$current" ] && [ "$current" != "$VERSION" ] &&
+              [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)" = "$current" ]
+            then
+              latest=false
+            fi
+          fi
+          echo "publish: make_latest=$latest (the latest release was '${current:-none}')"
           # The tag must still be absent, or at this commit, now: publishing under a tag that
           # someone made meanwhile elsewhere would pair it with assets built from $SHA.
           at=$(.release-tools/.github/release-tag.sh "$TAG")
@@ -349,7 +465,15 @@ jobs:
           "$GH" api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false \
             -f tag_name="$TAG" -f target_commitish="$SHA" \
             -F prerelease="$PRERELEASE" -f make_latest="$latest" > /dev/null
-          at=$(.release-tools/.github/release-tag.sh "$TAG")
+          # The new tag can take a moment to show; a lookup that fails is retried, so only a tag
+          # at another commit fails the run here. (A run that fails after the PATCH is finished by
+          # "Re-run all jobs": `plan` then checks the published tag; docs/releases/automation.md.)
+          for try in 1 2 3 4 5 6; do
+            at=$(.release-tools/.github/release-tag.sh "$TAG") || at=error
+            if [ "$at" != absent ] && [ "$at" != error ]; then break; fi
+            echo "publish: the tag $TAG reads as $at (try $try); looking again"
+            sleep 10
+          done
           [ "$at" = "$SHA" ] ||
             { echo "release: the new tag $TAG is at $at, not $SHA" >&2; exit 1; }
           echo "publish: $TAG is public, at $SHA"

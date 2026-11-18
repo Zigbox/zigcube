@@ -54,10 +54,33 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SOURCES
 dpkg --add-architecture arm64
 
+# libpq5 is Multi-Arch: same, so its amd64 and arm64 versions must be equal. The runner image
+# installs libpq5 from apt.postgresql.org (PGDG), which ports.ubuntu.com cannot match for arm64
+# (CI job 134461192114: amd64 18.6 against arm64 16.15). So PGDG's sources go, and both
+# architectures take the newest version Ubuntu serves for both, downgrading the host's if needed:
+# the release links Ubuntu 24.04's libpq, as docs/releases/automation.md says.
+for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+  [ -f "$f" ] || continue
+  if grep -q 'apt\.postgresql\.org' "$f"; then
+    echo "release-libs: removing $f (apt.postgresql.org)"
+    rm -f "$f"
+  fi
+done
+if grep -q 'apt\.postgresql\.org' /etc/apt/sources.list 2> /dev/null; then
+  sed -i '/apt\.postgresql\.org/d' /etc/apt/sources.list
+fi
+
 opts=(-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2)
 timeout 300 apt-get "${opts[@]}" update -q
-timeout 600 apt-get "${opts[@]}" install -y -q --no-install-recommends \
-  libsqlite3-dev libpq-dev libsqlite3-dev:arm64 libpq5:arm64 qemu-user
+versions() { apt-cache madison "$1" | awk -F'|' '{gsub(/ /, "", $2); print $2}' | sort -u; }
+pq=$(comm -12 <(versions libpq5:amd64) <(versions libpq5:arm64) | sort -V | tail -n 1)
+[ -n "$pq" ] || fail "no libpq5 version is served for both amd64 and arm64"
+timeout 600 apt-get "${opts[@]}" install -y -q --no-install-recommends --allow-downgrades \
+  libsqlite3-dev libsqlite3-dev:arm64 "libpq5=$pq" "libpq-dev=$pq" "libpq5:arm64=$pq" qemu-user
+# What the release linked, for whoever reproduces it (docs/releases/automation.md).
+dpkg-query -W -f='release-libs: ${Package}:${Architecture} ${Version}\n' \
+  libsqlite3-0:amd64 libsqlite3-dev:amd64 libsqlite3-0:arm64 libpq5:amd64 libpq-dev \
+  libpq5:arm64 qemu-user
 
 # A link whose target is not an AArch64 ELF file (e_machine 0xb7 at offset 18) is refused.
 arm=/usr/lib/aarch64-linux-gnu

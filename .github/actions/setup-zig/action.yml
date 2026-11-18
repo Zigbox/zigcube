@@ -2,6 +2,13 @@ name: Set up Zig
 description: >
   Installs the Zig toolchain pinned in build.zig.zon (minimum_zig_version) from ziglang.org
   and verifies the tarball against its published SHA-256 before using it.
+inputs:
+  cache:
+    description: >
+      'false' downloads and verifies the toolchain every time and neither reads nor writes the
+      cache: a cache hit is not verified again, so the release build (release.yml, and ci.yml's
+      `release` job) takes no toolchain that another job could have saved.
+    default: 'true'
 runs:
   using: composite
   steps:
@@ -10,6 +17,7 @@ runs:
     # only, because only a verified toolchain is ever saved.
     - name: Cache the Zig toolchain
       id: toolchain
+      if: ${{ inputs.cache != 'false' }}
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/zig-x86_64-linux-0.17.0

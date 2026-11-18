@@ -160,6 +160,10 @@ check $PR x "" "ops/jepsen/zigcube.sh" TFFFFFFFFFFFFTF
 check $PR x "" ".github/workflows/ci.yml" TTTTTTTTTTTTTTT
 check $PR x "" ".github/actions/setup-zig/action.yml" TTTTTTTTTTTTTTT
 check $PR x "" "docs/releases/automation.md" FFFFFFFFFFFFFFF
+# A release's notes are not documentation only: they run everything, on a pull request and on main.
+check $PR x "" "docs/releases/0.6.0.md" TTTTTTTTTTTTTTT
+check $PR x "" "docs/releases/0.6.0.md README.md site/index.html" TTTTTTTTTTTTTTT
+check push main "" "docs/releases/0.6.0.md" TTTTTTTTTTTTTTT
 
 if [ "$failed" -ne 0 ]; then
   echo "ci-changes-test: $failed of $n failed"

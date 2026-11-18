@@ -869,7 +869,34 @@ jobs:
             echo "::error::release.yml names a local action or script outside .release-tools"
             exit 1
           fi
+      # Code the release commit controls (build.zig, the build and its tests, every sudo step
+      # after it) runs in jobs with no write token: a job that runs `zig build` names no
+      # `contents: write`, GH_TOKEN, github.token or secret, and the workflow's default stays
+      # read-only. Only `draft`, `attach` and `publish` write, and none of them builds.
+      - name: release.yml builds only in jobs without a write token
+        run: |
+          awk '
+            /^[[:space:]]*#/ { next }
+            /^jobs:/ { in_jobs = 1; next }
+            !in_jobs && /^  contents: write/ { print "workflow default: contents: write"; bad = 1 }
+            in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { finish(); job = $1; build = 0; write = "" }
+            in_jobs && /zig build/ { build = 1 }
+            in_jobs && /contents:[[:space:]]*write|GH_TOKEN|github\.token|secrets\./ {
+              write = write " " $0
+            }
+            function finish() {
+              if (build && write != "") { print job " runs zig build and has:" write; bad = 1 }
+            }
+            END { finish(); exit bad }
+          ' .github/workflows/release.yml || {
+            echo "::error::a release.yml job that runs zig build holds a write token"
+            exit 1
+          }
+      - name: The release scripts pass shellcheck
+        run: shellcheck .github/release-*.sh
       - uses: ./.github/actions/setup-zig
+        with:
+          cache: 'false'
       - name: The aarch64 libraries and qemu-user
         run: |
           sudo .github/release-libs.sh "${RUNNER_TEMP}/aarch64-libs"
