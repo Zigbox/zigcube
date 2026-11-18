@@ -71,6 +71,7 @@ check $PR x "" "src/tls_server.zig src/tls_server_test.zig src/tls_testclient.zi
 check $PR x "" "build.zig" TTTTTTTTTTTTTTT
 check $PR x "" "build.zig.zon" TTTTTTTTTTTTTTT
 check $PR x "" ".github/workflows/ci.yml" TTTTTTTTTTTTTTT
+check $PR x "" ".github/actions/zig-cache/action.yml" TTTTTTTTTTTTTTT
 check $PR x "" ".github/ci-changes.sh" TTTTTTTTTTTTTTT
 check $PR x "" "src/demo_host.zig" TTTTTTTTTTTTTTT
 check $PR x "" "src/harness_tls.zig" TTTTTTTTTTTTTTT
