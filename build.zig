@@ -1915,7 +1915,7 @@ const c1_teeth_roots = [_]struct {
         .name = "register_unchecked",
         .root = "src/sim_c1_teeth_register_unchecked_main.zig",
         // I1b: the stale registration's lease expires with the agent quiet or cut off, the node
-        // is marked lost and its replicas are replaced while the agent still runs them (22 of
+        // is marked lost and its replicas are replaced while the agent still runs them (23 of
         // 40 seeds). The other seeds end in a liveness failure; the canary needs I1b itself.
         .symptom = "I1b",
         .canary_seeds = 40,

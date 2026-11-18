@@ -504,10 +504,10 @@ lease of its own when the agent asks for one, an earlier attempt's, older than t
 the agent's registration is accepted, a copy of it under that older lease is parked and delivered
 `lease_ttl_ms - 1000` ms later, as a late attempt would land (`late_registrations=` and `landed=` in
 the report; nothing is drawn from the seed). The server refuses it (ZC-E0510: the key is on a newer
-lease). With that lease-order check skipped (test-only, `c1_teeth.register_unchecked`) the key moves onto the older lease, which
-nobody renews and which expires: the node is marked lost and its replicas are replaced while the
-agent still runs them, I1b (22 of 40 seeds, 1..40, 100 operations, `--c1`; the others end in
-`agents kept fencing`, `a running replica was never reported`).
+lease). With that lease-order check skipped (test-only, `c1_teeth.register_unchecked`) the key
+moves onto the older lease, which nobody renews and which expires: the node is marked lost and its
+replicas are replaced while the agent still runs them, I1b (23 of 40 seeds, 1..40, 100
+operations, `--c1`; 15 others fail on liveness, such as `agents kept fencing`).
 
 `sim-c1-teeth-job_reuse` (B2.1 slice 4): the reuse world. A store-side retention jump
 (`Cluster.retention_jump`; it ticks no agent, and first lets the J4 client catch up, since the

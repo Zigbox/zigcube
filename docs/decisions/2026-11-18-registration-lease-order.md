@@ -78,7 +78,10 @@ accepted, a copy of it on that older lease is parked and delivered one second be
 lease's ttl ends. The key moves onto a lease nobody renews: I1b. The model draws nothing from the
 seed and is off unless asked (`--late-registration`, or the tooth). `sim-c1-late` runs the same
 world with the rule on, seeds 1..40: every check holds and every late registration is refused.
-MEASURED_TOOTH
+Measured on this branch (2026-11-18, `sim_c1_teeth_register_unchecked --seeds 1..40 100 --c1`):
+38 of 40 seeds fail, 23 of them with I1b; the other 15 fail on liveness (11 "agents kept
+fencing", 2 "a running replica was never reported", 1 J1, 1 "a replica is not running exactly
+once"), symptoms of the same stale lease. With the rule on, `sim-c1-late` passes all 40.
 
 ## Old replay worlds
 
