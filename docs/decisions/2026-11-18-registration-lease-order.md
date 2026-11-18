@@ -20,9 +20,16 @@ key is on the lease it renews (ZC-E0205), so that agent now fences at its next r
 
 1. **The lease order.** `PUT /v1/agent/nodes/{node}` reads the key. If it is on a lease newer
    than the registration's, the registration is refused (ZC-E0510, no new code) and moves
-   nothing. Otherwise the server writes in one transaction compared on the revision it read
-   (0: absent), so a registration that races another one between the read and the write is
-   refused the same way.
+   nothing. If it is on the registration's own lease with the same value, the PUT is a copy of
+   the one that wrote it (a retried or duplicated request): it is answered with the key's
+   revision and writes nothing, so the tenure its agent holds stays the key's (rewriting it
+   would end that tenure and stop every container on the node). Otherwise the server writes in
+   one transaction compared on the revision it read (0: absent). Within one server the read and
+   the write are under the API's write lock, but the driver's `expire_leases` is not, so a lease
+   that ends between them makes the compare fail, and the registration is refused (ZC-E0510)
+   with the cause "the key changed between the server's read and its write". The compare also
+   guards a second server on the store (C7); a newer registration refused because an older one
+   committed between its read and its write is then the agent's to retry on its next step.
 2. **Why the order is enough.** The #237 PUT is an earlier attempt, so its lease is older than
    the one the agent registered on next: lease ids only grow (SQLite `AUTOINCREMENT`, a Postgres
    identity column, the memory store's counter; a conformance test), and an agent grants its
@@ -34,12 +41,36 @@ key is on the lease it renews (ZC-E0205), so that agent now fences at its next r
    `replaces` decided nothing that the order does not, and it cost an upgrade order (a new agent
    got a 400 from an old server) and left agents that do not send it unprotected. It is gone,
    with the agent's kept tenure across a fence. With the order alone, **every agent version is
-   held to the rule**, so no minimum agent version is needed and there is no upgrade order: a
-   new server protects old agents, and a new agent works with an old server. (The agent's client
-   still reads ZC-E0510 on a registration as a failed step rather than a failed compare, so it
-   does not assert; an old agent that meets the refusal fails its step the same way and
-   registers again on its next one.)
+   held to the rule**, so no minimum agent version is needed, and a new agent works with an old
+   server. This PR's agent client reads ZC-E0510 on a registration as a failed step rather than
+   a failed compare, so it does not assert, and registers again on a fresh lease next step.
+   **An agent built before this change does not** (see "Old agents" below).
 4. The keepalive check (B7 slice 3) stays as it is.
+
+## Old agents: a crash and a restart
+
+An agent built before this change (0.5.x, `main` at 190f8dc) maps every ZC-E0510 from the server
+to a failed compare, and `Agent.heartbeat` asserts that a registration's compare held. Before this
+change no registration was ever answered ZC-E0510, so the assert was unreachable; now an old agent
+that meets the refusal panics. Measured on 2026-11-18: a ReleaseSafe 190f8dc `zcube-agent`
+against this server, its registration on lease 1 held by a proxy while node1 was registered on
+lease 2, then released: the server answered 503 ZC-E0510, the agent printed `bug[ZC-B0001]`
+and exited 70. Started again on the same state directory, it registered on lease 3 at once and
+ran normally (no loop). Its containers run under their own supervisors through the crash and the
+restarted agent adopts them, so this is a crash and a restart, not I1b.
+
+An old agent gets the refusal only when a registration of its node lands after a newer one: two
+agents run under one node name (an operator's error, or a supervisor that starts a new agent
+while the old one is still in a slow registration), or a registration is delayed on the wire for
+as long as the agent's own step (#237 itself), or the key's lease ends between the server's read
+and its write. **Upgrade note:** during a rollout in which servers are upgraded before agents, an
+operator may see an old `zcube-agent` exit 70 with `ZC-B0001` in those cases; its supervisor
+(systemd's `Restart=`) restarts it and it registers again. Upgrading agents removes it. The owner
+settled on no minimum agent version (below), so this is accepted rather than gated.
+The restart's recovery is pinned in `agent_api_test.zig` (the stale registration refused, then
+one on a freshly granted lease accepted over the live key) and the new client's reading in
+`agent_client_test.zig`; the old agent's panic itself is the measurement above, since the tree
+holds no old agent to run.
 
 ## Rejected: a minimum agent version (option A)
 
@@ -58,16 +89,24 @@ key sits on a lease nobody renews, which is older than any lease the agent grant
 ends within one ttl, and the agent's next registration (on a newer lease) is accepted over it.
 For that window the node looks registered with no agent renewing it, as it would between an
 agent's crash and its lease's expiry; work placed there is run by the agent once it registers
-again, or replaced when the late key's lease ends, the usual paths of a lost node.
+again, or replaced when the late key's lease ends, the usual paths of a lost node. `agent_api_test.zig` ("a late registration
+finds the key gone ...") pins it: register on L2, revoke L2, the L1 PUT is
+accepted, the L3 registration is accepted over it, and revoking L1 leaves the key on L3. The
+simulator's late-registration world cannot reach this case (its orphan lease ends with the
+agent's), so the unit test is the only evidence.
 
 ## The barrier (test-only)
 
-`src/server_register_barrier.zig` holds a node's registration transaction just before it runs,
-for the zigcube-jepsen test that delays a real registration while its lease is still live. It is
-compiled only with `-Dregister-barrier=true` and armed only by `ZCUBE_TEST_REGISTER_BARRIER=DIR`;
-`zig build`, `dist` and `release` leave it out. The lease order is checked before the barrier and
-the compare after it, so a registration released after a newer one took the key comes back
-refused in both orders. It is shell code (files, a sleep) and wraps the store's `txn` only.
+`src/server_register_barrier.zig` holds a node's registration request, for the zigcube-jepsen test
+that delays a real registration while its lease is still live. It is a hook of the HTTP layer
+(`server_http.Hook`) that runs before the request takes the API's write lock, so other writes
+(other nodes' keepalives, a newer registration of the same node) go on while one is held, and the
+held one, released, meets the key on the newer lease and comes back refused (ZC-E0510). Only
+`zcube_server.zig` imports it, behind `build_options.register_barrier` (`-Dregister-barrier=true`);
+every other build ignores `ZCUBE_TEST_REGISTER_BARRIER` and compiles none of it, and `dist` and
+`release` set the option false. `Server.Options.hook` is null in every shipped server. The unit
+test `server_register_barrier_test.zig` runs it in a real server (arm, hold, a newer registration
+landing during the hold, release, `done`), so a change that breaks it fails `zig build test`.
 
 ## The tooth
 

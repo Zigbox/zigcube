@@ -7,6 +7,10 @@
 //! restarting `zcube-server` changes nothing because the store is the only state, on SQLite,
 //! with a simulated agent keeping a service running while the server restarts.
 
+test {
+    _ = @import("server_register_barrier_test.zig"); // #237's barrier, in a real server.
+}
+
 const std = @import("std");
 const testing = std.testing;
 const net = std.Io.net;

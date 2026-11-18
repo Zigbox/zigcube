@@ -38,15 +38,17 @@ const Diag = diag_mod.Diag;
 /// (a cancel is not a failure to name), nothing is left open, and the caller stops quietly.
 pub const Error = error{ StartFailed, OutOfMemory, Canceled };
 
+pub const Hook = http.Hook;
+
 pub const Options = struct {
     version: []const u8,
     /// Print the controller's failures to stderr; tests that break the store turn it off.
     report_failures: bool = true,
     /// Log requests to stderr; tests turn it off.
     log_requests: bool = true,
-    /// Test-only (#237): hold the next registration of a node before its transaction
-    /// (server_register_barrier.zig). Null in every shipped server.
-    register_barrier: ?[]const u8 = null,
+    /// Test-only (#237): runs around every write before it takes the API's lock
+    /// (`server_http.Hook`, the registration barrier). Null in every shipped server.
+    hook: ?http.Hook = null,
 };
 
 pub const Server = struct {
@@ -104,7 +106,6 @@ pub const Server = struct {
             return error.StartFailed;
         };
         errdefer backend.close();
-        if (options.register_barrier) |dir| try backend.arm_register_barrier(io, dir);
         const server = try gpa.create(Server);
         errdefer gpa.destroy(server);
         server.* = try init_value(gpa, io, backend, config, options);
@@ -164,6 +165,7 @@ pub const Server = struct {
                     .quiet = config.quiet,
                     .silent = !options.log_requests,
                 },
+                .hook = options.hook,
             },
             .driver = .{
                 .gpa = gpa,

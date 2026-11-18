@@ -1,91 +1,89 @@
-//! Test-only: a barrier immediately before a node's registration transaction (#237, the
-//! zigcube-jepsen stale-registration test). Shell code: files and a sleep. It exists only in a
-//! server built with `-Dregister-barrier=true` and armed by `ZCUBE_TEST_REGISTER_BARRIER=DIR`;
-//! `zig build`, `dist` and `release` leave it out (`build_options.register_barrier` is false and
-//! `zcube_server.zig` refuses the variable).
+//! Test-only: a barrier in front of a node's registration request (#237, the zigcube-jepsen
+//! stale-registration test). Shell code: files and a sleep. `zcube-server` arms it only when
+//! built with `-Dregister-barrier=true` and run with `ZCUBE_TEST_REGISTER_BARRIER=DIR`; any other
+//! build ignores the variable and compiles none of this (`zcube_server.zig` imports it behind
+//! `build_options.register_barrier`, which `dist` and `release` set false). The unit tests reach
+//! it through `server_register_barrier_test.zig`.
 //!
 //! The protocol, all files in DIR:
-//! - The test creates `arm-<node>`. The next registration transaction of `<node>` (a put of
-//!   `/nodes/<node>` on a lease) removes it, creates `held-<node>-<lease>`, and waits.
-//! - The test creates `release-<node>-<lease>`; the transaction then runs as it would have.
+//! - The test creates `arm-<node>`. The next `PUT /v1/agent/nodes/<node>` removes it, creates
+//!   `held-<node>-<lease>`, and waits.
+//! - The test creates `release-<node>-<lease>`; the request then runs as it would have.
 //!   Without a release it runs after `wait_ms_max`, so a lost test cannot wedge a server.
 //! - The barrier writes `done-<node>-<lease>`: `succeeded <0|1> revision <N> at_ms <unix ms>`.
-//!   The API's checks (the lease order of #237) ran before the barrier; the transaction's compare
-//!   on the key's revision runs after it, so a registration released after a newer one took the
-//!   key must come back refused (`succeeded 0`).
 //!
-//! Only the armed registration waits: the agent's next attempt, on a newer lease, passes.
+//! The hold is before the server's write lock (`server_http.Shared.handle`) and before the API
+//! reads anything, so other writes go on while a registration is held, a newer registration of
+//! the node can land, and the held one, once released, meets the key on the newer lease and comes
+//! back refused (`succeeded 0`, ZC-E0510). Only the armed request waits.
 
 const std = @import("std");
 const assert = std.debug.assert;
-const diag_mod = @import("diag.zig");
-const records = @import("records.zig");
+const api_mod = @import("api.zig");
+const http = @import("server_http.zig");
 const store = @import("store.zig");
-
-const Diag = diag_mod.Diag;
-const Store = store.Store;
 
 /// The longest a held registration waits for its release.
 pub const wait_ms_max: u64 = 300_000;
 const poll_ms: u64 = 10;
-
-/// The one barrier of the process: a store's vtable functions get the inner store's context, so
-/// the wrapped `txn` finds its state here. Set once, before any request is served.
-var installed: ?*Barrier = null;
+const path_prefix = "/v1/agent/nodes/";
 
 pub const Barrier = struct {
-    inner: Store,
-    vtable: Store.VTable,
     io: std.Io,
     /// The directory of the protocol's files; owned by the caller and outliving the server.
     dir: []const u8,
+    wait_ms: u64 = wait_ms_max,
 
-    /// `inner` with its `txn` behind the barrier. Call once per process.
-    pub fn install(barrier: *Barrier, inner: Store, io: std.Io, dir: []const u8) Store {
-        assert(installed == null);
-        assert(dir.len > 0);
-        barrier.* = .{ .inner = inner, .vtable = inner.vtable.*, .io = io, .dir = dir };
-        barrier.vtable.txn = txn;
-        installed = barrier;
-        return .{ .context = inner.context, .vtable = &barrier.vtable };
+    pub fn hook(barrier: *Barrier) http.Hook {
+        assert(barrier.dir.len > 0);
+        return .{ .context = barrier, .before = before, .after = after };
     }
 
-    fn txn(
-        context: *anyopaque,
-        request: store.TxnRequest,
-        diag: *Diag,
-    ) store.Error!store.TxnResult {
-        const barrier = installed.?;
-        assert(context == barrier.inner.context);
-        const registration = registered(request) orelse
-            return barrier.inner.vtable.txn(context, request, diag);
-        if (!barrier.take_arm(registration.node)) {
-            return barrier.inner.vtable.txn(context, request, diag);
-        }
+    /// Holds the armed registration; true when it held this request.
+    fn before(context: *anyopaque, request: api_mod.Request) bool {
+        const barrier: *Barrier = @ptrCast(@alignCast(context));
+        const registration = registered(request) orelse return false;
+        if (!barrier.take_arm(registration.node)) return false;
         barrier.hold(registration);
-        const result = barrier.inner.vtable.txn(context, request, diag);
-        const succeeded = if (result) |done| done.succeeded else |_| false;
-        const revision = if (result) |done| done.revision else |_| 0;
+        return true;
+    }
+
+    fn after(context: *anyopaque, request: api_mod.Request, response: api_mod.Response) void {
+        const barrier: *Barrier = @ptrCast(@alignCast(context));
+        const registration = registered(request) orelse return; // `before` held it.
+        const succeeded = response.status == 200;
+        const revision = if (succeeded) revision_of(response.body) else 0;
         barrier.note(registration, "done", succeeded, revision);
-        return result;
     }
 
     const Registration = struct { node: []const u8, lease: store.LeaseId };
 
-    /// The node a transaction registers: a put of `/nodes/<node>` on a lease.
-    fn registered(request: store.TxnRequest) ?Registration {
-        for (request.on_success) |op| {
-            const put = switch (op) {
-                .put => |put| put,
-                else => continue,
-            };
-            if (!std.mem.startsWith(u8, put.key, records.prefix_nodes)) continue;
-            if (put.lease == store.lease_none) continue;
-            const node = put.key[records.prefix_nodes.len..];
-            if (node.len == 0 or std.mem.indexOfScalar(u8, node, '/') != null) continue;
-            return .{ .node = node, .lease = put.lease };
-        }
-        return null;
+    /// The node and lease of a `PUT /v1/agent/nodes/<node>`; null for any other request and for
+    /// a body without a lease (the API refuses that one itself).
+    fn registered(request: api_mod.Request) ?Registration {
+        if (!std.mem.eql(u8, request.method, "PUT")) return null;
+        if (!std.mem.startsWith(u8, request.path, path_prefix)) return null;
+        const node = request.path[path_prefix.len..];
+        if (node.len == 0 or std.mem.indexOfScalar(u8, node, '/') != null) return null;
+        var buffer: [4096]u8 = undefined;
+        var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+        const Body = struct { lease: store.LeaseId = store.lease_none };
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const allocator = fixed.allocator();
+        const body = std.json.parseFromSliceLeaky(Body, allocator, request.body, options) catch
+            return null;
+        if (body.lease == store.lease_none) return null;
+        return .{ .node = node, .lease = body.lease };
+    }
+
+    fn revision_of(body: []const u8) store.Revision {
+        var buffer: [4096]u8 = undefined;
+        var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+        const Answer = struct { revision: store.Revision = 0 };
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const answer = std.json.parseFromSliceLeaky(Answer, fixed.allocator(), body, options) catch
+            return 0;
+        return answer.revision;
     }
 
     fn take_arm(barrier: *Barrier, node: []const u8) bool {
@@ -103,7 +101,7 @@ pub const Barrier = struct {
             barrier.dir, registration.node, registration.lease,
         }) catch return;
         var waited_ms: u64 = 0;
-        while (waited_ms < wait_ms_max) : (waited_ms += poll_ms) {
+        while (waited_ms < barrier.wait_ms) : (waited_ms += poll_ms) {
             if (std.Io.Dir.cwd().access(barrier.io, path, .{})) |_| return else |_| {}
             barrier.io.sleep(.fromMilliseconds(poll_ms), .awake) catch return;
         }

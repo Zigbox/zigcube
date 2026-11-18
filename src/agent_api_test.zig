@@ -9,6 +9,7 @@ const agent_api = @import("agent_api.zig");
 const api_mod = @import("api.zig");
 const apply_mod = @import("apply.zig");
 const constants = @import("constants.zig");
+const controller = @import("controller.zig");
 const agent_client = @import("agent_client.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
@@ -219,24 +220,36 @@ test "a registration on a lease older than the key's is ZC-E0510 and moves nothi
     const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
     try testing.expectEqual(second, field(field(listed, "kvs").array.items[0], "lease").integer);
 
-    rig.world.advance(11_000);
+    // What the refused agent does next, a new one in its next step and an old one (built before
+    // #237, which panics on the refusal) once restarted: grant a lease and register on it,
+    // accepted over the live key (docs/decisions/2026-11-18-registration-lease-order.md).
     const third = try rig.grant("node2");
-    const again = try register_text(&buffer, third);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", try register_text(&buffer, third));
+    try testing.expectEqual(third, try node2_lease(&rig));
+
+    rig.world.advance(11_000);
+    const fourth = try rig.grant("node2");
+    const again = try register_text(&buffer, fourth);
     _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", again);
 }
 
 test "a registration on the key's own lease or a newer one is accepted (#237)" {
-    // Goal: an agent whose registration landed but whose reply was lost retries, on the same
-    // lease or a newer one, and is not refused for a key its own attempt moved. Method: register
-    // on L2 twice (same lease), then on L3 (newer); a registration on L1 is then refused.
+    // Goal: a copy of the registration that wrote the key (a retried or duplicated PUT) is
+    // answered with the key's revision and writes nothing, so the tenure its agent holds stays
+    // the key's; a registration on a newer lease is accepted. Method: register on L2 twice
+    // (same lease, same body), then on L3 (newer); a registration on L1 is then refused.
     var rig = try Rig.start(6);
     defer rig.stop();
     var buffer: [512]u8 = undefined;
     const first = try rig.grant("node2");
     const second = try rig.grant("node2");
     const body = try register_text(&buffer, second);
-    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
-    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    const written = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    const before = try rig.revision();
+    const repeated = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    const revision = field(written, "revision").integer;
+    try testing.expectEqual(revision, field(repeated, "revision").integer);
+    try testing.expectEqual(before, try rig.revision());
     const third = try rig.grant("node2");
     const retry = try register_text(&buffer, third);
     _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", retry);
@@ -244,6 +257,153 @@ test "a registration on the key's own lease or a newer one is accepted (#237)" {
     try testing.expectEqual(third, field(field(listed, "kvs").array.items[0], "lease").integer);
     const stale = try register_text(&buffer, first);
     try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", stale), 503, "ZC-E0510");
+}
+
+test "a late registration finds the key gone: accepted, and it dies with its lease (#237)" {
+    // Goal: the gap the lease order leaves open is harmless (#237): when the key is absent, a
+    // late registration on an older lease lands, but on a lease nobody renews, and the agent's
+    // next registration on a newer lease is not refused over it. Method: register on L2, revoke
+    // L2 (key gone, L1 alive), deliver the L1 PUT (accepted), register on L3 (accepted, key on
+    // L3); then L1 alone ends and the key stays on L3.
+    var rig = try Rig.start(9);
+    defer rig.stop();
+    var buffer: [512]u8 = undefined;
+    const first = try rig.grant("node2");
+    const second = try rig.grant("node2");
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", try register_text(&buffer, second));
+    try revoke(&rig, second);
+    try testing.expectEqual(@as(usize, 0), try node2_keys(&rig));
+
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", try register_text(&buffer, first));
+    try testing.expectEqual(first, try node2_lease(&rig));
+    const third = try rig.grant("node2");
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", try register_text(&buffer, third));
+    try testing.expectEqual(third, try node2_lease(&rig));
+    try revoke(&rig, first);
+    try testing.expectEqual(third, try node2_lease(&rig));
+}
+
+fn revoke(rig: *Rig, lease: i64) !void {
+    rig.world.diag.reset();
+    const handle = rig.world.store_handle();
+    _ = try handle.lease_revoke(@intCast(lease), &rig.world.diag);
+}
+
+fn node2_keys(rig: *Rig) !usize {
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
+    return field(listed, "kvs").array.items.len;
+}
+
+fn node2_lease(rig: *Rig) !i64 {
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
+    const kvs = field(listed, "kvs").array.items;
+    try testing.expectEqual(@as(usize, 1), kvs.len);
+    return field(kvs[0], "lease").integer;
+}
+
+/// A store whose next `get` of `/nodes/node2` is followed by a write of the intruder's own,
+/// between the registration's read and its transaction: what `expire_leases` (or, one day, a
+/// second server) can do while a registration is in flight.
+const Intruder = struct {
+    inner: store.Store,
+    vtable: store.Store.VTable,
+    armed: bool = false,
+    /// Put the key on this lease; or, with `lease_none`, revoke `revoke_lease`.
+    put_lease: store.LeaseId = store.lease_none,
+    revoke_lease: store.LeaseId = store.lease_none,
+    value: []const u8 = "",
+
+    var current: ?*Intruder = null;
+
+    fn init(intruder: *Intruder, inner: store.Store) store.Store {
+        intruder.* = .{ .inner = inner, .vtable = inner.vtable.* };
+        intruder.vtable.get = get;
+        current = intruder;
+        return .{ .context = inner.context, .vtable = &intruder.vtable };
+    }
+
+    fn get(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        key: []const u8,
+        at_revision: ?store.Revision,
+        diag: *Diag,
+    ) store.Error!store.GetResult {
+        const intruder = current.?;
+        const found = try intruder.inner.vtable.get(context, arena, key, at_revision, diag);
+        if (!intruder.armed or !std.mem.eql(u8, key, "/nodes/node2")) return found;
+        intruder.armed = false;
+        if (intruder.put_lease == store.lease_none) {
+            _ = try intruder.inner.vtable.lease_revoke(context, intruder.revoke_lease, diag);
+        } else {
+            const put: store.Put = .{
+                .key = key,
+                .value = intruder.value,
+                .lease = intruder.put_lease,
+            };
+            const ops = [_]store.Op{.{ .put = put }};
+            const request: store.TxnRequest = .{ .on_success = &ops };
+            _ = try intruder.inner.vtable.txn(context, request, diag);
+        }
+        return found;
+    }
+};
+
+/// The context of a call through `intruder`, armed; set its write after this.
+fn intruder_context(rig: *Rig, intruder: *Intruder) controller.Context {
+    var ctx = rig.world.controller_context();
+    ctx.store = intruder.init(rig.world.store_handle());
+    intruder.armed = true;
+    return ctx;
+}
+
+fn intruded_call(rig: *Rig, ctx: *const controller.Context, body: []const u8) api_mod.Response {
+    ctx.diag.reset();
+    return rig.api.handle(ctx, .{
+        .caller = .local,
+        .method = "PUT",
+        .path = "/v1/agent/nodes/node2",
+        .query = "",
+        .body = body,
+    });
+}
+
+test "a key that changes between the registration's read and its write is ZC-E0510 (#237)" {
+    // Goal: the lease-order check and the write are one transaction: a registration that read
+    // the key and then lost it, to a newer registration or to its lease's end, writes nothing.
+    // Method: a store that writes between the API's `get` and its `txn`; the key afterwards is
+    // the intruder's.
+    var rig = try Rig.start(10);
+    defer rig.stop();
+    var buffer: [512]u8 = undefined;
+    const first = try rig.grant("node2");
+    const second = try rig.grant("node2");
+    const third = try rig.grant("node2");
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", try register_text(&buffer, first));
+    const value = try node2_value(&rig);
+
+    // A newer registration lands in between: the key stays on it.
+    var intruder: Intruder = undefined;
+    var ctx = intruder_context(&rig, &intruder);
+    intruder.put_lease = @intCast(third);
+    intruder.value = value;
+    try rig.refused(intruded_call(&rig, &ctx, try register_text(&buffer, second)), 503, "ZC-E0510");
+    try testing.expectEqual(third, try node2_lease(&rig));
+    try testing.expectEqualStrings(value, try node2_value(&rig));
+
+    // The key's lease ends in between: the key stays absent.
+    const fourth = try rig.grant("node2");
+    ctx = intruder_context(&rig, &intruder);
+    intruder.revoke_lease = @intCast(third);
+    try rig.refused(intruded_call(&rig, &ctx, try register_text(&buffer, fourth)), 503, "ZC-E0510");
+    try testing.expectEqual(@as(usize, 0), try node2_keys(&rig));
+}
+
+fn node2_value(rig: *Rig) ![]const u8 {
+    rig.world.diag.reset();
+    const arena = rig.parsed.allocator();
+    const found = try rig.world.store_handle().get(arena, "/nodes/node2", null, &rig.world.diag);
+    return arena.dupe(u8, found.kv.?.value);
 }
 
 test "a keepalive of a lease the node's key is not on is ZC-E0205 (#237)" {
