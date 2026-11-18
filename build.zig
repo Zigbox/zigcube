@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
     add_agent_smoke_step(b, built, shared_options);
     add_jepsen_client_step(b, shared_options, built);
     add_dist_step(b, manifest.version, pq_include, web_files);
+    add_release_step(b, manifest.version, pq_include, web_files);
     add_swarm_smoke_steps(b, shared_options, built);
     add_relay_teeth_step(b, shared_options);
     add_mtls_interop_step(b, shared_options, built);
@@ -371,8 +372,73 @@ fn add_dist_step(
     const lib_dir_help = "Where dist links libsqlite3 and libpq";
     const lib_dir = b.option([]const u8, "dist-lib-dir", lib_dir_help) orelse
         "/usr/lib/x86_64-linux-gnu";
+    const dist_options = shipped_options(b, .x86_64, version, pq_include, lib_dir, web_files);
+    const built = add_executables(b, dist_options);
+    const run = dist_run(b, "jepsen", "zig-out/dist", version);
+    const binaries = [_]*std.Build.Step.Compile{
+        built.cli, built.server, built.agent, jepsen_client_exe(b, dist_options),
+    };
+    for (binaries) |exe| {
+        run.addPrefixedFileArg(b.fmt("bin/{s}=", .{exe.name}), exe.getEmittedBin());
+    }
+    for (jepsen_recipe_files) |name| {
+        const prefix = b.fmt("share/jepsen/{s}=", .{name});
+        run.addPrefixedFileArg(prefix, b.path(b.fmt("ops/jepsen/{s}", .{name})));
+    }
+    const help = "Build the release tarball for the Jepsen battery into zig-out/dist " ++
+        "(x86_64 Linux, ReleaseSafe, with its SHA-256)";
+    b.step("dist", help).dependOn(&run.step);
+}
+
+/// The architectures a Zigcube release ships, each for Linux with glibc
+/// (docs/releases/automation.md).
+const release_arches = [_]std.Target.Cpu.Arch{ .x86_64, .aarch64 };
+
+/// `zig build release`: the assets of a GitHub release (docs/releases/automation.md and
+/// docs/decisions/2026-11-17-release-workflow-built.md): for each of `release_arches`, a tarball
+/// `zigcube-<version>-<arch>-linux.tar.gz` holding zcube, zcube-server and zcube-agent
+/// (ReleaseSafe, baseline CPU, glibc 2.39 or later, as `dist`), LICENSE and COMMIT, and one
+/// `SHA256SUMS` over the tarballs, written into `zig-out/release/` by src/dist.zig. It refuses a
+/// tree whose tracked files differ from HEAD. The server links libsqlite3 and libpq from
+/// `-Drelease-lib-dir-<arch>` (default `/usr/lib/<arch>-linux-gnu`); `.github/release-libs.sh`
+/// puts the aarch64 ones there on an x86_64 Ubuntu 24.04 host.
+fn add_release_step(
+    b: *std.Build,
+    version: []const u8,
+    pq_include: []const u8,
+    web_files: *std.Build.Module,
+) void {
+    const run = dist_run(b, "release", "zig-out/release", version);
+    for (release_arches) |arch| {
+        const option = b.fmt("release-lib-dir-{t}", .{arch});
+        const help = b.fmt("Where release links the {t} libsqlite3 and libpq", .{arch});
+        const lib_dir = b.option([]const u8, option, help) orelse
+            b.fmt("/usr/lib/{t}-linux-gnu", .{arch});
+        const options = shipped_options(b, arch, version, pq_include, lib_dir, web_files);
+        const built = add_executables(b, options);
+        run.addArg(b.fmt("--platform={t}-linux", .{arch}));
+        for ([_]*std.Build.Step.Compile{ built.cli, built.server, built.agent }) |exe| {
+            run.addPrefixedFileArg(b.fmt("bin/{s}=", .{exe.name}), exe.getEmittedBin());
+        }
+        run.addPrefixedFileArg("LICENSE=", b.path("LICENSE"));
+    }
+    const help = "Build the release assets into zig-out/release (x86_64 and aarch64 Linux, " ++
+        "ReleaseSafe, and SHA256SUMS)";
+    b.step("release", help).dependOn(&run.step);
+}
+
+/// The options of the executables a tarball ships: Linux with glibc 2.39 for `arch`, baseline
+/// CPU, ReleaseSafe, the C libraries linked from `lib_dir`, nothing installed.
+fn shipped_options(
+    b: *std.Build,
+    arch: std.Target.Cpu.Arch,
+    version: []const u8,
+    pq_include: []const u8,
+    lib_dir: []const u8,
+    web_files: *std.Build.Module,
+) ExecutablesOptions {
     const target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
+        .cpu_arch = arch,
         .os_tag = .linux,
         .abi = .gnu,
         .cpu_model = .baseline,
@@ -387,7 +453,7 @@ fn add_dist_step(
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "product", "zigcube");
-    const dist_options: ExecutablesOptions = .{
+    return .{
         .target = target,
         .optimize = optimize,
         .options = options,
@@ -397,7 +463,16 @@ fn add_dist_step(
         .web_files = web_files,
         .install = false,
     };
-    const built = add_executables(b, dist_options);
+}
+
+/// A run of src/dist.zig in `mode` (`jepsen` or `release`), writing into `out` under the build
+/// root; the caller adds the entries.
+fn dist_run(
+    b: *std.Build,
+    mode: []const u8,
+    out: []const u8,
+    version: []const u8,
+) *std.Build.Step.Run {
     const tool = b.addExecutable(.{
         .name = "dist",
         .root_module = b.createModule(.{
@@ -408,27 +483,14 @@ fn add_dist_step(
     });
     const run = b.addRunArtifact(tool);
     // The tool reads the commit from git, which the build's cache cannot see, and replaces the
-    // tarball of an earlier commit in zig-out/dist, which an install step would leave beside it.
+    // tarball of an earlier commit in its out directory, which an install step would leave
+    // beside it.
     run.has_side_effects = true;
     // Run in the build root, so `.` is the checkout git reads, and the tarball lands in its
-    // `zig-out/dist` whatever `--prefix` says (as relay-teeth's `zig-out/teeth`).
+    // `zig-out/...` whatever `--prefix` says (as relay-teeth's `zig-out/teeth`).
     run.setCwd(b.path("."));
-    run.addArg("zig-out/dist");
-    run.addArg(".");
-    run.addArg(version);
-    const binaries = [_]*std.Build.Step.Compile{
-        built.cli, built.server, built.agent, jepsen_client_exe(b, dist_options),
-    };
-    for (binaries) |exe| {
-        run.addPrefixedFileArg(b.fmt("bin/{s}=", .{exe.name}), exe.getEmittedBin());
-    }
-    for (jepsen_recipe_files) |name| {
-        const prefix = b.fmt("share/jepsen/{s}=", .{name});
-        run.addPrefixedFileArg(prefix, b.path(b.fmt("ops/jepsen/{s}", .{name})));
-    }
-    const help = "Build the release tarball for the Jepsen battery into zig-out/dist " ++
-        "(x86_64 Linux, ReleaseSafe, with its SHA-256)";
-    b.step("dist", help).dependOn(&run.step);
+    run.addArgs(&.{ mode, out, ".", version });
+    return run;
 }
 
 /// `zig build agent-smoke`: the server and the agent as real processes, with real containers

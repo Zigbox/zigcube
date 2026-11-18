@@ -1,0 +1,39 @@
+name: Set up the GitHub CLI (pinned)
+description: >
+  Downloads gh 2.74.0 for the runner's operating system and architecture, checks the archive
+  against the SHA-256 published in gh_2.74.0_checksums.txt, puts it first on PATH and sets GH to
+  its absolute path. The release workflow uses this instead of the runner image's gh, whose
+  version changes with the image.
+runs:
+  using: composite
+  steps:
+    - name: Install gh 2.74.0
+      shell: bash --noprofile --norc -euo pipefail {0}
+      env:
+        GH_VERSION: 2.74.0
+        # From https://github.com/cli/cli/releases/download/v2.74.0/gh_2.74.0_checksums.txt.
+        SHA_LINUX_AMD64: e55c9d49dc49c0b0fef0a9acd3510482fd9e27ff52ae80f8a6e838cd25b4cd89
+        SHA_MACOS_ARM64: 4fd32fe65b46966882d7d94466d0b971f10ac69eb8bd7b58242ef489eda119e4
+        SHA_MACOS_AMD64: 406d6f9bf55b2e11f02b9f5c9fca71ecdd1c7d4e8f743d7d1ded571f6565ba72
+      run: |
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64) name="gh_${GH_VERSION}_linux_amd64.tar.gz"; sha="$SHA_LINUX_AMD64" ;;
+          macOS-ARM64) name="gh_${GH_VERSION}_macOS_arm64.zip"; sha="$SHA_MACOS_ARM64" ;;
+          macOS-X64) name="gh_${GH_VERSION}_macOS_amd64.zip"; sha="$SHA_MACOS_AMD64" ;;
+          *) echo "setup-gh: no pinned gh for ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        dir="${RUNNER_TEMP}/gh-pinned"
+        mkdir -p "$dir"
+        curl -fsSL --retry 3 -o "$dir/$name" "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${name}"
+        echo "${sha}  ${dir}/${name}" > "$dir/sum"
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          shasum -a 256 -c "$dir/sum"
+          unzip -q "$dir/$name" -d "$dir"
+        else
+          sha256sum -c "$dir/sum"
+          tar -xzf "$dir/$name" -C "$dir"
+        fi
+        bin=$(echo "$dir"/gh_"${GH_VERSION}"_*/bin)
+        echo "$bin" >> "$GITHUB_PATH"
+        echo "GH=$bin/gh" >> "$GITHUB_ENV"
+        "$bin/gh" --version

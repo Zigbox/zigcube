@@ -132,4 +132,5 @@ test {
     _ = @import("trust_file.zig");
     _ = @import("jepsen_history.zig");
     _ = @import("jepsen_client_test.zig");
+    _ = @import("dist.zig");
 }

@@ -88,6 +88,16 @@ const shell_allowlist = [_][]const u8{
     // Its table test sits beside it and runs in the same job.
     ".github/ci-changes.sh",
     ".github/ci-changes-test.sh",
+    // The release workflow's steps (docs/releases/automation.md), loaded from the workflow's
+    // own commit: `release-libs.sh` is a list of `apt-get`, `dpkg` and `ln` calls as root;
+    // `release-check.sh` checks the release with tools other than the ones that built it
+    // (`sha256sum`, `tar`, `readelf`, `qemu-aarch64`), which is its point; `release-tag.sh`
+    // wraps one `gh api` call; `release-env.sh` reads the `release` environment's protection
+    // with two. Each is also what a step of the YAML would hold inline.
+    ".github/release-libs.sh",
+    ".github/release-check.sh",
+    ".github/release-tag.sh",
+    ".github/release-env.sh",
     // The OpenSSL fixtures of x509_foreign_test.zig (docs/mtls.md): run by hand only to change a
     // fixture, never in a build or test, and nothing but a list of `openssl` calls; the point is
     // certificates another tool made, so the build cannot make them itself.

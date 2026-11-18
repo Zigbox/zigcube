@@ -11,7 +11,8 @@
 #     job: they report as skipped, which required checks count as passing.
 #   - Any other change runs format, build, test, wasm and the simulations, and of the rest only
 #     what its paths can affect on a pull request: the Postgres store suites, demo-c0, demo-c1,
-#     demo-b1 (as two jobs, one per database), demo-b7 (SQLite) and the Zigbox smoke. A path no rule names runs everything.
+#     demo-b1 (as two jobs, one per database), demo-b7 (SQLite), the Zigbox smoke and the release build
+#     (release.yml's build and checks, publishing nothing). A path no rule names runs everything.
 #   - A push to main, a pull request from a claude/release-* branch and a pull request labelled
 #     full-ci run everything, so a break the filter missed shows on main.
 #   - The jobs whose time is compiling restore the Zig build cache (.github/actions/zig-cache);
@@ -62,6 +63,7 @@ jobs:
       demo_b6: ${{ steps.pick.outputs.demo_b6 || 'true' }}
       demo_b4: ${{ steps.pick.outputs.demo_b4 || 'true' }}
       jepsen: ${{ steps.pick.outputs.jepsen || 'true' }}
+      release: ${{ steps.pick.outputs.release || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -843,3 +845,65 @@ jobs:
         run: |
           sudo bash ops/jepsen/test-postgres.sh "${TOP}/bin/zcube" "${TOP}/bin/zcube-server" \
             "${TOP}/bin/zcube-agent" "${TOP}/bin/zcube-jepsen-client"
+
+  # The release workflow's build and checks (release.yml's `build` job), publishing nothing: no
+  # draft, no upload, no tag, contents: read. Runs when release.yml, its scripts or actions, or
+  # src/dist.zig change, and on a full run (docs/releases/automation.md). No build cache: the
+  # release builds from nothing, and this job runs rarely enough not to spend the cache budget.
+  release:
+    name: release build (x86_64, aarch64; nothing published)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.release == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # release.yml must load its local actions and scripts from .release-tools (the workflow's
+      # own commit), never from the release commit's checkout.
+      - name: release.yml runs local tools only from .release-tools
+        run: |
+          if grep -vE '^[[:space:]]*#' .github/workflows/release.yml |
+            grep -nE "(^|[[:space:]\"'(])(\./)?\.github/(actions/|release-)"; then
+            echo "::error::release.yml names a local action or script outside .release-tools"
+            exit 1
+          fi
+      # Code the release commit controls (build.zig, the build and its tests, every sudo step
+      # after it) runs in jobs with no write token: a job that runs `zig build` names no
+      # `contents: write`, GH_TOKEN, github.token or secret, and the workflow's default stays
+      # read-only. Only `draft`, `attach` and `publish` write, and none of them builds.
+      - name: release.yml builds only in jobs without a write token
+        run: |
+          awk '
+            /^[[:space:]]*#/ { next }
+            /^jobs:/ { in_jobs = 1; next }
+            !in_jobs && /^  contents: write/ { print "workflow default: contents: write"; bad = 1 }
+            in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { finish(); job = $1; build = 0; write = "" }
+            in_jobs && /zig build/ { build = 1 }
+            in_jobs && /contents:[[:space:]]*write|GH_TOKEN|github\.token|secrets\./ {
+              write = write " " $0
+            }
+            function finish() {
+              if (build && write != "") { print job " runs zig build and has:" write; bad = 1 }
+            }
+            END { finish(); exit bad }
+          ' .github/workflows/release.yml || {
+            echo "::error::a release.yml job that runs zig build holds a write token"
+            exit 1
+          }
+      - name: The release scripts pass shellcheck
+        run: shellcheck .github/release-*.sh
+      - uses: ./.github/actions/setup-zig
+        with:
+          cache: 'false'
+      - name: The aarch64 libraries and qemu-user
+        run: |
+          sudo .github/release-libs.sh "${RUNNER_TEMP}/aarch64-libs"
+          echo "LIBS_AARCH64=${RUNNER_TEMP}/aarch64-libs" >> "${GITHUB_ENV}"
+      - name: Build
+        run: zig build release -Drelease-lib-dir-aarch64="${LIBS_AARCH64}" --summary all
+      - name: Check
+        run: |
+          version=$(sed -n 's/^ *\.version = "\([^"]*\)",.*/\1/p' build.zig.zon | head -n 1)
+          .github/release-check.sh zig-out/release "${version}" "$(git rev-parse HEAD)"
