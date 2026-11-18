@@ -197,7 +197,7 @@ test "a node takes a lease, registers on it and renews it" {
     try testing.expectEqual(@as(i64, 10000), field(field(renewed, "lease"), "ttl_ms").integer);
 }
 
-test "a registration on a lease older than the key's is ZC-E0510 and moves nothing (#237)" {
+test "a registration on a lease older than the key's is ZC-E0205 and moves nothing (#237)" {
     // Goal: a registration PUT that lands after the agent's newer one cannot take the node key
     // onto its own, abandoned lease, whatever the agent sends: the rule is the lease order, so an
     // agent of any version is held to it. Method: register on L1, then on L2, then deliver L1's
@@ -215,14 +215,17 @@ test "a registration on a lease older than the key's is ZC-E0510 and moves nothi
     const before = try rig.revision();
 
     const late = try register_text(&buffer, first);
-    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", late), 503, "ZC-E0510");
+    const refusal = rig.call("PUT", "/v1/agent/nodes/node2", "", late);
+    try rig.refused(refusal, 503, "ZC-E0205");
+    // The cause names this case, not the keepalive's or an ended lease's.
+    try testing.expect(std.mem.indexOf(u8, refusal.body, "older than lease") != null);
     try testing.expectEqual(before, try rig.revision());
     const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
     try testing.expectEqual(second, field(field(listed, "kvs").array.items[0], "lease").integer);
 
-    // What the refused agent does next, a new one in its next step and an old one (built before
-    // #237, which panics on the refusal) once restarted: grant a lease and register on it,
-    // accepted over the live key (docs/decisions/2026-11-18-registration-lease-order.md).
+    // What the refused agent does next, of any version: its step fails (ZC-E0504, nothing
+    // fenced), and its next step grants a lease and registers on it, accepted over the live key
+    // (docs/decisions/2026-11-18-registration-lease-order.md).
     const third = try rig.grant("node2");
     _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", try register_text(&buffer, third));
     try testing.expectEqual(third, try node2_lease(&rig));
@@ -256,7 +259,7 @@ test "a registration on the key's own lease or a newer one is accepted (#237)" {
     const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
     try testing.expectEqual(third, field(field(listed, "kvs").array.items[0], "lease").integer);
     const stale = try register_text(&buffer, first);
-    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", stale), 503, "ZC-E0510");
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", stale), 503, "ZC-E0205");
 }
 
 test "a late registration finds the key gone: accepted, and it dies with its lease (#237)" {
@@ -368,7 +371,7 @@ fn intruded_call(rig: *Rig, ctx: *const controller.Context, body: []const u8) ap
     });
 }
 
-test "a key that changes between the registration's read and its write is ZC-E0510 (#237)" {
+test "a key that changes between the registration's read and its write is ZC-E0205 (#237)" {
     // Goal: the lease-order check and the write are one transaction: a registration that read
     // the key and then lost it, to a newer registration or to its lease's end, writes nothing.
     // Method: a store that writes between the API's `get` and its `txn`; the key afterwards is
@@ -387,7 +390,7 @@ test "a key that changes between the registration's read and its write is ZC-E05
     var ctx = intruder_context(&rig, &intruder);
     intruder.put_lease = @intCast(third);
     intruder.value = value;
-    try rig.refused(intruded_call(&rig, &ctx, try register_text(&buffer, second)), 503, "ZC-E0510");
+    try rig.refused(intruded_call(&rig, &ctx, try register_text(&buffer, second)), 503, "ZC-E0205");
     try testing.expectEqual(third, try node2_lease(&rig));
     try testing.expectEqualStrings(value, try node2_value(&rig));
 
@@ -395,7 +398,7 @@ test "a key that changes between the registration's read and its write is ZC-E05
     const fourth = try rig.grant("node2");
     ctx = intruder_context(&rig, &intruder);
     intruder.revoke_lease = @intCast(third);
-    try rig.refused(intruded_call(&rig, &ctx, try register_text(&buffer, fourth)), 503, "ZC-E0510");
+    try rig.refused(intruded_call(&rig, &ctx, try register_text(&buffer, fourth)), 503, "ZC-E0205");
     try testing.expectEqual(@as(usize, 0), try node2_keys(&rig));
 }
 

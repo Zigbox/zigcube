@@ -344,7 +344,7 @@ const Call = struct {
     /// when absent), so the check and the write are one; or the registration it repeats.
     const Held = union(enum) { compare: u64, repeated: u64 };
 
-    /// A key on a NEWER lease than the registration's is refused (ZC-E0510), whatever the agent
+    /// A key on a NEWER lease than the registration's is refused (ZC-E0205), whatever the agent
     /// sends: that registration is an earlier attempt, delayed on the wire, and accepting it
     /// would move the key off the lease its agent renews onto one nobody renews (#237). Lease ids
     /// only grow (docs/authority.md), an agent grants a fresh lease before every registration,
@@ -1452,17 +1452,22 @@ fn tenure_ended(ctx: *const Context, node: []const u8) Failure {
     return error.Failed;
 }
 
-/// A registration that is refused (#237): the node's key is on a newer lease than this
-/// registration's (`newer`), or the key changed between the server's read and its write (null):
-/// written on another lease, or deleted when its lease ended. Within one server the read and the
-/// write are under one lock, so only a lease's end (`expire_leases`, a revoke) gets between them
-/// today; the compare also guards a second server on the store (C7). Nothing is written.
+/// A registration that is refused (#237), with ZC-E0205: the node's key is on a newer lease than
+/// this registration's (`newer`), or the key changed between the server's read and its write
+/// (null): written on another lease, or deleted when its lease ended. Within one server the read
+/// and the write are under one lock, so only a lease's end (`expire_leases`, a revoke) gets
+/// between them today; the compare also guards a second server on the store (C7). Nothing is
+/// written. ZC-E0205, not ZC-E0510: every agent, built before this rule or after, reads ZC-E0205
+/// at registration as a failed step (ZC-E0504) and registers on a new lease at its next step,
+/// while an agent built before it asserts on ZC-E0510 there (decision 2026-11-18).
 fn tenure_moved(ctx: *const Context, node: []const u8, lease: u64, newer: ?u64) Failure {
     assert(ctx.diag.code == null);
-    ctx.diag.raise(.E0510);
+    ctx.diag.raise(.E0205);
     if (newer) |current| {
         ctx.diag.cause("this registration of node {s} is on lease {d}, older than lease {d} " ++
-            "the node is registered on", .{ node, lease, current });
+            "the node is registered on: an earlier attempt that arrived late", .{
+            node, lease, current,
+        });
     } else {
         ctx.diag.cause("the key /nodes/{s} changed between the server's read and its write " ++
             "of this registration on lease {d} (written on another lease, or its lease ended)", .{

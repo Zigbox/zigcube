@@ -219,7 +219,7 @@ identified by that key's `mod_revision` at registration (the *tenure revision*).
 This is real fencing, because the store is the shared resource and it checks the token.
 
 **A registration is compared too (#237).** Registering is the one write that creates a tenure. The
-server reads `/nodes/<node>`, refuses the registration (ZC-E0510) if the key is on a lease newer
+server reads `/nodes/<node>`, refuses the registration (ZC-E0205) if the key is on a lease newer
 than the registration's, and otherwise writes in one transaction that compares the revision it
 read (or absent). A registration that was delayed on the wire and arrives after a newer one
 finds the key on a newer lease and is refused; without the rule it would move the key onto
@@ -228,11 +228,12 @@ replicas (I1b). A key on an older lease is a tenure the agent left behind (its l
 lapsed while the key stood) and is replaced. The agent grants a fresh lease for every attempt, so a
 registration on the key's own lease is a duplicated copy of the accepted one: it is answered with
 the key's revision and writes nothing, so it cannot move the tenure the agent holds. If the key
-changes between the read and the write, the compare refuses the registration (ZC-E0510): within
+changes between the read and the write, the compare refuses the registration (ZC-E0205): within
 one server only a lease's end (`expire_leases`, which does not take the API's write lock) gets
 between them today; the compare also guards a second server on the store (C7). The rule needs
-nothing from the agent, so every agent is held to it; one built before it panics on the refusal
-and is restarted by its supervisor (the decision's "Old agents"). **Lease ids only grow
+nothing from the agent, so every agent is held to it, and every agent reads the refusal as a
+failed step: it holds no tenure on that lease, fences nothing, and registers on a new lease at
+its next step (the decision's "Old agents"). **Lease ids only grow
 within one store's history** (SQLite `AUTOINCREMENT`, a Postgres identity column, the memory
 counter; the conformance test checks one store process, and a SQLite test a reopened file) and a
 registration's lease is granted before it is sent. That does not hold through an async failover

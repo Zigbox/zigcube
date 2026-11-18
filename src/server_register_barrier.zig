@@ -15,7 +15,7 @@
 //! The hold is before the server's write lock (`server_http.Shared.handle`) and before the API
 //! reads anything, so other writes go on while a registration is held, a newer registration of
 //! the node can land, and the held one, once released, meets the key on the newer lease and comes
-//! back refused (`succeeded 0`, ZC-E0510). Only the armed request waits.
+//! back refused (`succeeded 0`, ZC-E0205). Only the armed request waits.
 
 const std = @import("std");
 const assert = std.debug.assert;

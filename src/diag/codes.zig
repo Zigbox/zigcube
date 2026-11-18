@@ -691,8 +691,15 @@ pub const registry = [_]Entry{
         \\its workloads, grants a new lease and registers again.
         \\
         \\The same code answers a keepalive for a lease the node's registration is
-        \\not on, and a registration made on a lease that is gone. The first means
-        \\a later registration took the node: the agent fences, as above.
+        \\not on: a later registration took the node, and the agent fences, as
+        \\above.
+        \\
+        \\It also answers a registration that cannot take the node: one made on a
+        \\lease that is gone, or on a lease older than the one the node is
+        \\registered on (an earlier attempt that arrived late, #237). Nothing was
+        \\written and the agent holds no tenure on that lease, so it fences
+        \\nothing: its step fails, and its next step registers on a new lease,
+        \\which is accepted at once.
         ,
     },
     .{
@@ -1212,12 +1219,6 @@ pub const registry = [_]Entry{
         \\while the node's registration is the one it made. This write named a
         \\registration that has since ended or been replaced, because the lease
         \\ran out or another registration took its place. Nothing was written.
-        \\
-        \\A registration is refused the same way when the node's key is already on
-        \\a newer lease: it is an earlier attempt that arrived late, and it must
-        \\not take the node back onto a lease nobody renews (#237). The agent's
-        \\next attempt carries a newer lease and is accepted at once; there is
-        \\nothing to wait for.
         \\
         \\The agent stops its containers, registers again and reports from the
         \\new tenure. Nothing needs doing unless this repeats: then two agents

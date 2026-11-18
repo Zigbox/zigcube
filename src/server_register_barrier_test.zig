@@ -97,7 +97,7 @@ fn wait_for(io: std.Io, dir: std.Io.Dir, name: []const u8) !void {
 test "the barrier holds a registration before the write lock; released, it is refused (#237)" {
     // Goal: the zigcube-jepsen test's case can happen: while node1's registration on L1 is held,
     // other writes go on and a registration on L2 lands; L1, released, meets the key on L2 and is
-    // refused (ZC-E0510), and `done` says so. Method: a real server with the barrier's hook.
+    // refused (ZC-E0205), and `done` says so. Method: a real server with the barrier's hook.
     var threaded: std.Io.Threaded = .init(testing.allocator, .{
         .concurrent_limit = .limited(constants.http_connections_max +
             constants.http_refusals_max + constants.server_threads_extra + 8),
@@ -154,7 +154,7 @@ test "the barrier holds a registration before the write lock; released, it is re
     const late = held.reply orelse return error.NoReply;
     defer late.free();
     try testing.expectEqual(@as(u16, 503), late.status);
-    try testing.expect(std.mem.indexOf(u8, late.body, "ZC-E0510") != null);
+    try testing.expect(std.mem.indexOf(u8, late.body, "ZC-E0205") != null);
     const done_name = try std.fmt.bufPrint(&name_buffer, "done-node1-{d}", .{first});
     var done_buffer: [96]u8 = undefined;
     const done = try tmp.dir.readFile(io, done_name, &done_buffer);
