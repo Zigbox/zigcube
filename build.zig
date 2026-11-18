@@ -1,4 +1,5 @@
 const std = @import("std");
+const constants = @import("src/constants.zig");
 
 const executables = [_]struct { name: []const u8, root: []const u8 }{
     .{ .name = "zcube", .root = "src/zcube.zig" },
@@ -32,8 +33,6 @@ pub fn build(b: *std.Build) void {
 
     const pq_include = pq_include_option(b);
     const c_modules = add_c_modules(b, target, optimize, .{ .pq_include = pq_include });
-    const sqlite = c_modules.sqlite;
-    const libpq_module = c_modules.libpq;
     const console = add_console_steps(b);
     const web_files = add_web_files(b, console);
 
@@ -42,8 +41,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .options = options,
         .zigbox = zigbox_module,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
+        .sqlite = c_modules.sqlite,
+        .libpq = c_modules.libpq,
         .web_files = web_files,
     };
     const built = add_executables(b, shared_options);
@@ -56,8 +55,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .zigbox = zigbox_module,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
+        .sqlite = c_modules.sqlite,
+        .libpq = c_modules.libpq,
     });
     add_agent_smoke_step(b, built, shared_options);
     add_jepsen_client_step(b, shared_options, built);
@@ -382,6 +381,33 @@ const jepsen_recipe_files = [_][]const u8{
     "zcube-agent.service",
 };
 
+/// The fencing contract's declared bounds, as EDN, for the Jepsen checker
+/// (`share/jepsen/fencing-bounds.edn` in `zig build dist`; docs/jepsen.md, "The declared bounds").
+/// Written from `src/constants.zig` by the build that compiles the binaries beside it, so the
+/// checker reads the bounds of exactly the Zigcube it tests and none is hard-coded there
+/// (docs/decisions/2026-11-18-fencing-dispatch-and-clock-step.md).
+fn fencing_bounds_edn(b: *std.Build) []const u8 {
+    const lines = .{
+        .{ "lease-ttl-ms", constants.lease_ttl_ms },
+        .{ "lost-grace-ms", constants.lost_grace_ms },
+        .{ "fence-margin-ms", constants.fence_margin_ms },
+        .{ "fence-window-min-ms", constants.fence_window_min_ms },
+        .{ "fence-stop-ms", constants.fence_stop_ms },
+        .{ "clock-skew-per-mille", constants.clock_skew_per_mille },
+        .{ "fence-kill-latency-ms", constants.fence_kill_latency_ms },
+        .{ "kill-dispatch-ms", constants.kill_dispatch_ms },
+        .{ "clock-step-max-ms", constants.clock_step_max_ms },
+        .{ "fence-poll-ms", constants.fence_poll_ms },
+        .{ "stop-grace-ms", constants.stop_grace_ms },
+    };
+    var text: []const u8 = ";; The fencing contract's declared bounds (src/constants.zig), " ++
+        "written by zig build dist.\n{:format 1\n";
+    inline for (lines) |line| {
+        text = b.fmt("{s} :{s} {d}\n", .{ text, line[0], line[1] });
+    }
+    return b.fmt("{s}}}\n", .{text});
+}
+
 /// `zig build dist`: the release tarball the Jepsen battery deploys (AGENTS.md, "Commands", and
 /// docs/decisions/2026-11-17-jepsen-j2-dist-and-recipe.md): zcube, zcube-server, zcube-agent and
 /// zcube-jepsen-client for x86_64 Linux (baseline CPU, glibc 2.39 or later), ReleaseSafe whatever
@@ -413,6 +439,8 @@ fn add_dist_step(
         const prefix = b.fmt("share/jepsen/{s}=", .{name});
         run.addPrefixedFileArg(prefix, b.path(b.fmt("ops/jepsen/{s}", .{name})));
     }
+    const bounds = b.addWriteFiles().add("fencing-bounds.edn", fencing_bounds_edn(b));
+    run.addPrefixedFileArg("share/jepsen/fencing-bounds.edn=", bounds);
     const help = "Build the release tarball for the Jepsen battery into zig-out/dist " ++
         "(x86_64 Linux, ReleaseSafe, with its SHA-256)";
     b.step("dist", help).dependOn(&run.step);
@@ -1765,6 +1793,12 @@ const c1_teeth_roots = [_]struct {
         .any_symptom = true,
     },
     .{
+        .name = "store_step",
+        .root = "src/sim_c1_teeth_store_step_main.zig",
+        .symptom = "I1b",
+        .canary_seeds = 30,
+    },
+    .{
         .name = "wedge",
         .root = "src/sim_c1_teeth_wedge_main.zig",
         .symptom = "I1b: a replaced replica kept executing longer",
@@ -2072,7 +2106,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_c1_comparison(b, sim, exe, step, nodes_text, false);
     add_c1_comparison(b, sim, exe, step, nodes_text, true);
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 33 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the fault-on sim-c1 runners");
     const shard = teeth_shard(b, teeth);
     for (c1_teeth_roots, 0..) |entry, index| {
         // CI's shards (`-Dteeth-shard=K -Dteeth-shards=N`) take every Nth tooth from K, so their

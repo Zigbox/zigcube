@@ -485,7 +485,10 @@ test runs over the real core in `zig build test`.
 Negative tests (`zig build sim-c1-teeth`, one step per test, each passes only if its check fires):
 a wedged node, not excused, breaks I1b (the overlap tracker's own sentence); skew beyond the
 bound fires the older fencing check (a container running on a node whose lease ran out longer ago
-than the lost grace), which sim-c1 labels I1b, not the overlap tracker; skipping the allocation
+than the lost grace), which sim-c1 labels I1b, not the overlap tracker; a store clock that steps
+forward by more than `clock_step_max_ms` (`store_step`, every 5 s of simulated time on average, by
+501 ms plus a quarter to a half of the ttl) fires the same check, while faults run
+(docs/decisions/2026-11-18-fencing-dispatch-and-clock-step.md; 9 of seeds 1..30 at 100 operations fail I1b); skipping the allocation
 compare breaks I6; skipping the readiness compare with a node lost between planning and commit
 breaks I7; a node that registers again between a controller's read of a report and the decision's
 commit (as if the tenure were not compared) breaks I3; a scheduler that ranks locality ahead of

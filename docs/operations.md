@@ -29,6 +29,28 @@ A migrated store has no hashes below the revision it was migrated at: `hash_at` 
   both revisions, and acts on nothing until an operator decides.
 - Both are run for real by `zig build test-store-faults -Dbackend=postgres` (`docs/demos/c1.md`).
 
+## Clocks
+
+Lease deadlines are absolute times on the store's clock: Postgres's `clock_timestamp()` on the
+database host, or the server host's wall clock for SQLite. A forward step of that clock ends every lease early by
+the step, and the node controller may then place a replacement while the old node, which fences
+on its own monotonic clock, is still running the replica. The fencing contract
+(`docs/authority.md` §3) allows for a step of at most `clock_step_max_ms`, **500 ms**. It is an
+operator requirement: Zigcube cannot see a step.
+
+- **Slew, never step, after boot.** With chrony: `makestep 1.0 3` (step only in the first three
+  updates, at boot) and no later `makestep`; `maxslewrate` left at its default. With
+  systemd-timesyncd or ntpd, the equivalent: no step once the service has synchronised
+  (`ntpd -x`, or `tinker step 0`).
+- **No manual `date -s`, `timedatectl set-time` or `hwclock --hctosys`** on the database host while
+  the server runs. A host restored from a snapshot boots with an old clock: let it synchronise
+  before Postgres accepts connections.
+- **A backward step** does not break fencing (leases end late, which only delays replacement),
+  but it does delay failover by the step.
+- With SQLite the server's host is the database host, and the rule is its own. The agents' hosts
+  need no such rule for fencing: the agent fences on
+  `CLOCK_BOOTTIME`, and only clock **rates** (1 %, `clock_skew_per_mille`) enter the contract.
+
 ## The server's memory of the store (`--state-dir`)
 
 The server remembers the highest store revision and hash it has seen in `<state dir>/<db file name>.<16 hex digits>.remembered` (SQLite; `<state dir>/remembered` for Postgres),

@@ -154,6 +154,14 @@ pub const fence_window_min_ms: u32 = 5000;
 pub const renew_slack_min_ms: u32 = 1000;
 /// How often a fencing agent looks at its containers while it waits for them to stop.
 pub const fence_poll_ms: u32 = 100;
+/// How late after its deadline the fencing agent may send SIGKILL: its look at the containers
+/// comes every `fence_poll_ms`, so the kill can wait one poll (docs/authority.md §3).
+pub const kill_dispatch_ms: u32 = fence_poll_ms;
+/// The furthest the store's clock may step forward at once. Lease deadlines are absolute on that
+/// clock, so a forward step ends every lease early by the step. An operator requirement, not
+/// something Zigcube can check: the database host's clock slews and never steps after boot
+/// (docs/operations.md, "Clocks"; docs/decisions/2026-11-18-fencing-dispatch-and-clock-step.md).
+pub const clock_step_max_ms: u32 = 500;
 pub const lost_grace_ms: u32 = 1000;
 /// The longest `zcube-server --lost-grace-ms` accepts: an hour.
 pub const lost_grace_ms_max: u32 = 60 * 60 * 1000;
@@ -906,9 +914,13 @@ comptime {
     assert(fake_poll_ms < fake_start_timeout_ms);
     assert(fake_file_bytes_max <= store_value_bytes_max);
     assert(agent_io_timeout_ms > agent_watch_slice_ms);
-    // docs/authority.md §3: fence_margin >= fence_stop + ttl * skew + kill latency.
+    // docs/authority.md §3, at the shipped ttl and grace: the agent's condition, fence_margin >=
+    // fence_stop + ttl * skew + kill delivery; and the contract, fence_margin + lost_grace >= the
+    // same + kill dispatch + clock step.
     const skew_ms = lease_ttl_ms * clock_skew_per_mille / 1000;
     assert(fence_margin_ms >= fence_stop_ms + skew_ms + fence_kill_latency_ms);
+    assert(fence_margin_ms + lost_grace_ms >= fence_stop_ms + skew_ms + fence_kill_latency_ms +
+        kill_dispatch_ms + clock_step_max_ms);
     assert(fence_margin_ms < lease_ttl_ms);
     assert(decision_evidence_bytes_max < store_value_bytes_max);
 

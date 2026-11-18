@@ -846,11 +846,35 @@ pub const PhaseTotals = struct {
 /// node was among them at any time.
 const Overlap = struct { name_hash: u64, since_ms: u64, wedged_at_ms: ?u64, seen: bool };
 
+/// The store's clock: the world's, plus every forward step the `store_clock_step` tooth took.
+/// Without the tooth it is the world's clock exactly.
+const StoreClock = struct {
+    manual: *const ManualClock,
+    step_ms: u64 = 0,
+
+    fn clock(store_clock: *StoreClock) Clock {
+        return .{ .context = store_clock, .now_ms_fn = now_ms_impl };
+    }
+
+    fn now_ms_impl(context: *anyopaque) u64 {
+        const store_clock: *StoreClock = @ptrCast(@alignCast(context));
+        return store_clock.manual.ms + store_clock.step_ms;
+    }
+};
+
+/// The `store_clock_step` tooth: one forward step every `store_step_every_ms` on average, of
+/// more than `clock_step_max_ms` plus a quarter of the shipped ttl, and up to a quarter more, from
+/// a PRNG of its own. A step within the simulated kill's slack breaks nothing, so the steps are
+/// large enough to break I1b whenever one lands while a cut-off node's lease runs out.
+const store_step_every_ms: u32 = 5_000;
+
 pub const Cluster = struct {
     gpa: Allocator,
     seed: u64,
     swarm: Swarm,
     manual: ManualClock,
+    store_clock: StoreClock,
+    store_step_prng: std.Random.DefaultPrng,
     memory: *MemoryStore,
     /// Beneath `ack_loss`: sees every revision as it commits (sim-c1's per-revision checks).
     tap: sim_tap.TapStore,
@@ -980,7 +1004,9 @@ pub const Cluster = struct {
         c.swarm.replicas_pct = options.replicas_pct orelse sim_shape.replicas_pct_default;
         assert(c.swarm.replicas_pct > 0);
         c.manual = .{ .ms = epoch_ms };
-        memory.init(gpa, c.manual.clock());
+        c.store_clock = .{ .manual = &c.manual };
+        c.store_step_prng = .init(seed ^ 0x5707_e5e9);
+        memory.init(gpa, c.store_clock.clock());
         c.memory = memory;
         c.tap = .{
             .inner = memory.interface(),
@@ -1309,6 +1335,17 @@ pub const Cluster = struct {
         }
     }
 
+    /// The `store_clock_step` tooth: now and then the store's clock jumps forward by more than
+    /// the contract's `clock_step_max_ms`, so every lease ends early by the step.
+    fn step_store_clock(c: *Cluster, slice: u64) void {
+        comptime assert(c1_teeth.store_clock_step);
+        const random = c.store_step_prng.random();
+        if (random.uintLessThan(u64, store_step_every_ms) >= slice) return;
+        const quarter = constants.lease_ttl_ms / 4;
+        c.store_clock.step_ms += constants.clock_step_max_ms + 1 + quarter +
+            random.uintLessThan(u32, quarter);
+    }
+
     pub fn advance(c: *Cluster, ms: u64) void {
         var left = ms;
         while (left > 0) {
@@ -1316,6 +1353,9 @@ pub const Cluster = struct {
             const slice = @min(left, tick_ms);
             c.manual.advance(slice);
             left -= slice;
+            // Only while faults run: a step after the heal would keep ending leases early, and
+            // the liveness check, not I1b, would catch it.
+            if (c1_teeth.store_clock_step and c.fault_totals == null) c.step_store_clock(slice);
             if (c.fault_totals == null) c.fault_ms += slice;
             for (c.nodes) |node| {
                 if (node.down) continue;

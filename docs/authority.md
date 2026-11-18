@@ -288,12 +288,20 @@ assumptions.
 The agent has finished stopping before any replacement is placed, provided that:
 
 - `fence_margin ≥ fence_stop_ms + ttl × skew + kill latency`, where `skew` bounds the difference
-  between the two hosts' clock **rates**. Absolute clock values do not matter.
+  between the two hosts' clock **rates** (the agent checks this of every grant).
+- `fence_margin + lost_grace_ms ≥ fence_stop_ms + ttl × skew + kill latency + kill_dispatch_ms +
+  clock_step_max_ms` (the server checks this at start, ZC-E0121). `kill_dispatch_ms` (one
+  `fence_poll_ms`, 100 ms) is how late the agent's look at its containers may send the kill;
+  `clock_step_max_ms` (500 ms) bounds a forward step of the store's clock, on which lease deadlines
+  are absolute: a step ends every lease early by its size. That bound is an operator requirement
+  (operations.md, "Clocks"). Otherwise absolute clock values do not matter.
 - The agent process is alive and scheduled.
 - The kernel delivers `SIGKILL` and the process exits.
 
-Proposed constants (fixed in the C1 brief): `ttl` 10 s, `fence_stop_ms` 2 s, `skew` 1 %,
-`fence_margin` 3 s, `lost_grace_ms` 1 s.
+Constants (fixed in the C1 brief; the dispatch and clock-step terms by
+decisions/2026-11-18-fencing-dispatch-and-clock-step.md): `ttl` 10 s, `fence_stop_ms` 2 s, `skew`
+1 %, `fence_margin` 3 s, `lost_grace_ms` 1 s; at those values the second line holds with 400 ms
+to spare, and a grace under 600 ms is refused.
 
 **The stated window for stateless replicas.** Two instances of one replica's *work* can run at
 once for at most `lost_grace_ms` plus kill latency, **unless the node is wedged**: the agent is

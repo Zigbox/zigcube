@@ -4,8 +4,14 @@
 //! An agent whose last acknowledged keepalive was sent at `s` (its own CLOCK_BOOTTIME) stops its
 //! containers at `s + ttl - fence_margin` and kills what is left `fence_stop_ms` later. The
 //! server declares the node lost once the lease has run out and places replacements
-//! `lost_grace_ms` after that. The margin must cover the stop, the clock-rate difference between
-//! the two hosts over one ttl, and the kernel's delivery of SIGKILL.
+//! `lost_grace_ms` after that. Two conditions (docs/decisions/2026-11-18-fencing-dispatch-and-
+//! clock-step.md):
+//!
+//! - the margin alone covers the stop, the clock-rate difference of the two hosts over one ttl
+//!   and the kernel's delivery of SIGKILL (the agent's own check: a grant carries no grace);
+//! - the margin and the grace together also cover the agent's late dispatch of SIGKILL (one
+//!   fence poll) and a forward step of the store's clock (`clock_step_max_ms`), which ends a
+//!   lease early. The server checks this one, against its own grace, at start.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -24,15 +30,29 @@ pub fn margin_needed_ms(ttl_ms: u32) u32 {
     return constants.fence_stop_ms + skew_ms(ttl_ms) + constants.fence_kill_latency_ms;
 }
 
+/// What the margin and the lost grace must together at least be for a lease of `ttl_ms`.
+pub fn cover_needed_ms(ttl_ms: u32) u32 {
+    return margin_needed_ms(ttl_ms) + constants.kill_dispatch_ms + constants.clock_step_max_ms;
+}
+
+/// The shortest lost grace a lease of `ttl_ms` admits; 600 ms at the default ttl.
+pub fn grace_min_ms(ttl_ms: u32) u32 {
+    return cover_needed_ms(ttl_ms) -| constants.fence_margin_ms;
+}
+
 pub const Problem = enum {
-    /// `fence_margin_ms` is less than the stop, the skew and the kill latency need.
+    /// `fence_margin_ms` is less than the stop, the skew and the kill delivery need.
     margin_too_small,
     /// The margin leaves too little time before the fence for a renewal
     /// (`ttl < margin + fence_window_min_ms`).
     ttl_too_short,
+    /// The margin and the lost grace together are less than the stop, the skew, the kill's
+    /// delivery and dispatch and the store's clock step need.
+    grace_too_small,
 };
 
-/// Null if a lease of `ttl_ms` can fence an agent in time.
+/// Null if a lease of `ttl_ms` can fence an agent in time, whatever the server's grace: what an
+/// agent can check of a grant.
 pub fn inequality_problem(ttl_ms: u32) ?Problem {
     // The old-rule negative test lifts the bound to see the old rule fail below it.
     const window_min = if (c1_teeth.old_renewal_rule) 1 else constants.fence_window_min_ms;
@@ -41,10 +61,24 @@ pub fn inequality_problem(ttl_ms: u32) ?Problem {
     return null;
 }
 
+/// Null if a lease of `ttl_ms` with a lost grace of `grace_ms` meets the whole contract: what the
+/// server checks of its configuration.
+pub fn contract_problem(ttl_ms: u32, grace_ms: u32) ?Problem {
+    if (inequality_problem(ttl_ms)) |problem| return problem;
+    if (grace_ms < grace_min_ms(ttl_ms)) return .grace_too_small;
+    return null;
+}
+
 /// ZC-E0121 for a ttl that `inequality_problem` refused, wherever it came from: the server's
 /// configuration, or a grant an agent was handed. The fix points the way the problem does: a
 /// ttl below the bound is lengthened, one the margin cannot cover is shortened.
 pub fn raise_problem(diag: *Diag, ttl_ms: u32, problem: Problem) void {
+    assert(problem != .grace_too_small); // An agent knows no grace: `raise_contract_problem`.
+    raise_contract_problem(diag, ttl_ms, 0, problem);
+}
+
+/// ZC-E0121 for a configuration `contract_problem` refused; `grace_ms` is the server's grace.
+pub fn raise_contract_problem(diag: *Diag, ttl_ms: u32, grace_ms: u32, problem: Problem) void {
     diag.raise(.E0121);
     switch (problem) {
         .ttl_too_short => {
@@ -64,6 +98,20 @@ pub fn raise_problem(diag: *Diag, ttl_ms: u32, problem: Problem) void {
             );
             diag.fix(.{ .sentence = "shorten the lease ttl until the fence margin covers it, " ++
                 "such as the default of 10000" });
+        },
+        .grace_too_small => {
+            diag.cause(
+                "a lease ttl of {d} ms needs a lost grace of at least {d} ms; it is {d} ms (the " ++
+                    "{d} ms fence margin and the grace must cover the stop, the clock skew, the " ++
+                    "kill's delivery and dispatch and a {d} ms store clock step: {d} ms)",
+                .{
+                    ttl_ms,                      grace_min_ms(ttl_ms),
+                    grace_ms,                    constants.fence_margin_ms,
+                    constants.clock_step_max_ms, cover_needed_ms(ttl_ms),
+                },
+            );
+            diag.fix(.{ .sentence = "lengthen the lost grace to at least the shortest, " ++
+                "or use the default of 1000" });
         },
     }
 }
@@ -129,6 +177,26 @@ test "the shipped constants satisfy the inequality, and every ttl in range that 
 fn real_dead_ms(ttl_ms: u32, per_mille: u32) u64 {
     const agent_ms = kill_at_ms(fence_at_ms(0, ttl_ms));
     return (agent_ms * (1000 + per_mille) + 999) / 1000 + constants.fence_kill_latency_ms;
+}
+
+test "the margin and the grace cover the dispatch and the clock step, with 400 ms to spare" {
+    // Goal: the bound of docs/decisions/2026-11-18-fencing-dispatch-and-clock-step.md. Method:
+    // the arithmetic at the default ttl and grace, then the shortest grace at both ends of the
+    // admitted ttls, one under it refused, and a ttl the margin alone refuses whatever the grace.
+    const ttl = constants.lease_ttl_ms;
+    try testing.expectEqual(@as(u32, 3_600), cover_needed_ms(ttl));
+    try testing.expectEqual(@as(u32, 400), constants.fence_margin_ms + constants.lost_grace_ms -
+        cover_needed_ms(ttl));
+    try testing.expectEqual(@as(?Problem, null), contract_problem(ttl, constants.lost_grace_ms));
+    try testing.expectEqual(@as(u32, 600), grace_min_ms(ttl));
+    try testing.expectEqual(@as(?Problem, null), contract_problem(ttl, 600));
+    try testing.expectEqual(@as(?Problem, .grace_too_small), contract_problem(ttl, 599));
+    try testing.expectEqual(@as(?Problem, .grace_too_small), contract_problem(ttl, 0));
+    try testing.expectEqual(@as(u32, 580), grace_min_ms(8_000));
+    try testing.expectEqual(@as(?Problem, .grace_too_small), contract_problem(8_000, 579));
+    try testing.expectEqual(@as(?Problem, .ttl_too_short), contract_problem(7_999, 60_000));
+    const long = constants.lost_grace_ms_max;
+    try testing.expectEqual(@as(?Problem, .margin_too_small), contract_problem(ttl + 1, long));
 }
 
 test "the fence and the kill come at the margin and the stop time, and beat the lease's end" {
