@@ -409,7 +409,7 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
     const listen_text = flags.listen orelse file.listen orelse
         if (insecure_text == null) @as([]const u8, listen_default) else null;
     const store_text = flags.store orelse file.store orelse "memory";
-    return .{
+    const config: Config = .{
         .listen = if (listen_text) |text| try parse_listen(text, diag) else null,
         .insecure_listen = if (insecure_text) |t| try parse_insecure_listen(t, diag) else null,
         .tls_name = try tls_name_of(
@@ -427,6 +427,8 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .relays = try relays_valid(file.relays, diag),
         .cluster = try cluster_of(file.cluster, file.relays, diag),
     };
+    try fencing_of(config.lease_ttl_ms, config.lost_grace_ms, diag);
+    return config;
 }
 
 /// The trust domain, checked as a DNS name (ZC-E0106), and required when a relay checks its
@@ -467,8 +469,15 @@ fn lease_ttl_of(given: ?u32, diag: *Diag) Error!u32 {
             ttl, constants.lease_ttl_ms_min, constants.lease_ttl_ms_max,
         }, "choose a ttl inside the range");
     }
-    const problem = fencing.inequality_problem(ttl) orelse return ttl;
-    fencing.raise_problem(diag, ttl, problem);
+    return ttl;
+}
+
+/// ZC-E0121 for a ttl and a lost grace that together cannot fence an agent in time
+/// (docs/authority.md §3): the margin must cover the stop, the skew and the kill's delivery,
+/// and the margin and the grace together also the kill's dispatch and the store's clock step.
+fn fencing_of(ttl: u32, grace: u32, diag: *Diag) Error!void {
+    const problem = fencing.contract_problem(ttl, grace) orelse return;
+    fencing.raise_contract_problem(diag, ttl, grace, problem);
     return error.BadConfig;
 }
 
@@ -1193,6 +1202,25 @@ test "a lease ttl an agent cannot fence in time is ZC-E0121" {
     diag.reset();
     const shortest = try merge(.{ .lease_ttl_ms = 8_000 }, .{}, &diag);
     try testing.expectEqual(@as(u32, 8_000), shortest.lease_ttl_ms);
+}
+
+test "a lost grace too short for the ttl is refused with ZC-E0121, naming the grace" {
+    // Goal: the grace is part of the fencing check (docs/decisions/2026-11-18-fencing-dispatch-
+    // and-clock-step.md). Method: at the default ttl the shortest grace is 600 ms: 599 is
+    // refused with a cause naming the grace and 600, 600 and the default are admitted.
+    var diag: Diag = undefined;
+    diag.reset();
+    try testing.expectError(error.BadConfig, merge(.{ .lost_grace_ms = 599 }, .{}, &diag));
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0121), diag.code);
+    const cause = diag.last_cause().?;
+    try testing.expect(std.mem.indexOf(u8, cause, "needs a lost grace of at least 600 ms") != null);
+    try testing.expect(std.mem.indexOf(u8, cause, "it is 599 ms") != null);
+    diag.reset();
+    try testing.expectEqual(@as(u32, 600), (try merge(.{ .lost_grace_ms = 600 }, .{}, &diag))
+        .lost_grace_ms);
+    // The shortest ttl needs 20 ms less.
+    const short = try merge(.{ .lease_ttl_ms = 8_000, .lost_grace_ms = 580 }, .{}, &diag);
+    try testing.expectEqual(@as(u32, 580), short.lost_grace_ms);
 }
 
 test "the lost grace is a flag, a file setting, and refused over an hour" {

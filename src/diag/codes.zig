@@ -463,10 +463,14 @@ pub const registry = [_]Entry{
         \\only after the lease has run out and a grace period has passed. The
         \\margin must cover the time the agent needs to stop its containers, the
         \\drift between the two clocks over one lease, and the time the kernel
-        \\needs to kill a process. These settings leave too little, so two copies
-        \\of a replica could run at once.
+        \\needs to kill a process. The margin and the grace together must also
+        \\cover how late the agent may send the kill and how far the database's
+        \\clock may step forward (500 ms). These settings leave too little, so
+        \\two copies of a replica could run at once.
         \\
-        \\The cause line names the numbers. A lease time to live that is too
+        \\The cause line names the numbers and the setting that falls short. A
+        \\lost grace that is too short must be lengthened; the cause line names
+        \\the shortest, and the default is 1000 ms. A lease time to live that is too
         \\long for the margin must be shortened. One that is too short, under
         \\8000 ms, leaves the agent no time to renew it before it fences, so it
         \\must be lengthened; the cause line names the shortest. The default is

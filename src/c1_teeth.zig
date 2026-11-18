@@ -19,6 +19,9 @@ pub const skip_allocation_compare = declared("c1_teeth_skip_allocation_compare")
 pub const skip_readiness_compare = declared("c1_teeth_skip_readiness_compare");
 /// Nodes' clocks run beyond the skew bound (must break I1b).
 pub const skew_beyond_bound = declared("c1_teeth_skew_beyond_bound");
+/// The store's clock steps forward by more than `clock_step_max_ms` from time to time, so leases
+/// end early (docs/decisions/2026-11-18-fencing-dispatch-and-clock-step.md; must break I1b).
+pub const store_clock_step = declared("c1_teeth_store_clock_step");
 /// Agents freeze and containers ignore stops, and a wedged node is not excused (must break I1b).
 pub const wedge = declared("c1_teeth_wedge");
 
@@ -195,7 +198,7 @@ pub const signed_world = job_untrusted;
 pub const tenant_world = placement_exclusive or relabel_kept;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
-    skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
+    skew_beyond_bound or store_clock_step or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
@@ -222,6 +225,7 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_skip_allocation_compare", "sim_c1_teeth_allocation" },
     .{ "c1_teeth_skip_readiness_compare", "sim_c1_teeth_readiness" },
     .{ "c1_teeth_skew_beyond_bound", "sim_c1_teeth_skew" },
+    .{ "c1_teeth_store_clock_step", "sim_c1_teeth_store_step" },
     .{ "c1_teeth_wedge", "sim_c1_teeth_wedge" },
     .{ "c1_teeth_stale_observation", "sim_c1_teeth_stale" },
     .{ "c1_teeth_locality_before_spread", "sim_c1_teeth_locality" },

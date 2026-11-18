@@ -152,9 +152,31 @@ can see of them.
   another node can remain for a while after a replacement; it is not admissible, and I1a is
   about ownership, not reports.)
 - **I1b** (host). A replaced replica's old process and its replacement do not run at once for
-  longer than `lost_grace_ms` plus kill latency, unless the old node was `SIGSTOP`ped (wedged) or
-  its clock was moved beyond the skew bound; the harness records those overlaps and does not fail
-  them, as the sim does.
+  longer than `lost_grace_ms` plus kill latency, unless the old node was `SIGSTOP`ped (wedged),
+  its clock was moved beyond the skew bound, or the store's clock stepped forward by more than
+  `clock_step_max_ms`; the harness records those overlaps and does not fail them, as the sim does.
+  The overlap alone can hide a late kill behind a slow replacement, so the harness also judges
+  each old instance against its own **budget** (below), whatever its replacement did.
+
+#### The declared bounds: `share/jepsen/fencing-bounds.edn`
+
+`zig build dist` writes the fencing contract's constants (`src/constants.zig`) into the tarball as
+an EDN map, from the same build as the executables beside it, so a checker reads the bounds of the
+Zigcube it deploys and hard-codes none: `:lease-ttl-ms`, `:lost-grace-ms` (the defaults; a run
+started with other values uses those), `:fence-margin-ms`, `:fence-window-min-ms`,
+`:fence-stop-ms`, `:clock-skew-per-mille`, `:fence-kill-latency-ms`, `:kill-dispatch-ms`,
+`:clock-step-max-ms`, `:fence-poll-ms`, `:stop-grace-ms`, and `:format 1` (a change of meaning
+bumps it). With `skew = ceil(ttl × clock-skew-per-mille / 1000)` and the ttl and grace the run used:
+
+- the agent's condition, `fence-margin-ms >= fence-stop-ms + skew + fence-kill-latency-ms`;
+- the contract, `fence-margin-ms + lost-grace-ms >= fence-stop-ms + skew + fence-kill-latency-ms
+  + kill-dispatch-ms + clock-step-max-ms` (`zcube-server` refuses a pair that fails either,
+  ZC-E0121);
+- **an instance's budget**: an instance on a node whose last accepted keepalive was at `s` (the
+  node's own `CLOCK_BOOTTIME`) is dead by `s + ttl - fence-margin-ms + fence-stop-ms +
+  fence-kill-latency-ms + kill-dispatch-ms`; on the store's clock, by the lease's expiry plus
+  `lost-grace-ms` (the contract's slack is what is left), unless the node was wedged or a clock
+  broke its bound. An instance that outlives it is a timing violation even with no overlap.
 - **I2.** Across the revisions read, a replica's placement epoch (its assignment's
   `mod_revision`) never goes backwards while the replica exists. A refused commit leaves no trace a
   view can show; this is the part of I2 an outcome shows.
@@ -266,8 +288,9 @@ the wall clock with `date -s`; `ntp-start` lets it converge back. A step is not 
 1 % bound of authority.md is on rates, and a step on the hosts below is outside it. Which clock
 each host's step reaches:
 
-- **The Postgres primary's host**: lease deadlines are the database's time. A forward step
-  expires leases early (a jump past the ttl expires every lease at once: replacements while the
+- **The Postgres primary's host**: lease deadlines are the database's time. A forward step of at
+  most `clock_step_max_ms` (500 ms) is inside the fencing contract and excuses nothing; a larger
+  one (docs/operations.md, "Clocks", forbids it) expires leases early (a jump past the ttl expires every lease at once: replacements while the
   old nodes still run until their own fences, so I1b's overlaps are excused from the step to
   `ttl - fence_margin_ms` after it); a backward step lengthens leases, delaying replacement of a
   dead node (no violation, only latency).
