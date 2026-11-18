@@ -144,6 +144,17 @@ An agent re-reads its whole context on every turn, so cost grows with context si
 - **Purely mechanical work goes to Haiku** (owner, 2026-10-30). A change fully specified by a pattern (threading an argument through call sites, a rename, copying generated output into a doc, a status update, a CI tweak) is done by a Haiku subagent or session, given the exact pattern; whoever delegated checks its diff. Anything that needs judgment (design, tests, invariants, review) stays with Sonnet or the supervisor. Briefs name a slice's mechanical parts.
 - The supervisor follows the same rules; its own handoff is [docs/supervisor-handoff.md](docs/supervisor-handoff.md).
 
+## Instructions to the owner (owner, 2026-11-17)
+
+When a session gives the owner steps to carry out (cloud setup, secrets, releases, accounts):
+
+- Give the full stack: every step from tools and logins to the final check that it worked,
+  in order, with nothing left as "then set X up". Name each value the owner must supply and how
+  to find it.
+- Use the command line wherever a CLI can do it (`gcloud`, `gh`, `git`, `wrangler`, ...), as
+  copyable commands, ideally one script that is safe to re-run. Describe browser clicks only
+  for what no CLI can do, and say why.
+
 ## Reviews on GitHub (owner, 2026-11-05)
 
 Every adversarial review of a pull request (a slice review, a re-review, either release reviewer) is posted on that pull request as a GitHub pull request review, so the record stays with the PR.
