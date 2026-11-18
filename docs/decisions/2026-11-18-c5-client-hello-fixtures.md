@@ -15,4 +15,11 @@ share before x25519, ECH GREASE, many extensions. Chromium's covers all of these
 Safari hellos can be added later with the same tool on a machine that has them (Playwright's
 `firefox` and `webkit` launchers accept the same arguments); each is one file and one test row.
 
+**When and where the rest are recorded** (review of #282; the supervisor may move it): before
+slice 4b, the first slice that listens on :443 for real browsers, on a machine that has Firefox
+and Safari (a macOS host: Safari runs only there, and Firefox runs there too). Each fixture is
+one file under `src/testdata/tls/` and one row in the public tests' fixture table. Until then
+Firefox's and Safari's hellos are untested by fixture: a server that refuses one of them would
+first show as a failure on that browser in 4b's `edge-smoke` or the C5 demo, not in `check`.
+
 Where: `src/testdata/tls/README.md`, `src/tls_server_public_test.zig`.
