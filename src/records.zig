@@ -855,6 +855,16 @@ pub fn observed_valid(observed: *const Observed) bool {
     return exit.kind != .refused;
 }
 
+/// True if an assignment written at `assignment` (its `mod_revision`) is older than the run
+/// record it is read with, created at `run_created`: it placed an earlier job of the same name
+/// (#243). A run id is `<name>-job`, so a reused name meets the old assignment's key; a run is
+/// placed after its record is created and never moved, so every assignment of this incarnation
+/// is later. The rule needs no stored field, so it holds for assignments any server version
+/// wrote; the job controller, the agent API and the agent each apply it.
+pub fn assignment_is_stale(assignment: u64, run_created: u64) bool {
+    return assignment < run_created;
+}
+
 /// The placement: the scheduler's decision to run a replica on a node.
 pub const Assigned = struct {
     v: u32 = 2,
@@ -866,6 +876,11 @@ pub const Assigned = struct {
     /// The job a run belongs to (version 2): set for `<name>-job` ids, absent for replicas. Every
     /// reader of `service` takes this branch for a run (`assigned_group`).
     job: ?[]const u8 = null,
+    /// The run's incarnation (#243): the `create_revision` of the `/job-runs/<name>` record the
+    /// scheduler placed. A job name created again gets a new run record, so an assignment left
+    /// from the old one names another value and is none of the new run's. Set for a run by this
+    /// release and later; absent in a replica's and in a run's an older server wrote.
+    run_created: ?u64 = null,
 };
 
 /// Assignments are written at the oldest version that holds their members: version 2 only for a

@@ -249,9 +249,26 @@ const World = struct {
         return &world.statuses[at];
     }
 
-    fn assignment(world: *const World, run_id: []const u8) ?*const Entry(records.Assigned) {
-        const at = world.assigned_of.get(run_id) orelse return null;
-        return &world.assigned[at];
+    /// The run's assignment, if it places this incarnation of the run, else none (#243): nothing
+    /// an assignment a reused job name left carries (a placement, a claim, an ending) moves this
+    /// run. A run is placed after it is created and never moved, so an assignment of this
+    /// incarnation was written after the run record (`records.assignment_is_stale`, the rule the
+    /// agent API and the agent apply too); one an older server wrote is judged by that alone.
+    /// `run_created`, where the scheduler wrote it, must also name this run record.
+    fn placement(
+        world: *const World,
+        entry: *const Entry(records.JobRun),
+    ) ?*const Entry(records.Assigned) {
+        const at = world.assigned_of.get(entry.rec.id) orelse return null;
+        const placed = &world.assigned[at];
+        // Test-only (`c1_teeth.job_reuse_assigned`): any incarnation's assignment is taken.
+        if (c1_teeth.job_reuse_assigned) return placed;
+        if (records.assignment_is_stale(placed.kv.mod_revision, entry.kv.create_revision)) {
+            return null;
+        }
+        const created = placed.rec.run_created orelse return placed;
+        if (created != entry.kv.create_revision) return null;
+        return placed;
     }
 
     fn node_entry(world: *const World, name: []const u8) ?*const Entry(records.Node) {
@@ -754,7 +771,7 @@ const Pass = struct {
     fn refused(pass: *Pass, run: *const Entry(records.JobRun)) bool {
         // Test-only fault (sim-c1-teeth-relabel_kept): a relabelled node keeps its runs.
         if (c1_teeth.relabel_kept) return false;
-        const placed = pass.world.assignment(run.rec.id) orelse return false;
+        const placed = pass.world.placement(run) orelse return false;
         const node = pass.world.node_entry(assigned_node(placed.kv.key)) orelse return false;
         const require = if (run.rec.placement) |placement| placement.require else &.{};
         return scheduler.refuses(node.rec.labels, require);
@@ -776,7 +793,7 @@ const Pass = struct {
         run: *const Entry(records.JobRun),
     ) Error!Claim {
         const ctx = pass.ctx;
-        const placed = pass.world.assignment(run.rec.id) orelse return .none;
+        const placed = pass.world.placement(run) orelse return .none;
         const key = records.job_observed_key(assigned_node(placed.kv.key), job.rec.name);
         const got = try ctx.store.get(ctx.arena, key.slice(), pass.world.revision, ctx.diag);
         const kv = got.kv orelse return .none;
@@ -802,7 +819,7 @@ const Pass = struct {
         const world = pass.world;
         const node = world.node_entry(entry.rec.node) orelse return false;
         if (node.kv.mod_revision != entry.rec.tenure) return false;
-        const placed = world.assignment(run.rec.id) orelse return false;
+        const placed = world.placement(run) orelse return false;
         if (placed.kv.mod_revision != entry.rec.assignment) return false;
         if (!std.mem.eql(u8, assigned_node(placed.kv.key), entry.rec.node)) return false;
         const judged = world.node_status(entry.rec.node) orelse return false;
@@ -866,7 +883,7 @@ const Pass = struct {
     ) Error!void {
         const ctx = pass.ctx;
         const world = pass.world;
-        const placed = world.assignment(run.rec.id) orelse return;
+        const placed = world.placement(run) orelse return;
         const node = assigned_node(placed.kv.key);
         batch.expect(placed.kv.key, placed.kv.mod_revision);
         const node_at = if (world.node_entry(node)) |entry| entry.kv.mod_revision else 0;
@@ -973,7 +990,7 @@ const Pass = struct {
         if (claim_seen) |entry| return pass.judge_claimed(job, run, status, entry);
         if (run.rec.stop) |stop| return pass.end_unstarted(job, run, status, stop);
         if (try pass.stop_cause(job, run)) |cause| return pass.write_stop(job, run, status, cause);
-        const placed = pass.world.assignment(run.rec.id) orelse return;
+        const placed = pass.world.placement(run) orelse return;
         if (status.rec.state != .pending) return;
         try pass.mark_placed(job, run, status, placed);
     }
@@ -1012,7 +1029,7 @@ const Pass = struct {
         const now = pass.ctx.clock.now_ms();
         // Test-only (`c1_teeth.job_unclaimed`): a run nobody claimed is never ended (J8).
         if (!c1_teeth.job_unclaimed and now > run.rec.start_by_ms) return .not_started;
-        const placed = pass.world.assignment(run.rec.id) orelse {
+        const placed = pass.world.placement(run) orelse {
             pass.wake_at_ms = @min(pass.wake_at_ms, run.rec.start_by_ms +| 1);
             return null;
         };
@@ -1043,7 +1060,7 @@ const Pass = struct {
         status: *const Entry(records.JobStatus),
     ) Error!void {
         if (status.rec.state == .running) return pass.judge_running(job, run, status);
-        const placed = pass.world.assignment(run.rec.id) orelse return;
+        const placed = pass.world.placement(run) orelse return;
         const node = assigned_node(placed.kv.key);
         const stop = run.rec.stop orelse {
             if (job.rec.cancel_requested != null) {

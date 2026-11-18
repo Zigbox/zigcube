@@ -206,12 +206,14 @@ pub const SimNode = struct {
         for (records) |record| {
             const stopped = (try node.status_of_record(arena, &record, diag)) == .stopped;
             const same = std.mem.eql(u8, record.name, name);
-            if (same) assert(stopped);
-            if (!stopped) continue;
+            // `job_reuse_assigned` starts a run again while it runs (J2, judged at the start):
+            // the running container is replaced, as `SimRuntime.start` does.
             if (same) {
+                if (!c1_teeth.job_reuse_assigned) assert(stopped);
                 oldest = record;
                 break;
             }
+            if (!stopped) continue;
             const older = if (oldest) |best|
                 record.spec.started_at_ms < best.spec.started_at_ms
             else

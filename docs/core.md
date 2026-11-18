@@ -524,8 +524,20 @@ before `runtime.start`) are not judged. The tooth makes the simulated node's lis
 unchanged. `sim-c1-reuse` is the world with the agent right (seeds 1..60, 300 operations). Opening
 the world exposed that I4 model gap: retention's sweep of stray `/job-observed/` keys spans nodes
 and jobs, which I4's `retention_only` rejected; `writers.foreign_key` accepts a delete-only request on
-that prefix only while `Cluster.retention_jump` runs retention (the tap is told so). The report adds `jobs: reuse jumps=.. dropped=.. reused creates=.. met a container=..`
-in this world only; every other world is unchanged bit for bit. `docs/decisions/2026-11-11-job-reuse-tooth.md`.
+that prefix only while `Cluster.retention_jump` runs retention (the tap is told so). The report adds `jobs: reuse jumps=.. dropped=.. held assigned=.. reused creates=.. met a
+container=..` in this world only; every other world is unchanged bit for bit.
+`docs/decisions/2026-11-11-job-reuse-tooth.md`.
+
+Since #243 the scheduler is down before every jump in this world (`Scheduler.runs_held`, set
+from `Cluster.reuse_runs_held` from the create before the jump to the reuse after it): no run's
+assignment is released, so retention meets ended jobs whose runs are still assigned and must keep
+them (`held assigned=..` counts them). `sim-c1-teeth-job_reuse_assigned` turns off every part of
+the fix (retention's `/assigned/` check, the job controller's incarnation compare in
+`World.placement`, and the revision rule in the agent API and the agent): a reused name then takes the old run's assignment, and the agent starts the
+new run under it again (J2) or reports the old ending for it (J4). Under that tooth only, the
+simulated runtime and node let a running container be replaced under the same name. It is sparse:
+7 of seeds 1..60 fail at 300 operations, so the negative test runs 30..60 (first hit at 33) and
+also seed 40. `docs/decisions/2026-11-18-job-incarnation.md`.
 
 **Relays (B3 slice 3).** `SimRuntime` models the listener of a job's relay (`Spec.relay`): open from the
 start, closed by every ending (exit, signal, stop, deadline, a lost supervisor), gone with a wiped disk;

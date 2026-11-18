@@ -763,6 +763,10 @@ pub const Scheduler = struct {
     source: controller.DecisionSource,
     holds: [hold_memory_max]Hold = @splat(.{ .replica = 0, .evidence = 0 }),
     holds_next: u32 = 0,
+    /// The simulator's reuse world only (#243): while set, no run's assignment is released, as
+    /// when the scheduler is down. It has no effect in a build without that world
+    /// (`c1_teeth.reuse_world` is comptime), so no server can hold its releases.
+    runs_held: bool = false,
 
     pub fn init(instance: u16) Scheduler {
         return .{ .source = .{ .instance = instance } };
@@ -807,7 +811,10 @@ pub const Scheduler = struct {
     ) Error!void {
         const assign = world.assigns.items[index];
         if (!assign.live) return;
-        if (assign.job) return sc.release_run(ctx, world, pass, index);
+        if (assign.job) {
+            if (c1_teeth.reuse_world and sc.runs_held) return;
+            return sc.release_run(ctx, world, pass, index);
+        }
         if (world.desired.contains(assign.replica)) return;
         if (assign.node == no_node) return; // No record names the node: nothing to release from.
         const view = &world.nodes[assign.node];
@@ -1148,7 +1155,8 @@ pub const Scheduler = struct {
             .read_revision = world.revision,
         }, &batch);
         const key = try assign_key(ctx, name, run_id);
-        const value = records.assigned_run(run_id, job, need, reason);
+        var value = records.assigned_run(run_id, job, need, reason);
+        value.run_created = run_kv.create_revision;
         batch.put(key, try records.encode(ctx.arena, value, ctx.diag));
         const after = add(view.allocated, need);
         try put_allocation(ctx, &batch, name, after, view.count + 1, view.node.kv.mod_revision);

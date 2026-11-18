@@ -1122,6 +1122,29 @@ test "a leftover of an earlier job of the same name is not this job's claim, sta
     try testing.expectEqual(epoch, now.epoch);
 }
 
+test "an assignment an earlier job of the same name left is never claimed (#243)" {
+    // Goal: a reused name has the old run id, so an assignment left from the earlier job has
+    // the new run's key. Method: the assignment is written before the run record. The agent
+    // neither claims nor starts the run; the server would refuse the claim too (#243).
+    var rig = try Rig.start();
+    defer rig.stop();
+    const assigned: records.Assigned = .{
+        .replica = run_id,
+        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        .reason = "test",
+        .job = job_name,
+    };
+    const key = records.assigned_key(sim_world.node_name, run_id);
+    _ = try rig.put(.scheduler, key.slice(), assigned);
+    const run = rig.run_record(null, 60_000);
+    _ = try rig.put(.job_controller, records.job_run_key(job_name).slice(), run);
+    rig.step();
+    rig.step();
+    try testing.expect(!rig.running());
+    try testing.expect((try rig.observed()) == null);
+    try testing.expect((try rig.start_record()) == null);
+}
+
 test "a leftover container of an earlier job of the same name is stopped, never adopted" {
     // Goal: containers made under an assignment older than the run (a job of the same name that
     // is gone) must not be adopted as this job's. Method: leave one running and one exited

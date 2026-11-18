@@ -1554,6 +1554,48 @@ test "a claim replaces a leftover observation older than the run, and says appli
     try testing.expectEqualStrings("claimed", field(field(rec, "value"), "status").string);
 }
 
+test "an assignment older than the run is never claimed, nor its input given (#243)" {
+    // Goal: a reused job name has the old run id, so an assignment an earlier job of the name
+    // left has the new run's key. The claim under it is refused as a failed compare (every
+    // agent reads again), nothing is written, and the input is not given under it either.
+    var rig = try Rig.start(28);
+    defer rig.stop();
+    try rig.join("node2");
+    const assigned: records.Assigned = .{
+        .replica = "train-job",
+        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        .reason = "test",
+        .job = "train",
+    };
+    const assigned_key = records.assigned_key("node2", "train-job");
+    const left = try put_as(&rig, .scheduler, assigned_key.slice(), assigned);
+    const run_key = records.job_run_key("train");
+    const run_revision = try put_as(&rig, .job_controller, run_key.slice(), run_fixture);
+    _ = try put_as(&rig, .api, records.job_input_key("train").slice(), records.JobInput{
+        .base64 = "aGVsbG8=",
+    });
+    var buffer: [512]u8 = undefined;
+    const text = try claim_text(&buffer, rig.tenure, run_revision, left);
+    const before = try rig.revision();
+    const answer = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    try testing.expect(!field(answer, "applied").bool);
+    try testing.expectEqual(before, try rig.revision());
+    // A claim that got in some other way (an older server admitted it) still gets no input.
+    const claimed: records.JobObserved = .{
+        .run = "train-job",
+        .node = "node2",
+        .tenure = @intCast(rig.tenure),
+        .assignment = left,
+        .status = .claimed,
+        .reported_at_ms = 2,
+    };
+    const claim_key = records.job_observed_key("node2", "train");
+    _ = try put_as(&rig, .{ .agent = "node2" }, claim_key.slice(), claimed);
+    const input = rig.call("GET", "/v1/agent/nodes/node2/runs/train/input", "", "");
+    try rig.refused(input, input.status, "ZC-E0133");
+    try testing.expect(std.mem.indexOf(u8, input.body, "an earlier job of that name") != null);
+}
+
 test "a damaged input value is ZC-E0523, with nothing left in the diagnostic" {
     var rig = try Rig.start(23);
     defer rig.stop();

@@ -32,8 +32,6 @@ pub fn build(b: *std.Build) void {
 
     const pq_include = pq_include_option(b);
     const c_modules = add_c_modules(b, target, optimize, .{ .pq_include = pq_include });
-    const sqlite = c_modules.sqlite;
-    const libpq_module = c_modules.libpq;
     const console = add_console_steps(b);
     const web_files = add_web_files(b, console);
 
@@ -42,8 +40,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .options = options,
         .zigbox = zigbox_module,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
+        .sqlite = c_modules.sqlite,
+        .libpq = c_modules.libpq,
         .web_files = web_files,
     };
     const built = add_executables(b, shared_options);
@@ -56,8 +54,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .zigbox = zigbox_module,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
+        .sqlite = c_modules.sqlite,
+        .libpq = c_modules.libpq,
     });
     add_agent_smoke_step(b, built, shared_options);
     add_jepsen_client_step(b, shared_options, built);
@@ -1985,6 +1983,22 @@ const c1_teeth_roots = [_]struct {
         .ops = 300,
     },
     .{
+        .name = "job_reuse_assigned",
+        .root = "src/sim_c1_teeth_job_reuse_assigned_main.zig",
+        // #243: retention deletes a job whose run is still assigned and the job controller
+        // takes any incarnation's assignment; a job created again under the name meets it.
+        // The reuse world holds the scheduler's releases around a jump (`reuse_runs_held`).
+        // Sparse: 7 of seeds 1..60 fail at 300 operations, `--c1` (2026-11-18), J2 at 33 36 39
+        // 44 57 59 and J4 at 40; CI runs 30..60 and stops at 33. The fleet's 180 fresh seeds at
+        // a rate of 0.117 miss a working check with probability 0.883^180 = 2e-10.
+        .symptom = "J2|J4",
+        .canary_seeds = 180,
+        .also_seeds = &.{40},
+        .first_seed = 30,
+        .seeds = 60,
+        .ops = 300,
+    },
+    .{
         .name = "job_untrusted",
         .root = "src/sim_c1_teeth_job_untrusted_main.zig",
         // J12 (a run started that its node's trust policy refuses); signed jobs and node
@@ -2072,7 +2086,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_c1_comparison(b, sim, exe, step, nodes_text, false);
     add_c1_comparison(b, sim, exe, step, nodes_text, true);
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 33 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 34 fault-on sim-c1 runners");
     const shard = teeth_shard(b, teeth);
     for (c1_teeth_roots, 0..) |entry, index| {
         // CI's shards (`-Dteeth-shard=K -Dteeth-shards=N`) take every Nth tooth from K, so their

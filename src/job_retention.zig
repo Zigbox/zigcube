@@ -20,6 +20,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
@@ -41,6 +42,8 @@ pub const Cursor = struct {
     /// Jobs deleted whole, and inputs deleted alone, counted when the delete went in.
     dropped: u64 = 0,
     inputs_dropped: u64 = 0,
+    /// Old jobs a pass kept because their run was still assigned, counted once per pass each.
+    held_assigned: u64 = 0,
     failing: bool = false,
     failures: u64 = 0,
     failure: diag_mod.Diag = undefined,
@@ -91,6 +94,9 @@ const Ended = struct {
     has_input: bool = false,
     /// The `mod_revision` of the input read with `has_input`; the delete expects it.
     input_revision: store.Revision = 0,
+    /// Its run still has an `/assigned/` record (or the scan could not tell): the job stays
+    /// until the scheduler releases it, or a name created again would meet it (#243).
+    assigned: bool = false,
 };
 
 /// One pass; returns when the next is due.
@@ -100,6 +106,7 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
     var ended: std.ArrayList(Ended) = .empty;
     try read_ended(ctx, revision, &ended);
     try mark_inputs(ctx, revision, ended.items);
+    try mark_assigned(ctx, revision, ended.items);
     const swept_more = try sweep_observed(ctx, cursor, revision, ended.items, now_ms);
     const Rank = struct {
         fn older(_: void, first: Ended, second: Ended) bool {
@@ -116,6 +123,10 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
         // Old at the end of the last finished sweep, not merely now: see `Cursor.swept_ms`.
         if (!cursor.swept) break;
         if (!old_at(job, cursor.swept_ms, cursor.age())) break; // Sorted: the rest are younger.
+        if (job.assigned) {
+            cursor.held_assigned += 1;
+            continue;
+        }
         if (dropped == constants.retention_batch_pairs) {
             more = true;
             break;
@@ -170,6 +181,37 @@ fn read_ended(
         }
         after = page.continue_after orelse return;
     }
+}
+
+/// Sets `assigned` on the ended jobs whose run has an `/assigned/<node>/<name>-job` record at
+/// `revision`, on any node. No assignment of an ended run can be written after it: a placement
+/// compares the job's status at a pending revision, and `drop_job` compares the status read. A
+/// scan cut short at `pages_max` marks every job: nothing is dropped on a guess.
+fn mark_assigned(ctx: *const Context, revision: store.Revision, ended: []Ended) Error!void {
+    // Test-only (`c1_teeth.job_reuse_assigned`): an assigned run's job is deleted.
+    if (c1_teeth.job_reuse_assigned) return;
+    var by_name: std.StringHashMapUnmanaged(usize) = .empty;
+    for (ended, 0..) |job, at| {
+        by_name.put(ctx.arena, job.name, at) catch return failures.no_memory(ctx.diag);
+    }
+    var after: ?[]const u8 = null;
+    for (0..pages_max) |_| {
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = records.prefix_assigned,
+            .at_revision = revision,
+            .limit = constants.store_list_limit_max,
+            .continue_after = after,
+        }, ctx.diag);
+        for (page.kvs) |kv| {
+            const slash = std.mem.lastIndexOfScalar(u8, kv.key, '/') orelse continue;
+            const run = kv.key[slash + 1 ..];
+            const name = records.job_of_run(run) orelse continue;
+            const at = by_name.get(name) orelse continue;
+            ended[at].assigned = true;
+        }
+        after = page.continue_after orelse return;
+    }
+    for (ended) |*job| job.assigned = true;
 }
 
 /// Sets `has_input` on the ended jobs that still have an input. Both lists ascend by name.
@@ -440,6 +482,35 @@ test "an ended job goes whole after the age, never before the floor" {
     try testing.expectEqual(@as(usize, 1), try fixture.count(records.prefix_job_status));
     try testing.expectEqual(@as(usize, 0), try fixture.count("/job-observed/n1/past"));
     try testing.expectEqual(@as(usize, 1), try fixture.count(records.prefix_job_observed));
+}
+
+test "an old job whose run is still assigned stays until the release (#243)" {
+    // Goal: retention never frees a name while an assignment of its run survives, on any node,
+    // or a job created again under that name would meet the old assignment (#243, TLA+ jobs
+    // model findings `job-reuse-assigned` and `job-reuse-report`). Method: two jobs past the
+    // age; one run's assignment is on a node the status does not name. Only the other goes; once
+    // the assignment is released the held one goes too.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const age = constants.job_finished_age_ms_max;
+    try fixture.job("held", age + 1);
+    try fixture.job("free", age + 1);
+    const assigned = records.assigned_key("n2", "held-job");
+    try fixture.put(assigned.slice(), "{}");
+    try fixture.put(records.assigned_key("n1", "free-1").slice(), "{}"); // A replica's.
+    const ctx = fixture.context();
+    var cursor: Cursor = .{};
+    _ = try prune(&ctx, &cursor, fixture.manual.ms);
+    try testing.expectEqual(@as(u64, 1), cursor.dropped);
+    try testing.expectEqual(@as(u64, 1), cursor.held_assigned);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("/jobs/held"));
+    try testing.expectEqual(@as(usize, 0), try fixture.count("/jobs/free"));
+    const ops = [_]store.Op{.{ .delete = assigned.slice() }};
+    try testing.expect((try ctx.store.txn(.{ .on_success = &ops }, ctx.diag)).succeeded);
+    _ = try prune(&ctx, &cursor, fixture.manual.ms);
+    try testing.expectEqual(@as(u64, 2), cursor.dropped);
+    try testing.expectEqual(@as(usize, 0), try fixture.count(records.prefix_jobs));
 }
 
 test "the input goes when the job has ended, and a running job keeps its records" {

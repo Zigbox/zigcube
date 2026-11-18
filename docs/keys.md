@@ -597,6 +597,17 @@ assignment is still written as version 1. Every reader of `service` treats an as
 agent reads the run's `relay` (B3) from the run record it already fetches for the claim; the
 assignment itself carries no address.
 
+`run_created` (#243, optional, still version 2) is the run's incarnation: the `create_revision` of
+the `/job-runs/<name>` record the scheduler placed. It is absent on replicas' assignments and on
+those an older server wrote; a reader that does not know the field ignores it. Because a job's run
+id is a function of its name, a job created again under a deleted job's name has the same key, so
+an assignment the earlier job left can still stand. An assignment whose `mod_revision` is lower
+than the run record's `create_revision` is that earlier job's (`records.assignment_is_stale`: a run
+is placed after it is created and never moved): the job controller treats it as absent, and so
+does one whose `run_created` names another incarnation; the agent API refuses a claim under it and
+gives no job input or certificate for it (ZC-E0133); the agent does not claim under it.
+`docs/decisions/2026-11-18-job-incarnation.md`.
+
 ## Compare sets
 
 Each transaction carries compares on every fact it rests on (`src/compare_sets.zig`): a placement
