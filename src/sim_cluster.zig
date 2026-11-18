@@ -1345,7 +1345,9 @@ pub const Cluster = struct {
             const slice = @min(left, tick_ms);
             c.manual.advance(slice);
             left -= slice;
-            if (c1_teeth.store_clock_step) c.step_store_clock(slice);
+            // Only while faults run: a step after the heal would keep ending leases early, and
+            // the liveness check, not I1b, would catch it.
+            if (c1_teeth.store_clock_step and c.fault_totals == null) c.step_store_clock(slice);
             if (c.fault_totals == null) c.fault_ms += slice;
             for (c.nodes) |node| {
                 if (node.down) continue;
