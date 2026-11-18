@@ -84,5 +84,9 @@ old assignment while its container still runs, so under this tooth only `SimRunt
 and `sim_node.make_room` let a running container be replaced under the same name (outside it the
 asserts stand). Measured 2026-11-18, 300 operations, `--c1`: 7 of seeds 1..60 fail, J2 at 33 36 39
 44 57 59 and J4 at 40; with the fix all 60 pass (`sim-c1-reuse`), and `sim-c1-teeth-job_reuse`
-still fails J11. `sim-c1-teeth-job_reuse_assigned` runs seeds 30..60 (stopping at 33) and seed 40
+still fails J11. With retention's wait alone off (the tooth's runner built with the job
+controller's, the agent API's and the agent's checks on), the seven seeds all pass, each with
+`held assigned=0` and reused creates that met a container: the revision rule holds J2 and J4 by
+itself, as the review asked (before it, the same measurement failed J2 at all seven).
+`sim-c1-teeth-job_reuse_assigned` runs seeds 30..60 (stopping at 33) and seed 40
 alone; the fleet canary runs 180 fresh seeds (miss probability 0.883^180, about 2e-10).
