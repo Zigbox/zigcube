@@ -1,5 +1,5 @@
 // Records the first TLS handshake message a real browser sends (its ClientHello), as raw record
-// bytes, for the public TLS mode's fixtures (docs/briefs/c5.md, slice 1; fixtures/tls/README.md).
+// bytes, for the public TLS mode's fixtures (docs/briefs/c5.md, slice 1; src/testdata/tls/README.md).
 // Uses the Chromium that is already installed (never `playwright install`; no npm dependency).
 //
 //   node tools/record_client_hello.mjs --out FILE

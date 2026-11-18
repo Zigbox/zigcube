@@ -20,6 +20,15 @@
 //! ever sees it; a failed `open` wipes the record buffer and the keys; bytes behind a key change
 //! in one record are refused; after a fatal error nothing more is produced but the one alert.
 //!
+//! The public path (docs/briefs/c5.md, "Public TLS"; docs/decisions/2026-11-15-c5-public-tls-mode.md):
+//! a server set up with `init_public` faces the internet. It sends no CertificateRequest and
+//! takes no client certificate; the handshake ends at the client's Finished. It picks the
+//! certificate chain by the canonical server name (SNI) from a `PublicTable` of P-256 keys,
+//! leaves and opaque intermediates, refuses a ClientHello with no server name or an unknown one
+//! (`unrecognized_name`), and one whose ALPN list lacks http/1.1 (`no_application_protocol`).
+//! Its CertificateVerify is ECDSA P-256 with the chain's key. Neither cluster path is reachable
+//! from it.
+//!
 //! Core code: no allocation, no clock, no randomness, no I/O.
 
 const std = @import("std");
@@ -32,6 +41,7 @@ const tls_client = @import("tls_client.zig");
 const wire = @import("tls_wire.zig");
 const x509 = @import("x509.zig");
 const p256 = @import("x509_p256.zig");
+const edge_host = @import("edge_host.zig");
 
 const Diag = diag_mod.Diag;
 const Code = @import("diag/codes.zig").Code;
@@ -85,14 +95,116 @@ pub const Peer = struct {
     not_after_ms: u64,
 };
 
+/// One host's chain on the public path.
+pub const PublicChain = struct {
+    /// The canonical host name (`edge_host.canonicalize`).
+    host: []const u8,
+    /// The leaf's key; it must outlive every handshake that may pick this chain.
+    key: *const p256.KeyPair,
+    /// The leaf first, then the intermediates, sent as given: this server never parses them.
+    certificates: []const []const u8,
+};
+
+/// The public path's chains, sorted by host with no two the same, so that `find` is a binary
+/// search. A server reads it only while it answers a ClientHello, so a shell may swap tables
+/// between connections.
+pub const PublicTable = struct {
+    chains: []const PublicChain,
+
+    pub const TableError = error{
+        TooManyHosts,
+        NotCanonical,
+        Unsorted,
+        ChainEmpty,
+        ChainTooLong,
+        CertificateTooLarge,
+        ChainTooLarge,
+    };
+
+    /// Checks every rule above and the bounds of `constants.edge_*`.
+    pub fn init(chains: []const PublicChain) TableError!PublicTable {
+        if (chains.len > constants.edge_hosts_max) return error.TooManyHosts;
+        for (chains, 0..) |chain, index| {
+            var canonical: edge_host.Name = undefined;
+            const host = edge_host.canonicalize(&canonical, chain.host) catch
+                return error.NotCanonical;
+            if (!std.mem.eql(u8, host, chain.host)) return error.NotCanonical;
+            if (index > 0) {
+                const before = chains[index - 1].host;
+                if (std.mem.order(u8, before, chain.host) != .lt) return error.Unsorted;
+            }
+            try check_chain(chain.certificates);
+        }
+        return .{ .chains = chains };
+    }
+
+    fn check_chain(certificates: []const []const u8) TableError!void {
+        if (certificates.len == 0) return error.ChainEmpty;
+        if (certificates.len > constants.edge_chain_certificates_max) return error.ChainTooLong;
+        var total: u32 = 0;
+        for (certificates) |certificate| {
+            if (certificate.len == 0) return error.ChainEmpty;
+            if (certificate.len > constants.edge_certificate_bytes_max) {
+                return error.CertificateTooLarge;
+            }
+            total += @intCast(certificate.len);
+        }
+        if (total > constants.edge_chain_bytes_max) return error.ChainTooLarge;
+    }
+
+    /// The chain for a canonical host name, or null.
+    pub fn find(self: *const PublicTable, host: []const u8) ?*const PublicChain {
+        var low: usize = 0;
+        var high: usize = self.chains.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            switch (std.mem.order(u8, self.chains[middle].host, host)) {
+                .eq => return &self.chains[middle],
+                .lt => low = middle + 1,
+                .gt => high = middle,
+            }
+        }
+        return null;
+    }
+};
+
+pub const PublicConfig = struct {
+    random: [32]u8,
+    /// The ephemeral x25519 secret.
+    secret: [32]u8,
+    /// Read only while the ClientHello is answered.
+    table: *const PublicTable,
+};
+
+/// Why the public path refused a handshake, for the edge's `edge_handshakes_refused{reason}`.
+pub const PublicRefusal = enum {
+    server_name_missing,
+    server_name_unknown,
+    alpn,
+    /// x25519 listed without a key share: it would take a HelloRetryRequest, which this server
+    /// does not send (docs/briefs/c5.md, "Public TLS").
+    x25519_without_share,
+    other,
+};
+
+const Mode = enum { cluster, public };
+
+/// The most certificates either path sends.
+const chain_certificates_max: u32 =
+    @max(constants.tls_chain_certificates_max, constants.edge_chain_certificates_max);
+
 const peer_name_bytes_max: u32 =
     @max(constants.x509_spiffe_bytes_max, constants.x509_dns_name_bytes_max);
 
 /// The server's flight after ServerHello, as one sealed record: EncryptedExtensions,
 /// CertificateRequest, Certificate, CertificateVerify and Finished.
-const flight_content_bytes_max: u32 = wire.encrypted_extensions_message.len +
-    wire.certificate_request_message.len + wire.certificate_bytes_max +
-    wire.certificate_verify_bytes_max + 4 + schedule.hash_bytes;
+/// The public path sends a longer EncryptedExtensions and chain, and no CertificateRequest.
+const flight_content_bytes_max: u32 = @max(
+    wire.encrypted_extensions_message.len + wire.certificate_request_message.len +
+        wire.certificate_bytes_max,
+    wire.encrypted_extensions_public_alpn.len + wire.certificate_request_message.len +
+        wire.certificate_public_bytes_max,
+) + wire.certificate_verify_bytes_max + 4 + schedule.hash_bytes;
 
 /// What one step writes at most: the ServerHello record, the change_cipher_spec and the flight.
 pub const output_bytes_max: u32 = header_bytes + wire.server_hello_bytes_max + (header_bytes + 1) +
@@ -101,6 +213,8 @@ pub const output_bytes_max: u32 = header_bytes + wire.server_hello_bytes_max + (
 comptime {
     assert(wire.certificate_request_message.len == wire.certificate_request_message_p256.len);
     assert(wire.certificate_verify_bytes <= wire.certificate_verify_bytes_max);
+    assert(wire.encrypted_extensions_public.len <= wire.encrypted_extensions_public_alpn.len);
+    assert(wire.encrypted_extensions_message.len <= wire.encrypted_extensions_public_alpn.len);
     assert(flight_content_bytes_max <= constants.tls_record_plaintext_bytes_max);
     assert(output_bytes_max >= schedule.sealed_bytes(flight_content_bytes_max));
     assert(output_bytes_max >= schedule.sealed_bytes(schedule.key_update_bytes));
@@ -149,6 +263,12 @@ pub const TestFault = enum {
     early_data,
     /// The client's KeyUpdates are not counted against the limit.
     key_update_limit,
+    /// The public path serves its first chain for a missing or unknown server name.
+    sni_check,
+    /// The public path takes an ALPN list without http/1.1.
+    alpn_check,
+    /// The public path sends a CertificateRequest.
+    cert_request_sent,
 };
 var faults: [std.enums.values(TestFault).len]bool = @splat(false);
 
@@ -162,6 +282,7 @@ fn fault_on(fault: TestFault) bool {
 
 pub const Server = struct {
     state: State,
+    mode: Mode,
     anchor: [32]u8,
     now_ms: u64,
     random: [32]u8,
@@ -205,18 +326,26 @@ pub const Server = struct {
     flight_length: u32,
     out: [output_bytes_max]u8,
     out_length: u32,
+    /// The public path's table and the chain the server name picked: set only while the
+    /// ClientHello is answered.
+    public_table: ?*const PublicTable,
+    public_chain: ?*const PublicChain,
+    /// The client offered ALPN with http/1.1, so EncryptedExtensions selects it.
+    alpn_http11: bool,
+    /// The canonical server name the client asked for (public path).
+    host: edge_host.Name,
+    host_length: u32,
+    refusal: ?PublicRefusal,
 
     /// Sets the server up in place (it is large), waiting for a ClientHello.
     pub fn init(self: *Server, config: *const Config) void {
         const certificates = config.identity.certificates;
         assert(certificates.len >= 1);
         assert(certificates.len <= constants.tls_chain_certificates_max);
-        self.state = .wait_client_hello;
+        self.init_common(config.random, config.secret);
+        self.mode = .cluster;
         self.anchor = config.anchor;
         self.now_ms = config.now_ms;
-        self.random = config.random;
-        self.secret = config.secret;
-        self.public_key = X25519.recoverPublicKey(config.secret);
         assert(config.client_kinds.count() >= 1);
         assert(!config.client_kinds.contains(.ca));
         self.client_kinds = config.client_kinds;
@@ -230,13 +359,41 @@ pub const Server = struct {
         self.identity_count = @intCast(certificates.len);
         self.signer = config.identity.signer;
         self.init_browser(config.browser);
+        self.peer_kind = first_kind(config.client_kinds);
+    }
+
+    /// Sets the server up in place for the public path, waiting for a ClientHello. The table
+    /// must be valid (`PublicTable.init`).
+    pub fn init_public(self: *Server, config: *const PublicConfig) void {
+        assert(config.table.chains.len <= constants.edge_hosts_max);
+        self.init_common(config.random, config.secret);
+        self.mode = .public;
+        self.anchor = @splat(0);
+        self.now_ms = 0;
+        // No client certificate is ever read, so no kind is taken.
+        self.client_kinds = .empty;
+        self.identity_lengths = @splat(0);
+        self.identity_count = 0;
+        self.signer = .{ .context = config.table, .sign = never_signs };
+        self.init_browser(null);
+        self.scheme = .ecdsa_p256;
+        self.peer_kind = .client;
+        self.public_table = config.table;
+        assert(self.mode == .public);
+        assert(!self.browser_enabled);
+    }
+
+    fn init_common(self: *Server, random: [32]u8, secret: [32]u8) void {
+        self.state = .wait_client_hello;
+        self.random = random;
+        self.secret = secret;
+        self.public_key = X25519.recoverPublicKey(secret);
         self.schedule = schedule.Schedule.init();
         self.transcript = schedule.Transcript.init();
         self.read_next = @splat(0);
         self.read_protected = false;
         self.ccs_dropped = 0;
         self.leaf_key = @splat(0);
-        self.peer_kind = first_kind(config.client_kinds);
         self.peer_name_length = 0;
         self.peer_scope = null;
         self.peer_not_before_ms = 0;
@@ -246,6 +403,11 @@ pub const Server = struct {
         self.record_total = 0;
         self.flight_length = 0;
         self.out_length = 0;
+        self.public_table = null;
+        self.public_chain = null;
+        self.alpn_http11 = false;
+        self.host_length = 0;
+        self.refusal = null;
         self.read.wipe();
         self.write.wipe();
         assert(self.read.dead);
@@ -300,6 +462,19 @@ pub const Server = struct {
             .not_before_ms = self.peer_not_before_ms,
             .not_after_ms = self.peer_not_after_ms,
         };
+    }
+
+    /// The canonical server name the public path served; null before the ClientHello is
+    /// answered and on the cluster path.
+    pub fn server_name(self: *const Server) ?[]const u8 {
+        if (self.mode != .public) return null;
+        if (self.host_length == 0) return null;
+        return self.host[0..self.host_length];
+    }
+
+    /// Why the public path refused the handshake; null while it has not.
+    pub fn public_refusal(self: *const Server) ?PublicRefusal {
+        return self.refusal;
     }
 
     /// How many more bytes complete the record being read: 0 once the connection is over.
@@ -458,7 +633,11 @@ pub const Server = struct {
     /// A client that could not read the ServerHello has no keys: its alert comes in the clear,
     /// before any protected record.
     fn plain_alert_allowed(self: *const Server) bool {
-        if (self.state != .wait_certificate) return false;
+        const after_flight: State = switch (self.mode) {
+            .cluster => .wait_certificate,
+            .public => .wait_finished,
+        };
+        if (self.state != after_flight) return false;
         if (self.flight_length != 0) return false;
         return self.read.sequence == 0;
     }
@@ -558,7 +737,7 @@ pub const Server = struct {
         }
         diag.raise(.E0813);
         diag.cause("the client sent the fatal alert {s} ({d})", .{ wire.alert_name(code), code });
-        add_fix(diag, .E0813);
+        self.add_fix_for_path(diag, .E0813);
         return self.refuse(diag, null);
     }
 
@@ -650,8 +829,10 @@ pub const Server = struct {
 
     fn on_client_hello(self: *Server, diag: *Diag, kind: u8, message: []const u8) Error!void {
         try self.expect_kind(diag, kind, wire.handshake_client_hello, "ClientHello");
-        const hello = wire.parse_client_hello(message[4..]) catch |err|
-            return self.wire_failure(diag, err, "ClientHello");
+        const hello = switch (self.mode) {
+            .cluster => try self.read_hello(diag, message),
+            .public => try self.read_public_hello(diag, message),
+        };
         if (hello.early_data and !fault_on(.early_data)) {
             return self.fail(
                 diag,
@@ -660,15 +841,6 @@ pub const Server = struct {
                 "the client offers early data; this server takes none",
                 .{},
             );
-        }
-        if (!hello.ed25519) {
-            // The ClientHello lists the browser's scheme only; without a browser identity this
-            // server has no certificate the client would take.
-            if (!self.browser_enabled) {
-                return self.wire_failure(diag, error.SignatureScheme, "ClientHello");
-            }
-            assert(hello.ecdsa_p256);
-            self.scheme = .ecdsa_p256;
         }
         self.transcript.add(message);
         var shared = X25519.scalarmult(self.secret, hello.public_key) catch {
@@ -712,7 +884,129 @@ pub const Server = struct {
         self.write = schedule.Direction.init(&secrets.server);
         self.read_protected = true;
         try self.send_flight(diag);
-        self.state = .wait_certificate;
+        // The table is not read after this: a shell may swap it once the flight is out.
+        self.public_table = null;
+        self.public_chain = null;
+        self.state = switch (self.mode) {
+            .cluster => .wait_certificate,
+            .public => .wait_finished,
+        };
+    }
+
+    /// The cluster paths' ClientHello: ed25519, or the browser's scheme with a browser identity.
+    fn read_hello(self: *Server, diag: *Diag, message: []const u8) Error!wire.ClientHello {
+        assert(self.mode == .cluster);
+        const hello = wire.parse_client_hello(message[4..]) catch |err|
+            return self.wire_failure(diag, err, "ClientHello");
+        if (!hello.ed25519) {
+            // The ClientHello lists the browser's scheme only; without a browser identity this
+            // server has no certificate the client would take.
+            if (!self.browser_enabled) {
+                return self.wire_failure(diag, error.SignatureScheme, "ClientHello");
+            }
+            assert(hello.ecdsa_p256);
+            self.scheme = .ecdsa_p256;
+        }
+        return hello;
+    }
+
+    /// The public path's ClientHello: ecdsa_secp256r1_sha256, a server name the table has, and
+    /// http/1.1 among the ALPN protocols if the client offers any.
+    fn read_public_hello(self: *Server, diag: *Diag, message: []const u8) Error!wire.ClientHello {
+        assert(self.mode == .public);
+        assert(self.scheme == .ecdsa_p256);
+        const parsed = wire.parse_client_hello_public(message[4..]) catch |err| {
+            if (err == error.HelloRetryRequest) {
+                return self.refuse_public(
+                    diag,
+                    .x25519_without_share,
+                    .handshake_failure,
+                    "the client lists x25519 without a key share for it; this server sends " ++
+                        "no HelloRetryRequest",
+                    .{},
+                );
+            }
+            self.refusal = .other;
+            return self.wire_failure(diag, err, "ClientHello");
+        };
+        if (!parsed.hello.ecdsa_p256) {
+            self.refusal = .other;
+            return self.wire_failure(diag, error.SignatureScheme, "ClientHello");
+        }
+        try self.pick_chain(diag, parsed.server_name);
+        switch (parsed.alpn) {
+            .absent => {},
+            .http11 => self.alpn_http11 = true,
+            .other => if (!fault_on(.alpn_check)) {
+                return self.refuse_public(
+                    diag,
+                    .alpn,
+                    .no_application_protocol,
+                    "the client's ALPN list does not include http/1.1",
+                    .{},
+                );
+            },
+        }
+        return parsed.hello;
+    }
+
+    /// The chain for the client's server name, canonicalized as `Host` is.
+    fn pick_chain(self: *Server, diag: *Diag, name: ?[]const u8) Error!void {
+        const table = self.public_table orelse unreachable; // Set by `init_public`.
+        assert(self.public_chain == null);
+        const given = name orelse {
+            if (fault_on(.sni_check) and table.chains.len > 0) return self.serve(&table.chains[0]);
+            return self.refuse_public(
+                diag,
+                .server_name_missing,
+                .unrecognized_name,
+                "the client sent no server name (SNI)",
+                .{},
+            );
+        };
+        var canonical: edge_host.Name = undefined;
+        const host = edge_host.canonicalize(&canonical, given) catch |err| {
+            if (fault_on(.sni_check) and table.chains.len > 0) return self.serve(&table.chains[0]);
+            return self.refuse_public(
+                diag,
+                .server_name_unknown,
+                .unrecognized_name,
+                "the client's server name is not a host name: {s}",
+                .{edge_host.describe(err)},
+            );
+        };
+        const chain = table.find(host) orelse {
+            if (fault_on(.sni_check) and table.chains.len > 0) return self.serve(&table.chains[0]);
+            return self.refuse_public(
+                diag,
+                .server_name_unknown,
+                .unrecognized_name,
+                "no service here is public under the server name {s}",
+                .{host},
+            );
+        };
+        self.serve(chain);
+        @memcpy(self.host[0..host.len], host);
+        self.host_length = @intCast(host.len);
+    }
+
+    fn serve(self: *Server, chain: *const PublicChain) void {
+        assert(chain.certificates.len >= 1);
+        assert(chain.certificates.len <= constants.edge_chain_certificates_max);
+        self.public_chain = chain;
+    }
+
+    fn refuse_public(
+        self: *Server,
+        diag: *Diag,
+        reason: PublicRefusal,
+        alert: wire.Alert,
+        comptime format: []const u8,
+        args: anytype,
+    ) Error {
+        assert(self.mode == .public);
+        self.refusal = reason;
+        return self.fail(diag, .E0818, alert, format, args);
     }
 
     /// EncryptedExtensions, CertificateRequest, Certificate, CertificateVerify and Finished in one
@@ -722,15 +1016,20 @@ pub const Server = struct {
         var content: [flight_content_bytes_max]u8 = undefined;
         defer std.crypto.secureZero(u8, &content);
         var length: u32 = 0;
-        length += self.append(&content, length, &wire.encrypted_extensions_message);
-        const request = switch (self.scheme) {
-            .ed25519 => &wire.certificate_request_message,
-            .ecdsa_p256 => &wire.certificate_request_message_p256,
-        };
-        length += self.append(&content, length, request);
-        var chain: [constants.tls_chain_certificates_max][]const u8 = undefined;
+        length += self.append(&content, length, self.encrypted_extensions());
+        if (self.mode == .cluster or fault_on(.cert_request_sent)) {
+            const request = switch (self.scheme) {
+                .ed25519 => &wire.certificate_request_message,
+                .ecdsa_p256 => &wire.certificate_request_message_p256,
+            };
+            length += self.append(&content, length, request);
+        }
+        var chain: [chain_certificates_max][]const u8 = undefined;
         const chain_used = self.server_chain(&chain);
-        const certificate = wire.write_certificate(content[length..], chain_used);
+        const certificate = switch (self.mode) {
+            .cluster => wire.write_certificate(content[length..], chain_used),
+            .public => wire.write_certificate_public(content[length..], chain_used),
+        };
         self.transcript.add(certificate);
         length += @intCast(certificate.len);
         const certificate_hash = self.transcript.hash();
@@ -760,11 +1059,28 @@ pub const Server = struct {
         assert(self.out_length <= output_bytes_max);
     }
 
+    /// The cluster paths send an empty EncryptedExtensions; the public path acknowledges the
+    /// server name (RFC 6066 section 3) and selects http/1.1 when the client offered ALPN.
+    fn encrypted_extensions(self: *const Server) []const u8 {
+        return switch (self.mode) {
+            .cluster => &wire.encrypted_extensions_message,
+            .public => if (self.alpn_http11)
+                &wire.encrypted_extensions_public_alpn
+            else
+                &wire.encrypted_extensions_public,
+        };
+    }
+
     /// The certificates this server presents on the handshake's path, leaf first.
     fn server_chain(
         self: *const Server,
-        chain: *[constants.tls_chain_certificates_max][]const u8,
+        chain: *[chain_certificates_max][]const u8,
     ) []const []const u8 {
+        if (self.mode == .public) {
+            const picked = self.public_chain orelse unreachable; // Set by `pick_chain`.
+            for (picked.certificates, 0..) |certificate, index| chain[index] = certificate;
+            return chain[0..picked.certificates.len];
+        }
         switch (self.scheme) {
             .ed25519 => {
                 for (0..self.identity_count) |index| {
@@ -810,7 +1126,10 @@ pub const Server = struct {
                 return out[0..message.len];
             },
             .ecdsa_p256 => {
-                const key = self.browser_key orelse unreachable; // Set with browser_enabled.
+                const key = switch (self.mode) {
+                    .cluster => self.browser_key orelse unreachable, // Set with browser_enabled.
+                    .public => (self.public_chain orelse unreachable).key, // Set by `pick_chain`.
+                };
                 var der: [p256.signature_der_bytes_max]u8 = undefined;
                 const signature = p256.signature_write(&der, p256.sign(key.*, content));
                 return wire.write_certificate_verify_p256(out, signature);
@@ -1073,7 +1392,7 @@ pub const Server = struct {
     ) Error {
         diag.raise(code);
         diag.cause(format, args);
-        add_fix(diag, code);
+        self.add_fix_for_path(diag, code);
         return self.refuse(diag, alert);
     }
 
@@ -1090,18 +1409,30 @@ pub const Server = struct {
                 .{},
             ),
             error.Group => diag.cause("the client sent no x25519 key share", .{}),
-            error.SignatureScheme => diag.cause(
-                "the client's {s} does not use ed25519",
-                .{message},
-            ),
+            error.SignatureScheme => switch (self.mode) {
+                .cluster => diag.cause("the client's {s} does not use ed25519", .{message}),
+                .public => diag.cause(
+                    "the client's {s} does not offer ecdsa_secp256r1_sha256",
+                    .{message},
+                ),
+            },
             error.HelloRetryRequest => unreachable, // Only a ServerHello is one.
             else => diag.cause("the client's {s} is {s}", .{
                 message, tls_client.wire_reason(err),
             }),
         }
-        add_fix(diag, code);
+        self.add_fix_for_path(diag, code);
         const hello = self.state == .wait_client_hello;
         return self.refuse(diag, server_wire_alert(err, hello));
+    }
+
+    /// The fix line for the handshake's own refusals: a cluster client must bring a cluster
+    /// certificate, a public one only what a browser offers.
+    fn add_fix_for_path(self: *const Server, diag: *Diag, code: Code) void {
+        switch (self.mode) {
+            .cluster => add_fix(diag, code),
+            .public => add_public_fix(diag, code),
+        }
     }
 
     fn record_failure(self: *Server, diag: *Diag, err: schedule.Error) Error {
@@ -1138,6 +1469,9 @@ pub const Server = struct {
     /// Ends the connection: queues the alert (if any), wipes every secret and the record buffer,
     /// and stops all further input and output. Always returns `error.Refused`.
     fn refuse(self: *Server, diag: *Diag, alert: ?wire.Alert) Error {
+        if (self.mode == .public and self.state != .connected and self.refusal == null) {
+            self.refusal = .other;
+        }
         self.out_length = 0;
         if (alert) |description| {
             self.queue_alert(wire.alert_level_fatal, description);
@@ -1206,6 +1540,13 @@ fn server_wire_alert(err: wire.Error, hello: bool) wire.Alert {
     return tls_client.wire_alert(err);
 }
 
+/// The public path's signer slot: it signs with the chain's P-256 key, never through a signer.
+fn never_signs(context: *const anyopaque, message: []const u8) ?[64]u8 {
+    _ = context;
+    _ = message;
+    unreachable; // `sign_certificate_verify` takes the P-256 branch on the public path.
+}
+
 fn first_kind(kinds: x509.Kinds) x509.Kind {
     var copy = kinds;
     var iterator = copy.iterator();
@@ -1215,6 +1556,17 @@ fn first_kind(kinds: x509.Kinds) x509.Kind {
 fn message_name(kind: u8) []const u8 {
     if (kind == wire.handshake_client_hello) return "ClientHello";
     return tls_client.message_name(kind);
+}
+
+/// The public path's fix line: the other end is a browser or an HTTP client on the internet.
+fn add_public_fix(diag: *Diag, code: Code) void {
+    const sentence = switch (code) {
+        .E0810, .E0813, .E0818 => "Check that the client asks, by server name (SNI), for a " ++
+            "host this edge serves, and offers TLS 1.3 with x25519, TLS_AES_128_GCM_SHA256, " ++
+            "ECDSA P-256 signatures and, if it uses ALPN, http/1.1.",
+        else => return add_fix(diag, code),
+    };
+    diag.fix(.{ .sentence = sentence });
 }
 
 /// The fix line: the server's side of each code. The other end is a client of this cluster, so
