@@ -1,6 +1,7 @@
 # Jepsen runs on GCP, applied and torn down by CI
 
-Date: 2026-11-18. Decided by the owner (2026-11-17), recorded by the supervisor.
+Date: 2026-11-18. Decided by the owner (2026-11-17), recorded by the supervisor. It follows
+`2026-11-15-jepsen-on-google-cloud.md` and records the setup as built and its first run.
 
 ## Decision
 
