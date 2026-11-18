@@ -98,9 +98,15 @@ because a copy can drift.
 ## The tooth
 
 `sim-c1-teeth-store_step` (`src/sim_c1_teeth_store_step_main.zig`, `c1_teeth.store_clock_step`):
-the simulated store's clock steps forward by more than `clock_step_max_ms` (by 501 ms up to half
-the ttl more, about every 30 s of simulated time, from a PRNG of its own), and sim-c1 must fail
-I1b. Catch rate: see the slice's report and `docs/core.md`, "sim-c1".
+while faults run, the simulated store's clock steps forward by more than `clock_step_max_ms`
+(by 501 ms plus a quarter to a half of the ttl, about every 5 s of simulated time, from a PRNG of
+its own, so worlds without the tooth draw as before), and sim-c1 must fail I1b. A step only
+matters when it lands while a cut-off node's lease runs out, and one inside the simulated kill's
+slack breaks nothing, hence the size. Catch rate, `sim_c1_teeth_store_step <seed> 100 --c1`:
+**9 of seeds 1..30** (4 5 10 14 15 17 19 26 29), every one I1b ("a container runs on a node whose
+lease ran out longer ago than the lost grace"); the other 21 pass. Stepping after the heal too
+made every other seed fail the liveness check instead, so the tooth stops at the heal.
+`sim-c1-teeth-store_step` catches it at seed 4 of 1..10; its canary runs seeds 1..30.
 
 Where: `src/fencing.zig`, `src/constants.zig`, `src/server_config.zig`, docs/authority.md §3,
 docs/operations.md "Clocks", docs/core.md "sim-c1".

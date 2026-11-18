@@ -1733,7 +1733,6 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_store_step_main.zig",
         .symptom = "I1b",
         .canary_seeds = 30,
-        .any_symptom = true,
     },
     .{
         .name = "wedge",
