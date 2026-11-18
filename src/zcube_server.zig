@@ -120,6 +120,25 @@ fn issue(init: std.process.Init, request: *const config_mod.Issue) u8 {
     return say(init.io, line);
 }
 
+/// Test-only (#237): the registration barrier (server_register_barrier.zig), compiled only in a
+/// server built with `-Dregister-barrier=true`; any other build ignores the variable.
+const RegisterBarrier = if (build_options.register_barrier)
+    @import("server_register_barrier.zig").Barrier
+else
+    void;
+var register_barrier_state: RegisterBarrier = undefined;
+
+/// The barrier's hook when it is built in and `ZCUBE_TEST_REGISTER_BARRIER` names a directory.
+fn register_barrier(init: std.process.Init, io: std.Io) ?server_mod.Hook {
+    if (build_options.register_barrier) {
+        const dir = init.environ_map.get("ZCUBE_TEST_REGISTER_BARRIER") orelse return null;
+        if (dir.len == 0) return null;
+        register_barrier_state = .{ .io = io, .dir = dir };
+        return register_barrier_state.hook();
+    }
+    return null;
+}
+
 fn run(init: std.process.Init, config: config_mod.Config) u8 {
     verbose_panics = config.verbose;
     const limit = constants.http_connections_max + constants.http_refusals_max +
@@ -131,6 +150,7 @@ fn run(init: std.process.Init, config: config_mod.Config) u8 {
     diag.reset();
     const server = server_mod.Server.start(init.gpa, io, config, .{
         .version = build_options.version,
+        .hook = register_barrier(init, io),
     }, &diag) catch |err| switch (err) {
         error.OutOfMemory => return constants.exit_environment,
         error.Canceled => return constants.exit_ok, // Stopped on request: nothing to report.

@@ -689,6 +689,17 @@ pub const registry = [_]Entry{
         \\
         \\A node agent that sees this has lost its place in the cluster. It stops
         \\its workloads, grants a new lease and registers again.
+        \\
+        \\The same code answers a keepalive for a lease the node's registration is
+        \\not on: a later registration took the node, and the agent fences, as
+        \\above.
+        \\
+        \\It also answers a registration that cannot take the node: one made on a
+        \\lease that is gone, or on a lease older than the one the node is
+        \\registered on (an earlier attempt that arrived late, #237). Nothing was
+        \\written and the agent holds no tenure on that lease, so it fences
+        \\nothing: its step fails, and its next step registers on a new lease,
+        \\which is accepted at once.
         ,
     },
     .{

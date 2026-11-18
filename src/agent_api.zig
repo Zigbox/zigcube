@@ -340,6 +340,37 @@ const Call = struct {
         }
     }
 
+    /// What a registration meets at `/nodes/<node>`: the revision its transaction compares (0
+    /// when absent), so the check and the write are one; or the registration it repeats.
+    const Held = union(enum) { compare: u64, repeated: u64 };
+
+    /// A key on a NEWER lease than the registration's is refused (ZC-E0205), whatever the agent
+    /// sends: that registration is an earlier attempt, delayed on the wire, and accepting it
+    /// would move the key off the lease its agent renews onto one nobody renews (#237). Lease ids
+    /// only grow (docs/authority.md), an agent grants a fresh lease before every registration,
+    /// and a keepalive renews only the lease the key is on, so a live key on a newer lease is
+    /// never the agent's own retry: a lost reply, a crash before it recorded the tenure, a
+    /// server restart and a wiped state directory all register on a newer lease and are
+    /// accepted. A key on the registration's own lease with the same value is a copy of the
+    /// registration that wrote it (a retried or duplicated PUT): it is answered with the key's
+    /// revision and nothing is written, so the tenure the agent holds stays the key's. The rule
+    /// needs nothing from the agent (docs/decisions/2026-11-18-registration-lease-order.md).
+    fn registration_held(call: Call, lease_id: store.LeaseId, value: []const u8) Failure!Held {
+        const ctx = call.ctx;
+        const key = records.node_key(call.node);
+        const found = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
+            return propagate(ctx);
+        };
+        const kv = found.kv orelse return .{ .compare = 0 };
+        if (kv.lease == lease_id and std.mem.eql(u8, kv.value, value)) {
+            return .{ .repeated = kv.mod_revision };
+        }
+        if (kv.lease <= lease_id) return .{ .compare = kv.mod_revision };
+        // Test-only (#237): the check is left out, as the server did before the rule.
+        if (c1_teeth.register_unchecked) return .{ .compare = kv.mod_revision };
+        return tenure_moved(ctx, call.node, lease_id, kv.lease);
+    }
+
     // ---- PUT /v1/agent/nodes/{node} ----
 
     fn register(call: Call) Failure!Reply {
@@ -376,10 +407,21 @@ const Call = struct {
         const value = records.encode(ctx.arena, node, ctx.diag) catch return propagate(ctx);
         const put: store.Put = .{ .key = key.slice(), .value = value, .lease = input.lease };
         const op: store.Op = .{ .put = put };
-        const request: store.TxnRequest = .{ .on_success = &.{op} };
+        // A registration on a lease older than the key's is refused (#237, the lease order);
+        // the compare on the revision read makes that check and the write one transaction.
+        const held = switch (try call.registration_held(input.lease, value)) {
+            .repeated => |revision| return reply(ctx, .{
+                .revision = revision,
+                .chain = try call.chain(),
+            }),
+            .compare => |revision| revision,
+        };
+        const compares = [_]store.Compare{.{ .key = key.slice(), .mod_revision = held }};
+        const request: store.TxnRequest = .{ .compares = &compares, .on_success = &.{op} };
         const role: writers.Role = .{ .agent = call.node };
         const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
+        if (!result.succeeded) return tenure_moved(ctx, call.node, input.lease, null);
         const pair = try call.chain_written(result);
         return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
@@ -398,7 +440,8 @@ const Call = struct {
             return bad_request(ctx, "lease", "is not a number");
         if (id == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
         // Only the lease of this node's registration: a node certificate may keep its own node
-        // alive and no other (B7 slice 3).
+        // alive and no other (B7 slice 3); a lease the key has moved off is no longer the
+        // agent's and must not keep pushing back its fence (#237).
         try call.registered_on(id, "a node keeps alive only the lease of its registration");
         const granted = ctx.store.lease_keepalive(id, ctx.diag) catch return propagate(ctx);
         const lease_reply = .{ .id = granted.id, .ttl_ms = granted.ttl_ms };
@@ -1406,6 +1449,32 @@ fn tenure_ended(ctx: *const Context, node: []const u8) Failure {
     ctx.diag.raise(.E0510);
     ctx.diag.cause("node {s} is not registered under the tenure this write names", .{node});
     ctx.diag.fix(.{ .sentence = "the agent stops its containers and registers the node again" });
+    return error.Failed;
+}
+
+/// A registration that is refused (#237), with ZC-E0205: the node's key is on a newer lease than
+/// this registration's (`newer`), or the key changed between the server's read and its write
+/// (null): written on another lease, or deleted when its lease ended. Within one server the read
+/// and the write are under one lock, so only a lease's end (`expire_leases`, a revoke) gets
+/// between them today; the compare also guards a second server on the store (C7). Nothing is
+/// written. ZC-E0205, not ZC-E0510: every agent, built before this rule or after, reads ZC-E0205
+/// at registration as a failed step (ZC-E0504) and registers on a new lease at its next step,
+/// while an agent built before it asserts on ZC-E0510 there (decision 2026-11-18).
+fn tenure_moved(ctx: *const Context, node: []const u8, lease: u64, newer: ?u64) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0205);
+    if (newer) |current| {
+        ctx.diag.cause("this registration of node {s} is on lease {d}, older than lease {d} " ++
+            "the node is registered on: an earlier attempt that arrived late", .{
+            node, lease, current,
+        });
+    } else {
+        ctx.diag.cause("the key /nodes/{s} changed between the server's read and its write " ++
+            "of this registration on lease {d} (written on another lease, or its lease ended)", .{
+            node, lease,
+        });
+    }
+    ctx.diag.fix(.{ .sentence = "the agent registers the node again by itself" });
     return error.Failed;
 }
 
