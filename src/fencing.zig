@@ -105,8 +105,8 @@ pub fn raise_contract_problem(diag: *Diag, ttl_ms: u32, grace_ms: u32, problem: 
                     "{d} ms fence margin and the grace must cover the stop, the clock skew, the " ++
                     "kill's delivery and dispatch and a {d} ms store clock step: {d} ms)",
                 .{
-                    ttl_ms,                    grace_min_ms(ttl_ms),
-                    grace_ms,                  constants.fence_margin_ms,
+                    ttl_ms,                      grace_min_ms(ttl_ms),
+                    grace_ms,                    constants.fence_margin_ms,
                     constants.clock_step_max_ms, cover_needed_ms(ttl_ms),
                 },
             );

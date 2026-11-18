@@ -198,7 +198,8 @@ pub const signed_world = job_untrusted;
 pub const tenant_world = placement_exclusive or relabel_kept;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
-    skew_beyond_bound or store_clock_step or wedge or stale_observation or locality_before_spread or job_restart or
+    skew_beyond_bound or store_clock_step or wedge or stale_observation or locality_before_spread or
+    job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
